@@ -38,6 +38,7 @@
             meta = with pkgs.lib; {
               description = "Lean 4 compiler and safety verifier for Linux accel/ane";
               mainProgram = "vane";
+              license = licenses.mit;
               platforms = systems;
             };
           });
