@@ -33,6 +33,12 @@ def parse? (s : String) : Option Target :=
 
 end Target
 
+/-- Byte size of the task-stream opening prologue frame. -/
+def prologueFrameBytes : Nat := 16
+
+/-- Byte alignment granularity for task starts and zero-block padding frames. -/
+def taskFrameAlignBytes : Nat := 16
+
 /-- Maximum byte length of `__TEXT,__text` (384 KiB). -/
 def maxTextSize : Nat := 0x60000
 
@@ -276,8 +282,8 @@ def encodeTaskStream (target : Target) (stream : TaskStream) : Except String Enc
 
 /-- Validate raw `__TEXT,__text` bytes according to all structural task-stream invariants. -/
 def validateTaskStream (target : Target) (bs : ByteArray) : Except String TaskStreamInfo := do
-  if bs.size < 16 || bs.size > maxTextSize then
-    throw s!"task stream size {bs.size} out of range [16, {maxTextSize}]"
+  if bs.size < prologueFrameBytes || bs.size > maxTextSize then
+    throw s!"task stream size {bs.size} out of range [{prologueFrameBytes}, {maxTextSize}]"
   if bs.size % 4 != 0 then
     throw s!"task stream size {bs.size} is not a multiple of 4"
 
@@ -289,9 +295,9 @@ def validateTaskStream (target : Target) (bs : ByteArray) : Except String TaskSt
   | .h17 =>
     if prologue != 0 && prologue != 1 then
       throw s!"H17 task stream prologue must be 0 or 1, got {prologue}"
-  checkAllZero bs 4 12 "task stream opening frame"
+  checkAllZero bs 4 (prologueFrameBytes - 4) "task stream opening frame"
 
-  let mut pos := 16
+  let mut cursor := prologueFrameBytes
   let mut taskCount := 0
   let mut recordCount := 0
   let mut recordLimit := 0
@@ -299,33 +305,33 @@ def validateTaskStream (target : Target) (bs : ByteArray) : Except String TaskSt
   let mut barSlots : Array UInt8 := #[]
   let mut payloadSites : Array Nat := #[]
 
-  while pos < bs.size do
-    if pos + 16 > bs.size then
-      throw s!"task stream at offset {toHex pos}: fewer than 16 bytes remain ({bs.size - pos})"
-    let w0 ← readU32LE bs pos
+  while cursor < bs.size do
+    if cursor + taskFrameAlignBytes > bs.size then
+      throw s!"task stream at offset {toHex cursor}: fewer than {taskFrameAlignBytes} bytes remain ({bs.size - cursor})"
+    let w0 ← readU32LE bs cursor
     let words := ((w0 >>> 16) &&& 0x7ff).toNat
     if words == 0 then
-      checkAllZero bs pos 16 s!"task stream zero block at {toHex pos}"
-      pos := pos + 16
+      checkAllZero bs cursor taskFrameAlignBytes s!"task stream zero block at {toHex cursor}"
+      cursor := cursor + taskFrameAlignBytes
     else
       if words < 9 then
-        throw s!"task at {toHex pos}: word count {words} < 9"
+        throw s!"task at {toHex cursor}: word count {words} < 9"
       let taskBytes := 4 * words
-      if pos + taskBytes > bs.size then
-        throw s!"task at {toHex pos}: extends past end of __text ({pos + taskBytes} > {bs.size})"
-      let taskEnd := pos + taskBytes
-      let w8 ← readU32LE bs (pos + 32)
+      if cursor + taskBytes > bs.size then
+        throw s!"task at {toHex cursor}: extends past end of __text ({cursor + taskBytes} > {bs.size})"
+      let taskEnd := cursor + taskBytes
+      let w8 ← readU32LE bs (cursor + 32)
       let headerWords := if (w8 &&& 3) == 3 then 10 else 9
       if words < headerWords then
-        throw s!"task at {toHex pos}: word count {words} < header words {headerWords}"
+        throw s!"task at {toHex cursor}: word count {words} < header words {headerWords}"
 
-      let recStart := pos + 4 * headerWords
+      let recStart := cursor + 4 * headerWords
       recordLimit := recordLimit + (taskEnd - recStart) / 8
 
       let mut recPos := recStart
       while recPos < taskEnd do
         if recPos + 4 > taskEnd then
-          throw s!"task at {toHex pos}: truncated register record header at {toHex recPos}"
+          throw s!"task at {toHex cursor}: truncated register record header at {toHex recPos}"
         let h ← readU32LE bs recPos
         recPos := recPos + 4
         let base := (h &&& 0x7fff).toNat
@@ -334,19 +340,19 @@ def validateTaskStream (target : Target) (bs : ByteArray) : Except String TaskSt
           if isBitmask then
             let mask := ((h >>> 15) &&& 0xffff).toUInt16
             if !isAllowedRegWord base then
-              throw s!"task at {toHex pos}, bitmask record: base register word {toHex base} (byte {toHex (base * 4)}) outside allowed blocks"
+              throw s!"task at {toHex cursor}, bitmask record: base register word {toHex base} (byte {toHex (base * 4)}) outside allowed blocks"
             for i in [:16] do
               if ((mask.toNat >>> i) &&& 1) == 1 then
                 let reg := base + i + 1
                 if !isAllowedRegWord reg then
-                  throw s!"task at {toHex pos}, bitmask record: register word {toHex reg} (byte {toHex (reg * 4)}) outside allowed blocks"
+                  throw s!"task at {toHex cursor}, bitmask record: register word {toHex reg} (byte {toHex (reg * 4)}) outside allowed blocks"
             pure (1 + popcount16 mask)
           else
             let cnt := (((h >>> 15) &&& 0x3f).toNat) + 1
             for i in [:cnt] do
               let reg := base + i
               if !isAllowedRegWord reg then
-                throw s!"task at {toHex pos}, sequential record: register word {toHex reg} (byte {toHex (reg * 4)}) outside allowed blocks"
+                throw s!"task at {toHex cursor}, sequential record: register word {toHex reg} (byte {toHex (reg * 4)}) outside allowed blocks"
             if ((h >>> 29) &&& 1) == 1 then
               let slot := ((h >>> 23) &&& 0x3f).toUInt8
               if !barSlots.contains slot then
@@ -354,26 +360,26 @@ def validateTaskStream (target : Target) (bs : ByteArray) : Except String TaskSt
             pure cnt
 
         if recPos + 4 * count > taskEnd then
-          throw s!"task at {toHex pos}: register record at {toHex (recPos - 4)} payload ({count} words) overruns task end {toHex taskEnd}"
+          throw s!"task at {toHex cursor}: register record at {toHex (recPos - 4)} payload ({count} words) overruns task end {toHex taskEnd}"
         for i in [:count] do
           payloadSites := payloadSites.push (recPos + 4 * i)
         recPos := recPos + 4 * count
         recordCount := recordCount + 1
 
       if recPos != taskEnd then
-        throw s!"task at {toHex pos}: register records ended at {toHex recPos} != task end {toHex taskEnd}"
+        throw s!"task at {toHex cursor}: register records ended at {toHex recPos} != task end {toHex taskEnd}"
 
       taskCount := taskCount + 1
       finalTaskEnd := taskEnd
 
       if taskEnd < bs.size then
-        let nextPos := alignUp taskEnd 16
-        if nextPos > bs.size then
-          throw s!"task at {toHex pos}: inter-task alignment target {toHex nextPos} exceeds __text size {toHex bs.size}"
-        checkAllZero bs taskEnd (nextPos - taskEnd) s!"inter-task zero padding after {toHex taskEnd}"
-        pos := nextPos
+        let nextCursor := alignUp taskEnd taskFrameAlignBytes
+        if nextCursor > bs.size then
+          throw s!"task at {toHex cursor}: inter-task alignment target {toHex nextCursor} exceeds __text size {toHex bs.size}"
+        checkAllZero bs taskEnd (nextCursor - taskEnd) s!"inter-task zero padding after {toHex taskEnd}"
+        cursor := nextCursor
       else
-        pos := taskEnd
+        cursor := taskEnd
 
   if taskCount == 0 then
     throw "task stream contains 0 tasks"

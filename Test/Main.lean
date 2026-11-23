@@ -241,6 +241,41 @@ private def runAllTests : IO (Array TestResult) := do
     pure ()
   ))
 
+  -- 6. Canonical ascending BAR slot ordering in OPERATION regardless of encounter order
+  results := results.push (checkOk "pos: OPERATION BAR bindings sorted ascending" (do
+    let in0 := SurfaceSpec.packed "in0" "input_0" .input 1 8 4 4
+    let out0 := SurfaceSpec.packed "out0" "output_0" .output 1 8 4 4
+    -- Reference BAR slots intentionally out of order: 8 (kernel), 6 (input), 3 (scratch), 7 (output)
+    let recs : Array RegRecord := #[
+      .sequential 0x1340 (some 8) #[0x00000010],
+      .sequential 0x0000 (some 6) #[0x00000001],
+      .sequential 0x1240 (some 3) #[0x00000000],
+      .sequential 0x1040 (some 7) #[0x00000002]
+    ]
+    let prog : HwxProgram := {
+      target := .h17
+      surfaces := #[in0, out0]
+      constants := zeroBytes 16
+      kernel := some (zeroBytes 128)
+      scratch := some { size := 0x4000, usable := 0x2000 }
+      taskStream := { prologue := 1, tasks := #[Task.mk9 recs] }
+    }
+    let (_, _, secs) ← roundTrip prog
+    let refCount ← readU32LE secs.operation 0x0c
+    if refCount != 4 then throw s!"expected 4 BAR bindings, got {refCount}"
+    let mut emittedSlots : Array UInt32 := #[]
+    let mut emittedTags : Array UInt32 := #[]
+    for j in [:4] do
+      emittedSlots := emittedSlots.push (← readU32LE secs.operation (0x10 + 8 * j))
+      emittedTags := emittedTags.push (← readU32LE secs.operation (0x14 + 8 * j))
+    if emittedSlots != #[3, 6, 7, 8] then
+      throw s!"expected ascending BAR slots [3, 6, 7, 8], got {emittedSlots.toList}"
+    -- Expected tags: slot 3 -> scratch (6), slot 6 -> input (5), slot 7 -> output (4), slot 8 -> kernel (1007)
+    if emittedTags != #[6, 5, 4, 1007] then
+      throw s!"expected tags [6, 5, 4, 1007], got {emittedTags.toList}"
+    pure ()
+  ))
+
   -- Prepare valid baseline binaries for mutation-based negative tests
   let unwrap {α : Type} (label : String) (res : Except String α) : IO α :=
     match res with

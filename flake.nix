@@ -13,28 +13,34 @@
     {
       packages = forAllSystems (system: pkgs:
         let
-          vane = pkgs.stdenv.mkDerivation {
+          vane = pkgs.stdenv.mkDerivation (finalAttrs: {
             pname = "vane";
             version = "0.1.0";
             src = self;
 
             nativeBuildInputs = [ pkgs.lean4 ];
+            dontConfigure = true;
 
             buildPhase = ''
               runHook preBuild
-              export HOME=$TMPDIR
+              export HOME="$TMPDIR"
               lake build
               runHook postBuild
             '';
 
             installPhase = ''
               runHook preInstall
-              mkdir -p $out/bin
-              cp .lake/build/bin/vane $out/bin/vane
-              cp .lake/build/bin/vane-test $out/bin/vane-test
+              install -Dm755 .lake/build/bin/vane "$out/bin/vane"
+              install -Dm755 .lake/build/bin/vane-test "$out/bin/vane-test"
               runHook postInstall
             '';
-          };
+
+            meta = with pkgs.lib; {
+              description = "Lean 4 compiler and safety verifier for Linux accel/ane";
+              mainProgram = "vane";
+              platforms = systems;
+            };
+          });
         in
         {
           default = vane;

@@ -64,6 +64,8 @@ DRM_ANE_H16_SURFACES = 4
 DRM_ANE_H16_EXEC_IN_PLACE = 1 << 0
 
 PAGE_SIZE_16K = 0x4000
+PROLOGUE_FRAME_BYTES = 16
+TASK_FRAME_ALIGN = 16
 EXIT_SKIP = 4
 
 _IOC_WRITE = 1
@@ -172,19 +174,19 @@ def build_sections_from_hwx(hwx: bytes) -> dict[int, bytes]:
     text_bytes = hwx[text_off : text_off + text_size]
 
     # Walk task stream to count tasks and collect BAR slots referenced with bit 29 set
-    pos = 16
+    stream_off = PROLOGUE_FRAME_BYTES
     task_count = 0
     bar_slots: list[int] = []
-    while pos < len(text_bytes):
-        w0 = struct.unpack_from("<I", text_bytes, pos)[0]
+    while stream_off < len(text_bytes):
+        w0 = struct.unpack_from("<I", text_bytes, stream_off)[0]
         words = (w0 >> 16) & 0x7FF
         if words == 0:
-            pos += 16
+            stream_off += TASK_FRAME_ALIGN
             continue
-        task_end = pos + 4 * words
-        w8 = struct.unpack_from("<I", text_bytes, pos + 32)[0]
+        task_end = stream_off + 4 * words
+        w8 = struct.unpack_from("<I", text_bytes, stream_off + 32)[0]
         hdr_words = 10 if (w8 & 3) == 3 else 9
-        rec = pos + 4 * hdr_words
+        rec = stream_off + 4 * hdr_words
         while rec < task_end:
             h = struct.unpack_from("<I", text_bytes, rec)[0]
             rec += 4
@@ -199,7 +201,7 @@ def build_sections_from_hwx(hwx: bytes) -> dict[int, bytes]:
                         bar_slots.append(slot)
             rec += 4 * count
         task_count += 1
-        pos = align_up(task_end, 16) if task_end < len(text_bytes) else task_end
+        stream_off = align_up(task_end, TASK_FRAME_ALIGN) if task_end < len(text_bytes) else task_end
 
     # Assign buffer IDs: output = 4, inputs = 5, 6, ..., scratch = next
     next_in = 5
@@ -253,6 +255,8 @@ def build_sections_from_hwx(hwx: bytes) -> dict[int, bytes]:
         raise ValueError("task stream references no non-zero BAR slots")
     if kernel_addr is not None and not has_kernel_binding:
         raise ValueError("HWX has __KERN_0 but no kernel BAR binding")
+
+    bindings.sort(key=lambda item: item[0])
 
     op = bytearray(0x410)
     struct.pack_into("<I", op, 0x00, 1)

@@ -452,10 +452,22 @@ class TestRunnerAndCliIntegration(unittest.TestCase):
             self.assertIn("target: h17", val.stdout)
 
             # Verify pure-Python section builder matches Lean `vane sections` byte-for-byte
+            # and emits OPERATION BAR slot bindings in canonical ascending slot order
             hwx_bytes = (demo_dir / "program.hwx").read_bytes()
             py_secs = ane_runner.build_sections_from_hwx(hwx_bytes)
             for kind, fname in ane_runner.SECTION_FILENAMES.items():
                 self.assertEqual(py_secs[kind], (demo_dir / fname).read_bytes(), f"mismatch on {fname}")
+
+            op_bytes = py_secs[ane_runner.DRM_ANE_H16_SECTION_OPERATION]
+            ref_count = struct.unpack_from("<I", op_bytes, 0x0C)[0]
+            # demo_h17 references slots 6, 7, 8, 3 in encounter order -> emitted canonically as 3, 6, 7, 8
+            emitted_pairs = [
+                struct.unpack_from("<II", op_bytes, 0x10 + 8 * j) for j in range(ref_count)
+            ]
+            self.assertEqual(
+                emitted_pairs,
+                [(3, 6), (6, 5), (7, 4), (8, ane_runner.DRM_ANE_H16_RESOURCE_KERNEL)],
+            )
 
             manifest = json.loads((demo_dir / "manifest.json").read_text(encoding="utf-8"))
             in_span = manifest["surfaces"][0]["span"]

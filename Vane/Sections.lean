@@ -146,11 +146,13 @@ def buildSectionsFromInfo (info : HwxInfo) : Except String LoadSections := do
   if info.kernelSection.isSome && !hasKernelBinding then
     throw "HWX contains __KERN_0 but task stream never references the kernel BAR slot"
 
+  let sortedBindings := bindings.qsort fun a b => a.1 < b.1
+
   let mut op := zeroBytes 0x410
   op ← putU32LE op 0x00 1
-  op ← putU32LE op 0x0c bindings.size.toUInt32
-  for j in [:bindings.size] do
-    let (slot, tag) := bindings[j]!
+  op ← putU32LE op 0x0c sortedBindings.size.toUInt32
+  for j in [:sortedBindings.size] do
+    let (slot, tag) := sortedBindings[j]!
     op ← putU32LE op (0x10 + 8 * j) slot
     op ← putU32LE op (0x14 + 8 * j) tag
 
