@@ -1,0 +1,14 @@
+name = "vane"
+version = "0.1.0"
+defaultTargets = ["Vane", "vane", "vane-test"]
+
+[[lean_lib]]
+name = "Vane"
+
+[[lean_exe]]
+name = "vane"
+root = "Main"
+
+[[lean_exe]]
+name = "vane-test"
+root = "Test.Main"
