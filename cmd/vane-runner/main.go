@@ -56,13 +56,14 @@ func (f *optFloatFlag) Set(s string) error {
 func usage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  vane-runner probe [--device PATH] [--json]")
-	fmt.Fprintln(w, "  vane-runner run --hwx PATH [--sections-dir DIR] [--input PATH]... [--output-out PATH]")
+	fmt.Fprintln(w, "  vane-runner run --hwx PATH [--sections-dir DIR] [--input PATH]... [--alt-input PATH]... [--output-out PATH]")
 	fmt.Fprintln(w, "                  [--expected PATH] [--runs N] [--in-place] [--atol F] [--rtol F]")
 	fmt.Fprintln(w, "                  [--max-ulp N] [--device PATH] [--json] [--json-out PATH]")
 	fmt.Fprintln(w, "  vane-runner gen-conv1x1 --h H --w W --cin C --cout O [--bias] [--relu | --act NAME [act flags]] [--lut-bin PATH] [--seed N] --out-dir DIR [--json]")
 	fmt.Fprintln(w, "  vane-runner gen-conv3x3 --mode <dense|depthwise> --h H --w W --cin C --cout O --stride <1|2> --pad <same|valid> [--bias] [--relu | --act NAME [act flags]] [--lut-bin PATH] [--seed N] --out-dir DIR [--json]")
 	fmt.Fprintln(w, "  vane-runner gen-pe --op <abs|square|linear|chain|sadd|ssub|srsub|smul|sdiv|add|sub|rsub|mul|max|min> --h H --w W --c C [--z-h ZH --z-w ZW --z-c ZC] [--alpha F] [--beta F] [--in-scale F] [--bias F] [--scale F] [--scalar F] [--edge-values] [--seed N] --out-dir DIR [--json]")
 	fmt.Fprintln(w, "  vane-runner gen-lut --act NAME --h H --w W --c C [--alpha F] [--beta F] [--lo F] [--hi F] [--eps F] [--scalar F] [--all-fp16] [--lut-bin PATH] [--seed N] --out-dir DIR [--json]")
+	fmt.Fprintln(w, "  vane-runner gen-graph --spec PATH --out-dir DIR [--seed N] [--json]")
 	fmt.Fprintln(w, "  vane-runner compare-conv --manifest PATH --actual PATH --expected PATH [--atol F] [--rtol F] [--max-ulp N] [--json]")
 	fmt.Fprintln(w, "  vane-runner compare-conv1x1 --manifest PATH --actual PATH --expected PATH [--atol F] [--rtol F] [--max-ulp N] [--json]")
 	fmt.Fprintln(w, "  vane-runner compare-surface --manifest PATH --actual PATH --expected PATH [--atol F] [--rtol F] [--max-ulp N] [--json]")
@@ -86,6 +87,8 @@ func runCLI(args []string, tr ane.Transport, stdout, stderr io.Writer) int {
 		return cmdGenPe(args[1:], stdout, stderr)
 	case "gen-lut":
 		return cmdGenLut(args[1:], stdout, stderr)
+	case "gen-graph":
+		return cmdGenGraph(args[1:], stdout, stderr)
 	case "compare-conv":
 		return cmdCompareConv("compare-conv", args[1:], stdout, stderr)
 	case "compare-conv1x1":
@@ -276,6 +279,8 @@ func cmdRun(args []string, tr ane.Transport, stdout, stderr io.Writer) int {
 	sectionsDir := fs.String("sections-dir", "", "Directory containing the 4 host-built LOAD sections")
 	var inputPaths stringSliceFlag
 	fs.Var(&inputPaths, "input", "Input binary file (repeatable in HWX input surface order)")
+	var altInputPaths stringSliceFlag
+	fs.Var(&altInputPaths, "alt-input", "Alternate input binary file used on odd runs when --runs > 1 (repeatable)")
 	outputOut := fs.String("output-out", "", "Write output surface bytes to this path")
 	expectedPath := fs.String("expected", "", "Expected output fp16 binary for direct byte comparison")
 	runs := fs.Int("runs", 1, "Number of consecutive runs for repeatability verification")
@@ -331,6 +336,16 @@ func cmdRun(args []string, tr ane.Transport, stdout, stderr io.Writer) int {
 		inputPayloads = append(inputPayloads, b)
 	}
 
+	var altInputPayloads [][]byte
+	for _, p := range altInputPaths {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			fmt.Fprintf(stderr, "error: read alt-input %q: %v\n", p, err)
+			return 1
+		}
+		altInputPayloads = append(altInputPayloads, b)
+	}
+
 	var expectedBytes []byte
 	if *expectedPath != "" {
 		expectedBytes, err = os.ReadFile(*expectedPath)
@@ -364,12 +379,13 @@ func cmdRun(args []string, tr ane.Transport, stdout, stderr io.Writer) int {
 	}
 
 	outBytes, report, err := ane.ExecuteProgram(tr, fd, caps, loaded, inputPayloads, ane.ExecOptions{
-		Runs:     *runs,
-		InPlace:  *inPlace,
-		Expected: expectedBytes,
-		Atol:     *atol,
-		Rtol:     *rtol,
-		MaxULP:   maxULP,
+		Runs:      *runs,
+		InPlace:   *inPlace,
+		AltInputs: altInputPayloads,
+		Expected:  expectedBytes,
+		Atol:      *atol,
+		Rtol:      *rtol,
+		MaxULP:    maxULP,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "error: %v\n", err)
@@ -416,8 +432,12 @@ func cmdRun(args []string, tr ane.Transport, stdout, stderr io.Writer) int {
 			sumMS += v
 		}
 		meanMS := sumMS / float64(len(report.LatenciesMS))
-		fmt.Fprintf(stdout, "device=%s abi=v%d chip=H%d mode=%s runs=%d mean_ms=%.3f sha256=%s\n",
+		fmt.Fprintf(stdout, "device=%s abi=v%d chip=H%d mode=%s runs=%d mean_ms=%.3f sha256=%s",
 			report.Device, report.ABIVersion, report.ChipFamily, report.Mode, report.Runs, meanMS, report.OutputSHA256)
+		if report.AltOutputSHA256 != "" {
+			fmt.Fprintf(stdout, " alt_sha256=%s", report.AltOutputSHA256)
+		}
+		fmt.Fprintln(stdout)
 		if report.Comparison != nil {
 			c := report.Comparison
 			fmt.Fprintf(stdout, "reference: passed=%t max_abs=%.6g max_rel=%.6g rmse=%.6g max_ulp=%d exact=%d/%d\n",
@@ -1255,6 +1275,356 @@ func cmdGenLut(args []string, stdout, stderr io.Writer) int {
 	} else {
 		fmt.Fprintf(stdout, "generated lut %s (%dx%dx%d, all_fp16=%t, in=%dB) in %s\n",
 			spec.Name, *c, *h, *w, *allFP16, len(inBuf), *outDir)
+	}
+	return 0
+}
+
+func packTight64Surface(t ref.Tensor) ([]byte, int, int, int, error) {
+	rowStride := ref.AlignUp(2*t.W, 64)
+	planeStride := t.H * rowStride
+	batchStride := t.C * planeStride
+	buf, err := ref.PackSurface(t, batchStride, planeStride, rowStride, batchStride)
+	return buf, batchStride, planeStride, rowStride, err
+}
+
+func cmdGenGraph(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("gen-graph", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	specPath := fs.String("spec", "", "Path to multi-task graph JSON template/spec")
+	outDir := fs.String("out-dir", "", "Output directory for generated inputs, weights, graph_resolved.json, and expected outputs")
+	seed := fs.Uint64("seed", 1, "Deterministic PRNG seed")
+	asJSON := fs.Bool("json", false, "Emit JSON summary")
+
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	if *specPath == "" {
+		fmt.Fprintln(stderr, "error: --spec PATH is required")
+		return 1
+	}
+	if *outDir == "" {
+		fmt.Fprintln(stderr, "error: --out-dir DIR is required")
+		return 1
+	}
+
+	rawSpec, err := os.ReadFile(*specPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: read graph spec %q: %v\n", *specPath, err)
+		return 1
+	}
+	var spec ref.GraphSpec
+	if err := json.Unmarshal(rawSpec, &spec); err != nil {
+		fmt.Fprintf(stderr, "error: parse graph spec %q: %v\n", *specPath, err)
+		return 1
+	}
+	if len(spec.Inputs) < 1 || len(spec.Inputs) > 3 {
+		fmt.Fprintf(stderr, "error: graph must have 1..3 inputs, got %d\n", len(spec.Inputs))
+		return 1
+	}
+	if len(spec.Nodes) == 0 {
+		fmt.Fprintln(stderr, "error: graph must have at least 1 node")
+		return 1
+	}
+
+	if err := os.MkdirAll(*outDir, 0o755); err != nil {
+		fmt.Fprintf(stderr, "error: create out-dir: %v\n", err)
+		return 1
+	}
+	writeFile := func(name string, data []byte) error {
+		return os.WriteFile(filepath.Join(*outDir, name), data, 0o644)
+	}
+
+	rng := rand.New(rand.NewPCG(*seed, *seed^0x9e3779b97f4a7c15))
+
+	type dims3 struct{ c, h, w int }
+	shapes := make(map[string]dims3, len(spec.Inputs)+len(spec.Nodes))
+	inTensors := make(map[string]ref.Tensor, len(spec.Inputs))
+	inFiles := make([]string, 0, len(spec.Inputs))
+
+	for idx, inp := range spec.Inputs {
+		if inp.Name == "" || inp.C <= 0 || inp.H <= 0 || inp.W <= 0 {
+			fmt.Fprintf(stderr, "error: invalid input[%d] (%q: %dx%dx%d)\n", idx, inp.Name, inp.C, inp.H, inp.W)
+			return 1
+		}
+		t, err := ref.NewTensor(1, inp.C, inp.H, inp.W)
+		if err != nil {
+			fmt.Fprintf(stderr, "error: input %q: %v\n", inp.Name, err)
+			return 1
+		}
+		for i := range t.Data {
+			t.Data[i] = fp16.FromFloat64(rng.Float64()*2.0 - 1.0)
+		}
+		buf, _, _, _, err := packTight64Surface(t)
+		if err != nil {
+			fmt.Fprintf(stderr, "error: pack input %q: %v\n", inp.Name, err)
+			return 1
+		}
+		fname := fmt.Sprintf("input%d.bin", idx)
+		if err := writeFile(fname, buf); err != nil {
+			fmt.Fprintf(stderr, "error: write %s: %v\n", fname, err)
+			return 1
+		}
+		if len(spec.Inputs) == 1 {
+			if err := writeFile("input.bin", buf); err != nil {
+				fmt.Fprintf(stderr, "error: write input.bin: %v\n", err)
+				return 1
+			}
+		}
+		inFiles = append(inFiles, fname)
+		inTensors[inp.Name] = t
+		shapes[inp.Name] = dims3{inp.C, inp.H, inp.W}
+	}
+
+	resolved := spec
+	resolved.Nodes = make([]ref.GraphNodeSpec, len(spec.Nodes))
+	copy(resolved.Nodes, spec.Nodes)
+
+	nodeWeights := make(map[string]ref.GraphNodeWeights)
+	for i := range resolved.Nodes {
+		nd := &resolved.Nodes[i]
+		op := strings.ToLower(nd.Op)
+		switch op {
+		case "conv1x1":
+			if len(nd.Inputs) != 1 {
+				fmt.Fprintf(stderr, "error: node %q (conv1x1): expected 1 input\n", nd.ID)
+				return 1
+			}
+			inD, ok := shapes[nd.Inputs[0]]
+			if !ok {
+				fmt.Fprintf(stderr, "error: node %q: unknown input %q\n", nd.ID, nd.Inputs[0])
+				return 1
+			}
+			cin := inD.c
+			if nd.Cin != 0 {
+				cin = nd.Cin
+			}
+			if nd.Cout <= 0 {
+				fmt.Fprintf(stderr, "error: node %q (conv1x1): cout must be > 0\n", nd.ID)
+				return 1
+			}
+			wScale := math.Min(0.4, 1.5/math.Sqrt(float64(cin)))
+			w := make([]uint16, nd.Cout*cin)
+			for j := range w {
+				w[j] = fp16.FromFloat64((rng.Float64()*2.0 - 1.0) * wScale)
+			}
+			wName := fmt.Sprintf("%s_weights.bin", nd.ID)
+			if err := writeFile(wName, fp16.EncodeLE(w)); err != nil {
+				fmt.Fprintf(stderr, "error: write %s: %v\n", wName, err)
+				return 1
+			}
+			nd.Weights = wName
+			nd.Cin = cin
+
+			wantsBias, _, err := nd.ConvBiasSpec()
+			if err != nil {
+				fmt.Fprintf(stderr, "error: %v\n", err)
+				return 1
+			}
+			var b []uint16
+			if wantsBias {
+				b = make([]uint16, nd.Cout)
+				for j := range b {
+					b[j] = fp16.FromFloat64((rng.Float64() - 0.5) * 0.5)
+				}
+				bName := fmt.Sprintf("%s_bias.bin", nd.ID)
+				if err := writeFile(bName, fp16.EncodeLE(b)); err != nil {
+					fmt.Fprintf(stderr, "error: write %s: %v\n", bName, err)
+					return 1
+				}
+				rawB, _ := json.Marshal(bName)
+				nd.Bias = rawB
+			} else {
+				nd.Bias = nil
+			}
+			nd.HasBias = false
+			nodeWeights[nd.ID] = ref.GraphNodeWeights{Weights: w, Bias: b}
+			shapes[nd.ID] = dims3{nd.Cout, inD.h, inD.w}
+
+		case "conv3x3":
+			if len(nd.Inputs) != 1 {
+				fmt.Fprintf(stderr, "error: node %q (conv3x3): expected 1 input\n", nd.ID)
+				return 1
+			}
+			inD, ok := shapes[nd.Inputs[0]]
+			if !ok {
+				fmt.Fprintf(stderr, "error: node %q: unknown input %q\n", nd.ID, nd.Inputs[0])
+				return 1
+			}
+			mode := strings.ToLower(nd.Mode)
+			if mode == "" {
+				mode = "dense"
+			}
+			cin := inD.c
+			if nd.Cin != 0 {
+				cin = nd.Cin
+			}
+			cout := nd.Cout
+			groups := 1
+			if mode == "depthwise" {
+				groups = cin
+				if cout == 0 {
+					cout = cin
+				}
+			}
+			if cout <= 0 {
+				fmt.Fprintf(stderr, "error: node %q (conv3x3): cout must be > 0\n", nd.ID)
+				return 1
+			}
+			stride := nd.Stride
+			if stride == 0 {
+				stride = 1
+			}
+			pad := strings.ToLower(nd.Pad)
+			if pad == "" {
+				pad = "same"
+			}
+			ho, wo, _, _, err := ref.Conv3x3Geometry(inD.h, inD.w, stride, pad)
+			if err != nil {
+				fmt.Fprintf(stderr, "error: node %q: %v\n", nd.ID, err)
+				return 1
+			}
+			cinPerG := cin / groups
+			wScale := math.Min(0.35, 1.5/math.Sqrt(float64(cinPerG*9)))
+			w := make([]uint16, cout*cinPerG*9)
+			for j := range w {
+				w[j] = fp16.FromFloat64((rng.Float64()*2.0 - 1.0) * wScale)
+			}
+			wName := fmt.Sprintf("%s_weights.bin", nd.ID)
+			if err := writeFile(wName, fp16.EncodeLE(w)); err != nil {
+				fmt.Fprintf(stderr, "error: write %s: %v\n", wName, err)
+				return 1
+			}
+			nd.Weights = wName
+			nd.Cin = cin
+			nd.Cout = cout
+
+			wantsBias, _, err := nd.ConvBiasSpec()
+			if err != nil {
+				fmt.Fprintf(stderr, "error: %v\n", err)
+				return 1
+			}
+			var b []uint16
+			if wantsBias {
+				b = make([]uint16, cout)
+				for j := range b {
+					b[j] = fp16.FromFloat64((rng.Float64() - 0.5) * 0.5)
+				}
+				bName := fmt.Sprintf("%s_bias.bin", nd.ID)
+				if err := writeFile(bName, fp16.EncodeLE(b)); err != nil {
+					fmt.Fprintf(stderr, "error: write %s: %v\n", bName, err)
+					return 1
+				}
+				rawB, _ := json.Marshal(bName)
+				nd.Bias = rawB
+			} else {
+				nd.Bias = nil
+			}
+			nd.HasBias = false
+			nodeWeights[nd.ID] = ref.GraphNodeWeights{Weights: w, Bias: b}
+			shapes[nd.ID] = dims3{cout, ho, wo}
+
+		case "pe":
+			if len(nd.Inputs) == 1 {
+				inD, ok := shapes[nd.Inputs[0]]
+				if !ok {
+					fmt.Fprintf(stderr, "error: node %q: unknown input %q\n", nd.ID, nd.Inputs[0])
+					return 1
+				}
+				shapes[nd.ID] = inD
+			} else if len(nd.Inputs) == 2 {
+				d1, ok1 := shapes[nd.Inputs[0]]
+				d2, ok2 := shapes[nd.Inputs[1]]
+				if !ok1 || !ok2 {
+					fmt.Fprintf(stderr, "error: node %q: unknown input in %v\n", nd.ID, nd.Inputs)
+					return 1
+				}
+				bcast := func(a, b int) int {
+					if a == 1 {
+						return b
+					}
+					return a
+				}
+				shapes[nd.ID] = dims3{bcast(d1.c, d2.c), bcast(d1.h, d2.h), bcast(d1.w, d2.w)}
+			} else {
+				fmt.Fprintf(stderr, "error: node %q (pe): expected 1 or 2 inputs\n", nd.ID)
+				return 1
+			}
+
+		case "lut":
+			if len(nd.Inputs) != 1 {
+				fmt.Fprintf(stderr, "error: node %q (lut): expected 1 input\n", nd.ID)
+				return 1
+			}
+			inD, ok := shapes[nd.Inputs[0]]
+			if !ok {
+				fmt.Fprintf(stderr, "error: node %q: unknown input %q\n", nd.ID, nd.Inputs[0])
+				return 1
+			}
+			shapes[nd.ID] = inD
+
+		default:
+			fmt.Fprintf(stderr, "error: node %q: unsupported op %q\n", nd.ID, nd.Op)
+			return 1
+		}
+	}
+
+	yQ, _, err := ref.EvalGraphQ1516(resolved, inTensors, nodeWeights)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: Q15.16 graph reference failed: %v\n", err)
+		return 1
+	}
+	yF, _, err := ref.EvalGraphF64(resolved, inTensors, nodeWeights)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: float64 graph reference failed: %v\n", err)
+		return 1
+	}
+
+	expQBuf, _, _, _, err := packTight64Surface(yQ)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: pack expected_q1516: %v\n", err)
+		return 1
+	}
+	expFBuf, _, _, _, err := packTight64Surface(yF)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: pack expected_f64: %v\n", err)
+		return 1
+	}
+
+	resolvedJSON, err := json.MarshalIndent(resolved, "", "  ")
+	if err != nil {
+		fmt.Fprintf(stderr, "error: marshal graph_resolved.json: %v\n", err)
+		return 1
+	}
+	if err := writeFile("graph_resolved.json", append(resolvedJSON, '\n')); err != nil {
+		fmt.Fprintf(stderr, "error: write graph_resolved.json: %v\n", err)
+		return 1
+	}
+	if err := writeFile("expected_q1516.bin", expQBuf); err != nil {
+		fmt.Fprintf(stderr, "error: write expected_q1516.bin: %v\n", err)
+		return 1
+	}
+	if err := writeFile("expected_f64.bin", expFBuf); err != nil {
+		fmt.Fprintf(stderr, "error: write expected_f64.bin: %v\n", err)
+		return 1
+	}
+
+	summary := map[string]any{
+		"target":       resolved.Target,
+		"placement":    resolved.Placement,
+		"node_count":   len(resolved.Nodes),
+		"input_files":  inFiles,
+		"out_shape":    []int{yQ.N, yQ.C, yQ.H, yQ.W},
+		"out_bytes":    len(expQBuf),
+		"seed":         *seed,
+		"resolved":     filepath.Join(*outDir, "graph_resolved.json"),
+		"out_dir":      *outDir,
+	}
+	if *asJSON {
+		raw, _ := json.MarshalIndent(summary, "", "  ")
+		fmt.Fprintln(stdout, string(raw))
+	} else {
+		fmt.Fprintf(stdout, "generated graph (%d nodes, out=%dx%dx%d, %dB) in %s\n",
+			len(resolved.Nodes), yQ.C, yQ.H, yQ.W, len(expQBuf), *outDir)
 	}
 	return 0
 }

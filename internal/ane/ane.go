@@ -768,12 +768,13 @@ func LoadProgram(tr Transport, fd int, hwx []byte, sections map[uint32][]byte) (
 
 // ExecOptions configures program execution and optional reference checking.
 type ExecOptions struct {
-	Runs     int
-	InPlace  bool
-	Expected []byte
-	Atol     float64
-	Rtol     float64
-	MaxULP   *int
+	Runs      int
+	InPlace   bool
+	AltInputs [][]byte // Optional alternate input surfaces used on odd runs (run 2, 4, ...) when Runs > 1.
+	Expected  []byte
+	Atol      float64
+	Rtol      float64
+	MaxULP    *int
 }
 
 // RunReport summarizes device execution, repeatability, latency, and optional comparison.
@@ -788,6 +789,7 @@ type RunReport struct {
 	SurfaceDirections []uint32              `json:"surface_directions"`
 	OutputSize        uint64                `json:"output_size"`
 	OutputSHA256      string                `json:"output_sha256"`
+	AltOutputSHA256   string                `json:"alt_output_sha256,omitempty"`
 	LatenciesMS       []float64             `json:"latencies_ms"`
 	Repeatable        bool                  `json:"repeatable"`
 	Comparison        *ref.ComparisonResult `json:"comparison"`
@@ -795,6 +797,9 @@ type RunReport struct {
 
 // ExecuteProgram executes a loaded program opts.Runs times in copy or in-place mmap mode.
 // Copy mode poisons the output buffer with 0xff before every run.
+// When opts.AltInputs is non-empty and opts.Runs > 1, even runs (r=0,2,4,...) execute
+// inputs and odd runs (r=1,3,5,...) execute opts.AltInputs, checking independent
+// determinism for both input sets.
 func ExecuteProgram(
 	tr Transport,
 	fd int,
@@ -844,8 +849,47 @@ func ExecuteProgram(
 		}
 	}
 
+	var resolvedAltInputs [][]byte
+	if len(opts.AltInputs) > 0 {
+		if len(opts.AltInputs) != len(inIndices) {
+			return nil, RunReport{}, fmt.Errorf("provided %d alt-input buffers, program expects %d", len(opts.AltInputs), len(inIndices))
+		}
+		resolvedAltInputs = make([][]byte, len(inIndices))
+		for k, sIdx := range inIndices {
+			expSz := int(loaded.SurfaceSizes[sIdx])
+			if len(opts.AltInputs[k]) != expSz {
+				return nil, RunReport{}, fmt.Errorf("alt-input surface %d size mismatch: got %d, expected %d", sIdx, len(opts.AltInputs[k]), expSz)
+			}
+			resolvedAltInputs[k] = opts.AltInputs[k]
+		}
+	}
+
 	latencies := make([]float64, 0, runs)
 	var firstOutput []byte
+	var firstAltOutput []byte
+
+	recordOutput := func(r int, isAlt bool, outBytes []byte) error {
+		if isAlt {
+			if firstAltOutput == nil {
+				firstAltOutput = outBytes
+			} else if !bytes.Equal(outBytes, firstAltOutput) {
+				s1 := sha256.Sum256(firstAltOutput)
+				s2 := sha256.Sum256(outBytes)
+				return fmt.Errorf("non-deterministic alt-input output on run %d: sha256 %s != run 2 sha256 %s",
+					r+1, hex.EncodeToString(s2[:]), hex.EncodeToString(s1[:]))
+			}
+			return nil
+		}
+		if firstOutput == nil {
+			firstOutput = outBytes
+		} else if !bytes.Equal(outBytes, firstOutput) {
+			s1 := sha256.Sum256(firstOutput)
+			s2 := sha256.Sum256(outBytes)
+			return fmt.Errorf("non-deterministic output on run %d: sha256 %s != run 1 sha256 %s",
+				r+1, hex.EncodeToString(s2[:]), hex.EncodeToString(s1[:]))
+		}
+		return nil
+	}
 
 	if opts.InPlace {
 		psize := tr.PageSize()
@@ -874,8 +918,13 @@ func ExecuteProgram(
 		}
 
 		for r := 0; r < runs; r++ {
+			isAlt := resolvedAltInputs != nil && (r%2 == 1)
+			curInputs := resolvedInputs
+			if isAlt {
+				curInputs = resolvedAltInputs
+			}
 			for k, sIdx := range inIndices {
-				copy(mappings[sIdx][:len(resolvedInputs[k])], resolvedInputs[k])
+				copy(mappings[sIdx][:len(curInputs[k])], curInputs[k])
 			}
 			t0 := time.Now()
 			err := tr.H16Exec(fd, nil, loaded.SurfaceCount, true)
@@ -887,34 +936,26 @@ func ExecuteProgram(
 
 			outBytes := make([]byte, outSize)
 			copy(outBytes, mappings[outIdx][:outSize])
-			if firstOutput == nil {
-				firstOutput = outBytes
-			} else if !bytes.Equal(outBytes, firstOutput) {
-				s1 := sha256.Sum256(firstOutput)
-				s2 := sha256.Sum256(outBytes)
-				return nil, RunReport{}, fmt.Errorf("non-deterministic output on run %d: sha256 %s != run 1 sha256 %s",
-					r+1, hex.EncodeToString(s2[:]), hex.EncodeToString(s1[:]))
+			if err := recordOutput(r, isAlt, outBytes); err != nil {
+				return nil, RunReport{}, err
 			}
 		}
 	} else {
 		// Copy mode: allocate per-surface byte buffers and poison output with 0xff before every run.
 		surfBufs := make([][]byte, loaded.SurfaceCount)
-		inMap := make(map[int][]byte, len(inIndices))
-		for k, sIdx := range inIndices {
-			inMap[sIdx] = resolvedInputs[k]
-		}
 		for i := 0; i < loaded.SurfaceCount; i++ {
-			sz := int(loaded.SurfaceSizes[i])
-			if data, ok := inMap[i]; ok {
-				cp := make([]byte, sz)
-				copy(cp, data)
-				surfBufs[i] = cp
-			} else {
-				surfBufs[i] = make([]byte, sz)
-			}
+			surfBufs[i] = make([]byte, int(loaded.SurfaceSizes[i]))
 		}
 
 		for r := 0; r < runs; r++ {
+			isAlt := resolvedAltInputs != nil && (r%2 == 1)
+			curInputs := resolvedInputs
+			if isAlt {
+				curInputs = resolvedAltInputs
+			}
+			for k, sIdx := range inIndices {
+				copy(surfBufs[sIdx], curInputs[k])
+			}
 			for j := range surfBufs[outIdx] {
 				surfBufs[outIdx][j] = 0xff
 			}
@@ -928,18 +969,18 @@ func ExecuteProgram(
 
 			outBytes := make([]byte, outSize)
 			copy(outBytes, surfBufs[outIdx])
-			if firstOutput == nil {
-				firstOutput = outBytes
-			} else if !bytes.Equal(outBytes, firstOutput) {
-				s1 := sha256.Sum256(firstOutput)
-				s2 := sha256.Sum256(outBytes)
-				return nil, RunReport{}, fmt.Errorf("non-deterministic output on run %d: sha256 %s != run 1 sha256 %s",
-					r+1, hex.EncodeToString(s2[:]), hex.EncodeToString(s1[:]))
+			if err := recordOutput(r, isAlt, outBytes); err != nil {
+				return nil, RunReport{}, err
 			}
 		}
 	}
 
 	sum := sha256.Sum256(firstOutput)
+	var altSHA string
+	if firstAltOutput != nil {
+		as := sha256.Sum256(firstAltOutput)
+		altSHA = hex.EncodeToString(as[:])
+	}
 	var compPtr *ref.ComparisonResult
 	if opts.Expected != nil {
 		comp, err := ref.CompareFP16Bytes(firstOutput, opts.Expected, opts.Atol, opts.Rtol, opts.MaxULP)
@@ -964,6 +1005,7 @@ func ExecuteProgram(
 		SurfaceDirections: loaded.SurfaceDirections,
 		OutputSize:        uint64(outSize),
 		OutputSHA256:      hex.EncodeToString(sum[:]),
+		AltOutputSHA256:   altSHA,
 		LatenciesMS:       latencies,
 		Repeatable:        true,
 		Comparison:        compPtr,

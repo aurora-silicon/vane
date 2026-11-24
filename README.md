@@ -5,7 +5,7 @@ A Lean 4 compiler and safety verifier targeting Neural Engine (ANE) hardware on 
 ## Goals
 
 - **Hardware-verified compilation:** Emit ANE task descriptors and HWX program containers from an explicit, width-checked machine register model verified directly on Linux hardware (default kernel command line, no extra kernel parameters).
-- **Safety by construction:** Statically verify bitfield bounds, tiling legality, 2 MiB L2 SRAM footprints, PE anti-hang channel strides, 128-byte LUT table invariants, kernel chunk-slot limits, alignment, and DMA surface extents before emitting binaries.
+- **Safety by construction:** Statically verify bitfield bounds, tiling legality, 2 MiB L2 SRAM footprints, PE anti-hang channel strides, `[DL]` PE direct-write rules, 128-byte LUT table invariants, kernel chunk-slot limits and carry-over clearing, alignment, DMA surface/scratch extents, and whole-program multi-task hazard freedom (S1–S5) before emitting binaries.
 - **Reproducible on-device testing:** Every supported operator ships with independent float64, Q15.16, RNA16, and 128-byte LUT reference models and a static Linux `arm64` device runner (`vane-runner`).
 
 ## Building & Testing
@@ -74,8 +74,13 @@ vane compile-lut \
   --h 16 --w 32 --c 8 \
   --out-dir out_lut/
 
-# Validate an HWX container, LOAD sections, and decoded conv / NE activation / PE task legality
-vane validate --hwx out3x3/program.hwx --sections out3x3/ --check-tasks
+# Compile a multi-task DAG (conv1x1, conv3x3, PE, LUT) with automatic L2-resident chaining and DRAM scratch reuse
+vane compile-graph \
+  --spec vec_graph/graph_resolved.json \
+  --out-dir out_graph/
+
+# Validate an HWX container, LOAD sections, and whole-program S1-S5 multi-task safety
+vane validate --hwx out_graph/program.hwx --sections out_graph/ --check-tasks
 
 # Derive the 4 host-built LOAD sections from an HWX container
 vane sections --hwx out3x3/program.hwx --out-dir sections/
@@ -102,22 +107,27 @@ vane-runner gen-pe --op add --h 8 --w 16 --c 4 --z-h 1 --z-w 1 --z-c 4 --seed 1 
 # Generate deterministic or exhaustive (--all-fp16) standalone LUT test vectors
 vane-runner gen-lut --act tanh --h 16 --w 32 --c 8 --lut-bin out_lut/lut.bin --seed 1 --out-dir vec_lut/
 
-# Execute an HWX program on Linux accel/ane (copy mode or 16 KiB --in-place mmap mode)
-vane-runner run \
-  --hwx out3x3/program.hwx \
-  --sections-dir out3x3/ \
-  --input vec3x3/input.bin \
-  --output-out actual.bin \
-  --runs 3
+# Generate seeded inputs, weights/biases, graph_resolved.json, and Q15.16 + float64 expected outputs for a graph DAG
+vane-runner gen-graph --spec graph.json --seed 1 --out-dir vec_graph/ --json
 
-# Compare strided fp16 outputs using manifest.json geometry (works on conv, PE, and LUT manifests)
+# Execute an HWX program on Linux accel/ane (copy mode or 16 KiB --in-place mmap mode)
+# Optional repeatable --alt-input alternates a second input set on odd runs to verify multi-input determinism
+vane-runner run \
+  --hwx out_graph/program.hwx \
+  --sections-dir out_graph/ \
+  --input vec_graph/input0.bin \
+  --alt-input vec_graph_alt/input0.bin \
+  --output-out actual.bin \
+  --runs 4
+
+# Compare strided fp16 outputs using manifest.json geometry (works on conv, PE, LUT, and graph manifests)
 vane-runner compare-surface \
-  --manifest out3x3/manifest.json \
+  --manifest out_graph/manifest.json \
   --actual actual.bin \
-  --expected vec3x3/expected_f64.bin \
+  --expected vec_graph/expected_q1516.bin \
   --atol 1e-2 --rtol 1e-2 --json
 ```
 
 ## Status
 
-Milestone 3 (Planar Engine 1-source and 2-source broadcasted elementwise operations, standalone Neural Engine activations with 23 mathematically generated 128-byte LUT tables, fused 1×1 and 3×3 dense/depthwise/stride-2 conv+LUT compilation, unified independent static safety verifier, kernel-clean Lean 4 proofs, and Go reference/runner tooling). See [ROADMAP.md](ROADMAP.md) for upcoming milestones.
+Milestone 4 (Multi-task DAG compiler with L2-resident chaining, automatic L2-to-DRAM spilling, liveness-based DRAM scratch reuse via `__DATA,__bss`, shared `__KERN_0` kernel packing, whole-program S1–S5 static hazard verifier, formally verified interval allocator and forward-edge transitive closure in Lean 4, and Go multi-task DAG reference evaluator and alternating-input runner). See [ROADMAP.md](ROADMAP.md) for upcoming milestones.

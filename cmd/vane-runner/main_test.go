@@ -851,3 +851,296 @@ func TestAll23LutTablesMatchLeanByteForByteAndCliGuards(t *testing.T) {
 		}
 	})
 }
+
+func TestMultiTaskGraphEndToEndCLI(t *testing.T) {
+	vaneBin := findVaneBin(t)
+
+	cases := []struct {
+		name           string
+		specJSON       string
+		wantTasks      int
+		wantScratch    bool
+		maxScratch     int
+		tol            string
+	}{
+		{
+			name: "h17_l2_conv_chain",
+			specJSON: `{
+				"target": "h17",
+				"placement": "l2",
+				"inputs": [{"name": "x", "c": 16, "h": 8, "w": 16}],
+				"nodes": [
+					{"id": "c1", "op": "conv1x1", "inputs": ["x"], "cout": 16, "bias": true, "relu": true},
+					{"id": "c2", "op": "conv3x3", "mode": "depthwise", "inputs": ["c1"], "stride": 1, "pad": "same"},
+					{"id": "c3", "op": "conv1x1", "inputs": ["c2"], "cout": 16, "bias": true}
+				]
+			}`,
+			wantTasks:   3,
+			wantScratch: false,
+			tol:         "2e-2",
+		},
+		{
+			name: "h17_dram_conv_chain_reuse",
+			specJSON: `{
+				"target": "h17",
+				"placement": "dram",
+				"inputs": [{"name": "x", "c": 16, "h": 16, "w": 16}],
+				"nodes": [
+					{"id": "c1", "op": "conv1x1", "inputs": ["x"], "cout": 16, "relu": true},
+					{"id": "c2", "op": "conv3x3", "mode": "depthwise", "inputs": ["c1"], "stride": 1, "pad": "same"},
+					{"id": "c3", "op": "conv3x3", "mode": "dense", "inputs": ["c2"], "cout": 32, "stride": 2, "pad": "same", "relu": true},
+					{"id": "c4", "op": "conv1x1", "inputs": ["c3"], "cout": 16}
+				]
+			}`,
+			wantTasks:   4,
+			wantScratch: true,
+			maxScratch:  49151, // strictly < sum of 3 intermediates (49152B), confirming scratch reuse
+			tol:         "3e-2",
+		},
+		{
+			name: "h17_mixed_ne_pe_lut",
+			specJSON: `{
+				"target": "h17",
+				"placement": "auto",
+				"inputs": [{"name": "x", "c": 16, "h": 8, "w": 16}],
+				"nodes": [
+					{"id": "c1", "op": "conv1x1", "inputs": ["x"], "cout": 16, "bias": true, "act": "gelu"},
+					{"id": "p1", "op": "pe", "pe_op": "chain", "inputs": ["c1"], "in_scale": 0.5, "bias": 0.125},
+					{"id": "l1", "op": "lut", "inputs": ["p1"], "act": "silu"},
+					{"id": "c2", "op": "conv1x1", "inputs": ["l1"], "cout": 16}
+				]
+			}`,
+			wantTasks:   4,
+			wantScratch: false,
+			tol:         "5e-2",
+		},
+		{
+			name: "h17_residual_hybrid",
+			specJSON: `{
+				"target": "h17",
+				"placement": "auto",
+				"inputs": [{"name": "x", "c": 16, "h": 8, "w": 16}],
+				"nodes": [
+					{"id": "c1", "op": "conv3x3", "mode": "dense", "inputs": ["x"], "cout": 16, "stride": 1, "pad": "same", "relu": true, "out_placement": "l2"},
+					{"id": "c2", "op": "conv1x1", "inputs": ["c1"], "cout": 16, "out_placement": "dram"},
+					{"id": "res", "op": "pe", "pe_op": "add", "inputs": ["c2", "x"]}
+				]
+			}`,
+			wantTasks:   3,
+			wantScratch: true,
+			tol:         "3e-2",
+		},
+		{
+			name: "h16_two_input_broadcast_residual",
+			specJSON: `{
+				"target": "h16",
+				"placement": "auto",
+				"inputs": [
+					{"name": "x", "c": 16, "h": 8, "w": 16},
+					{"name": "z", "c": 16, "h": 1, "w": 1}
+				],
+				"nodes": [
+					{"id": "c1", "op": "conv1x1", "inputs": ["x"], "cout": 16, "bias": true, "relu": true},
+					{"id": "out", "op": "pe", "pe_op": "add", "inputs": ["c1", "z"]}
+				]
+			}`,
+			wantTasks:   2,
+			wantScratch: false,
+			tol:         "2e-2",
+		},
+	}
+
+	for idx, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			specFile := filepath.Join(tmp, "graph.json")
+			vecDir := filepath.Join(tmp, "vec")
+			compDir := filepath.Join(tmp, "comp")
+			if err := os.WriteFile(specFile, []byte(tc.specJSON), 0o644); err != nil {
+				t.Fatalf("write spec: %v", err)
+			}
+
+			var stdout, stderr bytes.Buffer
+			if rc := runCLI([]string{
+				"gen-graph", "--spec", specFile, "--seed", itoa(idx + 700), "--out-dir", vecDir, "--json",
+			}, nil, &stdout, &stderr); rc != 0 {
+				t.Fatalf("gen-graph failed rc=%d stderr=%s", rc, stderr.String())
+			}
+
+			runVane(t, vaneBin, "compile-graph",
+				"--spec", filepath.Join(vecDir, "graph_resolved.json"),
+				"--out-dir", compDir,
+			)
+
+			valOut := runVane(t, vaneBin, "validate",
+				"--hwx", filepath.Join(compDir, "program.hwx"),
+				"--sections", compDir,
+				"--check-tasks",
+			)
+			if !strings.Contains(valOut, "status: ok") {
+				t.Fatalf("unexpected graph validate output:\n%s", valOut)
+			}
+
+			// Verify manifest fields
+			var man struct {
+				TaskCount    int  `json:"task_count"`
+				HasScratch   bool `json:"has_scratch"`
+				ScratchBytes int  `json:"scratch_bytes"`
+			}
+			mRaw, err := os.ReadFile(filepath.Join(compDir, "manifest.json"))
+			if err != nil {
+				t.Fatalf("read manifest: %v", err)
+			}
+			if err := json.Unmarshal(mRaw, &man); err != nil {
+				t.Fatalf("parse manifest: %v", err)
+			}
+			if man.TaskCount != tc.wantTasks {
+				t.Fatalf("task_count = %d, want %d", man.TaskCount, tc.wantTasks)
+			}
+			if man.HasScratch != tc.wantScratch {
+				t.Fatalf("has_scratch = %t, want %t", man.HasScratch, tc.wantScratch)
+			}
+			if tc.maxScratch > 0 && man.ScratchBytes > tc.maxScratch {
+				t.Fatalf("scratch_bytes = %d > max %d (expected liveness reuse)", man.ScratchBytes, tc.maxScratch)
+			}
+
+			// Verify Go BuildSectionsFromHWX matches Lean sections byte-for-byte
+			hwxBytes, err := os.ReadFile(filepath.Join(compDir, "program.hwx"))
+			if err != nil {
+				t.Fatalf("read hwx: %v", err)
+			}
+			goSecs, err := ane.BuildSectionsFromHWX(hwxBytes)
+			if err != nil {
+				t.Fatalf("BuildSectionsFromHWX: %v", err)
+			}
+			for kind, fname := range ane.SectionFilenames {
+				leanBytes, err := os.ReadFile(filepath.Join(compDir, fname))
+				if err != nil {
+					t.Fatalf("read %s: %v", fname, err)
+				}
+				if !bytes.Equal(goSecs[kind], leanBytes) {
+					t.Fatalf("graph section %s mismatch between Go and Lean", fname)
+				}
+			}
+
+			// Verify compare-surface works on graph manifest (Q15.16 vs F64)
+			stdout.Reset()
+			stderr.Reset()
+			if rc := runCLI([]string{
+				"compare-surface",
+				"--manifest", filepath.Join(compDir, "manifest.json"),
+				"--actual", filepath.Join(vecDir, "expected_q1516.bin"),
+				"--expected", filepath.Join(vecDir, "expected_f64.bin"),
+				"--atol", tc.tol, "--rtol", tc.tol, "--json",
+			}, nil, &stdout, &stderr); rc != 0 {
+				t.Fatalf("compare-surface on graph failed rc=%d stdout=%s stderr=%s", rc, stdout.String(), stderr.String())
+			}
+		})
+	}
+}
+
+func TestRunAltInputMockTransport(t *testing.T) {
+	vaneBin := findVaneBin(t)
+	tmp := t.TempDir()
+	demoDir := filepath.Join(tmp, "demo_alt")
+	runVane(t, vaneBin, "emit-demo", "--target", "h17", "--out-dir", demoDir)
+
+	var manifest struct {
+		Surfaces []struct {
+			Span int `json:"span"`
+		} `json:"surfaces"`
+	}
+	mRaw, _ := os.ReadFile(filepath.Join(demoDir, "manifest.json"))
+	if err := json.Unmarshal(mRaw, &manifest); err != nil {
+		t.Fatalf("parse manifest: %v", err)
+	}
+	inSpan := manifest.Surfaces[0].Span
+	inA := make([]uint16, inSpan/2)
+	inB := make([]uint16, inSpan/2)
+	for i := range inA {
+		inA[i] = fp16.FromFloat64(float64(i%7+1) * 0.25)
+		inB[i] = fp16.FromFloat64(float64(i%5+2) * 0.5)
+	}
+	inAPath := filepath.Join(tmp, "inA.bin")
+	inBPath := filepath.Join(tmp, "inB.bin")
+	_ = os.WriteFile(inAPath, fp16.EncodeLE(inA), 0o644)
+	_ = os.WriteFile(inBPath, fp16.EncodeLE(inB), 0o644)
+
+	// 1. Copy mode and in-place mode with --alt-input --runs 4
+	for _, inPlace := range []bool{false, true} {
+		var observed [][]byte
+		tr := ane.NewMockTransport(map[string]ane.MockDeviceSpec{
+			"/dev/accel/accel0": {ABIVersion: ane.ABIV3, ChipFamily: ane.ChipH17},
+		}, func(inputs [][]byte, _ int) []byte {
+			cp := make([]byte, len(inputs[0]))
+			copy(cp, inputs[0])
+			observed = append(observed, cp)
+			// Return deterministic transform of input (XOR low byte with 0x55)
+			out := make([]byte, len(inputs[0]))
+			for i, b := range inputs[0] {
+				out[i] = b ^ 0x55
+			}
+			return out
+		})
+
+		args := []string{
+			"run",
+			"--hwx", filepath.Join(demoDir, "program.hwx"),
+			"--sections-dir", demoDir,
+			"--input", inAPath,
+			"--alt-input", inBPath,
+			"--runs", "4",
+			"--json",
+		}
+		if inPlace {
+			args = append(args, "--in-place")
+		}
+		var stdout, stderr bytes.Buffer
+		if rc := runCLI(args, tr, &stdout, &stderr); rc != 0 {
+			t.Fatalf("run --alt-input (inPlace=%t) failed rc=%d stderr=%s", inPlace, rc, stderr.String())
+		}
+		if len(observed) != 4 {
+			t.Fatalf("expected 4 runs, got %d", len(observed))
+		}
+		rawA := fp16.EncodeLE(inA)
+		rawB := fp16.EncodeLE(inB)
+		if !bytes.Equal(observed[0], rawA) || !bytes.Equal(observed[1], rawB) ||
+			!bytes.Equal(observed[2], rawA) || !bytes.Equal(observed[3], rawB) {
+			t.Fatalf("inputs did not alternate A, B, A, B (inPlace=%t)", inPlace)
+		}
+		var rep ane.RunReport
+		if err := json.Unmarshal(stdout.Bytes(), &rep); err != nil {
+			t.Fatalf("parse run report: %v", err)
+		}
+		if !rep.Repeatable || rep.AltOutputSHA256 == "" || rep.OutputSHA256 == rep.AltOutputSHA256 {
+			t.Fatalf("unexpected alt-input report: repeatable=%t sha=%s alt_sha=%s",
+				rep.Repeatable, rep.OutputSHA256, rep.AltOutputSHA256)
+		}
+	}
+
+	// 2. Non-deterministic alt-input run (run 4 disagrees with run 2) must fail
+	callIdx := 0
+	badTr := ane.NewMockTransport(map[string]ane.MockDeviceSpec{
+		"/dev/accel/accel0": {ABIVersion: ane.ABIV3, ChipFamily: ane.ChipH17},
+	}, func(inputs [][]byte, _ int) []byte {
+		callIdx++
+		out := make([]byte, len(inputs[0]))
+		copy(out, inputs[0])
+		if callIdx == 4 {
+			out[0] ^= 0xff // corrupt 2nd execution of alt-input
+		}
+		return out
+	})
+	var stdout, stderr bytes.Buffer
+	rc := runCLI([]string{
+		"run",
+		"--hwx", filepath.Join(demoDir, "program.hwx"),
+		"--sections-dir", demoDir,
+		"--input", inAPath,
+		"--alt-input", inBPath,
+		"--runs", "4",
+	}, badTr, &stdout, &stderr)
+	if rc == 0 || !strings.Contains(stderr.String(), "non-deterministic alt-input") {
+		t.Fatalf("expected non-deterministic alt-input failure, got rc=%d stderr=%s", rc, stderr.String())
+	}
+}
