@@ -134,7 +134,16 @@ def taskHeader0Layout : WordLayout := {
   ]
 }
 
-/-- Task header word 8: `flags[3:0] = 0x9`, `ene[18:16] = 0` (PE) or `logNE + 1` (NE), other bits 0. -/
+/-- Task header word 2: `firstFlags[7:0]` (`0x68` when first), `lastFlag[26:26]` (`1` when last). -/
+def taskHeader2Layout : WordLayout := {
+  name := "taskHeader[2]"
+  fields := #[
+    { name := "firstFlags", lo := 0, width := 8 },
+    { name := "lastFlag", lo := 26, width := 1 }
+  ]
+}
+
+/-- Task header word 8 (single-task): `flags[3:0] = 0x9`, `ene[18:16] = 0` (PE) or `logNE + 1` (NE), other bits 0. -/
 def taskHeader8Layout : WordLayout := {
   name := "taskHeader[8]"
   fixedMask := 0x0000000f
@@ -144,16 +153,63 @@ def taskHeader8Layout : WordLayout := {
   ]
 }
 
-/-- Fixed 9-word task header constants. -/
-def taskHeaderWord2Const : UInt32 := 0x04000068
-def taskHeaderWord4Const : UInt32 := 0x00fff868
-def taskHeaderWord4CopyConst : UInt32 := 0x00000068
+/-- Task header word 8 (multi-task): `active[0:0] = 1`, `isLast[3:3]`, `ene[18:16]`, other bits 0. -/
+def taskHeader8MultiLayout : WordLayout := {
+  name := "taskHeader[8]Multi"
+  fields := #[
+    { name := "active", lo := 0, width := 1 },
+    { name := "isLast", lo := 3, width := 1 },
+    { name := "ene", lo := 16, width := 3 }
+  ]
+}
 
-/-- Encode the 9-word task header with explicit `ene` (`0` for PE, `1..5` for NE) and
-    optional `header4` override (default `0x00fff868`). -/
-def encodeTaskHeader9Ex
+/-- Named constants for 9-word task header words 2 and 4. -/
+def taskHeader2FirstFlags : UInt32 := 0x68
+def taskHeader4H17Base : UInt32 := 0x00fff800
+def taskHeader4H16Base : UInt32 := 0x00fff820
+def taskHeader4FirstBit : UInt32 := 0x00000008
+def taskHeader4H17EdgeBits : UInt32 := 0x00000060
+def taskHeader4H16EdgeBits : UInt32 := 0x00000040
+def taskHeaderWord2Const : UInt32 := ((1 : UInt32) <<< 26) ||| taskHeader2FirstFlags
+def taskHeaderWord4Const : UInt32 := taskHeader4H17Base ||| taskHeader4FirstBit ||| taskHeader4H17EdgeBits
+def taskHeaderWord4CopyConst : UInt32 := taskHeader2FirstFlags
+
+/-- Target- and position-specific `header[4]` word for multi-task streams. -/
+def taskHeaderWord4Multi (target : Target) (isFirst isLast : Bool) : UInt32 :=
+  let firstBit := if isFirst then taskHeader4FirstBit else 0
+  match target with
+  | .h17 =>
+    let edgeBits := if isFirst || isLast then taskHeader4H17EdgeBits else 0
+    taskHeader4H17Base ||| firstBit ||| edgeBits
+  | .h16 =>
+    let edgeBits := if isFirst || isLast then taskHeader4H16EdgeBits else 0
+    taskHeader4H16Base ||| firstBit ||| edgeBits
+
+/-- 64 KiB L2 block size for `header[7]` live-L2 bitmasks (32 blocks cover 2 MiB). -/
+def l2MaskBlockBytes : Nat := 0x10000
+
+/-- Compute the 32-bit `header[7]` live-L2 64 KiB block bitmask for a byte range `[lo, hi)`. -/
+def l2BlockMask (lo hi : Nat) : UInt32 :=
+  if lo >= hi then 0
+  else
+    let b0 := lo / l2MaskBlockBytes
+    let b1 := min 31 ((hi - 1) / l2MaskBlockBytes)
+    Id.run do
+      let mut mask : UInt32 := 0
+      for b in [b0 : b1 + 1] do
+        if b < 32 then
+          mask := mask ||| ((1 : UInt32) <<< b.toUInt32)
+      return mask
+
+/-- Encode a 9-word task header for single-task or multi-task streams.
+    Sets `header[2]`, `header[4]`, `header[7]` (live-L2 64 KiB block bitmask, forced 0 on `isLast`),
+    and `header[8]` (`active = 1`, `isLast`, `ene`). -/
+def encodeTaskHeader9Multi
+    (target : Target)
     (taskId taskWords ene : Nat)
-    (header4 : UInt32 := taskHeaderWord4Const) : Except String (Array UInt32) := do
+    (isFirst isLast : Bool)
+    (liveL2Mask : UInt32 := 0)
+    (header4Override : Option UInt32 := none) : Except String (Array UInt32) := do
   if taskId > 0xffff then
     throw s!"task header: taskId {taskId} exceeds 16-bit maximum 65535"
   if ene > 5 then
@@ -167,8 +223,25 @@ def encodeTaskHeader9Ex
     ("taskId", taskIdU32),
     ("taskWords", taskWordsU32)
   ]
-  let w8 ← encodeWord taskHeader8Layout #[("ene", eneU32)]
-  pure #[w0, 0, taskHeaderWord2Const, 0, header4, 0, 0, 0, w8]
+  let w2 ← encodeWord taskHeader2Layout #[
+    ("firstFlags", if isFirst then taskHeader2FirstFlags else 0),
+    ("lastFlag", if isLast then 1 else 0)
+  ]
+  let w4 := header4Override.getD (taskHeaderWord4Multi target isFirst isLast)
+  let w7 := if isLast then 0 else liveL2Mask
+  let w8 ← encodeWord taskHeader8MultiLayout #[
+    ("active", 1),
+    ("isLast", if isLast then 1 else 0),
+    ("ene", eneU32)
+  ]
+  pure #[w0, 0, w2, 0, w4, 0, 0, w7, w8]
+
+/-- Encode the 9-word task header with explicit `ene` (`0` for PE, `1..5` for NE) and
+    optional `header4` override (default `0x00fff868`). -/
+def encodeTaskHeader9Ex
+    (taskId taskWords ene : Nat)
+    (header4 : UInt32 := taskHeaderWord4Const) : Except String (Array UInt32) :=
+  encodeTaskHeader9Multi .h17 taskId taskWords ene true true 0 (some header4)
 
 /-- Encode the 9-word NE task header (`ene = logNE + 1`).
     Checks `taskId < 65536`, `logNE <= 4`, and `9 <= taskWords <= 0x7ff`. -/
@@ -379,7 +452,7 @@ def neActShiftEnLayout : WordLayout := {
   ]
 }
 
-/-- `0x4104` src1Cfg: `mode[1:0]`, `P[11:8]`, fixed flags `0x00500070`. -/
+/-- `0x4104` src1Cfg (single-task): `mode[1:0]`, `P[11:8]`, fixed flags `0x00500070`. -/
 def src1CfgLayout : WordLayout := {
   name := "src1Cfg"
   fixedMask := 0xfff0f0fc
@@ -390,7 +463,25 @@ def src1CfgLayout : WordLayout := {
   ]
 }
 
-/-- `0x4148` resCfg: `mode[1:0]`, `direct[3:3]`, `P[11:8]`, fixed flags `0x00500070`. -/
+/-- `0x4104`/`0x4108` multi-task source port config layout:
+    `mode[1:0]`, `handoffNe[2:2]`, `handoffPe[3:3]`, `waitNe4[4:4]`, `waitNe5[5:5]`,
+    `dmaFlag[6:6]`, `P[11:8]`, `waitPe20[20:20]`, `waitPe22[22:22]` (all other bits 0). -/
+def portCfgMultiLayout (name : String) : WordLayout := {
+  name := name
+  fields := #[
+    { name := "mode", lo := 0, width := 2 },
+    { name := "handoffNe", lo := 2, width := 1 },
+    { name := "handoffPe", lo := 3, width := 1 },
+    { name := "waitNe4", lo := 4, width := 1 },
+    { name := "waitNe5", lo := 5, width := 1 },
+    { name := "dmaFlag", lo := 6, width := 1 },
+    { name := "P", lo := 8, width := 4 },
+    { name := "waitPe20", lo := 20, width := 1 },
+    { name := "waitPe22", lo := 22, width := 1 }
+  ]
+}
+
+/-- `0x4148` resCfg (single-task): `mode[1:0]`, `direct[3:3]`, `P[11:8]`, fixed flags `0x00500070`. -/
 def resCfgLayout : WordLayout := {
   name := "resCfg"
   fixedMask := 0xfff0f0f4
@@ -399,6 +490,22 @@ def resCfgLayout : WordLayout := {
     { name := "mode", lo := 0, width := 2 },
     { name := "direct", lo := 3, width := 1 },
     { name := "P", lo := 8, width := 4 }
+  ]
+}
+
+/-- `0x4148` resCfg (multi-task): `mode[1:0]`, `direct[3:3]`, `waitNe4[4:4]`, `waitNe5[5:5]`,
+    `dmaFlag[6:6]`, `P[11:8]`, `waitPe20[20:20]`, `waitPe22[22:22]` (all other bits 0). -/
+def resCfgMultiLayout : WordLayout := {
+  name := "resCfgMulti"
+  fields := #[
+    { name := "mode", lo := 0, width := 2 },
+    { name := "direct", lo := 3, width := 1 },
+    { name := "waitNe4", lo := 4, width := 1 },
+    { name := "waitNe5", lo := 5, width := 1 },
+    { name := "dmaFlag", lo := 6, width := 1 },
+    { name := "P", lo := 8, width := 4 },
+    { name := "waitPe20", lo := 20, width := 1 },
+    { name := "waitPe22", lo := 22, width := 1 }
   ]
 }
 
@@ -433,12 +540,24 @@ def scalarBiasLayout : WordLayout := dim16Layout "scalarBias"
 /-- `0x4910` neScale: IEEE fp16 bits in `[15:0]`. -/
 def neScaleLayout : WordLayout := dim16Layout "neScale"
 
-/-- `0x4d00` src1Dep: `code[7:0]`, `task[23:16]`. -/
+/-- `0x4d00` src1Dep (single-task): `code[7:0]`, `task[23:16]`. -/
 def src1DepLayout : WordLayout := {
   name := "src1Dep"
   fields := #[
     { name := "code", lo := 0, width := 8 },
     { name := "task", lo := 16, width := 8 }
+  ]
+}
+
+/-- `0x4d00`/`0x4d04` multi-task source DMA dependency layout:
+    `code[7:0]`, `task[23:16]`, `depDist[27:24]`, `depKind[29:28]` (all other bits 0). -/
+def srcDepMultiLayout (name : String) : WordLayout := {
+  name := name
+  fields := #[
+    { name := "code", lo := 0, width := 8 },
+    { name := "task", lo := 16, width := 8 },
+    { name := "depDist", lo := 24, width := 4 },
+    { name := "depKind", lo := 28, width := 2 }
   ]
 }
 
@@ -461,13 +580,26 @@ def resDepLayout : WordLayout := {
   ]
 }
 
-/-- `0x5500` kernelStage: fixed `0x000002c0`, `sparse[5:5]`, `stage[23:16]` (`0x000102c0 | (sparse << 5)`). -/
+/-- `0x5500` kernelStage (single-task): fixed `0x000002c0`, `sparse[5:5]`, `stage[23:16]`. -/
 def kernelStageLayout : WordLayout := {
   name := "kernelStage"
   fixedMask := 0xff00ffdf
   fixedValue := 0x000002c0
   fields := #[
     { name := "sparse", lo := 5, width := 1 },
+    { name := "stage", lo := 16, width := 8 }
+  ]
+}
+
+/-- `0x5500` kernelStage (multi-task): `sparse[5:5]`, `kernEn[6:6]`, `isLast[7:7]`,
+    `kernCfg[9:9]`, `stage[23:16]` (all other bits 0). -/
+def kernelStageMultiLayout : WordLayout := {
+  name := "kernelStageMulti"
+  fields := #[
+    { name := "sparse", lo := 5, width := 1 },
+    { name := "kernEn", lo := 6, width := 1 },
+    { name := "isLast", lo := 7, width := 1 },
+    { name := "kernCfg", lo := 9, width := 1 },
     { name := "stage", lo := 16, width := 8 }
   ]
 }
@@ -514,9 +646,33 @@ def resDepCode : Target → UInt32
   | .h16 => 0x31
   | .h17 => 0x21
 
+-- Named multi-task port config, dependency, and BAR constants
+def portModeL2 : UInt32 := 0
+def portModeDma : UInt32 := 2
+def cfgBitHandoffNe : UInt32 := (1 : UInt32) <<< 2
+def cfgBitHandoffPe : UInt32 := (1 : UInt32) <<< 3
+def cfgBitWaitNe4 : UInt32 := (1 : UInt32) <<< 4
+def cfgBitWaitNe5 : UInt32 := (1 : UInt32) <<< 5
+def cfgDmaFlag : UInt32 := (1 : UInt32) <<< 6
+def cfgBitWaitPe20 : UInt32 := (1 : UInt32) <<< 20
+def cfgBitWaitPe22 : UInt32 := (1 : UInt32) <<< 22
+def cfgFirstTaskMask : UInt32 := cfgBitWaitNe4 ||| cfgBitWaitNe5 ||| cfgBitWaitPe20 ||| cfgBitWaitPe22
+def resDepScratchFlags : UInt32 := 0xc0
+def srcDepCodeDma : UInt32 := 0x21
+def srcDepCodePrev : UInt32 := 0x41
+def srcDmaCfgPrev : UInt32 := 0x0000004e
+def srcFmtPayloadP1 : UInt32 := 0x002031
+def resFmtPayloadP1 : UInt32 := 0x302031
+def srcFmtWordP1 : UInt32 := ((1 : UInt32) <<< 24) ||| srcFmtPayloadP1
+def resFmtWordP1 : UInt32 := ((1 : UInt32) <<< 24) ||| resFmtPayloadP1
+def out2FormValue : UInt32 := 0xe0
+def barSlotScratch : UInt8 := 3
+def barSlotConfigZero : UInt8 := 4
+def barSlotFirstSurface : UInt8 := 6
+
 -- Fixed register constants
-def src2CfgValue : UInt32 := 0x00500130
-def src2CfgEnabledValue : UInt32 := 0x00500172
+def src2CfgValue : UInt32 := cfgFirstTaskMask ||| ((1 : UInt32) <<< 8) ||| portModeL2
+def src2CfgEnabledValue : UInt32 := cfgFirstTaskMask ||| ((1 : UInt32) <<< 8) ||| cfgDmaFlag ||| portModeDma
 def src1DmaCfgValue : UInt32 := 0x000000ce
 def fp16OneBits : UInt32 := 0x3c00
 def fp16InvLn2Bits : UInt16 := 0x3dc5

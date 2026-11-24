@@ -183,15 +183,20 @@ def broadcastDims (s1 s2 : TensorDims) : Except String TensorDims := do
   validateBroadcastAxis s2.w out.w "src2" "W"
   pure out
 
-/-- Whether PE result staging operates in direct mode (`true` on H17; staged on H16 iff
-    `k == 5 && align_up(W, 8) > 32 && lastStrip == 24`). -/
+/-- Whether PE result staging operates in direct mode.
+    Enforces `[DL]` (multi-strip direct writes require `(1 << k) % 32 == 0` at `P = 1`, i.e., `k >= 5`
+    whenever `outW > 2^k`) on both H16 and H17, plus the H16 `k == 5, lastStrip == 24` staged rule. -/
 def peIsDirect (target : Target) (outW k : Nat) : Bool :=
-  match target with
-  | .h17 => true
-  | .h16 =>
-    let r := alignUp outW 8
-    let lastStrip := if r == 0 then 0 else r - 32 * ((r - 1) / 32)
-    !(k == 5 && r > 32 && lastStrip == 24)
+  let stripW := peStripWidth k
+  if outW > stripW && stripW % 32 != 0 then
+    false
+  else
+    match target with
+    | .h17 => true
+    | .h16 =>
+      let r := alignUp outW 8
+      let lastStrip := if r == 0 then 0 else r - 32 * ((r - 1) / 32)
+      !(k == 5 && r > 32 && lastStrip == 24)
 
 /-- Direct-mode L2 output ring buffer reservation in bytes for PE tasks:
     `alignUp(max(2048, min(outC * drow * th, 4 * drow * th)), 64)`. -/

@@ -1,6 +1,8 @@
 import Vane.Binary
 import Vane.TaskStream
 import Vane.Register
+import Vane.Reach
+import Vane.Alloc
 import Vane.Tiling
 import Vane.Pe
 import Vane.Lut
@@ -10,6 +12,8 @@ namespace Vane.Proofs
 open Vane.Binary
 open Vane.TaskStream
 open Vane.Register
+open Vane.Reach
+open Vane.Alloc
 open Vane.Tiling
 open Vane.Pe
 open Vane.Lut
@@ -78,6 +82,16 @@ theorem dmaFmtLayout_valid (name : String) : (validateWordLayout (dmaFmtLayout n
 theorem resDepLayout_valid : (validateWordLayout resDepLayout).isOk = true := by decide
 theorem chunkSlotLayout_valid : (validateWordLayout chunkSlotLayout).isOk = true := by decide
 theorem out2Layout_valid : (validateWordLayout out2Layout).isOk = true := by decide
+theorem taskHeader2Layout_valid : (validateWordLayout taskHeader2Layout).isOk = true := by decide
+theorem taskHeader8MultiLayout_valid : (validateWordLayout taskHeader8MultiLayout).isOk = true := by decide
+theorem resCfgMultiLayout_valid : (validateWordLayout resCfgMultiLayout).isOk = true := by decide
+theorem kernelStageMultiLayout_valid : (validateWordLayout kernelStageMultiLayout).isOk = true := by decide
+theorem portCfgMultiLayout_valid (name : String) : (validateWordLayout (portCfgMultiLayout name)).isOk = true := by
+  simp [validateWordLayout, portCfgMultiLayout, validateWordLayoutFields, BitField.mask, BitField.maskNat]
+  rfl
+theorem srcDepMultiLayout_valid (name : String) : (validateWordLayout (srcDepMultiLayout name)).isOk = true := by
+  simp [validateWordLayout, srcDepMultiLayout, validateWordLayoutFields, BitField.mask, BitField.maskNat]
+  rfl
 
 -- Kernel-clean BitVec / UInt32 bitwise algebra helpers (zero bv_decide, zero custom axioms)
 
@@ -1179,5 +1193,543 @@ theorem validateNeActTiling_bounds
   obtain ⟨hL2, _⟩ := except_if_err_ok hv
   have hthNe : t.tileHeight ≠ 0 := by simpa using hth0
   exact ⟨by omega, by omega, by omega, by omega, by omega, by omega, by omega, by omega, by omega⟩
+
+-- ============================================================================
+-- 7. Milestone 4: Multi-task WordLayout round-trips & [DL] / header invariants
+-- ============================================================================
+
+theorem taskHeader2_roundTrip (firstFlags lastFlag : UInt32)
+    (hff : firstFlags < 256) (hlf : lastFlag < 2) :
+    ∃ w, encodeWord taskHeader2Layout #[("firstFlags", firstFlags), ("lastFlag", lastFlag)] = .ok w ∧
+         decodeFieldChecked taskHeader2Layout w "firstFlags" = .ok firstFlags ∧
+         decodeFieldChecked taskHeader2Layout w "lastFlag" = .ok lastFlag := by
+  have h1 : ¬ firstFlags.toNat ≥ 256 := u32_not_ge_of_lt hff
+  have h2 : ¬ lastFlag.toNat ≥ 2 := u32_not_ge_of_lt hlf
+  have henc : encodeWord taskHeader2Layout #[("firstFlags", firstFlags), ("lastFlag", lastFlag)] =
+      .ok (((0 : UInt32) ||| (firstFlags <<< 0)) ||| (lastFlag <<< 26)) := by
+    change (if firstFlags.toNat ≥ 256 then _ else if lastFlag.toNat ≥ 2 then _ else _) = _
+    simp only [h1, h2, ↓reduceIte]
+    rfl
+  exact ⟨_, henc,
+    encodeWord_decodeFieldChecked _ _ _ "firstFlags" firstFlags henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "lastFlag" lastFlag henc rfl⟩
+
+theorem taskHeader8Multi_roundTrip (active isLast ene : UInt32)
+    (ha : active < 2) (hl : isLast < 2) (he : ene < 8) :
+    ∃ w, encodeWord taskHeader8MultiLayout #[("active", active), ("isLast", isLast), ("ene", ene)] = .ok w ∧
+         decodeFieldChecked taskHeader8MultiLayout w "active" = .ok active ∧
+         decodeFieldChecked taskHeader8MultiLayout w "isLast" = .ok isLast ∧
+         decodeFieldChecked taskHeader8MultiLayout w "ene" = .ok ene := by
+  have h1 : ¬ active.toNat ≥ 2 := u32_not_ge_of_lt ha
+  have h2 : ¬ isLast.toNat ≥ 2 := u32_not_ge_of_lt hl
+  have h3 : ¬ ene.toNat ≥ 8 := u32_not_ge_of_lt he
+  have henc : encodeWord taskHeader8MultiLayout #[("active", active), ("isLast", isLast), ("ene", ene)] =
+      .ok ((((0 : UInt32) ||| (active <<< 0)) ||| (isLast <<< 3)) ||| (ene <<< 16)) := by
+    change (if active.toNat ≥ 2 then _ else if isLast.toNat ≥ 2 then _ else if ene.toNat ≥ 8 then _ else _) = _
+    simp only [h1, h2, h3, ↓reduceIte]
+    rfl
+  exact ⟨_, henc,
+    encodeWord_decodeFieldChecked _ _ _ "active" active henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "isLast" isLast henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "ene" ene henc rfl⟩
+
+/-- Any 9-word multi-task `header[8]` encoded with `active = 1` never sets bit 1,
+    so `(w &&& 3) ≠ 3` and task-stream decoders always classify it as a 9-word header. -/
+theorem taskHeader8Multi_never_10word (isLast ene : UInt32)
+    (hl : isLast < 2) (he : ene < 8) :
+    ∃ w, encodeWord taskHeader8MultiLayout #[("active", 1), ("isLast", isLast), ("ene", ene)] = .ok w ∧
+         (w &&& 3) ≠ 3 := by
+  have h2 : ¬ isLast.toNat ≥ 2 := u32_not_ge_of_lt hl
+  have h3 : ¬ ene.toNat ≥ 8 := u32_not_ge_of_lt he
+  have henc : encodeWord taskHeader8MultiLayout #[("active", 1), ("isLast", isLast), ("ene", ene)] =
+      .ok ((((0 : UInt32) ||| ((1 : UInt32) <<< 0)) ||| (isLast <<< 3)) ||| (ene <<< 16)) := by
+    change (if isLast.toNat ≥ 2 then _ else if ene.toNat ≥ 8 then _ else _) = _
+    simp only [h2, h3, ↓reduceIte]
+    rfl
+  refine ⟨_, henc, ?_⟩
+  intro heq
+  have hbit := congrArg (fun u : UInt32 => u.toBitVec[1]) heq
+  have h3t : (3 : UInt32).toBitVec[1] = true := by simp [BitVec.getElem_eq_testBit_toNat]; decide
+  have hbit1 : (((((0 : UInt32) ||| ((1 : UInt32) <<< 0)) ||| (isLast <<< 3)) ||| (ene <<< 16)) &&& 3).toBitVec[1] = false := by
+    have h0 : (0 : UInt32).toBitVec[1] = false := by simp [BitVec.getElem_eq_testBit_toNat]
+    have hone : ((1 : UInt32) <<< 0).toBitVec[1] = false := by simp [BitVec.getElem_eq_testBit_toNat]; decide
+    have hl1 : (isLast <<< 3).toBitVec[1] = false := by
+      rw [BitVec.getElem_eq_testBit_toNat]
+      change (isLast <<< 3).toNat.testBit 1 = false
+      rw [UInt32.toNat_shiftLeft]
+      change ((isLast.toNat <<< 3) % 2 ^ 32).testBit 1 = false
+      rw [Nat.testBit_mod_two_pow]
+      simp [Nat.testBit_shiftLeft]
+    have he1 : (ene <<< 16).toBitVec[1] = false := by
+      rw [BitVec.getElem_eq_testBit_toNat]
+      change (ene <<< 16).toNat.testBit 1 = false
+      rw [UInt32.toNat_shiftLeft]
+      change ((ene.toNat <<< 16) % 2 ^ 32).testBit 1 = false
+      rw [Nat.testBit_mod_two_pow]
+      simp [Nat.testBit_shiftLeft]
+    rw [u32_bit_and _ _ 1 (by omega), u32_bit_or _ _ 1 (by omega),
+        u32_bit_or _ _ 1 (by omega), u32_bit_or _ _ 1 (by omega),
+        h0, hone, hl1, he1]
+    rfl
+  rw [hbit1, h3t] at hbit
+  cases hbit
+
+theorem srcDepMulti_roundTrip (name : String) (code task depDist depKind : UInt32)
+    (hc : code < 256) (ht : task < 256) (hd : depDist < 16) (hk : depKind < 4) :
+    ∃ w, encodeWord (srcDepMultiLayout name) #[
+            ("code", code), ("task", task), ("depDist", depDist), ("depKind", depKind)
+          ] = .ok w ∧
+         decodeFieldChecked (srcDepMultiLayout name) w "code" = .ok code ∧
+         decodeFieldChecked (srcDepMultiLayout name) w "task" = .ok task ∧
+         decodeFieldChecked (srcDepMultiLayout name) w "depDist" = .ok depDist ∧
+         decodeFieldChecked (srcDepMultiLayout name) w "depKind" = .ok depKind := by
+  have h1 : ¬ code.toNat ≥ 256 := u32_not_ge_of_lt hc
+  have h2 : ¬ task.toNat ≥ 256 := u32_not_ge_of_lt ht
+  have h3 : ¬ depDist.toNat ≥ 16 := u32_not_ge_of_lt hd
+  have h4 : ¬ depKind.toNat ≥ 4 := u32_not_ge_of_lt hk
+  have hlay : validateWordLayout (srcDepMultiLayout name) = .ok 0x3fff00ff := by
+    simp [validateWordLayout, srcDepMultiLayout, validateWordLayoutFields, BitField.mask, BitField.maskNat]
+    rfl
+  have hval : validateEncodeValues name (srcDepMultiLayout name).fields.toList
+      [("code", code), ("task", task), ("depDist", depDist), ("depKind", depKind)] [] = .ok () := by
+    simp [srcDepMultiLayout, validateEncodeValues]
+  have henc : encodeWord (srcDepMultiLayout name) #[
+      ("code", code), ("task", task), ("depDist", depDist), ("depKind", depKind)
+    ] = .ok (((((0 : UInt32) ||| (code <<< 0)) ||| (task <<< 16)) ||| (depDist <<< 24)) ||| (depKind <<< 28)) := by
+    unfold encodeWord
+    rw [hlay]
+    simp only [bind, Except.bind]
+    have hval' : validateEncodeValues (srcDepMultiLayout name).name (srcDepMultiLayout name).fields.toList
+        #[("code", code), ("task", task), ("depDist", depDist), ("depKind", depKind)].toList [] = .ok () := hval
+    rw [hval']
+    simp [srcDepMultiLayout, encodeWordFields, List.find?]
+    have c1 : ¬ 256 ≤ code.toNat := by omega
+    have c2 : ¬ 256 ≤ task.toNat := by omega
+    have c3 : ¬ 16 ≤ depDist.toNat := by omega
+    have c4 : ¬ 4 ≤ depKind.toNat := by omega
+    simp [c1, c2, c3, c4]
+  exact ⟨_, henc,
+    encodeWord_decodeFieldChecked _ _ _ "code" code henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "task" task henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "depDist" depDist henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "depKind" depKind henc rfl⟩
+
+theorem kernelStageMulti_roundTrip (sparse kernEn isLast kernCfg stage : UInt32)
+    (hsp : sparse < 2) (hke : kernEn < 2) (hil : isLast < 2) (hkc : kernCfg < 2) (hst : stage < 256) :
+    ∃ w, encodeWord kernelStageMultiLayout #[
+            ("sparse", sparse), ("kernEn", kernEn), ("isLast", isLast), ("kernCfg", kernCfg), ("stage", stage)
+          ] = .ok w ∧
+         decodeFieldChecked kernelStageMultiLayout w "sparse" = .ok sparse ∧
+         decodeFieldChecked kernelStageMultiLayout w "kernEn" = .ok kernEn ∧
+         decodeFieldChecked kernelStageMultiLayout w "isLast" = .ok isLast ∧
+         decodeFieldChecked kernelStageMultiLayout w "kernCfg" = .ok kernCfg ∧
+         decodeFieldChecked kernelStageMultiLayout w "stage" = .ok stage := by
+  have h1 : ¬ sparse.toNat ≥ 2 := u32_not_ge_of_lt hsp
+  have h2 : ¬ kernEn.toNat ≥ 2 := u32_not_ge_of_lt hke
+  have h3 : ¬ isLast.toNat ≥ 2 := u32_not_ge_of_lt hil
+  have h4 : ¬ kernCfg.toNat ≥ 2 := u32_not_ge_of_lt hkc
+  have h5 : ¬ stage.toNat ≥ 256 := u32_not_ge_of_lt hst
+  have henc : encodeWord kernelStageMultiLayout #[
+      ("sparse", sparse), ("kernEn", kernEn), ("isLast", isLast), ("kernCfg", kernCfg), ("stage", stage)
+    ] = .ok ((((((0 : UInt32) ||| (sparse <<< 5)) ||| (kernEn <<< 6)) ||| (isLast <<< 7)) |||
+      (kernCfg <<< 9)) ||| (stage <<< 16)) := by
+    change (if sparse.toNat ≥ 2 then _ else if kernEn.toNat ≥ 2 then _ else
+            if isLast.toNat ≥ 2 then _ else if kernCfg.toNat ≥ 2 then _ else
+            if stage.toNat ≥ 256 then _ else _) = _
+    simp only [h1, h2, h3, h4, h5, ↓reduceIte]
+    rfl
+  exact ⟨_, henc,
+    encodeWord_decodeFieldChecked _ _ _ "sparse" sparse henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "kernEn" kernEn henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "isLast" isLast henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "kernCfg" kernCfg henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "stage" stage henc rfl⟩
+
+/-- `[DL]` Direct PE DRAM write line rule: whenever `peIsDirect` authorizes direct mode,
+    either the output fits in a single strip (`outW ≤ 2^k`) or each strip spans an exact
+    multiple of 64-byte DMA lines (`2^k % 32 = 0` at `P = 1`). -/
+theorem peIsDirect_line_rule (target : Target) (outW k : Nat)
+    (h : peIsDirect target outW k = true) :
+    outW ≤ peStripWidth k ∨ peStripWidth k % 32 = 0 := by
+  unfold peIsDirect at h
+  dsimp only at h
+  by_cases hc : outW > peStripWidth k ∧ peStripWidth k % 32 ≠ 0
+  · have hcond : (decide (outW > peStripWidth k) && (peStripWidth k % 32 != 0)) = true := by
+      simp [hc.1, hc.2]
+    rw [hcond] at h
+    simp at h
+  · omega
+
+-- ============================================================================
+-- 8. Milestone 4: Vane.Alloc formal disjointness, packing & capacity proofs
+-- ============================================================================
+
+private theorem apart_symm {x y : Range} (h : Apart x y) : Apart y x := by
+  unfold Apart at *
+  exact h.symm
+
+private theorem meets_symm {f1 l1 f2 l2 : Nat} (h : meets f1 l1 f2 l2) : meets f2 l2 f1 l1 :=
+  ⟨h.2, h.1⟩
+
+private theorem le_topOf {ps : List PlacedBuf} {p : PlacedBuf} (hp : p ∈ ps) :
+    p.hi ≤ topOf ps := by
+  induction ps with
+  | nil => cases hp
+  | cons hd tl ih =>
+    simp only [topOf]
+    cases hp with
+    | head => exact Nat.le_max_left _ _
+    | tail _ htl => exact Nat.le_trans (ih htl) (Nat.le_max_right _ _)
+
+/-- Every buffer in any placed list ends by `topOf`. -/
+theorem allocate_le_top (firstFit : Bool) (bs : List LiveBuf) :
+    ∀ p ∈ allocate firstFit bs, p.hi ≤ topOf (allocate firstFit bs) :=
+  fun _ hp => le_topOf hp
+
+private theorem foldl_min_preserves {P : Nat → Prop} (xs : List Nat) (init : Nat)
+    (hinit : P init) (hxs : ∀ x ∈ xs, P x) :
+    P (xs.foldl min init) := by
+  induction xs generalizing init with
+  | nil => exact hinit
+  | cons hd tl ih =>
+    simp only [List.foldl_cons]
+    apply ih
+    · by_cases hle : init ≤ hd
+      · rwa [Nat.min_eq_left hle]
+      · rw [Nat.min_eq_right (Nat.le_of_not_le hle)]
+        exact hxs hd List.mem_cons_self
+    · intro x hx
+      exact hxs x (List.mem_cons_of_mem _ hx)
+
+private theorem clearFor_topOf (conf : List PlacedBuf) (bytes : Nat) :
+    clearFor conf bytes (topOf conf) = true := by
+  unfold clearFor
+  rw [List.all_eq_true]
+  intro p hp
+  simp only [decide_eq_true_eq]
+  left
+  exact le_topOf hp
+
+private theorem pickFirstFit_clear (conf : List PlacedBuf) (bytes : Nat) :
+    clearFor conf bytes (pickFirstFit conf bytes) = true := by
+  unfold pickFirstFit
+  apply foldl_min_preserves (P := fun off => clearFor conf bytes off = true)
+  · exact clearFor_topOf conf bytes
+  · intro x hx
+    rw [List.mem_filter] at hx
+    exact hx.2
+
+private theorem placeOne_apart (firstFit : Bool) (acc : List PlacedBuf) (b : LiveBuf) :
+    ∀ p ∈ acc, (placeOne firstFit acc b).conflicts p →
+      Apart (placeOne firstFit acc b).toRange p.toRange := by
+  intro p hp hconf
+  unfold placeOne at hconf ⊢
+  dsimp only [PlacedBuf.conflicts] at hconf
+  have hpConf : p ∈ acc.filter (fun q => decide (meets b.first b.last q.first q.last)) := by
+    rw [List.mem_filter]
+    exact ⟨hp, by simpa using hconf⟩
+  cases firstFit
+  · simp only [Bool.false_eq_true, ↓reduceIte]
+    apply apart_symm
+    left
+    exact le_topOf hpConf
+  · simp only [↓reduceIte]
+    have hcl := pickFirstFit_clear (acc.filter (fun q => decide (meets b.first b.last q.first q.last))) b.bytes
+    unfold clearFor at hcl
+    rw [List.all_eq_true] at hcl
+    have hpAp := hcl p hpConf
+    simp only [decide_eq_true_eq] at hpAp
+    exact apart_symm hpAp
+
+private theorem placeAll_disjoint (firstFit : Bool) (bs : List LiveBuf) (acc : List PlacedBuf)
+    (hacc : Disjoint acc) : Disjoint (placeAll firstFit bs acc) := by
+  induction bs generalizing acc with
+  | nil => exact hacc
+  | cons b rest ih =>
+    unfold placeAll
+    apply ih
+    exact List.Pairwise.cons (placeOne_apart firstFit acc b) hacc
+
+private theorem pairwise_reverse_symm {α : Type} {R : α → α → Prop}
+    (hsym : ∀ a b, R a b → R b a) (xs : List α) (h : xs.Pairwise R) :
+    xs.reverse.Pairwise R := by
+  rw [List.pairwise_reverse]
+  exact h.imp (fun {a b} hab => hsym a b hab)
+
+/-- Any two live-conflicting buffers placed by `allocate` occupy disjoint byte ranges. -/
+theorem allocate_disjoint (firstFit : Bool) (bs : List LiveBuf) :
+    Disjoint (allocate firstFit bs) := by
+  unfold allocate Disjoint
+  apply pairwise_reverse_symm
+  · intro a b hab hba
+    exact apart_symm (hab (meets_symm hba))
+  · exact placeAll_disjoint firstFit _ [] List.Pairwise.nil
+
+/-- Buffers live at any single task `t` are pairwise `Apart`. -/
+theorem liveAt_pairwise (ps : List PlacedBuf) (t : Nat) (hd : Disjoint ps) :
+    (liveAt ps t).Pairwise Apart := by
+  unfold liveAt
+  rw [List.pairwise_map]
+  have hfilt : (ps.filter (fun p => decide (p.live t))).Pairwise
+      (fun a b => a.live t ∧ b.live t ∧ (a.conflicts b → Apart a.toRange b.toRange)) := by
+    induction ps with
+    | nil => exact List.Pairwise.nil
+    | cons p rest ih =>
+      have ⟨hp, hrest⟩ := List.pairwise_cons.mp hd
+      simp only [List.filter_cons]
+      split
+      · rename_i hlive
+        have hpl : p.live t := by simpa using hlive
+        apply List.Pairwise.cons
+        · intro q hq
+          rw [List.mem_filter] at hq
+          have hql : q.live t := by simpa using hq.2
+          exact ⟨hpl, hql, hp q hq.1⟩
+        · exact ih hrest
+      · exact ih hrest
+  exact hfilt.imp fun {a b} h =>
+    h.2.2 ⟨Nat.le_trans h.1.1 h.2.1.2, Nat.le_trans h.2.1.1 h.1.2⟩
+
+private theorem bytesOf_partition (p : Range → Bool) (rs : List Range) :
+    bytesOf rs = bytesOf (rs.filter p) + bytesOf (rs.filter (fun x => !p x)) := by
+  induction rs with
+  | nil => simp [bytesOf]
+  | cons r rest ih =>
+    simp only [bytesOf, List.filter_cons]
+    cases h : p r <;> simp only [Bool.not_false, Bool.not_true, bytesOf, ↓reduceIte, Bool.false_eq_true] <;> omega
+
+private theorem filter_length_le {α : Type} (p : α → Bool) (xs : List α) :
+    (xs.filter p).length ≤ xs.length := by
+  induction xs with
+  | nil => simp
+  | cons x rest ih =>
+    simp only [List.filter_cons, List.length_cons]
+    cases p x <;> simp <;> omega
+
+private theorem sum_le_of_packed_in (n lo hi : Nat) (rs : List Range)
+    (hlen : rs.length ≤ n)
+    (hpw : rs.Pairwise Apart)
+    (hlo : ∀ r ∈ rs, lo ≤ r.base)
+    (hhi : ∀ r ∈ rs, r.hi ≤ hi) :
+    bytesOf rs ≤ hi - lo := by
+  induction n generalizing lo hi rs with
+  | zero =>
+    cases rs with
+    | nil => simp [bytesOf]
+    | cons _ _ => simp at hlen
+  | succ m ih =>
+    cases rs with
+    | nil => simp [bytesOf]
+    | cons r rest =>
+      have ⟨hrAll, hrestPw⟩ := List.pairwise_cons.mp hpw
+      have hrLo : lo ≤ r.base := hlo r List.mem_cons_self
+      have hrHi : r.hi ≤ hi := hhi r List.mem_cons_self
+      have hrestLen : rest.length ≤ m := by simp at hlen; omega
+      let p : Range → Bool := fun x => decide (x.hi ≤ r.base)
+      let left := rest.filter p
+      let right := rest.filter (fun x => !p x)
+      have hpart := bytesOf_partition p rest
+      have hleftLen : left.length ≤ m := Nat.le_trans (filter_length_le p rest) hrestLen
+      have hrightLen : right.length ≤ m := Nat.le_trans (filter_length_le _ rest) hrestLen
+      have hleftPw : left.Pairwise Apart := hrestPw.filter p
+      have hrightPw : right.Pairwise Apart := hrestPw.filter (fun x => !p x)
+      have hleftLo : ∀ x ∈ left, lo ≤ x.base := fun x hx =>
+        hlo x (List.mem_cons_of_mem _ (List.mem_filter.mp hx).1)
+      have hleftHi : ∀ x ∈ left, x.hi ≤ r.base := by
+        intro x hx
+        have hpx := (List.mem_filter.mp hx).2
+        simpa [p] using hpx
+      have hrightLo : ∀ x ∈ right, r.hi ≤ x.base := by
+        intro x hx
+        have ⟨hmem, hnpx⟩ := List.mem_filter.mp hx
+        have hnot : ¬ (x.hi ≤ r.base) := by
+          intro hle
+          have : p x = true := by simp [p, hle]
+          simp [this] at hnpx
+        cases hrAll x hmem with
+        | inl hle => exact hle
+        | inr hle => exact absurd hle hnot
+      have hrightHi : ∀ x ∈ right, x.hi ≤ hi := fun x hx =>
+        hhi x (List.mem_cons_of_mem _ (List.mem_filter.mp hx).1)
+      have hSumLeft : bytesOf left ≤ r.base - lo := ih lo r.base left hleftLen hleftPw hleftLo hleftHi
+      have hSumRight : bytesOf right ≤ hi - r.hi := ih r.hi hi right hrightLen hrightPw hrightLo hrightHi
+      dsimp only [left, right] at hSumLeft hSumRight
+      simp only [bytesOf, Range.hi] at hrHi hSumRight ⊢
+      rw [hpart]
+      omega
+
+/-- Any list of pairwise `Apart` ranges packed within `[0, cap)` has total bytes `≤ cap`. -/
+theorem sum_le_of_packed (cap : Nat) (rs : List Range) (hp : Packed cap rs) :
+    bytesOf rs ≤ cap := by
+  have h := sum_le_of_packed_in rs.length 0 cap rs (Nat.le_refl _) hp.1
+    (fun _ _ => Nat.zero_le _) hp.2
+  omega
+
+/-- Total live footprint at any task `t` is bounded by `cap` whenever placed buffers are
+    live-disjoint and end within `cap`. -/
+theorem liveAt_sum (ps : List PlacedBuf) (t cap : Nat)
+    (hd : Disjoint ps) (hcap : ∀ p ∈ ps, p.hi ≤ cap) :
+    bytesOf (liveAt ps t) ≤ cap := by
+  apply sum_le_of_packed cap (liveAt ps t)
+  refine ⟨liveAt_pairwise ps t hd, ?_⟩
+  intro r hr
+  unfold liveAt at hr
+  rw [List.mem_map] at hr
+  obtain ⟨p, hp, rfl⟩ := hr
+  rw [List.mem_filter] at hp
+  exact hcap p hp.1
+
+/-- Any offset returned by `findFreeOffset` fits inside `cap` and is `Apart` from every occupied range. -/
+theorem findFreeOffset_sound (occupied : List Range) (bytes cap off : Nat)
+    (h : findFreeOffset occupied bytes cap = some off) :
+    off + bytes ≤ cap ∧ ∀ r ∈ occupied, Apart r { base := off, bytes := bytes } := by
+  unfold findFreeOffset at h
+  dsimp only at h
+  generalize hv : (0 :: occupied.map Range.hi).filter (fun o =>
+    decide (o + bytes ≤ cap) &&
+    occupied.all (fun r => decide (Apart r { base := o, bytes := bytes }))) = valid at h
+  cases valid with
+  | nil => simp at h
+  | cons first rest =>
+    simp only [Option.some.injEq] at h
+    subst h
+    have hpred : ∀ x ∈ first :: rest,
+        x + bytes ≤ cap ∧ ∀ r ∈ occupied, Apart r { base := x, bytes := bytes } := by
+      intro x hx
+      rw [← hv, List.mem_filter] at hx
+      have hcond := hx.2
+      simp only [Bool.and_eq_true, decide_eq_true_eq, List.all_eq_true] at hcond
+      exact hcond
+    exact foldl_min_preserves rest first
+      (hpred first List.mem_cons_self)
+      (fun x hx => hpred x (List.mem_cons_of_mem _ hx))
+
+-- ============================================================================
+-- 9. Milestone 4: Vane.Reach forward-edge transitive closure soundness & completeness
+-- ============================================================================
+
+private theorem anyLt_iff (p : Nat → Bool) (m : Nat) :
+    anyLt p m = true ↔ ∃ j, j < m ∧ p j = true := by
+  induction m with
+  | zero =>
+    simp [anyLt]
+  | succ k ih =>
+    simp only [anyLt, Bool.or_eq_true, ih]
+    constructor
+    · rintro (⟨j, hj, hp⟩ | hp)
+      · exact ⟨j, by omega, hp⟩
+      · exact ⟨k, by omega, hp⟩
+    · rintro ⟨j, hj, hp⟩
+      by_cases hjk : j < k
+      · left; exact ⟨j, hjk, hp⟩
+      · right
+        have hEq : j = k := by omega
+        subst hEq
+        exact hp
+
+private theorem reachTableAux_size (step : Nat → Nat → Bool) (n m : Nat) :
+    (reachTableAux step n m).size = m := by
+  induction m with
+  | zero => rfl
+  | succ k ih =>
+    simp [reachTableAux, ih]
+
+private theorem reachTableAux_getElem?_lt (step : Nat → Nat → Bool) (n m i : Nat) (hi : i < m) :
+    (reachTableAux step n m)[i]? = (reachTableAux step n (i + 1))[i]? := by
+  induction m with
+  | zero => omega
+  | succ k ih =>
+    by_cases hik : i = k
+    · subst hik; rfl
+    · have hlt : i < k := by omega
+      conv => lhs; unfold reachTableAux
+      dsimp only
+      have hsz : (reachTableAux step n k).size = k := reachTableAux_size step n k
+      have hne : i ≠ (reachTableAux step n k).size := by omega
+      simp only [Array.getElem?_push, hne, ↓reduceIte]
+      exact ih hlt
+
+private theorem transGen_lt_of_fwd {step : Nat → Nat → Bool}
+    (hFwd : ∀ a b, step a b = true → a < b) {k i : Nat}
+    (h : Relation.TransGen (fun a b => step a b = true) k i) : k < i := by
+  induction h with
+  | single hki => exact hFwd _ _ hki
+  | tail _ hji ih => exact Nat.lt_trans ih (hFwd _ _ hji)
+
+private theorem ofFn_getD {n : Nat} (f : Fin n → Bool) (k : Nat) :
+    (Array.ofFn f).getD k false = if h : k < n then f ⟨k, h⟩ else false := by
+  unfold Array.getD
+  split
+  · rename_i hlt
+    have hk : k < n := by simpa [Array.size_ofFn] using hlt
+    simp only [hk, ↓reduceDIte]
+    exact Array.getElem_ofFn hlt
+  · rename_i hnot
+    have hk : ¬ k < n := by simpa [Array.size_ofFn] using hnot
+    simp only [hk, ↓reduceDIte]
+
+private theorem reachB_aux_iff (step : Nat → Nat → Bool)
+    (hFwd : ∀ a b, step a b = true → a < b) (n m : Nat) (hm : m ≤ n) :
+    ∀ i < m, ∀ k,
+      reachB (reachTableAux step n m) k i = true ↔
+      Relation.TransGen (fun a b => step a b = true) k i := by
+  induction m with
+  | zero =>
+    intro i hi
+    omega
+  | succ p ih =>
+    intro i hi k
+    have ihp := ih (by omega)
+    by_cases hip : i < p
+    · have hrow : (reachTableAux step n (p + 1))[i]? = (reachTableAux step n p)[i]? := by
+        rw [reachTableAux_getElem?_lt step n (p + 1) i hi,
+            reachTableAux_getElem?_lt step n p i hip]
+      unfold reachB
+      rw [hrow]
+      exact ihp i hip k
+    · have hiEq : i = p := by omega
+      subst hiEq
+      unfold reachB reachTableAux
+      dsimp only
+      have hsz : (reachTableAux step n i).size = i := reachTableAux_size step n i
+      simp only [Array.getElem?_push, hsz, ↓reduceIte]
+      rw [ofFn_getD]
+      constructor
+      · intro hget
+        split at hget
+        · simp only [Bool.or_eq_true] at hget
+          rcases hget with hstep | hany
+          · exact Relation.TransGen.single hstep
+          · rw [anyLt_iff] at hany
+            obtain ⟨j, hj, hcond⟩ := hany
+            simp only [Bool.and_eq_true] at hcond
+            have hreachJ : reachB (reachTableAux step n i) k j = true := hcond.2
+            have htgJ : Relation.TransGen (fun a b => step a b = true) k j :=
+              (ihp j hj k).mp hreachJ
+            exact Relation.TransGen.tail htgJ hcond.1
+        · cases hget
+      · intro htg
+        have hki : k < i := transGen_lt_of_fwd hFwd htg
+        have hkn : k < n := by omega
+        simp only [hkn, ↓reduceDIte, Bool.or_eq_true]
+        cases htg with
+        | single hstep =>
+          left; exact hstep
+        | tail hkj hji =>
+          right
+          rw [anyLt_iff]
+          have hjiLt : _ < i := hFwd _ _ hji
+          refine ⟨_, hjiLt, ?_⟩
+          simp only [Bool.and_eq_true]
+          exact ⟨hji, (ihp _ hjiLt k).mpr hkj⟩
+
+/-- Soundness and completeness of the forward-edge transitive-closure table `Vane.Reach.reachTable`:
+    for any forward relation (`step a b = true → a < b`) and any `i < n`,
+    `reachB (reachTable step n) k i = true` iff `Relation.TransGen (fun a b => step a b = true) k i`. -/
+theorem reachB_iff (step : Nat → Nat → Bool)
+    (hFwd : ∀ a b, step a b = true → a < b) (n k i : Nat) (hi : i < n) :
+    reachB (reachTable step n) k i = true ↔
+    Relation.TransGen (fun a b => step a b = true) k i :=
+  reachB_aux_iff step hFwd n n (Nat.le_refl n) i hi k
 
 end Vane.Proofs
