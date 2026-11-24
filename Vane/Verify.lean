@@ -1658,11 +1658,12 @@ def verifyPeTaskMulti
   else
     let wSrc1RowA ← requireDecodedWrite task.writes regSrc1RowBytesA "src1RowBytesA"
     let wSrc1RowB ← requireDecodedWrite task.writes regSrc1RowBytesB "src1RowBytesB"
-    let minAntiHang1 := 2 * min s1W stripW
-    if s1C > 1 && src1Chs < minAntiHang1 then
-      throw s!"{prefixMsg}: anti-hang violation: src1ChanStride ({src1Chs}) < 2 * min(W1={s1W}, T={stripW}) = {minAntiHang1}"
+    let effStripW := max stripW 32
+    let minAntiHang1 := 2 * min (alignUp s1W 8) effStripW
+    if src1Chs < minAntiHang1 then
+      throw s!"{prefixMsg}: anti-hang / 64B DMA line floor violation: src1ChanStride ({src1Chs}) < 2 * min(alignUp(W1={s1W}, 8), max(T={stripW}, 32)) = {minAntiHang1}"
     let whole1 := twoSource && s1C == 1 && s1H == 1 && s1W > 1 && outH > 1 && th < outH
-    let expRow1 := 2 * (if whole1 then alignUp s1W 8 else min (alignUp s1W 8) stripW)
+    let expRow1 := 2 * (if whole1 then alignUp s1W 8 else min (alignUp s1W 8) effStripW)
     if src1Chs != expRow1 then
       throw s!"{prefixMsg}: src1ChanStride ({src1Chs}) != expected {expRow1} (whole1={whole1})"
     let minU1 := s1C * src1Chs
@@ -1693,11 +1694,12 @@ def verifyPeTaskMulti
     else
       let wSrc2RowA ← requireDecodedWrite task.writes regSrc2RowBytesA "src2RowBytesA"
       let wSrc2RowB ← requireDecodedWrite task.writes regSrc2RowBytesB "src2RowBytesB"
-      let minAntiHang2 := 2 * min s2W stripW
-      if s2C > 1 && src2Chs < minAntiHang2 then
-        throw s!"{prefixMsg}: anti-hang violation: src2ChanStride ({src2Chs}) < 2 * min(W2={s2W}, T={stripW}) = {minAntiHang2}"
+      let effStripW := max stripW 32
+      let minAntiHang2 := 2 * min (alignUp s2W 8) effStripW
+      if src2Chs < minAntiHang2 then
+        throw s!"{prefixMsg}: anti-hang / 64B DMA line floor violation: src2ChanStride ({src2Chs}) < 2 * min(alignUp(W2={s2W}, 8), max(T={stripW}, 32)) = {minAntiHang2}"
       let whole2 := s2C == 1 && s2H == 1 && s2W > 1 && outH > 1 && th < outH
-      let expRow2 := 2 * (if whole2 then alignUp s2W 8 else min (alignUp s2W 8) stripW)
+      let expRow2 := 2 * (if whole2 then alignUp s2W 8 else min (alignUp s2W 8) effStripW)
       if src2Chs != expRow2 then
         throw s!"{prefixMsg}: src2ChanStride ({src2Chs}) != expected {expRow2} (whole2={whole2})"
       let minU2 := s2C * src2Chs
@@ -1729,7 +1731,7 @@ def verifyPeTaskMulti
     let expDirect := vPeIsDirect target outW k
     if direct != expDirect then
       throw s!"{prefixMsg}: resCfg direct={direct} disagrees with {target.name} PE direct={expDirect} (W={outW}, k={k})"
-    let expDrow := 2 * min (alignUp outW 8) stripW
+    let expDrow := 2 * min (alignUp outW 8) (max stripW 32)
     if direct then
       vCheckOmitted task.writes #[
         (regResChanStride, "resChanStride"), (regResRowStride, "resRowStride"),
@@ -1742,6 +1744,8 @@ def verifyPeTaskMulti
       let wResRow ← requireDecodedWrite task.writes regResRowStride "resRowStride"
       let wResRowA ← requireDecodedWrite task.writes regResRowBytesA "resRowBytesA"
       let wResRowB ← requireDecodedWrite task.writes regResRowBytesB "resRowBytesB"
+      if wResChs.value.toNat < expDrow then
+        throw s!"{prefixMsg}: 64B DMA line floor violation: staged resChanStride ({wResChs.value}) < {expDrow}"
       if wResChs.value.toNat != expDrow then
         throw s!"{prefixMsg}: staged resChanStride {wResChs.value} != expected {expDrow}"
       let minDu := outC * expDrow
@@ -2451,6 +2455,14 @@ def verifyProgramHazards (fps : Array VerifiedTaskFootprint) : Except String Uni
                 else if a.isWrite && b.isWrite then " [DRAM WAW]"
                 else " [DRAM RAW]"
               throw s!"S5 DRAM hazard{kindTag}: unordered conflict on {a.resource.name} between task {k} ({a.port.name} [{toHex a.lo}, {toHex a.hi})) and task {i} ({b.port.name} [{toHex b.lo}, {toHex b.hi}))"
+
+            -- BAR 3 DRAM-scratch read coherence: every scratch RAW reader (NE or PE, src1Dma or src2Dma)
+            -- must set depKind in {1, 2} on its own reading port (0x4d00 / 0x4d04).
+            if a.resource == .scratch && a.isWrite && !b.isWrite then
+              if b.port == .src1Dma && !(ti.sync.src1DepKind == 1 || ti.sync.src1DepKind == 2) then
+                throw s!"S5 DRAM scratch coherence: task {i} src1Dma reading scratch [{toHex b.lo}, {toHex b.hi}) written by task {k} must set 0x4d00 depKind to 1 or 2 (got {ti.sync.src1DepKind})"
+              if b.port == .src2Dma && !(ti.sync.src2DepKind == 1 || ti.sync.src2DepKind == 2) then
+                throw s!"S5 DRAM scratch coherence: task {i} src2Dma reading scratch [{toHex b.lo}, {toHex b.hi}) written by task {k} must set 0x4d04 depKind to 1 or 2 (got {ti.sync.src2DepKind})"
 
   pure ()
 

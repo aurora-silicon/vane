@@ -3550,6 +3550,163 @@ private def runM4Tests : IO (Array TestResult) := do
     tamperTaskRegAndVerify em.hwx em.info 0 regResCfg (origCfg ||| ((1 : UInt32) <<< 3))
   ) "[DL]")
 
+  -- =========================================================================
+  -- Milestone 4 Silicon-Contract Fixes:
+  -- 1. BAR 3 DRAM-scratch read coherence (depKind = 2 on PE 0x4d00 / 0x4d04)
+  -- 2. PE P=1 DMA-fed L2 channel-row stride 64-byte DMA line floor max(T, 32)
+  -- =========================================================================
+
+  -- Fix 1a: Compiled DRAM-scratch PE src1 & src2 readers (adjacent j = i-1 and skip j < i-1)
+  --         emit depKind = 2 with exact depDist = min 15 (i - j - 1) and pass verifyHwxTasks.
+  let basePeScratchCoherence ← match Vane.Graph.compileGraph {
+      target := .h17, defaultPlacement := .dram
+      inputs := #[{ name := "x", shape := { c := 16, h := 8, w := 16 } }]
+      nodes := #[
+        { id := "p0", inputs := #["x"], op := .pe1 .abs },
+        { id := "p1", inputs := #["p0"], op := .pe1 (.chain (some 0x3800) none none) },
+        { id := "add", inputs := #["p0", "p1"], op := .pe2 .add false }
+      ]
+    } with
+    | .ok g => pure g
+    | .error e => throw (IO.userError s!"basePeScratchCoherence setup failed: {e}")
+
+  results := results.push (checkOk "m4 fix1: BAR 3 DRAM-scratch PE src1 & src2 readers emit depKind=2 (adjacent + skip) and pass verifier" (do
+    let _ ← verifyCompiledGraph basePeScratchCoherence 3
+    -- Task 1 (p1): PE src1 reads p0 (j=0, i=1) -> 0x4d00 depKind=2, depDist=0
+    let f1 ← findTaskRegFileOffset basePeScratchCoherence.hwx basePeScratchCoherence.info 1 regSrc1Dep
+    let w1 ← readU32LE basePeScratchCoherence.hwx f1
+    let dk1 ← decodeFieldChecked (srcDepMultiLayout "src1Dep") w1 "depKind"
+    let dd1 ← decodeFieldChecked (srcDepMultiLayout "src1Dep") w1 "depDist"
+    if dk1 != 2 || dd1 != 0 then
+      throw s!"task 1 src1Dep: expected depKind=2, depDist=0; got depKind={dk1}, depDist={dd1}"
+    -- Task 2 (add): PE src1 reads p0 (j=0, i=2 -> depKind=2, depDist=1); src2 reads p1 (j=1, i=2 -> depKind=2, depDist=0)
+    let f2s1 ← findTaskRegFileOffset basePeScratchCoherence.hwx basePeScratchCoherence.info 2 regSrc1Dep
+    let w2s1 ← readU32LE basePeScratchCoherence.hwx f2s1
+    let dk2s1 ← decodeFieldChecked (srcDepMultiLayout "src1Dep") w2s1 "depKind"
+    let dd2s1 ← decodeFieldChecked (srcDepMultiLayout "src1Dep") w2s1 "depDist"
+    if dk2s1 != 2 || dd2s1 != 1 then
+      throw s!"task 2 src1Dep: expected depKind=2, depDist=1; got depKind={dk2s1}, depDist={dd2s1}"
+    let f2s2 ← findTaskRegFileOffset basePeScratchCoherence.hwx basePeScratchCoherence.info 2 regSrc2Dep
+    let w2s2 ← readU32LE basePeScratchCoherence.hwx f2s2
+    let dk2s2 ← decodeFieldChecked (srcDepMultiLayout "src2Dep") w2s2 "depKind"
+    let dd2s2 ← decodeFieldChecked (srcDepMultiLayout "src2Dep") w2s2 "depDist"
+    if dk2s2 != 2 || dd2s2 != 0 then
+      throw s!"task 2 src2Dep: expected depKind=2, depDist=0; got depKind={dk2s2}, depDist={dd2s2}"
+    -- Also test NE -> PE src1 & NE -> conv -> PE src2 (skip j=0, i=2) in DRAM
+    let gNePe ← Vane.Graph.compileGraph {
+      target := .h16, defaultPlacement := .dram
+      inputs := #[{ name := "x", shape := { c := 16, h := 8, w := 16 } }]
+      nodes := #[
+        { id := "c0", inputs := #["x"], op := .conv1x1 16 16 (mkGraphW1x1 16 16 1) none .none },
+        { id := "c1", inputs := #["c0"], op := .conv1x1 16 16 (mkGraphW1x1 16 16 2) none .none },
+        { id := "add", inputs := #["c1", "c0"], op := .pe2 .add false }
+      ]
+    }
+    let _ ← verifyCompiledGraph gNePe 3
+    let fNeS1 ← findTaskRegFileOffset gNePe.hwx gNePe.info 2 regSrc1Dep
+    let wNeS1 ← readU32LE gNePe.hwx fNeS1
+    let dkNeS1 ← decodeFieldChecked (srcDepMultiLayout "src1Dep") wNeS1 "depKind"
+    let ddNeS1 ← decodeFieldChecked (srcDepMultiLayout "src1Dep") wNeS1 "depDist"
+    if dkNeS1 != 2 || ddNeS1 != 0 then
+      throw s!"gNePe task 2 src1Dep: expected depKind=2, depDist=0; got depKind={dkNeS1}, depDist={ddNeS1}"
+    let fNeS2 ← findTaskRegFileOffset gNePe.hwx gNePe.info 2 regSrc2Dep
+    let wNeS2 ← readU32LE gNePe.hwx fNeS2
+    let dkNeS2 ← decodeFieldChecked (srcDepMultiLayout "src2Dep") wNeS2 "depKind"
+    let ddNeS2 ← decodeFieldChecked (srcDepMultiLayout "src2Dep") wNeS2 "depDist"
+    if dkNeS2 != 2 || ddNeS2 != 1 then
+      throw s!"gNePe task 2 src2Dep: expected depKind=2, depDist=1; got depKind={dkNeS2}, depDist={ddNeS2}"
+    pure ()
+  ))
+
+  -- Fix 1b: Mutating BAR 3 PE src1 reader depKind to 0 is rejected by verifier (S5) even with programOrderPE HB intact
+  results := results.push (checkErr "m4 fix1 neg: BAR 3 PE src1 reader depKind=0 rejected by S5 scratch coherence" (do
+    let f1 ← findTaskRegFileOffset basePeScratchCoherence.hwx basePeScratchCoherence.info 1 regSrc1Dep
+    let origCode := (← readU32LE basePeScratchCoherence.hwx f1) &&& 0xff
+    let wBad ← mkSrcDepWord "src1Dep" origCode 1 0 0
+    tamperTaskRegAndVerify basePeScratchCoherence.hwx basePeScratchCoherence.info 1 regSrc1Dep wBad
+  ) "scratch coherence")
+
+  -- Fix 1c: Mutating BAR 3 PE src2 reader depKind to 0 is rejected by verifier (S5) even with bit 22 intact
+  results := results.push (checkErr "m4 fix1 neg: BAR 3 PE src2 reader depKind=0 rejected by S5 scratch coherence" (do
+    let fCfg2 ← findTaskRegFileOffset basePeScratchCoherence.hwx basePeScratchCoherence.info 2 regSrc2Cfg
+    let origCfg2 ← readU32LE basePeScratchCoherence.hwx fCfg2
+    let h1 ← putU32LE basePeScratchCoherence.hwx fCfg2 (origCfg2 ||| cfgBitWaitPe22)
+    let f2 ← findTaskRegFileOffset h1 basePeScratchCoherence.info 2 regSrc2Dep
+    let origCode := (← readU32LE h1 f2) &&& 0xff
+    let wBad ← mkSrcDepWord "src2Dep" origCode 2 0 0
+    let h2 ← putU32LE h1 f2 wBad
+    let badInfo ← validateHwx h2
+    let _ ← verifyHwxTasks h2 badInfo (requireKnownTask := true)
+    pure ()
+  ) "scratch coherence")
+
+  -- Fix 2a: Natural staged PE case on H16 (C=9600, H=1, W=56 -> k=5, direct=false, 0x4114=0x4128=0x4150=0x40)
+  results := results.push (checkOk "m4 fix2: H16 natural staged PE (C=9600, H=1, W=56) selects k=5, direct=false, strides=0x40" (do
+    let d : TensorDims := { c := 9600, h := 1, w := 56 }
+    let comp ← compilePe .h16 (.binary .add d d false) d
+    if comp.tiling.k != 5 then
+      throw s!"expected k=5, got k={comp.tiling.k}"
+    if comp.direct then
+      throw "expected direct=false (staged) on H16 W=56 k=5"
+    let v1 ← readU32LE comp.hwx (← findTaskRegFileOffset comp.hwx comp.info 0 regSrc1ChanStride)
+    let v2 ← readU32LE comp.hwx (← findTaskRegFileOffset comp.hwx comp.info 0 regSrc2ChanStride)
+    let vr ← readU32LE comp.hwx (← findTaskRegFileOffset comp.hwx comp.info 0 regResChanStride)
+    if v1 != 0x40 || v2 != 0x40 || vr != 0x40 then
+      throw s!"expected 0x4114=0x4128=0x4150=0x40, got ({toHex v1.toNat}, {toHex v2.toNat}, {toHex vr.toNat})"
+    let _ ← verifyHwxTasksSummary comp.hwx comp.info (requireKnownTask := true)
+    pure ()
+  ))
+
+  -- Fix 2b: Explicit k=4 with W=32, direct=false, 0x4114=0x4128=0x4150=0x40 passes verifier;
+  --         patching any of 0x4114, 0x4128, or 0x4150 down to 0x20 is rejected (S3).
+  let basePeK4W32 ← match (do
+      let d : TensorDims := { c := 4, h := 4, w := 32 }
+      compilePe .h16 (.binary .add d d false) d (tilingOverride := some { k := 4, tileHeight := 4 })) with
+    | .ok c => pure c
+    | .error e => throw (IO.userError s!"basePeK4W32 setup failed: {e}")
+
+  results := results.push (checkOk "m4 fix2: explicit k=4 W=32 staged PE emits 0x4114=0x4128=0x4150=0x40 and passes verifier" (do
+    if basePeK4W32.tiling.k != 4 || basePeK4W32.direct then
+      throw s!"expected k=4 direct=false, got k={basePeK4W32.tiling.k} direct={basePeK4W32.direct}"
+    let v1 ← readU32LE basePeK4W32.hwx (← findTaskRegFileOffset basePeK4W32.hwx basePeK4W32.info 0 regSrc1ChanStride)
+    let v2 ← readU32LE basePeK4W32.hwx (← findTaskRegFileOffset basePeK4W32.hwx basePeK4W32.info 0 regSrc2ChanStride)
+    let vr ← readU32LE basePeK4W32.hwx (← findTaskRegFileOffset basePeK4W32.hwx basePeK4W32.info 0 regResChanStride)
+    if v1 != 0x40 || v2 != 0x40 || vr != 0x40 then
+      throw s!"expected 0x4114=0x4128=0x4150=0x40, got ({toHex v1.toNat}, {toHex v2.toNat}, {toHex vr.toNat})"
+    let _ ← verifyHwxTasksSummary basePeK4W32.hwx basePeK4W32.info (requireKnownTask := true)
+    pure ()
+  ))
+
+  results := results.push (checkErr "m4 fix2 neg: k=4 W=32 patching 0x4114 (src1ChanStride) to 0x20 rejected by S3" (do
+    let h1 ← putU32LE basePeK4W32.hwx (← findTaskRegFileOffset basePeK4W32.hwx basePeK4W32.info 0 regSrc1ChanStride) 0x20
+    let h2 ← putU32LE h1 (← findTaskRegFileOffset h1 basePeK4W32.info 0 regSrc1RowStride) (4 * 0x20)
+    let h3 ← putU32LE h2 (← findTaskRegFileOffset h2 basePeK4W32.info 0 regSrc1RowBytesA) (4 * 0x20)
+    let h4 ← putU32LE h3 (← findTaskRegFileOffset h3 basePeK4W32.info 0 regSrc1RowBytesB) (4 * 0x20)
+    let badInfo ← validateHwx h4
+    let _ ← verifyHwxTasks h4 badInfo (requireKnownTask := true)
+    pure ()
+  ) "64B DMA line floor")
+
+  results := results.push (checkErr "m4 fix2 neg: k=4 W=32 patching 0x4128 (src2ChanStride) to 0x20 rejected by S3" (do
+    let h1 ← putU32LE basePeK4W32.hwx (← findTaskRegFileOffset basePeK4W32.hwx basePeK4W32.info 0 regSrc2ChanStride) 0x20
+    let h2 ← putU32LE h1 (← findTaskRegFileOffset h1 basePeK4W32.info 0 regSrc2RowStride) (4 * 0x20)
+    let h3 ← putU32LE h2 (← findTaskRegFileOffset h2 basePeK4W32.info 0 regSrc2RowBytesA) (4 * 0x20)
+    let h4 ← putU32LE h3 (← findTaskRegFileOffset h3 basePeK4W32.info 0 regSrc2RowBytesB) (4 * 0x20)
+    let badInfo ← validateHwx h4
+    let _ ← verifyHwxTasks h4 badInfo (requireKnownTask := true)
+    pure ()
+  ) "64B DMA line floor")
+
+  results := results.push (checkErr "m4 fix2 neg: k=4 W=32 patching 0x4150 (resChanStride) to 0x20 rejected by S3" (do
+    let h1 ← putU32LE basePeK4W32.hwx (← findTaskRegFileOffset basePeK4W32.hwx basePeK4W32.info 0 regResChanStride) 0x20
+    let h2 ← putU32LE h1 (← findTaskRegFileOffset h1 basePeK4W32.info 0 regResRowStride) (4 * 0x20)
+    let h3 ← putU32LE h2 (← findTaskRegFileOffset h2 basePeK4W32.info 0 regResRowBytesA) (4 * 0x20)
+    let h4 ← putU32LE h3 (← findTaskRegFileOffset h3 basePeK4W32.info 0 regResRowBytesB) (4 * 0x20)
+    let badInfo ← validateHwx h4
+    let _ ← verifyHwxTasks h4 badInfo (requireKnownTask := true)
+    pure ()
+  ) "64B DMA line floor")
+
   pure results
 
 def main : IO UInt32 := do

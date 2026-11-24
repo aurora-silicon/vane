@@ -223,7 +223,8 @@ structure PeL2Layout where
   l2UseBytes : Nat
   deriving Repr, BEq, Inhabited
 
-/-- Compute exact L2 SRAM layout for a PE task given hardware `src1` and optional `src2`. -/
+/-- Compute exact L2 SRAM layout for a PE task given hardware `src1` and optional `src2`.
+    Every non-whole DMA-fed `P = 1` channel row enforces the 64-byte DMA line floor `max(T, 32)`. -/
 def computePeL2Layout
     (target : Target)
     (outDims hwSrc1 : TensorDims)
@@ -231,8 +232,9 @@ def computePeL2Layout
     (t : PeTiling) : PeL2Layout :=
   let twoSource := hwSrc2?.isSome
   let stripW := peStripWidth t.k
+  let effStripW := max stripW 32
   let whole1 := twoSource && hwSrc1.c == 1 && hwSrc1.h == 1 && hwSrc1.w > 1 && outDims.h > 1 && t.tileHeight < outDims.h
-  let row1 := 2 * (if whole1 then alignUp hwSrc1.w 8 else min (alignUp hwSrc1.w 8) stripW)
+  let row1 := 2 * (if whole1 then alignUp hwSrc1.w 8 else min (alignUp hwSrc1.w 8) effStripW)
   let u1 := hwSrc1.c * row1
   let size1 := (if hwSrc1.h > 1 then t.tileHeight else 1) * u1
   let (whole2, src2Base, row2, u2, size2, stop) :=
@@ -240,14 +242,14 @@ def computePeL2Layout
     | none => (false, 0, 0, 0, 0, size1)
     | some hwSrc2 =>
       let w2 := hwSrc2.c == 1 && hwSrc2.h == 1 && hwSrc2.w > 1 && outDims.h > 1 && t.tileHeight < outDims.h
-      let r2 := 2 * (if w2 then alignUp hwSrc2.w 8 else min (alignUp hwSrc2.w 8) stripW)
+      let r2 := 2 * (if w2 then alignUp hwSrc2.w 8 else min (alignUp hwSrc2.w 8) effStripW)
       let u2Val := hwSrc2.c * r2
       let b2 := alignUp size1 dmaLineBytes
       let sz2 := (if hwSrc2.h > 1 then t.tileHeight else 1) * u2Val
       (w2, b2, r2, u2Val, sz2, b2 + sz2)
   let direct := peIsDirect target outDims.w t.k
   let resBase := alignUp stop dmaLineBytes
-  let drow := 2 * min (alignUp outDims.w 8) stripW
+  let drow := 2 * min (alignUp outDims.w 8) effStripW
   let du := outDims.c * drow
   let resL2 := if direct then peDirectResBytes outDims.c drow t.tileHeight else t.tileHeight * du
   {
@@ -270,9 +272,9 @@ def computePeL2Layout
   }
 
 /-- Independent hard safety legality validator for PE tiling `(k, tileHeight)`.
-    Enforces dimension bounds, broadcast compatibility, `k` range, `1 <= th <= out.h`,
+    Enforces dimension bounds, broadcast compatibility, `k` range (`4..maxK`), `1 <= th <= out.h`,
     2 MiB L2 capacity (including direct-mode output ring reservation and `whole1`/`whole2`),
-    and the critical `l2ChanStride >= 2 * min(src.w, T)` anti-hang rule. -/
+    and the `2 * min(alignUp(W, 8), max(T, 32))` 64-byte DMA line floor on DMA-fed ports. -/
 def validatePeTiling
     (target : Target)
     (outDims hwSrc1 : TensorDims)
@@ -301,13 +303,16 @@ def validatePeTiling
     .error s!"illegal PE tiling: tileHeight={t.tileHeight} out of range 1..{outDims.h}"
   else
     let l2 := computePeL2Layout target outDims hwSrc1 hwSrc2? t
-    let minChs1 := 2 * min hwSrc1.w l2.stripW
-    if hwSrc1.c > 1 && l2.row1 < minChs1 then
-      .error s!"illegal PE tiling (anti-hang): src1ChanStride {l2.row1} < 2 * min(W1={hwSrc1.w}, T={l2.stripW}) = {minChs1}"
+    let effStripW := max l2.stripW 32
+    let minChs1 := 2 * min (alignUp hwSrc1.w 8) effStripW
+    if l2.row1 < minChs1 then
+      .error s!"illegal PE tiling (anti-hang / 64B DMA line floor): src1ChanStride {l2.row1} < {minChs1}"
     else if (match hwSrc2? with
-      | some hwSrc2 => hwSrc2.c > 1 && l2.row2 < 2 * min hwSrc2.w l2.stripW
+      | some hwSrc2 => decide (l2.row2 < 2 * min (alignUp hwSrc2.w 8) effStripW)
       | none => false) then
-      .error s!"illegal PE tiling (anti-hang): src2ChanStride {l2.row2} below 2 * min(W2, T)"
+      .error s!"illegal PE tiling (anti-hang / 64B DMA line floor): src2ChanStride {l2.row2} below minimum"
+    else if !l2.direct && l2.drow < 2 * min (alignUp outDims.w 8) effStripW then
+      .error s!"illegal PE tiling (64B DMA line floor): staged resChanStride {l2.drow} below minimum"
     else if l2.l2UseBytes > l2CapacityBytes then
       .error s!"illegal PE tiling: L2 footprint {l2.l2UseBytes}B exceeds {l2CapacityBytes}B (2 MiB)"
     else
@@ -343,7 +348,7 @@ private def maxPeTileHeightForK
   return best
 
 /-- Deterministic O(1) tile chooser for PE tasks.
-    Iterates `k` from `maxK` down to `4`, solves maximal `th` in O(1), ranks candidates by
+    Iterates `k` from `maxK` down to `5`, solves maximal `th` in O(1), ranks candidates by
     `(direct, min stripCount, max T*th, min T)`, and validates the winner via `validatePeTiling`. -/
 def choosePeTiling
     (target : Target)
@@ -364,8 +369,8 @@ def choosePeTiling
   let outWAligned := alignUp outDims.w 8
   let mut best? : Option (PeTiling × Bool × Nat × Nat × Nat) := none
 
-  -- Iterate k from maxK down to 4
-  for step in [:maxK - 3] do
+  -- Iterate k from maxK down to 5 (k = 4 never saves L2 under the max(T, 32) DMA line floor and forces [DL] staging)
+  for step in [:maxK - 4] do
     let k := maxK - step
     let th := maxPeTileHeightForK target outDims hwSrc1 hwSrc2? k
     if th >= 1 then

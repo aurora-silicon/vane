@@ -1095,6 +1095,15 @@ theorem pe_antihang_chanStride_ge (w T : Nat) :
   have h : w ≤ alignUp w 8 := alignUp_ge w 8
   omega
 
+/-- PE 64-byte DMA line floor invariant: for `P = 1` DMA-fed ports, using `max T 32`
+    both dominates the base `2 * min(w, T)` anti-hang bound and guarantees `>= 64` bytes
+    whenever `alignUp w 8 >= 32`. -/
+theorem pe_dma_line_floor_ge (w T : Nat) :
+    2 * min w T ≤ 2 * min (alignUp w 8) (max T 32) ∧
+    (32 ≤ alignUp w 8 → 64 ≤ 2 * min (alignUp w 8) (max T 32)) := by
+  have h : w ≤ alignUp w 8 := alignUp_ge w 8
+  constructor <;> omega
+
 /-- Prepending a 128-byte LUT table preserves 64-byte DMA line alignment for every chunk offset. -/
 theorem fused_lut_align64 (off : Nat) (h : off % 64 = 0) :
     (off + lutTableBytes) % 64 = 0 := by
@@ -1156,6 +1165,7 @@ theorem validatePeTiling_bounds
   obtain ⟨hkHi, hv⟩ := except_if_err_ok hv
   obtain ⟨hth0, hv⟩ := except_if_err_ok hv
   obtain ⟨hthHi, hv⟩ := except_if_err_ok hv
+  obtain ⟨_, hv⟩ := except_if_err_ok hv
   obtain ⟨_, hv⟩ := except_if_err_ok hv
   obtain ⟨_, hv⟩ := except_if_err_ok hv
   obtain ⟨hL2, _⟩ := except_if_err_ok hv

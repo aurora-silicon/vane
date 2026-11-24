@@ -313,9 +313,10 @@ private def peStageBasesForTh
     Option (Nat × Nat × Nat × Nat) := Id.run do
   let twoSource := hwSrc2?.isSome
   let stripW := peStripWidth k
+  let effStripW := max stripW 32
   let direct := if resIsL2 then false else peIsDirect target outDims.w k
   let whole1 := twoSource && hwSrc1.c == 1 && hwSrc1.h == 1 && hwSrc1.w > 1 && outDims.h > 1 && th < outDims.h
-  let row1 := 2 * (if whole1 then alignUp hwSrc1.w 8 else min (alignUp hwSrc1.w 8) stripW)
+  let row1 := 2 * (if whole1 then alignUp hwSrc1.w 8 else min (alignUp hwSrc1.w 8) effStripW)
   let size1 := if src1IsL2 then 0 else (if hwSrc1.h > 1 then th else 1) * (hwSrc1.c * row1)
   let size2 :=
     match hwSrc2? with
@@ -324,9 +325,9 @@ private def peStageBasesForTh
       if src2IsL2 then 0
       else
         let whole2 := hwSrc2.c == 1 && hwSrc2.h == 1 && hwSrc2.w > 1 && outDims.h > 1 && th < outDims.h
-        let row2 := 2 * (if whole2 then alignUp hwSrc2.w 8 else min (alignUp hwSrc2.w 8) stripW)
+        let row2 := 2 * (if whole2 then alignUp hwSrc2.w 8 else min (alignUp hwSrc2.w 8) effStripW)
         (if hwSrc2.h > 1 then th else 1) * (hwSrc2.c * row2)
-  let drow := 2 * min (alignUp outDims.w 8) stripW
+  let drow := 2 * min (alignUp outDims.w 8) effStripW
   let du := outDims.c * drow
   let sizeRes :=
     if resIsL2 then 0
@@ -393,7 +394,8 @@ private def choosePeTilingForGraph
   let outWAligned := alignUp outDims.w 8
   let mut best? : Option (PeTaskPlan × Nat × Nat × Nat) := none
 
-  for step in [:maxK - 3] do
+  -- Search k from maxK down to 5 (k = 4 never saves L2 under the max(T, 32) DMA line floor and forces [DL] staging)
+  for step in [:maxK - 4] do
     let k := maxK - step
     if let some (th, b1, b2, br, pk) := maxPeThForOccupied target outDims hwSrc1 hwSrc2? src1IsL2 src2IsL2 resIsL2 occupied k then
       let stripW := peStripWidth k
@@ -965,11 +967,12 @@ private def buildPreLoweredTasks
 
     | .pe1 _ dims, .pe pp =>
       let stripW := peStripWidth pp.tiling.k
+      let effStripW := max stripW 32
       match src1Loc with
       | .l2 base bytes =>
         l2Accs := l2Accs.push { lo := base, hi := base + bytes, isWrite := false, role := .src1L2 }
       | _ =>
-        let row1 := 2 * min (alignUp dims.w 8) stripW
+        let row1 := 2 * min (alignUp dims.w 8) effStripW
         let sz1 := (if dims.h > 1 then pp.tiling.tileHeight else 1) * (dims.c * row1)
         l2Accs := l2Accs.push { lo := pp.src1StageBase, hi := pp.src1StageBase + sz1, isWrite := true, role := .src1Stage }
         let off := match src1Loc with | .dram o _ => o | _ => 0
@@ -980,7 +983,7 @@ private def buildPreLoweredTasks
       | .l2 base bytes =>
         l2Accs := l2Accs.push { lo := base, hi := base + bytes, isWrite := true, role := .resL2 }
       | _ =>
-        let drow := 2 * min (alignUp dims.w 8) stripW
+        let drow := 2 * min (alignUp dims.w 8) effStripW
         let szRes := if pp.direct then peDirectResBytes dims.c drow pp.tiling.tileHeight else pp.tiling.tileHeight * (dims.c * drow)
         l2Accs := l2Accs.push { lo := pp.resStageBase, hi := pp.resStageBase + szRes, isWrite := true, role := .resStage }
         let off := match resLoc with | .dram o _ => o | _ => 0
@@ -992,13 +995,14 @@ private def buildPreLoweredTasks
       src2Loc? := some (resolveRefLoc r2)
       src1Prod? := resolveRefProd r1
       let stripW := peStripWidth pp.tiling.k
+      let effStripW := max stripW 32
       let th := pp.tiling.tileHeight
       match src1Loc with
       | .l2 base bytes =>
         l2Accs := l2Accs.push { lo := base, hi := base + bytes, isWrite := false, role := .src1L2 }
       | _ =>
         let whole1 := hw1.c == 1 && hw1.h == 1 && hw1.w > 1 && outDims.h > 1 && th < outDims.h
-        let row1 := 2 * (if whole1 then alignUp hw1.w 8 else min (alignUp hw1.w 8) stripW)
+        let row1 := 2 * (if whole1 then alignUp hw1.w 8 else min (alignUp hw1.w 8) effStripW)
         let sz1 := (if hw1.h > 1 then th else 1) * (hw1.c * row1)
         l2Accs := l2Accs.push { lo := pp.src1StageBase, hi := pp.src1StageBase + sz1, isWrite := true, role := .src1Stage }
         let off := match src1Loc with | .dram o _ => o | _ => 0
@@ -1011,7 +1015,7 @@ private def buildPreLoweredTasks
         l2Accs := l2Accs.push { lo := base, hi := base + bytes, isWrite := false, role := .src2L2 }
       | _ =>
         let whole2 := hw2.c == 1 && hw2.h == 1 && hw2.w > 1 && outDims.h > 1 && th < outDims.h
-        let row2 := 2 * (if whole2 then alignUp hw2.w 8 else min (alignUp hw2.w 8) stripW)
+        let row2 := 2 * (if whole2 then alignUp hw2.w 8 else min (alignUp hw2.w 8) effStripW)
         let sz2 := (if hw2.h > 1 then th else 1) * (hw2.c * row2)
         l2Accs := l2Accs.push { lo := pp.src2StageBase, hi := pp.src2StageBase + sz2, isWrite := true, role := .src2Stage }
         let off := match s2Loc with | .dram o _ => o | _ => 0
@@ -1022,7 +1026,7 @@ private def buildPreLoweredTasks
       | .l2 base bytes =>
         l2Accs := l2Accs.push { lo := base, hi := base + bytes, isWrite := true, role := .resL2 }
       | _ =>
-        let drow := 2 * min (alignUp outDims.w 8) stripW
+        let drow := 2 * min (alignUp outDims.w 8) effStripW
         let szRes := if pp.direct then peDirectResBytes outDims.c drow th else th * (outDims.c * drow)
         l2Accs := l2Accs.push { lo := pp.resStageBase, hi := pp.resStageBase + szRes, isWrite := true, role := .resStage }
         let off := match resLoc with | .dram o _ => o | _ => 0
@@ -1113,6 +1117,25 @@ private def computeSynchronization (pre : Array PreLoweredTask) : Array TaskSync
         else if prodEng == .pe && latestEngineBefore pre .pe i == some prod then
           syncs := syncs.set! i { syncs[i]! with src1HandoffPe := true }
 
+  -- Seed BAR 3 DRAM-scratch read coherence (depKind = 2, depDist = min 15 (i - j - 1)) on every PE src1/src2
+  -- reading a scratch buffer written by an earlier task j < i (latest writer j).
+  -- Never credit depDist > 0 as ordering: the fixpoint loop below adds HB / src2Wait5 / src2Wait22 whenever j < i - 1.
+  for i in [1 : n] do
+    if pre[i]!.node.engine == .pe then
+      for b in pre[i]!.dramAccesses do
+        if b.resource == .scratch && !b.isWrite then
+          let mut latestW? : Option Nat := none
+          for j in [:i] do
+            for a in pre[j]!.dramAccesses do
+              if a.resource == .scratch && a.isWrite && intervalsOverlap a.lo a.hi b.lo b.hi then
+                latestW? := some j
+          if let some j := latestW? then
+            let dist := min 15 (i - j - 1)
+            if b.port == .src1Dma then
+              syncs := syncs.set! i { syncs[i]! with src1DepKind := 2, src1DepDist := dist }
+            else if b.port == .src2Dma then
+              syncs := syncs.set! i { syncs[i]! with src2DepKind := 2, src2DepDist := dist }
+
   -- Fixpoint loop: converge whenever no new wait/dep bits are added (monotone, <= 8*n steps)
   let maxIters := 8 * n + 2
   for _ in [:maxIters] do
@@ -1198,9 +1221,6 @@ private def computeSynchronization (pre : Array PreLoweredTask) : Array TaskSync
                   else
                     if !syncs[i]!.src2WaitPe22 then
                       syncs := syncs.set! i { syncs[i]! with src2WaitPe22 := true }
-                      changed := true
-                    if k + 1 == i && syncs[i]!.src2DepKind != 2 then
-                      syncs := syncs.set! i { syncs[i]! with src2DepKind := 2, src2DepDist := 0 }
                       changed := true
               else if a.isWrite && !b.isWrite then
                 if !(hb k i || dramRawKind) then
@@ -1532,7 +1552,7 @@ private def emitTaskDesc
         { byteAddr := regSrc1RowStride, value := ← natToU32Checked l2Row "src1RowStride" }
       ]
     | loc =>
-      let row1 := 2 * min (alignUp dims.w 8) stripW
+      let row1 := 2 * min (alignUp dims.w 8) (max stripW 32)
       let u1 := dims.c * row1
       let dmaRow := alignUp (2 * dims.w) dmaLineBytes
       let dmaPlane := dims.h * dmaRow
@@ -1577,7 +1597,7 @@ private def emitTaskDesc
         { byteAddr := regResFmt, value := resFmtWordP1 }
       ]
       if !pp.direct then
-        let drow := 2 * min (alignUp dims.w 8) stripW
+        let drow := 2 * min (alignUp dims.w 8) (max stripW 32)
         let du := dims.c * drow
         plain := plain ++ #[
           { byteAddr := regResChanStride, value := ← natToU32Checked drow "resChanStride" },
@@ -1659,7 +1679,7 @@ private def emitTaskDesc
       ]
     | loc =>
       let whole1 := hw1.c == 1 && hw1.h == 1 && hw1.w > 1 && outDims.h > 1 && th < outDims.h
-      let row1 := 2 * (if whole1 then alignUp hw1.w 8 else min (alignUp hw1.w 8) stripW)
+      let row1 := 2 * (if whole1 then alignUp hw1.w 8 else min (alignUp hw1.w 8) (max stripW 32))
       let u1 := hw1.c * row1
       let dmaRow := alignUp (2 * hw1.w) dmaLineBytes
       let dmaPlane := hw1.h * dmaRow
@@ -1693,7 +1713,7 @@ private def emitTaskDesc
       ]
     | loc =>
       let whole2 := hw2.c == 1 && hw2.h == 1 && hw2.w > 1 && outDims.h > 1 && th < outDims.h
-      let row2 := 2 * (if whole2 then alignUp hw2.w 8 else min (alignUp hw2.w 8) stripW)
+      let row2 := 2 * (if whole2 then alignUp hw2.w 8 else min (alignUp hw2.w 8) (max stripW 32))
       let u2 := hw2.c * row2
       let dmaRow := alignUp (2 * hw2.w) dmaLineBytes
       let dmaPlane := hw2.h * dmaRow
@@ -1739,7 +1759,7 @@ private def emitTaskDesc
         { byteAddr := regResFmt, value := resFmtWordP1 }
       ]
       if !pp.direct then
-        let drow := 2 * min (alignUp outDims.w 8) stripW
+        let drow := 2 * min (alignUp outDims.w 8) (max stripW 32)
         let du := outDims.c * drow
         plain := plain ++ #[
           { byteAddr := regResChanStride, value := ← natToU32Checked drow "resChanStride" },
