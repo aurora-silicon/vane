@@ -29,28 +29,34 @@ def BitField.maskNat (f : BitField) : Nat :=
 def BitField.mask (f : BitField) : UInt32 :=
   f.maskNat.toUInt32
 
+/-- Recursive field-list validator for `WordLayout` (kernel-reducible for formal layout proofs). -/
+private def validateWordLayoutFields
+    (layoutName : String) (fixedMask : UInt32) :
+    List BitField → UInt32 → List String → Except String UInt32
+  | [], usedMask, _ => .ok usedMask
+  | f :: rest, usedMask, seenNames =>
+    if f.width == 0 then
+      .error s!"layout '{layoutName}.{f.name}': width must be >= 1"
+    else if f.lo + f.width > 32 then
+      .error s!"layout '{layoutName}.{f.name}': bit range [{f.lo + f.width - 1}:{f.lo}] exceeds 32 bits"
+    else if seenNames.any (fun nm => decide (nm = f.name)) then
+      .error s!"layout '{layoutName}': duplicate field name '{f.name}'"
+    else
+      let m := f.mask
+      if (m &&& fixedMask) != 0 then
+        .error s!"layout '{layoutName}.{f.name}': overlaps fixed constant mask {toHex fixedMask.toNat}"
+      else if (m &&& usedMask) != 0 then
+        .error s!"layout '{layoutName}.{f.name}': overlaps another field"
+      else
+        validateWordLayoutFields layoutName fixedMask rest (usedMask ||| m) (f.name :: seenNames)
+
 /-- Validate that a `WordLayout` has well-formed, non-overlapping fields within 32 bits
     and that `fixedValue` has no bits outside `fixedMask`. -/
-def validateWordLayout (layout : WordLayout) : Except String UInt32 := do
+def validateWordLayout (layout : WordLayout) : Except String UInt32 :=
   if (layout.fixedValue &&& (~~~layout.fixedMask)) != 0 then
-    throw s!"layout '{layout.name}': fixedValue {toHex layout.fixedValue.toNat} sets bits outside fixedMask {toHex layout.fixedMask.toNat}"
-  let mut usedMask : UInt32 := layout.fixedMask
-  let mut seenNames : Array String := #[]
-  for f in layout.fields do
-    if f.width == 0 then
-      throw s!"layout '{layout.name}.{f.name}': width must be >= 1"
-    if f.lo + f.width > 32 then
-      throw s!"layout '{layout.name}.{f.name}': bit range [{f.lo + f.width - 1}:{f.lo}] exceeds 32 bits"
-    if seenNames.contains f.name then
-      throw s!"layout '{layout.name}': duplicate field name '{f.name}'"
-    seenNames := seenNames.push f.name
-    let m := f.mask
-    if (m &&& layout.fixedMask) != 0 then
-      throw s!"layout '{layout.name}.{f.name}': overlaps fixed constant mask {toHex layout.fixedMask.toNat}"
-    if (m &&& usedMask) != 0 then
-      throw s!"layout '{layout.name}.{f.name}': overlaps another field"
-    usedMask := usedMask ||| m
-  pure usedMask
+    .error s!"layout '{layout.name}': fixedValue {toHex layout.fixedValue.toNat} sets bits outside fixedMask {toHex layout.fixedMask.toNat}"
+  else
+    validateWordLayoutFields layout.name layout.fixedMask layout.fields.toList layout.fixedMask []
 
 /-- Width-checked bitfield encoder: validates layout disjointness, checks that every field
     is supplied exactly once and fits strictly in `< 2^width`, and combines with fixed bits. -/

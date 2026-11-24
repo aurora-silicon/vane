@@ -6,6 +6,9 @@ open Vane.Hwx
 open Vane.Sections
 open Vane.Register
 open Vane.Tiling
+open Vane.Program
+open Vane.Verify
+open Vane.Conv
 open Vane.Conv1x1
 open Vane.Conv3x3
 
@@ -1638,6 +1641,87 @@ private def runAllTests : IO (Array TestResult) := do
     let cur ← readU32LE base3DenseS1.hwx fOff
     tamperReg3x3AndVerify base3DenseS1 regSrc1ChanStride (cur - 16)
   ) "srcPx")
+
+  -- =========================================================================
+  -- M2.5 Architecture Refactor: Silicon Safety vs Chooser Policy & Program IR
+  -- =========================================================================
+
+  results := results.push (checkOk "m2.5: Vane.Verify accepts silicon-safe task with relaxed chooser policy (F > ceil_log2(Cout))" (do
+    -- Cout = 4 has ceil_log2(4) = 2, so F = 3 violates chooser policy (F > ceil_log2(Cout))
+    -- yet is 100% silicon-safe (logNE=4, F=3, fat=0, WU=1 <= 3, rep=2, 4 active groups + 4 empty groups).
+    let sh3 : ConvSpec := {
+      kernelSize := 3, mode := .dense, h := 8, w := 16, cin := 8, cout := 4, stride := 1, pad := .same
+    }
+    let tRelaxed : Tiling := {
+      logNE := 4, f := 3, fat := 0, ocg := 0, shPref := 0, shMax := 4, tileHeight := 8
+    }
+    -- 1. Safety validator accepts; chooser policy rejects
+    validateConvSafety .h17 sh3 tRelaxed
+    match validateConvTiling .h17 sh3 tRelaxed with
+    | .ok () => throw "expected validateConvTiling to reject F=3 > ceil_log2(Cout=4)=2"
+    | .error _ => pure ()
+    -- 2. Lower via lowerConvTask + emitProgram and verify with standalone Vane.Verify
+    let ws := mkTaggedWeights3x3 4 8
+    let bs := mkTaggedBias 4
+    let packed ← packConvKernelChunks .h17 sh3 tRelaxed ws (some bs)
+    let td ← lowerConvTask .h17 sh3 tRelaxed packed true
+    let inSurf := makeFp16Surface .h17 "x" "input_x" .input sh3.cin sh3.h sh3.w
+    let outSurf := makeFp16Surface .h17 "y" "output_y" .output sh3.cout sh3.outH sh3.outW
+    let emitted ← emitProgram {
+      target := .h17
+      surfaces := #[inSurf, outSurf]
+      tasks := #[td]
+      kernel := some packed.bytes
+    }
+    let nChecked ← verifyConvHwxTasks emitted.hwx emitted.info (requireConvTask := true)
+    if nChecked != 1 then throw s!"expected 1 verified task, got {nChecked}"
+
+    -- Same check for 1x1 conv with F=3 > ceil_log2(Cout=4)=2
+    let sh1 : ConvSpec := {
+      kernelSize := 1, mode := .dense, h := 8, w := 16, cin := 8, cout := 4, stride := 1, pad := .same
+    }
+    validateConvSafety .h17 sh1 tRelaxed
+    match validateConvTiling .h17 sh1 tRelaxed with
+    | .ok () => throw "expected validateConvTiling to reject 1x1 F=3 > ceil_log2(Cout=4)=2"
+    | .error _ => pure ()
+    let ws1 := mkTaggedWeights 4 8
+    let packed1 ← packConvKernelChunks .h17 sh1 tRelaxed ws1 none
+    let td1 ← lowerConvTask .h17 sh1 tRelaxed packed1 false
+    let emitted1 ← emitProgram {
+      target := .h17
+      surfaces := #[inSurf, outSurf]
+      tasks := #[td1]
+      kernel := some packed1.bytes
+    }
+    let nChecked1 ← verifyConvHwxTasks emitted1.hwx emitted1.info (requireConvTask := true)
+    if nChecked1 != 1 then throw s!"expected 1 verified 1x1 task, got {nChecked1}"
+    pure ()
+  ))
+
+  results := results.push (checkOk "m2.5: generic emitProgram supports multi-task ProgramSpec (1x1 + 3x3 verified)" (do
+    let sh1 : ConvSpec := { kernelSize := 1, h := 8, w := 16, cin := 16, cout := 16 }
+    let sh3 : ConvSpec := { kernelSize := 3, h := 8, w := 16, cin := 16, cout := 16, stride := 1, pad := .same }
+    let t1 ← chooseConvTiling .h17 sh1
+    let t3 ← chooseConvTiling .h17 sh3
+    let pk1 ← packConvKernelChunks .h17 sh1 t1 (mkTaggedWeights 16 16) none
+    let pk3 ← packConvKernelChunks .h17 sh3 t3 (mkTaggedWeights3x3 16 16) none
+    -- Share one __KERN_0 buffer large enough for both tasks (task 0 uses [0, pk1.size), task 1 uses [0, pk3.size))
+    let td0 ← lowerConvTask .h17 sh1 t1 pk1 false (taskId := 0)
+    let td1 ← lowerConvTask .h17 sh3 t3 pk3 true (taskId := 1)
+    let inSurf := makeFp16Surface .h17 "x" "input_x" .input 16 8 16
+    let outSurf := makeFp16Surface .h17 "y" "output_y" .output 16 8 16
+    let emitted ← emitProgram {
+      target := .h17
+      surfaces := #[inSurf, outSurf]
+      tasks := #[td0, td1]
+      kernel := some (if pk3.bytes.size >= pk1.bytes.size then pk3.bytes else pk1.bytes)
+    }
+    if emitted.info.taskStream.taskCount != 2 then
+      throw s!"expected 2 tasks, got {emitted.info.taskStream.taskCount}"
+    let nChecked ← verifyConvHwxTasks emitted.hwx emitted.info (requireConvTask := true)
+    if nChecked != 2 then throw s!"expected 2 verified conv tasks, got {nChecked}"
+    pure ()
+  ))
 
   pure results
 
