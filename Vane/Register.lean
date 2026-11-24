@@ -149,6 +149,7 @@ def regWout : Nat := 0x0014
 def regHout : Nat := 0x0018
 def regCout : Nat := 0x001c
 def regConvCfg : Nat := 0x0028
+def regDwGroups : Nat := 0x0030
 def regTH : Nat := 0x0034
 def regNeCommon : Nat := 0x003c
 def regNeTile : Nat := 0x0040
@@ -238,7 +239,18 @@ def convCfgLayout : WordLayout := {
   ]
 }
 
-/-- `0x003c` neCommon: `kind[7:0]`, `shPref[10:8]`, `shMin[14:12]`, `shMax[18:16]`, `F[21:19]`. -/
+/-- `0x0030` dwGroups: `fixed[15:0] = 0x4000`, `perGroupIn[31:16]`. -/
+def dwGroupsLayout : WordLayout := {
+  name := "dwGroups"
+  fixedMask := 0x0000ffff
+  fixedValue := 0x00004000
+  fields := #[
+    { name := "perGroupIn", lo := 16, width := 16 }
+  ]
+}
+
+/-- `0x003c` neCommon: `kind[7:0]`, `shPref[10:8]`, `shMin[14:12]`, `shMax[18:16]`,
+    `F[21:19]`, `wide3x3[27:27]` (all other bits must be 0). -/
 def neCommonLayout : WordLayout := {
   name := "neCommon"
   fields := #[
@@ -246,7 +258,8 @@ def neCommonLayout : WordLayout := {
     { name := "shPref", lo := 8, width := 3 },
     { name := "shMin", lo := 12, width := 3 },
     { name := "shMax", lo := 16, width := 3 },
-    { name := "F", lo := 19, width := 3 }
+    { name := "F", lo := 19, width := 3 },
+    { name := "wide3x3", lo := 27, width := 1 }
   ]
 }
 
@@ -328,11 +341,13 @@ def resDepLayout : WordLayout := {
   ]
 }
 
-/-- `0x5500` kernelStage: `form[15:0]`, `stage[23:16]`. -/
+/-- `0x5500` kernelStage: fixed `0x000002c0`, `sparse[5:5]`, `stage[23:16]` (`0x000102c0 | (sparse << 5)`). -/
 def kernelStageLayout : WordLayout := {
   name := "kernelStage"
+  fixedMask := 0xff00ffdf
+  fixedValue := 0x000002c0
   fields := #[
-    { name := "form", lo := 0, width := 16 },
+    { name := "sparse", lo := 5, width := 1 },
     { name := "stage", lo := 16, width := 8 }
   ]
 }
@@ -364,6 +379,16 @@ def targetCfgValue : Target → UInt32
 def neCfgValue : Target → UInt32
   | .h16 => 0x00000082
   | .h17 => 0x10000082
+
+/-- `0x4900` neCfg: target base (`0x00000082` on H16, `0x10000082` on H17), `sparse[8:8]`. -/
+def neCfgLayout (target : Target) : WordLayout := {
+  name := "neCfg"
+  fixedMask := 0xfffffeff
+  fixedValue := neCfgValue target
+  fields := #[
+    { name := "sparse", lo := 8, width := 1 }
+  ]
+}
 
 def resDepCode : Target → UInt32
   | .h16 => 0x31

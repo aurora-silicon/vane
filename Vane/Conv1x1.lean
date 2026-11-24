@@ -240,10 +240,15 @@ def verifyConv1x1Task (info : HwxInfo) (task : DecodedTask) : Except String Unit
   let shMin := (← decodeFieldChecked neCommonLayout wNeCommon.value "shMin").toNat
   let shMax := (← decodeFieldChecked neCommonLayout wNeCommon.value "shMax").toNat
   let f := (← decodeFieldChecked neCommonLayout wNeCommon.value "F").toNat
+  let wide3x3 := (← decodeFieldChecked neCommonLayout wNeCommon.value "wide3x3").toNat
   if kind != 0 then
     throw s!"{prefixMsg}: neCommon kind={kind} != 0"
   if shMin != shPref then
     throw s!"{prefixMsg}: neCommon shMin={shMin} != shPref={shPref}"
+  if wide3x3 != 0 then
+    throw s!"{prefixMsg}: neCommon wide3x3={wide3x3} must be 0 for 1x1 conv"
+  if (findDecodedWrite task.writes regDwGroups).isSome then
+    throw s!"{prefixMsg}: dwGroups (0x0030) must not be written for 1x1 conv"
 
   -- Checks 0x40[31:6] == 0 via validateWordBits inside decodeFieldChecked
   let ocg := (← decodeFieldChecked neTileLayout wNeTile.value "ocg").toNat
@@ -336,12 +341,18 @@ def verifyConv1x1Task (info : HwxInfo) (task : DecodedTask) : Except String Unit
   if srcBase < resEnd && resBase < srcEnd then
     throw s!"{prefixMsg}: overlapping L2 ranges src [{toHex srcBase}, {toHex srcEnd}) and res [{toHex resBase}, {toHex resEnd})"
 
-  -- 5. Verify NE block config
+  -- 5. Verify NE block config & kernel stage
   let wNeCfg ← requireDecodedWrite task.writes regNeCfg "neCfg"
-  if wNeCfg.value != neCfgValue target then
-    throw s!"{prefixMsg}: neCfg {toHex wNeCfg.value.toNat} != expected {toHex (neCfgValue target).toNat}"
+  let neCfgSparse ← decodeFieldChecked (neCfgLayout target) wNeCfg.value "sparse"
+  if neCfgSparse != 0 then
+    throw s!"{prefixMsg}: neCfg sparse={neCfgSparse} must be 0 for 1x1 conv"
   let wNeOp ← requireDecodedWrite task.writes regNeOp "neOp"
   validateWordBits neOpLayout wNeOp.value
+  let wKernStage ← requireDecodedWrite task.writes regKernelStage "kernelStage"
+  let kernSparse ← decodeFieldChecked kernelStageLayout wKernStage.value "sparse"
+  let kernStageNum ← decodeFieldChecked kernelStageLayout wKernStage.value "stage"
+  if kernSparse != 0 || kernStageNum != 1 then
+    throw s!"{prefixMsg}: kernelStage sparse={kernSparse}, stage={kernStageNum} invalid for 1x1 conv"
 
   -- 6. Verify active kernel chunks & relocation
   let some kSec := info.kernelSection
@@ -510,7 +521,8 @@ def compileConv1x1
     ("shPref", tiling.shPref.toUInt32),
     ("shMin", tiling.shPref.toUInt32),
     ("shMax", tiling.shMax.toUInt32),
-    ("F", tiling.f.toUInt32)
+    ("F", tiling.f.toUInt32),
+    ("wide3x3", 0)
   ]
   let wNeTile ← encodeWord neTileLayout #[
     ("ocg", tiling.ocg.toUInt32),
@@ -523,6 +535,7 @@ def compileConv1x1
     ("direct", if direct then 1 else 0),
     ("P", 1)
   ]
+  let wNeCfg ← encodeWord (neCfgLayout target) #[("sparse", 0)]
   let wNeOp ← encodeWord neOpLayout #[
     ("biasInKernel", if packed.biasInKernel then 1 else 0),
     ("relu", if relu then 1 else 0)
@@ -530,7 +543,7 @@ def compileConv1x1
   let wNeScale ← encodeWord neScaleLayout #[("val", fp16OneBits)]
   let wSrc1Fmt ← encodeWord (dmaFmtLayout "src1Fmt") #[("format", 0x002031), ("P", 1)]
   let wResFmt ← encodeWord (dmaFmtLayout "resFmt") #[("format", 0x302031), ("P", 1)]
-  let wKernStage ← encodeWord kernelStageLayout #[("form", 0x2c0), ("stage", 1)]
+  let wKernStage ← encodeWord kernelStageLayout #[("sparse", 0), ("stage", 1)]
   let wChunkSlotVal ← encodeWord chunkSlotLayout #[("enable", 1), ("on20", 1), ("task", 0)]
   let wOut2 ← encodeWord out2Layout #[("form", 0xe0), ("task", 0)]
 
@@ -558,7 +571,7 @@ def compileConv1x1
     { byteAddr := regResCfg, value := wResCfg },
     { byteAddr := regResBase, value := srcL2.toUInt32 },
     -- Neural Engine block
-    { byteAddr := regNeCfg, value := neCfgValue target },
+    { byteAddr := regNeCfg, value := wNeCfg },
     { byteAddr := regNeOp, value := wNeOp },
     { byteAddr := regNeScale, value := wNeScale },
     -- Tile DMA (Source) block (non-BAR)

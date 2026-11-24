@@ -7,6 +7,7 @@ open Vane.Sections
 open Vane.Register
 open Vane.Tiling
 open Vane.Conv1x1
+open Vane.Conv3x3
 
 structure TestResult where
   name : String
@@ -157,7 +158,45 @@ private def tamperRegAndVerify (compiled : CompiledConv1x1) (regByteAddr : Nat) 
   let fOff ← findRegFileOffset compiled.hwx compiled.info regByteAddr
   let badHwx ← putU32LE compiled.hwx fOff newVal
   let info ← validateHwx badHwx
-  let _ ← verifyHwxTasks badHwx info (requireConvTask := true)
+  let _ ← verifyConvHwxTasks badHwx info (requireConvTask := true)
+  pure ()
+
+-- Helper: synthesize deterministic tagged 3x3 fp16 weights (`cout * cinW * 9` halfwords)
+private def mkTaggedWeights3x3 (cout cinW : Nat) (withZeros : Bool := false) : ByteArray := Id.run do
+  let mut bs := ByteArray.empty
+  let mut idx := 0
+  for o in [:cout] do
+    for ci in [:cinW] do
+      for tp in [:9] do
+        let tag : UInt16 :=
+          if withZeros && idx % 5 == 0 then 0x0000
+          else if withZeros && idx % 7 == 0 then 0x8000
+          else
+            -- Non-zero fp16-safe value (avoid 0x0000 and 0x8000)
+            let raw := ((o * 257 + ci * 31 + tp * 13 + 1) % 0x3bff) + 1
+            raw.toUInt16
+        bs := pushU16LE bs tag
+        idx := idx + 1
+  return bs
+
+-- Helper: brute-force tile scan reference for inRows3x3
+private def inRows3x3Brute (sh : Conv3x3Shape) (th : Nat) : Nat := Id.run do
+  let ho := sh.outH
+  let pt := sh.padTop
+  if th == 0 || ho == 0 then return 0
+  let nTiles := ceilDiv ho th
+  let mut best := 0
+  for i in [:nTiles] do
+    let r := tileInRows3x3 sh.h sh.stride pt ho th i
+    if r > best then best := r
+  return best
+
+-- Helper: tamper a single register payload word in a compiled 3x3 HWX and verify with unified verifier
+private def tamperReg3x3AndVerify (compiled : CompiledConv3x3) (regByteAddr : Nat) (newVal : UInt32) : Except String Unit := do
+  let fOff ← findRegFileOffset compiled.hwx compiled.info regByteAddr
+  let badHwx ← putU32LE compiled.hwx fOff newVal
+  let info ← validateHwx badHwx
+  let _ ← verifyConvHwxTasks badHwx info (requireConvTask := true)
   pure ()
 
 private def runAllTests : IO (Array TestResult) := do
@@ -886,12 +925,584 @@ private def runAllTests : IO (Array TestResult) := do
     tamperRegAndVerify baseConv regSrc1DmaRowStride 0x10000
   ) "DMA")
 
-  -- Verify M0 demo program still passes verifyHwxTasks when requireConvTask := false
+  -- Verify M0 demo program still passes unified verifyConvHwxTasks when requireConvTask := false
   results := results.push (checkOk "m1: M0 demo passes non-forced task verification" (do
-    let checked ← verifyHwxTasks baseLinearHwx baseLinearInfo (requireConvTask := false)
+    let checked ← verifyConvHwxTasks baseLinearHwx baseLinearInfo (requireConvTask := false)
     if checked != 0 then throw s!"expected 0 conv tasks in M0 demo, got {checked}"
     pure ()
   ))
+
+  -- =========================================================================
+  -- M2 Register Schema & Bitfield Tests (0x0030, 0x003c[27], 0x4900[8], 0x5500[5])
+  -- =========================================================================
+
+  results := results.push (checkOk "m2: bitfields round-trip (dwGroups, neCommon wide3x3, neCfg sparse, kernelStage sparse)" (do
+    let wDw ← encodeWord dwGroupsLayout #[("perGroupIn", 1)]
+    if wDw != 0x00014000 then throw s!"dwGroups={toHex wDw.toNat} != 0x00014000"
+    if (← decodeFieldChecked dwGroupsLayout wDw "perGroupIn") != 1 then
+      throw "dwGroups perGroupIn decode mismatch"
+
+    let wConv3Same ← encodeWord convCfgLayout #[
+      ("kw", 3), ("kh", 3), ("sx", 1), ("sy", 1),
+      ("pl", 1), ("pt", 1), ("hx", 1), ("vy", 1)
+    ]
+    if wConv3Same != 0x5042a0c3 then
+      throw s!"convCfg(3x3 s=1 same)={toHex wConv3Same.toNat} != 0x5042a0c3"
+
+    let wCom0 ← encodeWord neCommonLayout #[
+      ("kind", 0), ("shPref", 1), ("shMin", 1), ("shMax", 3), ("F", 4), ("wide3x3", 0)
+    ]
+    let wCom1 ← encodeWord neCommonLayout #[
+      ("kind", 0), ("shPref", 1), ("shMin", 1), ("shMax", 3), ("F", 4), ("wide3x3", 1)
+    ]
+    if wCom1 != (wCom0 ||| ((1 : UInt32) <<< 27)) then
+      throw s!"wide3x3 bit 27 mismatch: {toHex wCom0.toNat} vs {toHex wCom1.toNat}"
+    if (← decodeFieldChecked neCommonLayout wCom0 "wide3x3") != 0 then throw "wide3x3=0 decode mismatch"
+    if (← decodeFieldChecked neCommonLayout wCom1 "wide3x3") != 1 then throw "wide3x3=1 decode mismatch"
+
+    let wNeCfg16Dense ← encodeWord (neCfgLayout .h16) #[("sparse", 0)]
+    let wNeCfg16Sparse ← encodeWord (neCfgLayout .h16) #[("sparse", 1)]
+    let wNeCfg17Dense ← encodeWord (neCfgLayout .h17) #[("sparse", 0)]
+    let wNeCfg17Sparse ← encodeWord (neCfgLayout .h17) #[("sparse", 1)]
+    if wNeCfg16Dense != 0x00000082 then throw s!"h16 neCfg dense={toHex wNeCfg16Dense.toNat}"
+    if wNeCfg16Sparse != 0x00000182 then throw s!"h16 neCfg sparse={toHex wNeCfg16Sparse.toNat}"
+    if wNeCfg17Dense != 0x10000082 then throw s!"h17 neCfg dense={toHex wNeCfg17Dense.toNat}"
+    if wNeCfg17Sparse != 0x10000182 then throw s!"h17 neCfg sparse={toHex wNeCfg17Sparse.toNat}"
+    if (← decodeFieldChecked (neCfgLayout .h17) wNeCfg17Sparse "sparse") != 1 then throw "neCfg sparse decode mismatch"
+
+    let wKsDense ← encodeWord kernelStageLayout #[("sparse", 0), ("stage", 1)]
+    let wKsSparse ← encodeWord kernelStageLayout #[("sparse", 1), ("stage", 1)]
+    if wKsDense != 0x000102c0 then throw s!"kernelStage dense={toHex wKsDense.toNat}"
+    if wKsSparse != 0x000102e0 then throw s!"kernelStage sparse={toHex wKsSparse.toNat}"
+    if (← decodeFieldChecked kernelStageLayout wKsSparse "sparse") != 1 then throw "kernelStage sparse decode mismatch"
+    if (← decodeFieldChecked kernelStageLayout wKsSparse "stage") != 1 then throw "kernelStage stage decode mismatch"
+    pure ()
+  ))
+
+  results := results.push (checkErr "m2 neg: dwGroups bad fixed low bits rejected" (do
+    decodeFieldChecked dwGroupsLayout 0x00014001 "perGroupIn"
+  ) "fixed bits")
+
+  results := results.push (checkErr "m2 neg: neCommon wide3x3=2 overflow rejected" (do
+    encodeWord neCommonLayout #[
+      ("kind", 0), ("shPref", 0), ("shMin", 0), ("shMax", 0), ("F", 0), ("wide3x3", 2)
+    ]
+  ) "exceeds 1-bit")
+
+  results := results.push (checkErr "m2 neg: neCommon reserved bit 28 rejected on decode" (do
+    decodeFieldChecked neCommonLayout ((1 : UInt32) <<< 28) "wide3x3"
+  ) "reserved")
+
+  results := results.push (checkErr "m2 neg: neCfg reserved bit rejected on decode" (do
+    decodeFieldChecked (neCfgLayout .h17) 0x10000282 "sparse"
+  ) "fixed bits")
+
+  results := results.push (checkErr "m2 neg: kernelStage bad form bit rejected on decode" (do
+    decodeFieldChecked kernelStageLayout 0x000102c1 "sparse"
+  ) "fixed bits")
+
+  -- =========================================================================
+  -- M2 inRows3x3 O(1) vs Brute-Force Equivalence Tests
+  -- =========================================================================
+
+  results := results.push (checkOk "m2: inRows3x3 O(1) matches brute-force across diverse (H, s, pad, TH)" (do
+    let heights : Array Nat := #[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 16, 17, 23, 32, 63, 64, 127, 128, 255]
+    let strides : Array Nat := #[1, 2]
+    let pads : Array PadMode := #[.same, .valid]
+    for h in heights do
+      for s in strides do
+        for pad in pads do
+          if !(pad == .valid && h < 3) then
+            let sh : Conv3x3Shape := {
+              mode := .dense, h := h, w := max h 3, cin := 1, cout := 1, stride := s, pad := pad
+            }
+            let ho := sh.outH
+            let thList : Array Nat :=
+              if ho <= 20 then
+                Id.run do
+                  let mut arr : Array Nat := #[]
+                  for th in [1 : ho + 1] do arr := arr.push th
+                  return arr
+              else
+                #[1, 2, 3, 4, 5, 7, 8, 13, 16, ho / 3, ho / 2, ho - 2, ho - 1, ho]
+            for th in thList do
+              if th >= 1 && th <= ho then
+                let fast := inRows3x3 sh th
+                let brute := inRows3x3Brute sh th
+                if fast != brute then
+                  throw s!"inRows3x3 mismatch for H={h}, s={s}, pad={pad.name}, TH={th}: O(1)={fast} != brute={brute}"
+    pure ()
+  ))
+
+  -- =========================================================================
+  -- M2 Sparse Encoder / Decoder Round-Trip Tests
+  -- =========================================================================
+
+  results := results.push (checkOk "m2: sparse stream encode/decode round-trip (zeros, -0.0, mixed, non-16, LCG)" (do
+    let checkRoundTrip (label : String) (slots : Array (Option UInt16)) : Except String Unit := do
+      let enc ← encodeSparseStream slots
+      let (dec, consumed) ← decodeSparseStream enc 0
+      if consumed != enc.size then
+        throw s!"{label}: consumed {consumed} != encoded size {enc.size}"
+      let expLen := alignUp slots.size 16
+      if dec.size != expLen then
+        throw s!"{label}: decoded len {dec.size} != alignUp({slots.size}, 16)={expLen}"
+      -- Verify u24 byte-length prefix
+      let b0 := (enc.get! 0).toNat
+      let b1 := (enc.get! 1).toNat
+      let b2 := (enc.get! 2).toNat
+      let u24 := b0 ||| (b1 <<< 8) ||| (b2 <<< 16)
+      if u24 + 3 != enc.size then
+        throw s!"{label}: u24 prefix {u24} + 3 != encoded size {enc.size}"
+      for i in [:expLen] do
+        let exp : UInt16 :=
+          if i < slots.size then
+            match slots[i]! with
+            | some w => if (w &&& 0x7fff) != 0 then w else 0
+            | none => 0
+          else 0
+        if dec[i]! != exp then
+          throw s!"{label}: slot {i} got {toHex dec[i]!.toNat} != expected {toHex exp.toNat}"
+      pure ()
+
+    -- All zeros (including +0.0, -0.0, and none)
+    let allZero : Array (Option UInt16) := #[
+      some 0x0000, some 0x8000, none, some 0x0000,
+      some 0x8000, none, some 0x0000, some 0x8000,
+      none, none, some 0x0000, some 0x8000,
+      some 0x0000, none, some 0x8000, some 0x0000
+    ]
+    let encZero ← encodeSparseStream allZero
+    -- 16 all-zero slots => 3-byte u24 (= 2) + 1 mask u16 (0x0000) = 5 bytes
+    if encZero.size != 5 then throw s!"allZero encoded size {encZero.size} != 5"
+    checkRoundTrip "allZero" allZero
+
+    -- Non-multiple-of-16 mixed stream with -0.0 skipped
+    let mixed : Array (Option UInt16) := #[
+      some 0x3c00, some 0x8000, none, some 0xbc00,
+      some 0x0000, some 0x4000, some 0x0001, some 0x8001,
+      none, some 0x7bff, some 0x8000, some 0x3800,
+      some 0x0000, some 0x4200, none, some 0x4400,
+      some 0x3c00, some 0x8000, some 0x4500 -- 19 entries -> padded to 32
+    ]
+    checkRoundTrip "mixed19" mixed
+
+    -- Boundary 16 exact
+    let boundary16 : Array (Option UInt16) := Id.run do
+      let mut arr : Array (Option UInt16) := #[]
+      for i in [:16] do
+        arr := arr.push (some (0x3c00 + i.toUInt16))
+      return arr
+    let encFull ← encodeSparseStream boundary16
+    -- 16 non-zero slots => 3 + 2*(1 + 16) = 37 bytes
+    if encFull.size != 37 then throw s!"boundary16 encoded size {encFull.size} != 37"
+    checkRoundTrip "boundary16" boundary16
+
+    -- Deterministic LCG pseudorandom stream (length 137)
+    let randStream : Array (Option UInt16) := Id.run do
+      let mut arr : Array (Option UInt16) := #[]
+      let mut state : Nat := 0x1234567
+      for _ in [:137] do
+        state := (state * 1103515245 + 12345) % 0x80000000
+        let kind := state % 5
+        if kind == 0 then arr := arr.push none
+        else if kind == 1 then arr := arr.push (some 0x0000)
+        else if kind == 2 then arr := arr.push (some 0x8000)
+        else arr := arr.push (some ((state / 5) % 65536).toUInt16)
+      return arr
+    checkRoundTrip "lcg137" randStream
+
+    pure ()
+  ))
+
+  -- =========================================================================
+  -- M2 3x3 Tiling Validator & Independent O(1) Chooser Tests
+  -- =========================================================================
+
+  results := results.push (checkErr "m2 neg: 3x3 validator rejects stride=3" (do
+    let sh : Conv3x3Shape := { mode := .dense, h := 8, w := 8, cin := 8, cout := 8, stride := 3, pad := .same }
+    let t : Tiling := { logNE := 4, f := 3, fat := 0, ocg := 0, shPref := 0, shMax := 4, tileHeight := 1 }
+    validateConv3x3Tiling .h17 sh t
+  ) "stride")
+
+  results := results.push (checkErr "m2 neg: 3x3 validator rejects depthwise Cin != Cout" (do
+    let sh : Conv3x3Shape := { mode := .depthwise, h := 8, w := 8, cin := 8, cout := 16, stride := 1, pad := .same }
+    let t : Tiling := { logNE := 4, f := 4, fat := 0, ocg := 0, shPref := 0, shMax := 4, tileHeight := 8 }
+    validateConv3x3Tiling .h17 sh t
+  ) "depthwise")
+
+  results := results.push (checkErr "m2 neg: 3x3 validator rejects depthwise ocg != 0" (do
+    let sh : Conv3x3Shape := { mode := .depthwise, h := 8, w := 8, cin := 16, cout := 16, stride := 1, pad := .same }
+    let t : Tiling := { logNE := 4, f := 4, fat := 0, ocg := 1, shPref := 0, shMax := 4, tileHeight := 8 }
+    validateConv3x3Tiling .h17 sh t
+  ) "ocg=0")
+
+  results := results.push (checkErr "m2 neg: 3x3 validator rejects valid pad with H < 3" (do
+    let sh : Conv3x3Shape := { mode := .dense, h := 2, w := 8, cin := 8, cout := 8, stride := 1, pad := .valid }
+    let t : Tiling := { logNE := 4, f := 3, fat := 0, ocg := 0, shPref := 0, shMax := 4, tileHeight := 1 }
+    validateConv3x3Tiling .h17 sh t
+  ) "valid-padded")
+
+  results := results.push (checkErr "m2 neg: 3x3 validator rejects WU > 3" (do
+    let sh : Conv3x3Shape := { mode := .dense, h := 8, w := 8, cin := 8, cout := 1, stride := 1, pad := .same }
+    let t : Tiling := { logNE := 4, f := 0, fat := 0, ocg := 0, shPref := 0, shMax := 4, tileHeight := 8 }
+    validateConv3x3Tiling .h17 sh t
+  ) "WU=4")
+
+  results := results.push (checkErr "m2 neg: 3x3 validator rejects ocg > 4" (do
+    let sh : Conv3x3Shape := { mode := .dense, h := 8, w := 8, cin := 8, cout := 32, stride := 1, pad := .same }
+    let t : Tiling := { logNE := 4, f := 0, fat := 1, ocg := 5, shPref := 0, shMax := 4, tileHeight := 8 }
+    validateConv3x3Tiling .h17 sh t
+  ) "ocg=5")
+
+  results := results.push (checkErr "m2 neg: 3x3 validator rejects shPref > shMax" (do
+    let sh : Conv3x3Shape := { mode := .dense, h := 8, w := 8, cin := 8, cout := 16, stride := 1, pad := .same }
+    let t : Tiling := { logNE := 4, f := 4, fat := 0, ocg := 0, shPref := 3, shMax := 2, tileHeight := 8 }
+    validateConv3x3Tiling .h17 sh t
+  ) "shPref")
+
+  results := results.push (checkErr "m2 neg: 3x3 validator rejects coverMin(Wo) > shMax" (do
+    -- W=24, s=1, same => Wo=24 => coverMin(24, 128, 0) = 1 > shMax=0
+    let sh : Conv3x3Shape := { mode := .dense, h := 8, w := 24, cin := 8, cout := 16, stride := 1, pad := .same }
+    let t : Tiling := { logNE := 4, f := 4, fat := 0, ocg := 0, shPref := 0, shMax := 0, tileHeight := 8 }
+    validateConv3x3Tiling .h17 sh t
+  ) "coverMin")
+
+  results := results.push (checkErr "m2 neg: 3x3 validator rejects TH > Ho" (do
+    let sh : Conv3x3Shape := { mode := .dense, h := 8, w := 8, cin := 8, cout := 16, stride := 2, pad := .same }
+    -- Ho = 4; TH = 5 rejected
+    let t : Tiling := { logNE := 4, f := 4, fat := 0, ocg := 0, shPref := 0, shMax := 4, tileHeight := 5 }
+    validateConv3x3Tiling .h17 sh t
+  ) "tileHeight")
+
+  results := results.push (checkErr "m2 neg: 3x3 validator rejects L2 > 2 MiB" (do
+    -- W=128, s=1, same, Cin=1024, T=128 => srcPx=128, chs=256, srcRowStride=262144; TH=8 => inRows=8 => 2097152 + resBytes > 2 MiB
+    let sh : Conv3x3Shape := { mode := .dense, h := 16, w := 128, cin := 1024, cout := 16, stride := 1, pad := .same }
+    let t : Tiling := { logNE := 4, f := 4, fat := 0, ocg := 0, shPref := 0, shMax := 0, tileHeight := 8 }
+    validateConv3x3Tiling .h17 sh t
+  ) "2 MiB")
+
+  results := results.push (checkErr "m2 neg: 3x3 validator rejects stride-2 Cout > 256" (do
+    let sh : Conv3x3Shape := { mode := .dense, h := 8, w := 8, cin := 8, cout := 257, stride := 2, pad := .same }
+    let t : Tiling := { logNE := 4, f := 4, fat := 0, ocg := 4, shPref := 0, shMax := 4, tileHeight := 4 }
+    validateConv3x3Tiling .h17 sh t
+  ) "coverage")
+
+  results := results.push (checkErr "m2 neg: 3x3 validator rejects H17 Cout=320 with ocg=4 (must use ocg=3)" (do
+    let sh : Conv3x3Shape := { mode := .dense, h := 8, w := 8, cin := 8, cout := 320, stride := 1, pad := .same }
+    let t : Tiling := { logNE := 4, f := 4, fat := 0, ocg := 4, shPref := 0, shMax := 4, tileHeight := 8 }
+    validateConv3x3Tiling .h17 sh t
+  ) "F=4, ocg=3")
+
+  results := results.push (checkOk "m2: chooseConv3x3Tiling matrix (H16 & H17, dense/dw, s=1/2, same/valid, boundary, multi-tile, Cout=320)" (do
+    let commonShapes : Array Conv3x3Shape := #[
+      -- Dense stride 1 & 2, same & valid, even/odd/prime, Cout=1, Cin=1, Cout=256
+      { mode := .dense, h := 1, w := 1, cin := 1, cout := 1, stride := 1, pad := .same },
+      { mode := .dense, h := 1, w := 1, cin := 1, cout := 1, stride := 2, pad := .same },
+      { mode := .dense, h := 8, w := 8, cin := 16, cout := 1, stride := 1, pad := .same },
+      { mode := .dense, h := 9, w := 13, cin := 7, cout := 11, stride := 1, pad := .same },
+      { mode := .dense, h := 9, w := 13, cin := 7, cout := 11, stride := 1, pad := .valid },
+      { mode := .dense, h := 16, w := 16, cin := 16, cout := 32, stride := 2, pad := .same },
+      { mode := .dense, h := 15, w := 17, cin := 9, cout := 19, stride := 2, pad := .same },
+      { mode := .dense, h := 16, w := 16, cin := 16, cout := 32, stride := 2, pad := .valid },
+      { mode := .dense, h := 15, w := 17, cin := 9, cout := 1, stride := 2, pad := .valid },
+      { mode := .dense, h := 16, w := 32, cin := 64, cout := 256, stride := 1, pad := .same },
+      { mode := .dense, h := 16, w := 32, cin := 64, cout := 256, stride := 2, pad := .same },
+      -- Tall multi-tile 128x128 forcing TH < Ho
+      { mode := .dense, h := 128, w := 128, cin := 64, cout := 64, stride := 1, pad := .same },
+      { mode := .dense, h := 128, w := 128, cin := 64, cout := 64, stride := 2, pad := .same },
+      -- Depthwise C=1 (normalized to dense), C=7, C=16, C=29, C=64, stride 1 & 2, same & valid
+      { mode := .depthwise, h := 8, w := 8, cin := 1, cout := 1, stride := 1, pad := .same },
+      { mode := .depthwise, h := 8, w := 8, cin := 1, cout := 1, stride := 2, pad := .same },
+      { mode := .depthwise, h := 9, w := 11, cin := 7, cout := 7, stride := 1, pad := .same },
+      { mode := .depthwise, h := 9, w := 11, cin := 7, cout := 7, stride := 2, pad := .valid },
+      { mode := .depthwise, h := 16, w := 16, cin := 16, cout := 16, stride := 1, pad := .same },
+      { mode := .depthwise, h := 16, w := 16, cin := 16, cout := 16, stride := 2, pad := .same },
+      { mode := .depthwise, h := 13, w := 19, cin := 29, cout := 29, stride := 1, pad := .valid },
+      { mode := .depthwise, h := 13, w := 19, cin := 29, cout := 29, stride := 2, pad := .same },
+      { mode := .depthwise, h := 128, w := 128, cin := 64, cout := 64, stride := 1, pad := .same }
+    ]
+    for sh in commonShapes do
+      let t16 ← chooseConv3x3Tiling .h16 sh
+      validateConv3x3Tiling .h16 sh t16
+      let t17 ← chooseConv3x3Tiling .h17 sh
+      validateConv3x3Tiling .h17 sh t17
+      -- Verify maxTileHeight3x3 is truly maximal (th + 1 must exceed L2 whenever th < Ho)
+      if t17.tileHeight < sh.outH then
+        let nextCand : Tiling := { t17 with tileHeight := t17.tileHeight + 1 }
+        if l2UseBytes3x3 .h17 sh nextCand <= l2CapacityBytes then
+          throw s!"chooser did not find maximal TH for {repr sh}: chose {t17.tileHeight} but {t17.tileHeight + 1} fits"
+
+    -- Verify 128x128 Cin=64 actually triggers multi-tile TH < Ho
+    let tallSh : Conv3x3Shape := { mode := .dense, h := 128, w := 128, cin := 64, cout := 64, stride := 1, pad := .same }
+    let tTall ← chooseConv3x3Tiling .h17 tallSh
+    if tTall.tileHeight >= tallSh.outH then
+      throw s!"expected multi-tile TH < 128 for 128x128 Cin=64, got TH={tTall.tileHeight}"
+
+    -- H17 dense stride-1 Cout=320 uses F=4, ocg=3; H16 rejects Cout=320
+    let sh320 : Conv3x3Shape := { mode := .dense, h := 8, w := 16, cin := 16, cout := 320, stride := 1, pad := .same }
+    let t320 ← chooseConv3x3Tiling .h17 sh320
+    validateConv3x3Tiling .h17 sh320 t320
+    if t320.f != 4 || t320.ocg != 3 then
+      throw s!"expected H17 Cout=320 to pick F=4, ocg=3, got F={t320.f}, ocg={t320.ocg}"
+    match chooseConv3x3Tiling .h16 sh320 with
+    | .ok _ => throw "expected H16 to reject dense 3x3 Cout=320"
+    | .error _ => pure ()
+
+    -- Both H16 and H17 reject dense stride-2 Cout=320
+    let sh320s2 : Conv3x3Shape := { sh320 with stride := 2 }
+    match chooseConv3x3Tiling .h17 sh320s2 with
+    | .ok _ => throw "expected H17 to reject stride-2 dense Cout=320"
+    | .error _ => pure ()
+
+    pure ()
+  ))
+
+  -- =========================================================================
+  -- M2 3x3 Kernel Packer Exact Layout & Sparse Decode Tests
+  -- =========================================================================
+
+  results := results.push (checkOk "m2: 3x3 kernel packer (dense s=1/s=2, depthwise F=4/F<4/C=1, H16 rep vs H17)" (do
+    -- 1. Depthwise C=1 normalized to dense: scalarBiasMode=true, biasInKernel=false
+    let shDw1 : Conv3x3Shape := { mode := .depthwise, h := 6, w := 6, cin := 1, cout := 1, stride := 1, pad := .same }
+    let tDw1 ← chooseConv3x3Tiling .h17 shDw1
+    let wDw1 := mkTaggedWeights3x3 1 1
+    let bDw1 := mkTaggedBias 1
+    let pkDw1 ← packConv3x3KernelChunks .h17 shDw1 tDw1 wDw1 (some bDw1)
+    if pkDw1.biasInKernel then throw "depthwise C=1 must use scalarBias, not biasInKernel"
+    if pkDw1.scalarBiasBits != (← readU16LE bDw1 0) then throw "depthwise C=1 scalarBiasBits mismatch"
+    for tp in [:9] do
+      let got ← readU16LE pkDw1.bytes (2 * tp)
+      let exp ← readU16LE wDw1 (2 * tp)
+      if got != exp then throw s!"depthwise C=1 tap {tp} mismatch"
+
+    -- 2. Depthwise C=24 stride-1 (F=4 => group g gets channels g, g+16 as (o,1) blocks)
+    let shDw24 : Conv3x3Shape := { mode := .depthwise, h := 8, w := 8, cin := 24, cout := 24, stride := 1, pad := .same }
+    let tDw24 ← chooseConv3x3Tiling .h17 shDw24
+    let wDw24 := mkTaggedWeights3x3 24 1
+    let bDw24 := mkTaggedBias 24
+    let pkDw24 ← packConv3x3KernelChunks .h17 shDw24 tDw24 wDw24 (some bDw24)
+    if !pkDw24.biasInKernel then throw "depthwise C=24 must embed bias in kernel"
+    if pkDw24.slots.size != 16 then throw s!"depthwise C=24 expected 16 slots, got {pkDw24.slots.size}"
+    for g in [:16] do
+      let cs := pkDw24.slots[g]!
+      let blocks := groupOutputBlocks3x3 shDw24 tDw24 g
+      let mut pos := cs.offset
+      for (o0, n) in blocks do
+        if n != 1 then throw s!"depthwise F=4 expected block size 1, got {n}"
+        let gotB ← readU16LE pkDw24.bytes pos
+        let expB ← readU16LE bDw24 (2 * o0)
+        if gotB != expB then throw s!"depthwise C=24 o={o0} bias mismatch"
+        pos := pos + 2
+        for tp in [:9] do
+          let gotW ← readU16LE pkDw24.bytes (pos + 2 * tp)
+          let expW ← readU16LE wDw24 (2 * (o0 * 9 + tp))
+          if gotW != expW then throw s!"depthwise C=24 o={o0} tp={tp} weight mismatch"
+        pos := pos + 18
+
+    -- 3. Dense stride-2 with bias + zeros/-0.0: verify raw bias before u24 + sparse tap-slot decode
+    let shS2 : Conv3x3Shape := { mode := .dense, h := 10, w := 10, cin := 3, cout := 5, stride := 2, pad := .same }
+    let tS2 : Tiling := { logNE := 4, f := 2, fat := 0, ocg := 1, shPref := 0, shMax := 4, tileHeight := 5 }
+    let wS2 := mkTaggedWeights3x3 5 3 (withZeros := true)
+    let bS2 := mkTaggedBias 5
+    let pkS2 ← packConv3x3KernelChunks .h17 shS2 tS2 wS2 (some bS2)
+    if !pkS2.biasInKernel then throw "dense Cout=5 stride-2 must embed bias in kernel"
+    let groups := (1 : Nat) <<< tS2.f
+    for g in [:groups] do
+      let cs := pkS2.slots[g]!
+      let blocks := groupOutputBlocks3x3 shS2 tS2 g
+      let mut pos := cs.offset
+      for (o0, n) in blocks do
+        -- Raw uncompressed bias comes immediately before u24
+        for k in [:n] do
+          let gotB ← readU16LE pkS2.bytes (pos + 2 * k)
+          let expB ← readU16LE bS2 (2 * (o0 + k))
+          if gotB != expB then throw s!"stride-2 bias mismatch at g={g}, o={o0 + k}"
+        pos := pos + 2 * n
+        let (dec, consumed) ← decodeSparseStream pkS2.bytes pos
+        pos := pos + consumed
+        let ev := alignUp n 2
+        let mut sIdx := 0
+        for ci in [:3] do
+          for tpOpt in stride2TapSlots do
+            for l in [:ev] do
+              let exp : UInt16 :=
+                match tpOpt with
+                | some tp =>
+                  if l < n then
+                    let raw := (readU16LE wS2 (2 * (((o0 + l) * 3 + ci) * 9 + tp))).toOption.get!
+                    if (raw &&& 0x7fff) != 0 then raw else 0
+                  else 0
+                | none => 0
+              if dec[sIdx]! != exp then
+                throw s!"stride-2 sparse slot {sIdx} mismatch at g={g}, ci={ci}, l={l}"
+              sIdx := sIdx + 1
+
+    -- 4. H16 rep-replicated chunks vs H17 single-slot chunks (Cout=4, logNE=4, F=2 => rep=4)
+    let shRep : Conv3x3Shape := { mode := .dense, h := 8, w := 8, cin := 4, cout := 4, stride := 2, pad := .same }
+    let tRep : Tiling := { logNE := 4, f := 2, fat := 0, ocg := 0, shPref := 0, shMax := 4, tileHeight := 4 }
+    let wRep := mkTaggedWeights3x3 4 4 (withZeros := true)
+    let pk17 ← packConv3x3KernelChunks .h17 shRep tRep wRep none
+    let pk16 ← packConv3x3KernelChunks .h16 shRep tRep wRep none
+    if pk17.slots.map (·.slot) != #[0, 4, 8, 12] then throw "H17 3x3 slots mismatch"
+    if pk16.slots.size != 16 then throw s!"H16 3x3 expected 16 replicated slots, got {pk16.slots.size}"
+    for g in [:4] do
+      let refChunk := pk17.bytes.extract pk17.slots[g]!.offset (pk17.slots[g]!.offset + pk17.slots[g]!.size)
+      for j in [:4] do
+        let cs := pk16.slots[g * 4 + j]!
+        let gotChunk := pk16.bytes.extract cs.offset (cs.offset + cs.size)
+        if gotChunk != refChunk then throw s!"H16 3x3 replicated chunk mismatch at slot {cs.slot}"
+
+    pure ()
+  ))
+
+  -- =========================================================================
+  -- M2 Full compileConv3x3 Round-Trip & Unified Static Verifier Tests
+  -- =========================================================================
+
+  results := results.push (checkOk "m2: compileConv3x3 round-trip matrix (H16 & H17, dense/dw, s=1/2, same/valid, bias/relu, wide3x3)" (do
+    let cases : Array (Target × Conv3x3Shape × Bool × Bool) := #[
+      -- H17 dense s=1 & s=2, same & valid, Cout=1, Cin=1, Cout=320, wide3x3=true & false
+      (.h17, { mode := .dense, h := 8, w := 16, cin := 16, cout := 16, stride := 1, pad := .same }, true, true),
+      (.h17, { mode := .dense, h := 9, w := 13, cin := 7, cout := 11, stride := 1, pad := .valid }, false, false),
+      (.h17, { mode := .dense, h := 8, w := 16, cin := 16, cout := 1, stride := 1, pad := .same }, true, false),
+      (.h17, { mode := .dense, h := 8, w := 16, cin := 16, cout := 1, stride := 2, pad := .same }, true, true),
+      (.h17, { mode := .dense, h := 16, w := 16, cin := 8, cout := 16, stride := 2, pad := .same }, true, false),
+      (.h17, { mode := .dense, h := 15, w := 17, cin := 9, cout := 13, stride := 2, pad := .same }, false, true),
+      (.h17, { mode := .dense, h := 14, w := 18, cin := 6, cout := 12, stride := 2, pad := .valid }, true, true),
+      (.h17, { mode := .dense, h := 8, w := 16, cin := 16, cout := 320, stride := 1, pad := .same }, true, true),
+      -- H17 dense s=1 with maxBlockSlots > 32768*rep => wide3x3 must be false
+      (.h17, { mode := .dense, h := 4, w := 8, cin := 256, cout := 256, stride := 1, pad := .same }, false, false),
+      -- H17 depthwise C=1 (lowered to dense), C=7, C=16, C=29, s=1 & s=2, same & valid
+      (.h17, { mode := .depthwise, h := 8, w := 8, cin := 1, cout := 1, stride := 1, pad := .same }, true, true),
+      (.h17, { mode := .depthwise, h := 8, w := 8, cin := 1, cout := 1, stride := 2, pad := .same }, true, false),
+      (.h17, { mode := .depthwise, h := 9, w := 11, cin := 7, cout := 7, stride := 1, pad := .same }, true, false),
+      (.h17, { mode := .depthwise, h := 12, w := 14, cin := 16, cout := 16, stride := 2, pad := .same }, true, true),
+      (.h17, { mode := .depthwise, h := 13, w := 15, cin := 29, cout := 29, stride := 1, pad := .valid }, false, true),
+      (.h17, { mode := .depthwise, h := 13, w := 15, cin := 29, cout := 29, stride := 2, pad := .valid }, true, false),
+      -- H16 dense & depthwise, s=1 & s=2, same & valid, C=1, Cout=1
+      (.h16, { mode := .dense, h := 8, w := 16, cin := 16, cout := 16, stride := 1, pad := .same }, true, true),
+      (.h16, { mode := .dense, h := 11, w := 13, cin := 5, cout := 9, stride := 2, pad := .same }, true, false),
+      (.h16, { mode := .dense, h := 10, w := 12, cin := 8, cout := 1, stride := 2, pad := .valid }, false, true),
+      (.h16, { mode := .depthwise, h := 8, w := 8, cin := 1, cout := 1, stride := 1, pad := .same }, true, false),
+      (.h16, { mode := .depthwise, h := 10, w := 12, cin := 24, cout := 24, stride := 1, pad := .same }, true, true),
+      (.h16, { mode := .depthwise, h := 10, w := 12, cin := 24, cout := 24, stride := 2, pad := .valid }, false, false)
+    ]
+    for (target, sh, withBias, relu) in cases do
+      let cinW := if sh.mode == .depthwise then 1 else sh.cin
+      let ws := mkTaggedWeights3x3 sh.cout cinW (withZeros := sh.stride == 2)
+      let bs? := if withBias then some (mkTaggedBias sh.cout) else none
+      let compiled ← compileConv3x3 target sh ws bs? relu
+      let info ← validateHwx compiled.hwx
+      validateSectionsWithInfo info compiled.sections
+      let nVerified ← verifyConvHwxTasks compiled.hwx info (requireConvTask := true)
+      if nVerified != 1 then throw "expected 1 verified 3x3 conv task"
+
+      -- Check wide3x3 flag exact semantics
+      let expWide := computeWide3x3 target sh compiled.tiling
+      if compiled.wide3x3 != expWide then
+        throw s!"wide3x3 mismatch for {target.name} {repr sh}: got {compiled.wide3x3}, expected {expWide}"
+      if target == .h16 && compiled.wide3x3 then throw "wide3x3 must be false on H16"
+      if sh.effMode == .depthwise && compiled.wide3x3 then throw "wide3x3 must be false for depthwise"
+      if sh.stride == 2 && compiled.wide3x3 then throw "wide3x3 must be false for stride 2"
+
+      -- Check H16 16 KiB surface section rounding vs H17 exact span
+      for surf in info.surfaces do
+        match target with
+        | .h16 =>
+          if surf.sect.size != surf.vmSize || surf.sect.size.toNat % 0x4000 != 0 then
+            throw s!"H16 surface '{surf.shortName}' section size {surf.sect.size} not 16 KiB rounded"
+        | .h17 =>
+          if surf.sect.size != surf.span then
+            throw s!"H17 surface '{surf.shortName}' section size {surf.sect.size} != span {surf.span}"
+
+    -- Specifically assert the large-Cin H17 case had wide3x3=false (maxBlockSlots = 256*9*16 = 36864 > 32768)
+    let shNoWide : Conv3x3Shape := { mode := .dense, h := 4, w := 8, cin := 256, cout := 256, stride := 1, pad := .same }
+    let cNoWide ← compileConv3x3 .h17 shNoWide (mkTaggedWeights3x3 256 256) none false
+    if cNoWide.wide3x3 then
+      throw "expected wide3x3=false for Cin=256, Cout=256 (maxBlockSlots=36864 > 32768)"
+    pure ()
+  ))
+
+  -- =========================================================================
+  -- M2 Tampered-Task Negative Verifier Tests
+  -- =========================================================================
+
+  let base3DenseS1 ← unwrap "base3DenseS1" (compileConv3x3 .h17
+    { mode := .dense, h := 8, w := 16, cin := 16, cout := 16, stride := 1, pad := .same }
+    (mkTaggedWeights3x3 16 16) (some (mkTaggedBias 16)) true)
+
+  let base3DenseS2 ← unwrap "base3DenseS2" (compileConv3x3 .h17
+    { mode := .dense, h := 16, w := 16, cin := 8, cout := 16, stride := 2, pad := .same }
+    (mkTaggedWeights3x3 16 8 true) (some (mkTaggedBias 16)) false)
+
+  let base3Dw ← unwrap "base3Dw" (compileConv3x3 .h17
+    { mode := .depthwise, h := 8, w := 16, cin := 16, cout := 16, stride := 1, pad := .same }
+    (mkTaggedWeights3x3 16 1) (some (mkTaggedBias 16)) false)
+
+  let base3H16 ← unwrap "base3H16" (compileConv3x3 .h16
+    { mode := .dense, h := 8, w := 16, cin := 16, cout := 16, stride := 1, pad := .same }
+    (mkTaggedWeights3x3 16 16) none false)
+
+  let base3LargeBlock ← unwrap "base3LargeBlock" (compileConv3x3 .h17
+    { mode := .dense, h := 4, w := 8, cin := 256, cout := 256, stride := 1, pad := .same }
+    (mkTaggedWeights3x3 256 256) none false)
+
+  results := results.push (checkErr "m2 neg verifier: sparse mismatch (neCfg=1 vs kernelStage=0 on s=1)" (do
+    tamperReg3x3AndVerify base3DenseS1 regNeCfg 0x10000182
+  ) "sparse")
+
+  results := results.push (checkErr "m2 neg verifier: sparse mismatch (neCfg=1 vs kernelStage=0 on s=2)" (do
+    tamperReg3x3AndVerify base3DenseS2 regKernelStage 0x000102c0
+  ) "sparse")
+
+  results := results.push (checkErr "m2 neg verifier: wide3x3=1 on H16 rejected" (do
+    let fOff ← findRegFileOffset base3H16.hwx base3H16.info regNeCommon
+    let cur ← readU32LE base3H16.hwx fOff
+    tamperReg3x3AndVerify base3H16 regNeCommon (cur ||| ((1 : UInt32) <<< 27))
+  ) "wide3x3")
+
+  results := results.push (checkErr "m2 neg verifier: wide3x3=1 on stride-2 rejected" (do
+    let fOff ← findRegFileOffset base3DenseS2.hwx base3DenseS2.info regNeCommon
+    let cur ← readU32LE base3DenseS2.hwx fOff
+    tamperReg3x3AndVerify base3DenseS2 regNeCommon (cur ||| ((1 : UInt32) <<< 27))
+  ) "wide3x3")
+
+  results := results.push (checkErr "m2 neg verifier: wide3x3=1 on depthwise rejected" (do
+    let fOff ← findRegFileOffset base3Dw.hwx base3Dw.info regNeCommon
+    let cur ← readU32LE base3Dw.hwx fOff
+    tamperReg3x3AndVerify base3Dw regNeCommon (cur ||| ((1 : UInt32) <<< 27))
+  ) "wide3x3")
+
+  results := results.push (checkErr "m2 neg verifier: wide3x3=1 exceeding maxBlockSlots rejected" (do
+    let fOff ← findRegFileOffset base3LargeBlock.hwx base3LargeBlock.info regNeCommon
+    let cur ← readU32LE base3LargeBlock.hwx fOff
+    tamperReg3x3AndVerify base3LargeBlock regNeCommon (cur ||| ((1 : UInt32) <<< 27))
+  ) "maxBlockSlots")
+
+  results := results.push (checkErr "m2 neg verifier: dwGroups with ocg != 0 rejected" (do
+    let fOff ← findRegFileOffset base3Dw.hwx base3Dw.info regNeTile
+    let cur ← readU32LE base3Dw.hwx fOff
+    tamperReg3x3AndVerify base3Dw regNeTile (cur ||| 0x1)
+  ) "ocg=0")
+
+  results := results.push (checkErr "m2 neg verifier: L2 overflow rejected" (do
+    tamperReg3x3AndVerify base3DenseS1 regResBase 0x001fffe0
+  ) "exceeds 2 MiB")
+
+  results := results.push (checkErr "m2 neg verifier: L2 overlap rejected" (do
+    tamperReg3x3AndVerify base3DenseS1 regResBase 0
+  ) "overlapping L2")
+
+  results := results.push (checkErr "m2 neg verifier: disabled chunk slot with size written rejected" (do
+    tamperReg3x3AndVerify base3DenseS1 (regChunkSlot 0) 0x00000020
+  ) "enable bit 0")
+
+  results := results.push (checkErr "m2 neg verifier: wrong srcPx narrowing rejected" (do
+    let fOff ← findRegFileOffset base3DenseS1.hwx base3DenseS1.info regSrc1ChanStride
+    let cur ← readU32LE base3DenseS1.hwx fOff
+    tamperReg3x3AndVerify base3DenseS1 regSrc1ChanStride (cur - 16)
+  ) "srcPx")
 
   pure results
 

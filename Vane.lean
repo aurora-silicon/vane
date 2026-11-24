@@ -5,3 +5,4 @@ import Vane.Sections
 import Vane.Register
 import Vane.Tiling
 import Vane.Conv1x1
+import Vane.Conv3x3
