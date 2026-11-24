@@ -122,4 +122,49 @@ func TestDiscoverProbeAndMockExecution(t *testing.T) {
 	if _, _, err := ExecuteProgram(tr, fd, caps, loaded, [][]byte{inData}, ExecOptions{Runs: 2}); err == nil {
 		t.Fatalf("expected non-deterministic output error")
 	}
+
+	// LinuxTransport.H16Exec rejects empty buffer slice and empty individual buffers without panicking
+	var lt LinuxTransport
+	if err := lt.H16Exec(-1, nil, 0, false); err == nil {
+		t.Fatalf("expected error on empty bufs in LinuxTransport.H16Exec")
+	}
+	if err := lt.H16Exec(-1, [][]byte{make([]byte, 64), {}}, 2, false); err == nil {
+		t.Fatalf("expected error on zero-length buffer in LinuxTransport.H16Exec")
+	}
+}
+
+type zeroSizeLoadTransport struct {
+	*MockTransport
+}
+
+func (z zeroSizeLoadTransport) H16Load(fd int, hwx []byte, sections [4]struct {
+	Kind uint32
+	Data []byte
+}) (H16LoadArgs, error) {
+	return H16LoadArgs{
+		SurfaceCount:     2,
+		SurfaceSize:      [MaxSurfaces]uint64{64, 0},
+		SurfaceDirection: [MaxSurfaces]uint32{1, 2},
+	}, nil
+}
+
+func TestLoadProgramRejectsZeroSurfaceSize(t *testing.T) {
+	base := NewMockTransport(map[string]MockDeviceSpec{
+		"/dev/accel/accel0": {ABIVersion: ABIV3, ChipFamily: ChipH17},
+	}, nil)
+	tr := zeroSizeLoadTransport{MockTransport: base}
+	fd, _, err := DiscoverDevice(tr, "", ChipH17)
+	if err != nil {
+		t.Fatalf("DiscoverDevice failed: %v", err)
+	}
+	defer tr.Close(fd)
+	secs := map[uint32][]byte{
+		SectionGeneric:        make([]byte, SectionMin),
+		SectionOperation:      make([]byte, SectionMin),
+		SectionProcedure:      make([]byte, SectionMin),
+		SectionTextProperties: make([]byte, SectionMin),
+	}
+	if _, err := LoadProgram(tr, fd, []byte{1, 2, 3, 4}, secs); err == nil {
+		t.Fatalf("expected LoadProgram to reject zero SurfaceSize[1]")
+	}
 }

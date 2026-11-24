@@ -280,11 +280,103 @@ func combineStickyInf(curState int, curAcc int64, addSign int) (int, int64) {
 	return 0, 0
 }
 
+const (
+	q1516Min int64 = -(1 << 31)
+	q1516Max int64 = (1 << 31) - 1
+)
+
+// q1516Acc models the NE's 32-bit signed Q15.16 fixed-point accumulator with sticky +-inf overflow.
+type q1516Acc struct {
+	acc       int64
+	stickyInf int // 0=normal, +1=+inf, -1=-inf
+}
+
+func (a *q1516Acc) combineInf(addSign int) {
+	a.stickyInf, a.acc = combineStickyInf(a.stickyInf, a.acc, addSign)
+}
+
+func (a *q1516Acc) addQ(q int64, ov int) {
+	if ov != 0 {
+		a.combineInf(ov)
+	} else if a.stickyInf == 0 {
+		a.acc += q
+		if a.acc > q1516Max {
+			a.stickyInf, a.acc = 1, 0
+		} else if a.acc < q1516Min {
+			a.stickyInf, a.acc = -1, 0
+		}
+	}
+}
+
+// addProduct accumulates xh * wh on the Q15.16 grid.
+// Any non-finite operand (exp == 31, i.e., +-inf or +-NaN) triggers sticky +-inf
+// with sign = sign(xh) ^ sign(wh), matching measured H17 hardware behavior.
+func (a *q1516Acc) addProduct(xh, wh uint16) {
+	if (xh&0x7fff) == 0 || (wh&0x7fff) == 0 {
+		return
+	}
+	if !fp16.IsFinite(xh) || !fp16.IsFinite(wh) {
+		sign := 1
+		if ((xh ^ wh) & 0x8000) != 0 {
+			sign = -1
+		}
+		a.combineInf(sign)
+		return
+	}
+	if fp16.UnbiasedExp(xh)+fp16.UnbiasedExp(wh) < -16 {
+		return
+	}
+	q, ov := roundToQ1516(fp16.ToFloat64(xh) * fp16.ToFloat64(wh))
+	a.addQ(q, ov)
+}
+
+// addBias accumulates a single fp16 bias value on the Q15.16 grid.
+func (a *q1516Acc) addBias(bh uint16) {
+	if (bh & 0x7fff) == 0 {
+		return
+	}
+	if !fp16.IsFinite(bh) {
+		sign := 1
+		if (bh & 0x8000) != 0 {
+			sign = -1
+		}
+		a.combineInf(sign)
+		return
+	}
+	q, ov := roundToQ1516(fp16.ToFloat64(bh))
+	a.addQ(q, ov)
+}
+
+// finalize applies optional ReLU and rounds the Q15.16 accumulator to fp16 (ties away, no -0.0).
+func (a *q1516Acc) finalize(relu bool) uint16 {
+	if a.stickyInf > 0 {
+		return fp16.PosInf
+	}
+	if a.stickyInf < 0 {
+		if relu {
+			return fp16.PosZero
+		}
+		return fp16.NegInf
+	}
+	v := a.acc
+	if relu && v < 0 {
+		v = 0
+	}
+	if v == 0 {
+		return fp16.PosZero
+	}
+	res := fp16.FromFloat64TiesAway(float64(v) / 65536.0)
+	if res == fp16.NegZero {
+		res = fp16.PosZero
+	}
+	return res
+}
+
 // Conv2d1x1Q1516 evaluates the exact Q15.16 fixed-point NE 1x1 convolution arithmetic model:
 //   - 32-bit signed Q15.16 accumulator (LSB = 2^-16)
 //   - Each product x*w rounds to 2^-16 (ties away from zero), flushing to 0 when unbiased exp sum < -16
 //   - Optional bias joins on the 2^-16 grid
-//   - Products / sums outside [-2^15, 2^15) overflow to sticky +-inf (+inf + -inf -> +0)
+//   - Non-finite (exp == 31) operands and overflows trigger sticky +-inf (+inf + -inf -> +0)
 //   - Optional ReLU clamps negatives to +0; final output rounds to fp16 ties-away-from-zero with no -0.0.
 func Conv2d1x1Q1516(x Tensor, weight []uint16, cout int, bias []uint16, relu bool) (Tensor, error) {
 	if err := x.Validate(); err != nil {
@@ -305,9 +397,6 @@ func Conv2d1x1Q1516(x Tensor, weight []uint16, cout int, bias []uint16, relu boo
 		return Tensor{}, err
 	}
 
-	const qMin int64 = -(1 << 31)
-	const qMax int64 = (1 << 31) - 1
-
 	hw := x.H * x.W
 	for n := 0; n < x.N; n++ {
 		xBaseN := n * x.C * hw
@@ -316,81 +405,14 @@ func Conv2d1x1Q1516(x Tensor, weight []uint16, cout int, bias []uint16, relu boo
 			wRow := weight[o*x.C : (o+1)*x.C]
 			yBaseO := yBaseN + o*hw
 			for p := 0; p < hw; p++ {
-				var acc int64
-				stickyInf := 0 // 0=normal, +1=+inf, -1=-inf
-
+				var acc q1516Acc
 				for c := 0; c < x.C; c++ {
-					xh := x.Data[xBaseN+c*hw+p]
-					wh := wRow[c]
-					if (xh&0x7fff) == 0 || (wh&0x7fff) == 0 {
-						continue
-					}
-					if !fp16.IsFinite(xh) || !fp16.IsFinite(wh) {
-						prod := fp16.ToFloat64(xh) * fp16.ToFloat64(wh)
-						if math.IsInf(prod, 1) {
-							stickyInf, acc = combineStickyInf(stickyInf, acc, 1)
-						} else if math.IsInf(prod, -1) {
-							stickyInf, acc = combineStickyInf(stickyInf, acc, -1)
-						}
-						continue
-					}
-					if fp16.UnbiasedExp(xh)+fp16.UnbiasedExp(wh) < -16 {
-						continue
-					}
-					prod := fp16.ToFloat64(xh) * fp16.ToFloat64(wh)
-					q, ov := roundToQ1516(prod)
-					if ov != 0 {
-						stickyInf, acc = combineStickyInf(stickyInf, acc, ov)
-					} else if stickyInf == 0 {
-						acc += q
-						if acc > qMax {
-							stickyInf, acc = 1, 0
-						} else if acc < qMin {
-							stickyInf, acc = -1, 0
-						}
-					}
+					acc.addProduct(x.Data[xBaseN+c*hw+p], wRow[c])
 				}
-
 				if bias != nil {
-					bh := bias[o]
-					if (bh & 0x7fff) != 0 {
-						q, ov := roundToQ1516(fp16.ToFloat64(bh))
-						if ov != 0 {
-							stickyInf, acc = combineStickyInf(stickyInf, acc, ov)
-						} else if stickyInf == 0 {
-							acc += q
-							if acc > qMax {
-								stickyInf, acc = 1, 0
-							} else if acc < qMin {
-								stickyInf, acc = -1, 0
-							}
-						}
-					}
+					acc.addBias(bias[o])
 				}
-
-				var res uint16
-				if stickyInf > 0 {
-					res = fp16.PosInf
-				} else if stickyInf < 0 {
-					if relu {
-						res = fp16.PosZero
-					} else {
-						res = fp16.NegInf
-					}
-				} else {
-					if relu && acc < 0 {
-						acc = 0
-					}
-					if acc == 0 {
-						res = fp16.PosZero
-					} else {
-						res = fp16.FromFloat64TiesAway(float64(acc) / 65536.0)
-						if res == fp16.NegZero {
-							res = fp16.PosZero
-						}
-					}
-				}
-				out.Data[yBaseO+p] = res
+				out.Data[yBaseO+p] = acc.finalize(relu)
 			}
 		}
 	}
@@ -623,9 +645,6 @@ func Conv2d3x3Q1516(x Tensor, weight []uint16, cout int, bias []uint16, stride i
 		return Tensor{}, err
 	}
 
-	const qMin int64 = -(1 << 31)
-	const qMax int64 = (1 << 31) - 1
-
 	for n := 0; n < x.N; n++ {
 		for g := 0; g < groups; g++ {
 			cinStart := g * cinPerG
@@ -634,9 +653,7 @@ func Conv2d3x3Q1516(x Tensor, weight []uint16, cout int, bias []uint16, stride i
 				o := coutStart + og
 				for oh := 0; oh < hout; oh++ {
 					for ow := 0; ow < wout; ow++ {
-						var acc int64
-						stickyInf := 0
-
+						var acc q1516Acc
 						for cg := 0; cg < cinPerG; cg++ {
 							c := cinStart + cg
 							wBase := (o*cinPerG + cg) * 9
@@ -650,79 +667,14 @@ func Conv2d3x3Q1516(x Tensor, weight []uint16, cout int, bias []uint16, stride i
 									if iw < 0 || iw >= x.W {
 										continue
 									}
-									xh := x.Data[x.Index(n, c, ih, iw)]
-									wh := weight[wBase+kh*3+kw]
-									if (xh&0x7fff) == 0 || (wh&0x7fff) == 0 {
-										continue
-									}
-									if !fp16.IsFinite(xh) || !fp16.IsFinite(wh) {
-										prod := fp16.ToFloat64(xh) * fp16.ToFloat64(wh)
-										if math.IsInf(prod, 1) {
-											stickyInf, acc = combineStickyInf(stickyInf, acc, 1)
-										} else if math.IsInf(prod, -1) {
-											stickyInf, acc = combineStickyInf(stickyInf, acc, -1)
-										}
-										continue
-									}
-									if fp16.UnbiasedExp(xh)+fp16.UnbiasedExp(wh) < -16 {
-										continue
-									}
-									prod := fp16.ToFloat64(xh) * fp16.ToFloat64(wh)
-									q, ov := roundToQ1516(prod)
-									if ov != 0 {
-										stickyInf, acc = combineStickyInf(stickyInf, acc, ov)
-									} else if stickyInf == 0 {
-										acc += q
-										if acc > qMax {
-											stickyInf, acc = 1, 0
-										} else if acc < qMin {
-											stickyInf, acc = -1, 0
-										}
-									}
+									acc.addProduct(x.Data[x.Index(n, c, ih, iw)], weight[wBase+kh*3+kw])
 								}
 							}
 						}
-
 						if bias != nil {
-							bh := bias[o]
-							if (bh & 0x7fff) != 0 {
-								q, ov := roundToQ1516(fp16.ToFloat64(bh))
-								if ov != 0 {
-									stickyInf, acc = combineStickyInf(stickyInf, acc, ov)
-								} else if stickyInf == 0 {
-									acc += q
-									if acc > qMax {
-										stickyInf, acc = 1, 0
-									} else if acc < qMin {
-										stickyInf, acc = -1, 0
-									}
-								}
-							}
+							acc.addBias(bias[o])
 						}
-
-						var res uint16
-						if stickyInf > 0 {
-							res = fp16.PosInf
-						} else if stickyInf < 0 {
-							if relu {
-								res = fp16.PosZero
-							} else {
-								res = fp16.NegInf
-							}
-						} else {
-							if relu && acc < 0 {
-								acc = 0
-							}
-							if acc == 0 {
-								res = fp16.PosZero
-							} else {
-								res = fp16.FromFloat64TiesAway(float64(acc) / 65536.0)
-								if res == fp16.NegZero {
-									res = fp16.PosZero
-								}
-							}
-						}
-						out.Data[out.Index(n, o, oh, ow)] = res
+						out.Data[out.Index(n, o, oh, ow)] = acc.finalize(relu)
 					}
 				}
 			}

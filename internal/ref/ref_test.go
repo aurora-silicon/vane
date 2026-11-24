@@ -449,3 +449,46 @@ func TestConv2d3x3PadAndQ1516(t *testing.T) {
 		t.Fatalf("expected 3x3 +inf + -inf -> +0, got 0x%04x (err=%v)", yOv.Data[0], err)
 	}
 }
+
+func TestQ1516NaNMatchesH17StickyInf(t *testing.T) {
+	const (
+		posQNaN uint16 = 0x7e00
+		posSNaN uint16 = 0x7d00
+		negQNaN uint16 = 0xfe00
+		posOne  uint16 = 0x3c00
+		negOne  uint16 = 0xbc00
+	)
+	cases := []struct {
+		name string
+		x    uint16
+		w    uint16
+		relu bool
+		want uint16
+	}{
+		{"qNaN*+1", posQNaN, posOne, false, fp16.PosInf},
+		{"sNaN*+1", posSNaN, posOne, false, fp16.PosInf},
+		{"qNaN*-1", posQNaN, negOne, false, fp16.NegInf},
+		{"qNaN*-1_relu", posQNaN, negOne, true, fp16.PosZero},
+		{"-qNaN*-1", negQNaN, negOne, false, fp16.PosInf},
+		{"-qNaN*+1", negQNaN, posOne, false, fp16.NegInf},
+	}
+	for _, tc := range cases {
+		x1 := Tensor{N: 1, C: 1, H: 1, W: 1, Data: []uint16{tc.x}}
+		y1, err := Conv2d1x1Q1516(x1, []uint16{tc.w}, 1, nil, tc.relu)
+		if err != nil || y1.Data[0] != tc.want {
+			t.Fatalf("1x1 %s: got 0x%04x (err=%v), want 0x%04x", tc.name, y1.Data[0], err, tc.want)
+		}
+		w3 := make([]uint16, 9)
+		w3[4] = tc.w
+		y3, err := Conv2d3x3Q1516(x1, w3, 1, nil, 1, "same", 1, tc.relu)
+		if err != nil || y3.Data[0] != tc.want {
+			t.Fatalf("3x3 %s: got 0x%04x (err=%v), want 0x%04x", tc.name, y3.Data[0], err, tc.want)
+		}
+	}
+	// Non-finite bias (qNaN) also triggers sticky +inf
+	xZero := Tensor{N: 1, C: 1, H: 1, W: 1, Data: []uint16{fp16.PosZero}}
+	yBias, err := Conv2d1x1Q1516(xZero, []uint16{posOne}, 1, []uint16{posQNaN}, false)
+	if err != nil || yBias.Data[0] != fp16.PosInf {
+		t.Fatalf("bias qNaN: got 0x%04x (err=%v), want +inf", yBias.Data[0], err)
+	}
+}

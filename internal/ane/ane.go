@@ -581,8 +581,14 @@ func (LinuxTransport) H16Exec(fd int, bufs [][]byte, surfaceCount int, inPlace b
 		}
 		return linuxIoctl(fd, IoctlH16Exec, unsafe.Pointer(&execArgs))
 	}
+	if len(bufs) == 0 {
+		return errors.New("H16Exec requires at least 1 buffer in copy mode")
+	}
 	entries := make([]H16Buffer, len(bufs))
 	for i := range bufs {
+		if len(bufs[i]) == 0 {
+			return fmt.Errorf("H16Exec buffer %d is empty", i)
+		}
 		entries[i] = H16Buffer{
 			Ptr:  uint64(uintptr(unsafe.Pointer(&bufs[i][0]))),
 			Size: uint64(len(bufs[i])),
@@ -747,6 +753,9 @@ func LoadProgram(tr Transport, fd int, hwx []byte, sections map[uint32][]byte) (
 	sizes := make([]uint64, sc)
 	dirs := make([]uint32, sc)
 	for i := 0; i < sc; i++ {
+		if args.SurfaceSize[i] == 0 {
+			return LoadedProgram{}, fmt.Errorf("kernel returned zero size for surface %d", i)
+		}
 		sizes[i] = args.SurfaceSize[i]
 		dirs[i] = args.SurfaceDirection[i]
 	}
