@@ -197,16 +197,45 @@ func TestFusedConv1x1And3x3Lut(t *testing.T) {
 		bias[i] = fp16.FromFloat64(rng.Float64() - 0.5)
 	}
 
-	for _, spec := range []ActSpec{{Name: "tanh"}, {Name: "gelu"}, {Name: "silu"}, {Name: "hard_sigmoid", Alpha: 0.5, Beta: 0.25}} {
+	for _, spec := range []ActSpec{
+		{Name: "tanh"},
+		{Name: "gelu"},
+		{Name: "silu"},
+		{Name: "hard_sigmoid", Alpha: 0.5, Beta: 0.25},
+		{Name: "rsqrt", Eps: 0.0625},
+	} {
 		tbl, preScale, shift, err := BuildLutTable(spec)
 		if err != nil {
 			t.Fatalf("BuildLutTable(%s): %v", spec.Name, err)
 		}
-		y1F64, err := Conv2d1x1Act(x, w1, 4, bias, spec)
+		// Keep inputs strictly positive for rsqrt test so exact analytical reference is finite
+		xTest := x
+		w1Test := w1
+		w3Test := w3
+		bTest := bias
+		if spec.Name == "rsqrt" {
+			xTest, _ = NewTensor(1, 4, 6, 8)
+			for i := range xTest.Data {
+				xTest.Data[i] = fp16.FromFloat64(0.5 + rng.Float64()*0.5)
+			}
+			w1Test = make([]uint16, 4*4)
+			for i := range w1Test {
+				w1Test[i] = fp16.FromFloat64(0.1 + rng.Float64()*0.1)
+			}
+			w3Test = make([]uint16, 4*4*9)
+			for i := range w3Test {
+				w3Test[i] = fp16.FromFloat64(0.02 + rng.Float64()*0.02)
+			}
+			bTest = make([]uint16, 4)
+			for i := range bTest {
+				bTest[i] = fp16.FromFloat64(0.5)
+			}
+		}
+		y1F64, err := Conv2d1x1Act(xTest, w1Test, 4, bTest, spec)
 		if err != nil {
 			t.Fatalf("Conv2d1x1Act(%s): %v", spec.Name, err)
 		}
-		y1Lut, err := Conv2d1x1Q1516Lut(x, w1, 4, bias, tbl, preScale, shift)
+		y1Lut, err := Conv2d1x1Q1516Lut(xTest, w1Test, 4, bTest, tbl, preScale, shift)
 		if err != nil {
 			t.Fatalf("Conv2d1x1Q1516Lut(%s): %v", spec.Name, err)
 		}
@@ -215,17 +244,77 @@ func TestFusedConv1x1And3x3Lut(t *testing.T) {
 			t.Fatalf("1x1+%s mismatch: %+v err=%v", spec.Name, comp1, err)
 		}
 
-		y3F64, err := Conv2d3x3PadAct(x, w3, 4, bias, 2, "same", 1, spec)
+		y3F64, err := Conv2d3x3PadAct(xTest, w3Test, 4, bTest, 2, "same", 1, spec)
 		if err != nil {
 			t.Fatalf("Conv2d3x3PadAct(%s): %v", spec.Name, err)
 		}
-		y3Lut, err := Conv2d3x3Q1516Lut(x, w3, 4, bias, 2, "same", 1, tbl, preScale, shift)
+		y3Lut, err := Conv2d3x3Q1516Lut(xTest, w3Test, 4, bTest, 2, "same", 1, tbl, preScale, shift)
 		if err != nil {
 			t.Fatalf("Conv2d3x3Q1516Lut(%s): %v", spec.Name, err)
 		}
 		comp3, err := CompareFP16(y3Lut.Data, y3F64.Data, 2e-2, 2e-2, nil)
 		if err != nil || !comp3.Passed {
 			t.Fatalf("3x3+%s mismatch: %+v err=%v", spec.Name, comp3, err)
+		}
+	}
+
+	// M2: fused bias + LUT shift fp16 overflow must return an error
+	tblRsqrt, psRsqrt, shRsqrt, err := BuildLutTable(ActSpec{Name: "rsqrt", Eps: 32.0})
+	if err != nil {
+		t.Fatalf("BuildLutTable(rsqrt 32): %v", err)
+	}
+	bigBias := []uint16{0x7bff, 0x7bff, 0x7bff, 0x7bff}
+	if _, err := Conv2d1x1Q1516Lut(x, w1, 4, bigBias, tblRsqrt, psRsqrt, shRsqrt); err == nil {
+		t.Fatalf("expected Conv2d1x1Q1516Lut to reject fp16 bias+shift overflow")
+	}
+	if _, err := Conv2d3x3Q1516Lut(x, w3, 4, bigBias, 2, "same", 1, tblRsqrt, psRsqrt, shRsqrt); err == nil {
+		t.Fatalf("expected Conv2d3x3Q1516Lut to reject fp16 bias+shift overflow")
+	}
+}
+
+func TestThresholdedReluBoundaryAndLutParamValidation(t *testing.T) {
+	// Q3: thresholded_relu(a) exact boundary: prevF16(a) -> 0, a -> 0, nextF16(a) -> nextF16(a)
+	for _, a := range []float64{0.0, 1.0, -0.5, 2.25} {
+		aBits := f16CanonZero(a)
+		tbl, ps, sh, err := BuildLutTable(ActSpec{Name: "thresholded_relu", Alpha: a})
+		if err != nil {
+			t.Fatalf("BuildLutTable(thresholded_relu %g): %v", a, err)
+		}
+		if gotLo := binary.LittleEndian.Uint16(tbl[0:]); gotLo != aBits {
+			t.Fatalf("thresholded_relu(%g): lo=0x%04x, want 0x%04x", a, gotLo, aBits)
+		}
+		yPrev, _ := EvalLut(tbl, fp16.PrevF16(aBits), ps, sh)
+		yAt, _ := EvalLut(tbl, aBits, ps, sh)
+		nextBits := fp16.NextF16(aBits)
+		yNext, _ := EvalLut(tbl, nextBits, ps, sh)
+		if yPrev != fp16.PosZero || yAt != fp16.PosZero || yNext != nextBits {
+			t.Fatalf("thresholded_relu(%g) boundary: prev=0x%04x at=0x%04x next=0x%04x (want 0, 0, 0x%04x)",
+				a, yPrev, yAt, yNext, nextBits)
+		}
+	}
+
+	// M3: reject NaN, Inf, fp16 overflows, and hard_sigmoid preScale underflow
+	badSpecs := []ActSpec{
+		{Name: "clip", Lo: math.NaN(), Hi: 1.0},
+		{Name: "clip", Lo: -1.0, Hi: math.Inf(1)},
+		{Name: "clip", Lo: -70000, Hi: 1.0},
+		{Name: "leaky_relu", Alpha: math.NaN()},
+		{Name: "leaky_relu", Alpha: 70000},
+		{Name: "threshold", Scalar: math.Inf(-1)},
+		{Name: "thresholded_relu", Alpha: 70000},
+		{Name: "hard_sigmoid", Alpha: 20000, Beta: 0.5},
+		{Name: "hard_sigmoid", Alpha: 1e-9, Beta: 0.5},
+		{Name: "hard_sigmoid", Alpha: 0.2, Beta: 1e5},
+		{Name: "clamp_max", Scalar: math.Inf(1)},
+		{Name: "clamp_min", Scalar: -70000},
+		{Name: "elu", Alpha: 70000},
+		{Name: "scaled_tanh", Alpha: 70000, Beta: 1.0},
+		{Name: "scaled_tanh", Alpha: 1.0, Beta: math.Inf(1)},
+		{Name: "rsqrt", Eps: 70000},
+	}
+	for _, spec := range badSpecs {
+		if _, _, _, err := BuildLutTable(spec); err == nil {
+			t.Fatalf("expected BuildLutTable(%+v) to fail, but succeeded", spec)
 		}
 	}
 }

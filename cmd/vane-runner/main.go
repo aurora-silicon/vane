@@ -1027,11 +1027,21 @@ func cmdGenPe(args []string, stdout, stderr io.Writer) int {
 			yRNA, _ = ref.PeChain(x, nil, nil, f16Ptr(scalar.val))
 			yF64, _ = ref.PeChainF64(x, nil, nil, f16Ptr(scalar.val))
 		case "sdiv":
-			if !scalar.set || scalar.val == 0 || math.IsNaN(scalar.val) {
-				fmt.Fprintln(stderr, "error: sdiv requires non-zero --scalar F")
+			if !scalar.set || math.IsNaN(scalar.val) || math.IsInf(scalar.val, 0) {
+				fmt.Fprintln(stderr, "error: sdiv requires finite non-zero --scalar F")
 				return 1
 			}
-			inv := 1.0 / fp16.ToFloat64(fp16.FromFloat64(scalar.val))
+			sBits := fp16.FromFloat64(scalar.val)
+			if !fp16.IsFinite(sBits) || (sBits&0x7fff) == 0 {
+				fmt.Fprintln(stderr, "error: sdiv requires finite non-zero fp16 --scalar F")
+				return 1
+			}
+			inv := 1.0 / fp16.ToFloat64(sBits)
+			invBits := fp16.FromFloat64(inv)
+			if !fp16.IsFinite(invBits) {
+				fmt.Fprintln(stderr, "error: sdiv reciprocal overflows fp16 finite range")
+				return 1
+			}
 			yRNA, _ = ref.PeChain(x, nil, nil, f16Ptr(inv))
 			yF64, _ = ref.PeChainF64(x, nil, nil, f16Ptr(inv))
 		default:
@@ -1132,6 +1142,10 @@ func cmdGenLut(args []string, stdout, stderr io.Writer) int {
 	}
 	if *actName == "" || *h <= 0 || *w <= 0 || *c <= 0 || *outDir == "" {
 		fmt.Fprintln(stderr, "error: --act, --h, --w, --c, and --out-dir are required")
+		return 1
+	}
+	if *allFP16 && (*c)*(*h)*(*w) != 65536 {
+		fmt.Fprintf(stderr, "error: --all-fp16 requires C*H*W == 65536 (got %d)\n", (*c)*(*h)*(*w))
 		return 1
 	}
 

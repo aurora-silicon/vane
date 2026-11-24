@@ -742,3 +742,112 @@ func TestLutAndFusedConvEndToEndCLI(t *testing.T) {
 		}
 	})
 }
+
+func TestAll23LutTablesMatchLeanByteForByteAndCliGuards(t *testing.T) {
+	vaneBin := findVaneBin(t)
+
+	// M4: byte-for-byte cross-check of ALL 23 LUT ops + parameterized variants
+	// between `vane compile-lut` (`lut.bin` + manifest) and Go `ref.BuildLutTable`.
+	cases := []struct {
+		name      string
+		spec      ref.ActSpec
+		extraArgs []string
+	}{
+		{"relu6", ref.ActSpec{Name: "relu6"}, nil},
+		{"clip", ref.ActSpec{Name: "clip", Lo: -1.5, Hi: 2.5}, []string{"--lo", "-1.5", "--hi", "2.5"}},
+		{"leaky_relu", ref.ActSpec{Name: "leaky_relu", Alpha: 0.25}, []string{"--alpha", "0.25"}},
+		{"abs", ref.ActSpec{Name: "abs"}, nil},
+		{"sign", ref.ActSpec{Name: "sign"}, nil},
+		{"threshold", ref.ActSpec{Name: "threshold", Scalar: 0.5}, []string{"--scalar", "0.5"}},
+		{"thresholded_relu", ref.ActSpec{Name: "thresholded_relu", Alpha: 1.0}, []string{"--alpha", "1.0"}},
+		{"hard_sigmoid_std", ref.ActSpec{Name: "hard_sigmoid", Alpha: 0.2, Beta: 0.5}, []string{"--alpha", "0.2", "--beta", "0.5"}},
+		{"hard_sigmoid_shift", ref.ActSpec{Name: "hard_sigmoid", Alpha: 0.5, Beta: 0.25}, []string{"--alpha", "0.5", "--beta", "0.25"}},
+		{"clamp_max", ref.ActSpec{Name: "clamp_max", Scalar: -0.5}, []string{"--scalar", "-0.5"}},
+		{"clamp_min", ref.ActSpec{Name: "clamp_min", Scalar: 2.0}, []string{"--scalar", "2.0"}},
+		{"elu", ref.ActSpec{Name: "elu", Alpha: 1.0}, []string{"--alpha", "1.0"}},
+		{"tanh", ref.ActSpec{Name: "tanh"}, nil},
+		{"scaled_tanh_pos", ref.ActSpec{Name: "scaled_tanh", Alpha: 2.0, Beta: 0.5}, []string{"--alpha", "2.0", "--beta", "0.5"}},
+		{"scaled_tanh_neg", ref.ActSpec{Name: "scaled_tanh", Alpha: -2.0, Beta: -0.5}, []string{"--alpha", "-2.0", "--beta", "-0.5"}},
+		{"erf", ref.ActSpec{Name: "erf"}, nil},
+		{"sigmoid", ref.ActSpec{Name: "sigmoid"}, nil},
+		{"gelu", ref.ActSpec{Name: "gelu"}, nil},
+		{"silu", ref.ActSpec{Name: "silu"}, nil},
+		{"exp2", ref.ActSpec{Name: "exp2"}, nil},
+		{"exp", ref.ActSpec{Name: "exp"}, nil},
+		{"sqrt", ref.ActSpec{Name: "sqrt"}, nil},
+		{"rsqrt_zero", ref.ActSpec{Name: "rsqrt", Eps: 0.0}, []string{"--eps", "0.0"}},
+		{"rsqrt_eps", ref.ActSpec{Name: "rsqrt", Eps: 0.01}, []string{"--eps", "0.01"}},
+		{"inverse", ref.ActSpec{Name: "inverse"}, nil},
+		{"log2", ref.ActSpec{Name: "log2"}, nil},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			compArgs := append([]string{
+				"compile-lut", "--target", "h17", "--act", tc.spec.Name,
+				"--c", "2", "--h", "4", "--w", "8", "--out-dir", tmp,
+			}, tc.extraArgs...)
+			runVane(t, vaneBin, compArgs...)
+
+			leanLut, err := os.ReadFile(filepath.Join(tmp, "lut.bin"))
+			if err != nil {
+				t.Fatalf("read lut.bin: %v", err)
+			}
+			goLut, goPreScale, goShift, err := ref.BuildLutTable(tc.spec)
+			if err != nil {
+				t.Fatalf("BuildLutTable(%s): %v", tc.name, err)
+			}
+			if !bytes.Equal(leanLut, goLut) {
+				t.Fatalf("lut.bin mismatch for %s:\nlean=%x\ngo  =%x", tc.name, leanLut, goLut)
+			}
+
+			var m struct {
+				PreScaleF16   uint16  `json:"pre_scale_f16"`
+				InputShiftF16 *uint16 `json:"input_shift_f16"`
+			}
+			mRaw, err := os.ReadFile(filepath.Join(tmp, "manifest.json"))
+			if err != nil {
+				t.Fatalf("read manifest.json: %v", err)
+			}
+			if err := json.Unmarshal(mRaw, &m); err != nil {
+				t.Fatalf("parse manifest.json: %v", err)
+			}
+			if m.PreScaleF16 != goPreScale {
+				t.Fatalf("%s pre_scale_f16 mismatch: lean=0x%04x, go=0x%04x", tc.name, m.PreScaleF16, goPreScale)
+			}
+			if (m.InputShiftF16 == nil) != (goShift == nil) {
+				t.Fatalf("%s input_shift_f16 presence mismatch: lean=%v, go=%v", tc.name, m.InputShiftF16, goShift)
+			}
+			if m.InputShiftF16 != nil && *m.InputShiftF16 != *goShift {
+				t.Fatalf("%s input_shift_f16 mismatch: lean=0x%04x, go=0x%04x", tc.name, *m.InputShiftF16, *goShift)
+			}
+		})
+	}
+
+	// N3: gen-pe --op sdiv rejects underflowing fp16 zero and overflowing reciprocal
+	t.Run("n3_gen_pe_sdiv_guards", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		tmp := t.TempDir()
+		if rc := runCLI([]string{"gen-pe", "--op", "sdiv", "--c", "1", "--h", "2", "--w", "4", "--scalar", "1e-9", "--out-dir", tmp}, nil, &stdout, &stderr); rc == 0 {
+			t.Fatalf("expected gen-pe sdiv with 1e-9 (fp16 zero) to fail")
+		}
+		stderr.Reset()
+		if rc := runCLI([]string{"gen-pe", "--op", "sdiv", "--c", "1", "--h", "2", "--w", "4", "--scalar", "1e-6", "--out-dir", tmp}, nil, &stdout, &stderr); rc == 0 {
+			t.Fatalf("expected gen-pe sdiv with 1e-6 (reciprocal overflow) to fail")
+		}
+	})
+
+	// N5: gen-lut --all-fp16 rejects C*H*W != 65536
+	t.Run("n5_gen_lut_all_fp16_guard", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		tmp := t.TempDir()
+		if rc := runCLI([]string{"gen-lut", "--act", "tanh", "--c", "1", "--h", "8", "--w", "8", "--all-fp16", "--out-dir", tmp}, nil, &stdout, &stderr); rc == 0 {
+			t.Fatalf("expected gen-lut --all-fp16 with 64 elements to fail")
+		}
+		stderr.Reset()
+		if rc := runCLI([]string{"gen-lut", "--act", "tanh", "--c", "1", "--h", "256", "--w", "256", "--all-fp16", "--out-dir", tmp}, nil, &stdout, &stderr); rc != 0 {
+			t.Fatalf("expected gen-lut --all-fp16 with 65536 elements to succeed, stderr=%s", stderr.String())
+		}
+	})
+}

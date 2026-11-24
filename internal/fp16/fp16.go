@@ -256,6 +256,21 @@ func PrevF16(b uint16) uint16 {
 	return b + 1
 }
 
+// NextF16 returns the next larger IEEE-754 binary16 bit pattern strictly above b,
+// saturating at +inf (0x7c00).
+func NextF16(b uint16) uint16 {
+	if (b & 0x7fff) == 0 {
+		return 0x0001 // +2^-24
+	}
+	if (b & 0x8000) != 0 {
+		return b - 1
+	}
+	if b >= PosInf {
+		return PosInf
+	}
+	return b + 1
+}
+
 // OrderedInt maps a finite IEEE-754 binary16 value onto a monotonic int32 ULP lattice
 // where -0.0 and +0.0 both map to 0.
 func OrderedInt(h uint16) int32 {

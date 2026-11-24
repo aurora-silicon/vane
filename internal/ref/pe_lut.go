@@ -326,6 +326,17 @@ func f16CanonZero(x float64) uint16 {
 	return h
 }
 
+func finiteFP16(v float64, label string) (uint16, error) {
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return 0, fmt.Errorf("LUT %s: parameter must be finite (got %g)", label, v)
+	}
+	h := f16CanonZero(v)
+	if !fp16.IsFinite(h) {
+		return 0, fmt.Errorf("LUT %s: value %g overflows fp16 finite range [-65504, 65504]", label, v)
+	}
+	return h, nil
+}
+
 func packLutTable(lo, hi, outLo, outHi uint16, samples [33]uint16, ls, li, rs, ri, k, mode uint16) []byte {
 	var words [64]uint16
 	words[0] = lo
@@ -373,19 +384,30 @@ func BuildLutTable(spec ActSpec) (tableBytes []byte, preScaleBits uint16, inputS
 		return packPwlTable(posZero, f16CanonZero(6.0), posZero, f16CanonZero(6.0), posZero,
 			posOne, posZero, posOne, posZero, 0x0001), posOne, nil, nil
 	case "clip":
-		if math.IsNaN(spec.Lo) || math.IsNaN(spec.Hi) || spec.Lo > spec.Hi {
+		loH, err := finiteFP16(spec.Lo, "clip.lo")
+		if err != nil {
+			return nil, 0, nil, err
+		}
+		hiH, err := finiteFP16(spec.Hi, "clip.hi")
+		if err != nil {
+			return nil, 0, nil, err
+		}
+		if spec.Lo > spec.Hi {
 			return nil, 0, nil, fmt.Errorf("clip requires lo <= hi (got lo=%g, hi=%g)", spec.Lo, spec.Hi)
 		}
-		f0 := math.Max(spec.Lo, math.Min(spec.Hi, 0.0))
-		return packPwlTable(f16CanonZero(spec.Lo), f16CanonZero(spec.Hi),
-			f16CanonZero(spec.Lo), f16CanonZero(spec.Hi), f16CanonZero(f0),
+		f0H, err := finiteFP16(math.Max(spec.Lo, math.Min(spec.Hi, 0.0)), "clip.f0")
+		if err != nil {
+			return nil, 0, nil, err
+		}
+		return packPwlTable(loH, hiH, loH, hiH, f0H,
 			posOne, posZero, posOne, posZero, 0x0001), posOne, nil, nil
 	case "leaky_relu":
-		if math.IsNaN(spec.Alpha) {
-			return nil, 0, nil, fmt.Errorf("leaky_relu alpha must not be NaN")
+		alphaH, err := finiteFP16(spec.Alpha, "leaky_relu.alpha")
+		if err != nil {
+			return nil, 0, nil, err
 		}
 		return packPwlTable(negInf, posInf, negInf, posInf, posZero,
-			f16CanonZero(spec.Alpha), posZero, posOne, posZero, 0x0001), posOne, nil, nil
+			alphaH, posZero, posOne, posZero, 0x0001), posOne, nil, nil
 	case "abs":
 		return packPwlTable(negInf, posInf, posInf, posInf, posZero,
 			negOne, posZero, posOne, posZero, 0x0021), posOne, nil, nil
@@ -393,30 +415,43 @@ func BuildLutTable(spec ActSpec) (tableBytes []byte, preScaleBits uint16, inputS
 		return packPwlTable(0x8001, 0x0001, negOne, posOne, posZero,
 			posZero, posZero, posZero, posZero, 0x0001), posOne, nil, nil
 	case "threshold":
-		if math.IsNaN(spec.Scalar) {
-			return nil, 0, nil, fmt.Errorf("threshold scalar must not be NaN")
+		aH, err := finiteFP16(spec.Scalar, "threshold.a")
+		if err != nil {
+			return nil, 0, nil, err
 		}
-		f0 := math.Max(0.0, spec.Scalar)
-		return packPwlTable(f16CanonZero(spec.Scalar), posInf, f16CanonZero(spec.Scalar), posInf,
-			f16CanonZero(f0), posOne, posZero, posOne, posZero, 0x0001), posOne, nil, nil
+		f0H, err := finiteFP16(math.Max(0.0, spec.Scalar), "threshold.f0")
+		if err != nil {
+			return nil, 0, nil, err
+		}
+		return packPwlTable(aH, posInf, aH, posInf, f0H,
+			posOne, posZero, posOne, posZero, 0x0001), posOne, nil, nil
 	case "thresholded_relu":
-		if math.IsNaN(spec.Alpha) {
-			return nil, 0, nil, fmt.Errorf("thresholded_relu alpha must not be NaN")
+		lo, err := finiteFP16(spec.Alpha, "thresholded_relu.a")
+		if err != nil {
+			return nil, 0, nil, err
 		}
-		lo := fp16.PrevF16(f16CanonZero(spec.Alpha))
 		return packPwlTable(lo, posInf, posZero, posInf, posZero,
 			posOne, posZero, posOne, posZero, 0x0001), posOne, nil, nil
 	case "hard_sigmoid":
 		if math.IsNaN(spec.Alpha) || math.IsInf(spec.Alpha, 0) || spec.Alpha <= 0 {
 			return nil, 0, nil, fmt.Errorf("hard_sigmoid alpha must be finite and > 0 (got %g)", spec.Alpha)
 		}
-		if math.IsNaN(spec.Beta) || math.IsInf(spec.Beta, 0) {
-			return nil, 0, nil, fmt.Errorf("hard_sigmoid beta must be finite (got %g)", spec.Beta)
+		if _, err := finiteFP16(spec.Beta, "hard_sigmoid.beta"); err != nil {
+			return nil, 0, nil, err
 		}
 		scale := spec.Alpha / 0.2
-		preScaleBits = f16CanonZero(scale)
+		preScaleBits, err = finiteFP16(scale, "hard_sigmoid.preScale")
+		if err != nil {
+			return nil, 0, nil, err
+		}
+		if preScaleBits == posZero {
+			return nil, 0, nil, fmt.Errorf("hard_sigmoid: alpha (%g) underflows pre-LUT scale to 0", spec.Alpha)
+		}
 		if spec.Beta != 0.5 {
-			s := f16CanonZero((5.0*spec.Beta - 2.5) / scale)
+			s, err := finiteFP16((5.0*spec.Beta-2.5)/scale, "hard_sigmoid.inputShift")
+			if err != nil {
+				return nil, 0, nil, err
+			}
 			if s != posZero {
 				inputShiftBits = &s
 			}
@@ -425,30 +460,42 @@ func BuildLutTable(spec ActSpec) (tableBytes []byte, preScaleBits uint16, inputS
 			f16CanonZero(0.2), f16CanonZero(0.5), f16CanonZero(0.2), f16CanonZero(0.5), 0x0001),
 			preScaleBits, inputShiftBits, nil
 	case "clamp_max":
-		if math.IsNaN(spec.Scalar) {
-			return nil, 0, nil, fmt.Errorf("clamp_max scalar must not be NaN")
+		vH, err := finiteFP16(spec.Scalar, "clamp_max.v")
+		if err != nil {
+			return nil, 0, nil, err
 		}
-		f0 := math.Max(0.0, spec.Scalar)
-		return packPwlTable(f16CanonZero(spec.Scalar), posInf, f16CanonZero(spec.Scalar), posInf,
-			f16CanonZero(f0), posOne, posZero, posOne, posZero, 0x0001), posOne, nil, nil
+		f0H, err := finiteFP16(math.Max(0.0, spec.Scalar), "clamp_max.f0")
+		if err != nil {
+			return nil, 0, nil, err
+		}
+		return packPwlTable(vH, posInf, vH, posInf, f0H,
+			posOne, posZero, posOne, posZero, 0x0001), posOne, nil, nil
 	case "clamp_min":
-		if math.IsNaN(spec.Scalar) {
-			return nil, 0, nil, fmt.Errorf("clamp_min scalar must not be NaN")
+		vH, err := finiteFP16(spec.Scalar, "clamp_min.v")
+		if err != nil {
+			return nil, 0, nil, err
 		}
-		f0 := math.Min(0.0, spec.Scalar)
-		return packPwlTable(negInf, f16CanonZero(spec.Scalar), negInf, f16CanonZero(spec.Scalar),
-			f16CanonZero(f0), posOne, posZero, posOne, posZero, 0x0001), posOne, nil, nil
+		f0H, err := finiteFP16(math.Min(0.0, spec.Scalar), "clamp_min.f0")
+		if err != nil {
+			return nil, 0, nil, err
+		}
+		return packPwlTable(negInf, vH, negInf, vH, f0H,
+			posOne, posZero, posOne, posZero, 0x0001), posOne, nil, nil
 	case "elu":
-		if math.IsNaN(spec.Alpha) || math.IsInf(spec.Alpha, 0) {
-			return nil, 0, nil, fmt.Errorf("elu alpha must be finite")
+		if _, err := finiteFP16(spec.Alpha, "elu.alpha"); err != nil {
+			return nil, 0, nil, err
+		}
+		negAlphaH, err := finiteFP16(-spec.Alpha, "elu.-alpha")
+		if err != nil {
+			return nil, 0, nil, err
 		}
 		var samples [33]uint16
 		for i := 0; i < 33; i++ {
 			u := float64(i-32) / 4.0
 			samples[i] = f16CanonZero(spec.Alpha * math.Expm1(u))
 		}
-		return packLutTable(f16CanonZero(-8.0), posInf, f16CanonZero(-spec.Alpha), posInf, samples,
-			posZero, f16CanonZero(-spec.Alpha), posOne, posZero, 2, 0x0002), posOne, nil, nil
+		return packLutTable(f16CanonZero(-8.0), posInf, negAlphaH, posInf, samples,
+			posZero, negAlphaH, posOne, posZero, 2, 0x0002), posOne, nil, nil
 	case "tanh":
 		var samples [33]uint16
 		for i := 0; i < 33; i++ {
@@ -457,10 +504,22 @@ func BuildLutTable(spec ActSpec) (tableBytes []byte, preScaleBits uint16, inputS
 		return packLutTable(f16CanonZero(-4.0), f16CanonZero(4.0), negOne, posOne, samples,
 			posZero, negOne, posZero, posOne, 3, 0x0060), posOne, nil, nil
 	case "scaled_tanh":
-		if math.IsNaN(spec.Alpha) || math.IsInf(spec.Alpha, 0) || math.IsNaN(spec.Beta) || math.IsInf(spec.Beta, 0) {
-			return nil, 0, nil, fmt.Errorf("scaled_tanh alpha and beta must be finite")
+		if _, err := finiteFP16(spec.Alpha, "scaled_tanh.alpha"); err != nil {
+			return nil, 0, nil, err
+		}
+		betaH, err := finiteFP16(spec.Beta, "scaled_tanh.beta")
+		if err != nil {
+			return nil, 0, nil, err
 		}
 		a := math.Abs(spec.Alpha)
+		aH, err := finiteFP16(a, "scaled_tanh.|alpha|")
+		if err != nil {
+			return nil, 0, nil, err
+		}
+		negAH, err := finiteFP16(-a, "scaled_tanh.-|alpha|")
+		if err != nil {
+			return nil, 0, nil, err
+		}
 		mode := uint16(0x0060)
 		if spec.Alpha < 0 {
 			mode = 0x00a0
@@ -469,8 +528,8 @@ func BuildLutTable(spec ActSpec) (tableBytes []byte, preScaleBits uint16, inputS
 		for i := 0; i < 33; i++ {
 			samples[i] = f16CanonZero(a * math.Tanh(float64(i)/8.0))
 		}
-		return packLutTable(f16CanonZero(-4.0), f16CanonZero(4.0), f16CanonZero(-a), f16CanonZero(a), samples,
-			posZero, f16CanonZero(-a), posZero, f16CanonZero(a), 3, mode), f16CanonZero(spec.Beta), nil, nil
+		return packLutTable(f16CanonZero(-4.0), f16CanonZero(4.0), negAH, aH, samples,
+			posZero, negAH, posZero, aH, 3, mode), betaH, nil, nil
 	case "erf":
 		var samples [33]uint16
 		for i := 0; i < 33; i++ {
@@ -528,16 +587,17 @@ func BuildLutTable(spec ActSpec) (tableBytes []byte, preScaleBits uint16, inputS
 		if math.IsNaN(spec.Eps) || math.IsInf(spec.Eps, 0) || spec.Eps < 0 {
 			return nil, 0, nil, fmt.Errorf("rsqrt eps must be finite and >= 0 (got %g)", spec.Eps)
 		}
+		epsH, err := finiteFP16(spec.Eps, "rsqrt.eps")
+		if err != nil {
+			return nil, 0, nil, err
+		}
 		var samples [33]uint16
 		samples[0] = posZero
 		for i := 1; i < 33; i++ {
 			samples[i] = f16CanonZero(1.0 / math.Sqrt(float64(i)/16.0))
 		}
-		if spec.Eps != 0 {
-			s := f16CanonZero(spec.Eps)
-			if s != posZero {
-				inputShiftBits = &s
-			}
+		if spec.Eps != 0 && epsH != posZero {
+			inputShiftBits = &epsH
 		}
 		return packLutTable(posZero, posInf, posInf, posZero, samples,
 			posZero, posZero, posZero, posZero, 4, 0x0006), posOne, inputShiftBits, nil
@@ -932,7 +992,36 @@ func Conv2d1x1Act(x Tensor, weight []uint16, cout int, bias []uint16, spec ActSp
 	return out, nil
 }
 
+// foldFusedBiasShift folds an optional LUT input shift into the fp16 convolution bias
+// vector (or synthesizes a constant bias vector when bias == nil), matching fused
+// hardware lowering and checking for fp16 overflow.
+func foldFusedBiasShift(bias []uint16, cout int, inputShiftBits *uint16) ([]uint16, error) {
+	if inputShiftBits == nil {
+		return bias, nil
+	}
+	if !fp16.IsFinite(*inputShiftBits) {
+		return nil, fmt.Errorf("fused LUT input shift 0x%04x is not finite fp16", *inputShiftBits)
+	}
+	shiftF := fp16.ToFloat64(*inputShiftBits)
+	eff := make([]uint16, cout)
+	if bias != nil {
+		for o := 0; o < cout; o++ {
+			u := f16CanonZero(fp16.ToFloat64(bias[o]) + shiftF)
+			if !fp16.IsFinite(u) {
+				return nil, fmt.Errorf("fused LUT input shift overflowed fp16 on bias[%d] (orig=0x%04x, shift=0x%04x)", o, bias[o], *inputShiftBits)
+			}
+			eff[o] = u
+		}
+	} else {
+		for o := 0; o < cout; o++ {
+			eff[o] = *inputShiftBits
+		}
+	}
+	return eff, nil
+}
+
 // Conv2d1x1Q1516Lut computes a 1x1 convolution in Q15.16 followed by a fused 128-byte NE LUT.
+// Any inputShiftBits is folded into the fp16 bias before Q15.16 accumulation, matching hardware lowering.
 func Conv2d1x1Q1516Lut(x Tensor, weight []uint16, cout int, bias []uint16, tableBytes []byte, preScaleBits uint16, inputShiftBits *uint16) (Tensor, error) {
 	if err := x.Validate(); err != nil {
 		return Tensor{}, err
@@ -947,6 +1036,10 @@ func Conv2d1x1Q1516Lut(x Tensor, weight []uint16, cout int, bias []uint16, table
 		return Tensor{}, fmt.Errorf("bias length %d != cout (%d)", len(bias), cout)
 	}
 	if _, err := decodeLutTable(tableBytes); err != nil {
+		return Tensor{}, err
+	}
+	effBias, err := foldFusedBiasShift(bias, cout, inputShiftBits)
+	if err != nil {
 		return Tensor{}, err
 	}
 	out, err := NewTensor(x.N, cout, x.H, x.W)
@@ -965,10 +1058,10 @@ func Conv2d1x1Q1516Lut(x Tensor, weight []uint16, cout int, bias []uint16, table
 				for c := 0; c < x.C; c++ {
 					acc.addProduct(x.Data[xBaseN+c*hw+p], wRow[c])
 				}
-				if bias != nil {
-					acc.addBias(bias[o])
+				if effBias != nil {
+					acc.addBias(effBias[o])
 				}
-				y, err := EvalLutFloat64(tableBytes, acc.toFloat64(), preScaleBits, inputShiftBits)
+				y, err := EvalLutFloat64(tableBytes, acc.toFloat64(), preScaleBits, nil)
 				if err != nil {
 					return Tensor{}, err
 				}
@@ -1047,6 +1140,7 @@ func Conv2d3x3PadAct(x Tensor, weight []uint16, cout int, bias []uint16, stride 
 }
 
 // Conv2d3x3Q1516Lut computes a 3x3 convolution in Q15.16 followed by a fused 128-byte NE LUT.
+// Any inputShiftBits is folded into the fp16 bias before Q15.16 accumulation, matching hardware lowering.
 func Conv2d3x3Q1516Lut(x Tensor, weight []uint16, cout int, bias []uint16, stride int, pad string, groups int, tableBytes []byte, preScaleBits uint16, inputShiftBits *uint16) (Tensor, error) {
 	if err := x.Validate(); err != nil {
 		return Tensor{}, err
@@ -1063,6 +1157,10 @@ func Conv2d3x3Q1516Lut(x Tensor, weight []uint16, cout int, bias []uint16, strid
 		return Tensor{}, fmt.Errorf("bias length %d != %d", len(bias), cout)
 	}
 	if _, err := decodeLutTable(tableBytes); err != nil {
+		return Tensor{}, err
+	}
+	effBias, err := foldFusedBiasShift(bias, cout, inputShiftBits)
+	if err != nil {
 		return Tensor{}, err
 	}
 	hout, wout, padTop, padLeft, err := Conv3x3Geometry(x.H, x.W, stride, pad)
@@ -1099,10 +1197,10 @@ func Conv2d3x3Q1516Lut(x Tensor, weight []uint16, cout int, bias []uint16, strid
 								}
 							}
 						}
-						if bias != nil {
-							acc.addBias(bias[o])
+						if effBias != nil {
+							acc.addBias(effBias[o])
 						}
-						y, err := EvalLutFloat64(tableBytes, acc.toFloat64(), preScaleBits, inputShiftBits)
+						y, err := EvalLutFloat64(tableBytes, acc.toFloat64(), preScaleBits, nil)
 						if err != nil {
 							return Tensor{}, err
 						}
