@@ -1188,11 +1188,27 @@ private def runAllTests : IO (Array TestResult) := do
     validateConv3x3Tiling .h17 sh t
   ) "coverage")
 
+  results := results.push (checkErr "m2 neg: 3x3 validator rejects H17 dense s=1 ocg=4 (Cout=256)" (do
+    let sh : Conv3x3Shape := { mode := .dense, h := 16, w := 16, cin := 64, cout := 256, stride := 1, pad := .same }
+    let t : Tiling := { logNE := 4, f := 4, fat := 0, ocg := 4, shPref := 0, shMax := 4, tileHeight := 16 }
+    validateConv3x3Tiling .h17 sh t
+  ) "ocg=4")
+
   results := results.push (checkErr "m2 neg: 3x3 validator rejects H17 Cout=320 with ocg=4 (must use ocg=3)" (do
     let sh : Conv3x3Shape := { mode := .dense, h := 8, w := 8, cin := 8, cout := 320, stride := 1, pad := .same }
     let t : Tiling := { logNE := 4, f := 4, fat := 0, ocg := 4, shPref := 0, shMax := 4, tileHeight := 8 }
     validateConv3x3Tiling .h17 sh t
-  ) "F=4, ocg=3")
+  ) "ocg=4")
+
+  results := results.push (checkOk "m2: H16 dense s=1 and H17 dense s=2 still accept ocg=4" (do
+    let shS1 : Conv3x3Shape := { mode := .dense, h := 16, w := 16, cin := 64, cout := 256, stride := 1, pad := .same }
+    let tS1 : Tiling := { logNE := 4, f := 4, fat := 0, ocg := 4, shPref := 0, shMax := 4, tileHeight := 16 }
+    validateConv3x3Tiling .h16 shS1 tS1
+    let shS2 : Conv3x3Shape := { mode := .dense, h := 16, w := 16, cin := 64, cout := 256, stride := 2, pad := .same }
+    let tS2 : Tiling := { logNE := 4, f := 4, fat := 0, ocg := 4, shPref := 0, shMax := 4, tileHeight := 8 }
+    validateConv3x3Tiling .h17 shS2 tS2
+    pure ()
+  ))
 
   results := results.push (checkOk "m2: chooseConv3x3Tiling matrix (H16 & H17, dense/dw, s=1/2, same/valid, boundary, multi-tile, Cout=320)" (do
     let commonShapes : Array Conv3x3Shape := #[
@@ -1238,6 +1254,19 @@ private def runAllTests : IO (Array TestResult) := do
     let tTall ← chooseConv3x3Tiling .h17 tallSh
     if tTall.tileHeight >= tallSh.outH then
       throw s!"expected multi-tile TH < 128 for 128x128 Cin=64, got TH={tTall.tileHeight}"
+
+    -- H17 dense stride-1 Cout=256 picks F=4, ocg=3 (while H16 s=1 and H17 s=2 pick F=4, ocg=4)
+    let sh256s1 : Conv3x3Shape := { mode := .dense, h := 16, w := 16, cin := 64, cout := 256, stride := 1, pad := .same }
+    let t256H17 ← chooseConv3x3Tiling .h17 sh256s1
+    if t256H17.f != 4 || t256H17.ocg != 3 then
+      throw s!"expected H17 dense s=1 Cout=256 to pick F=4, ocg=3, got F={t256H17.f}, ocg={t256H17.ocg}"
+    let t256H16 ← chooseConv3x3Tiling .h16 sh256s1
+    if t256H16.f != 4 || t256H16.ocg != 4 then
+      throw s!"expected H16 dense s=1 Cout=256 to pick F=4, ocg=4, got F={t256H16.f}, ocg={t256H16.ocg}"
+    let sh256s2 : Conv3x3Shape := { sh256s1 with stride := 2 }
+    let t256H17s2 ← chooseConv3x3Tiling .h17 sh256s2
+    if t256H17s2.f != 4 || t256H17s2.ocg != 4 then
+      throw s!"expected H17 dense s=2 Cout=256 to pick F=4, ocg=4, got F={t256H17s2.f}, ocg={t256H17s2.ocg}"
 
     -- H17 dense stride-1 Cout=320 uses F=4, ocg=3; H16 rejects Cout=320
     let sh320 : Conv3x3Shape := { mode := .dense, h := 8, w := 16, cin := 16, cout := 320, stride := 1, pad := .same }
@@ -1371,8 +1400,9 @@ private def runAllTests : IO (Array TestResult) := do
       (.h17, { mode := .dense, h := 15, w := 17, cin := 9, cout := 13, stride := 2, pad := .same }, false, true),
       (.h17, { mode := .dense, h := 14, w := 18, cin := 6, cout := 12, stride := 2, pad := .valid }, true, true),
       (.h17, { mode := .dense, h := 8, w := 16, cin := 16, cout := 320, stride := 1, pad := .same }, true, true),
-      -- H17 dense s=1 with maxBlockSlots > 32768*rep => wide3x3 must be false
-      (.h17, { mode := .dense, h := 4, w := 8, cin := 256, cout := 256, stride := 1, pad := .same }, false, false),
+      (.h17, { mode := .dense, h := 16, w := 16, cin := 64, cout := 256, stride := 1, pad := .same }, true, false),
+      -- H17 dense s=1 with maxBlockSlots > 32768*rep => wide3x3 must be false (Cin=460, Cout=128 => 460*9*8=33120 > 32768)
+      (.h17, { mode := .dense, h := 4, w := 8, cin := 460, cout := 128, stride := 1, pad := .same }, false, false),
       -- H17 depthwise C=1 (lowered to dense), C=7, C=16, C=29, s=1 & s=2, same & valid
       (.h17, { mode := .depthwise, h := 8, w := 8, cin := 1, cout := 1, stride := 1, pad := .same }, true, true),
       (.h17, { mode := .depthwise, h := 8, w := 8, cin := 1, cout := 1, stride := 2, pad := .same }, true, false),
@@ -1416,11 +1446,16 @@ private def runAllTests : IO (Array TestResult) := do
           if surf.sect.size != surf.span then
             throw s!"H17 surface '{surf.shortName}' section size {surf.sect.size} != span {surf.span}"
 
-    -- Specifically assert the large-Cin H17 case had wide3x3=false (maxBlockSlots = 256*9*16 = 36864 > 32768)
-    let shNoWide : Conv3x3Shape := { mode := .dense, h := 4, w := 8, cin := 256, cout := 256, stride := 1, pad := .same }
-    let cNoWide ← compileConv3x3 .h17 shNoWide (mkTaggedWeights3x3 256 256) none false
+    -- Specifically assert the large-Cin H17 case had wide3x3=false (maxBlockSlots = 460*9*8 = 33120 > 32768)
+    let shNoWide : Conv3x3Shape := { mode := .dense, h := 4, w := 8, cin := 460, cout := 128, stride := 1, pad := .same }
+    let cNoWide ← compileConv3x3 .h17 shNoWide (mkTaggedWeights3x3 128 460) none false
     if cNoWide.wide3x3 then
-      throw "expected wide3x3=false for Cin=256, Cout=256 (maxBlockSlots=36864 > 32768)"
+      throw "expected wide3x3=false for Cin=460, Cout=128 (maxBlockSlots=33120 > 32768)"
+    -- Assert H17 dense s=1 (16x16, Cin=64, Cout=256) compiles with F=4, ocg=3
+    let sh256 : Conv3x3Shape := { mode := .dense, h := 16, w := 16, cin := 64, cout := 256, stride := 1, pad := .same }
+    let c256 ← compileConv3x3 .h17 sh256 (mkTaggedWeights3x3 256 64) none false
+    if c256.tiling.f != 4 || c256.tiling.ocg != 3 then
+      throw s!"expected H17 dense s=1 Cout=256 to compile with F=4, ocg=3, got F={c256.tiling.f}, ocg={c256.tiling.ocg}"
     pure ()
   ))
 
@@ -1445,8 +1480,8 @@ private def runAllTests : IO (Array TestResult) := do
     (mkTaggedWeights3x3 16 16) none false)
 
   let base3LargeBlock ← unwrap "base3LargeBlock" (compileConv3x3 .h17
-    { mode := .dense, h := 4, w := 8, cin := 256, cout := 256, stride := 1, pad := .same }
-    (mkTaggedWeights3x3 256 256) none false)
+    { mode := .dense, h := 4, w := 8, cin := 460, cout := 128, stride := 1, pad := .same }
+    (mkTaggedWeights3x3 128 460) none false)
 
   results := results.push (checkErr "m2 neg verifier: sparse mismatch (neCfg=1 vs kernelStage=0 on s=1)" (do
     tamperReg3x3AndVerify base3DenseS1 regNeCfg 0x10000182
@@ -1479,6 +1514,13 @@ private def runAllTests : IO (Array TestResult) := do
     let cur ← readU32LE base3LargeBlock.hwx fOff
     tamperReg3x3AndVerify base3LargeBlock regNeCommon (cur ||| ((1 : UInt32) <<< 27))
   ) "maxBlockSlots")
+
+  results := results.push (checkErr "m2 neg verifier: H17 dense s=1 ocg=4 rejected" (do
+    let fOff ← findRegFileOffset base3DenseS1.hwx base3DenseS1.info regNeTile
+    let cur ← readU32LE base3DenseS1.hwx fOff
+    -- Replace low 3 bits (ocg) with 4
+    tamperReg3x3AndVerify base3DenseS1 regNeTile ((cur &&& 0xfffffff8) ||| 0x4)
+  ) "ocg=4")
 
   results := results.push (checkErr "m2 neg verifier: dwGroups with ocg != 0 rejected" (do
     let fOff ← findRegFileOffset base3Dw.hwx base3Dw.info regNeTile

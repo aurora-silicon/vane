@@ -450,6 +450,8 @@ def verifyConv3x3Task (info : HwxInfo) (task : DecodedTask) : Except String Unit
   let wu := (← decodeFieldChecked neTileLayout wNeTile.value "WU").toNat
   if mode == .depthwise && ocg != 0 then
     throw s!"{prefixMsg}: dwGroups (0x0030) depthwise mode requires ocg=0, got ocg={ocg}"
+  if target == .h17 && shape.effMode == .dense && stride == 1 && ocg > 3 then
+    throw s!"{prefixMsg}: h17 stride-1 dense ocg={ocg} exceeds maximum 3"
   if ocg > 4 then
     throw s!"{prefixMsg}: ocg={ocg} exceeds maximum 4"
   if wu > 3 then

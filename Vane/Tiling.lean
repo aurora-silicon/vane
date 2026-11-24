@@ -508,8 +508,12 @@ def validateConv3x3Tiling (target : Target) (sh : Conv3x3Shape) (t : Tiling) : E
     if t.ocg != 0 then
       throw s!"illegal 3x3 tiling: depthwise mode requires ocg=0, got ocg={t.ocg}"
   | .dense =>
-    if t.ocg > 4 then
-      throw s!"illegal 3x3 tiling: ocg={t.ocg} exceeds maximum 4"
+    if target == .h17 && sh.stride == 1 then
+      if t.ocg > 3 then
+        throw s!"illegal 3x3 tiling: h17 stride-1 dense ocg={t.ocg} exceeds maximum 3"
+    else
+      if t.ocg > 4 then
+        throw s!"illegal 3x3 tiling: ocg={t.ocg} exceeds maximum 4"
 
   -- Rule 6 & Rule 7: Output channel coverage and group bound
   let maxF := min 4 (ceilLog2 sh.cout)
@@ -533,7 +537,7 @@ def validateConv3x3Tiling (target : Target) (sh : Conv3x3Shape) (t : Tiling) : E
       | .h17 =>
         let multiRoundOk := t.f == 4 && t.ocg == 3
         if sh.cout > singleCap && !multiRoundOk then
-          throw s!"illegal 3x3 tiling: h17 stride-1 dense Cout={sh.cout} exceeds coverage {singleCap} (F={t.f}, ocg={t.ocg}); Cout > 256 requires F=4, ocg=3"
+          throw s!"illegal 3x3 tiling: h17 stride-1 dense Cout={sh.cout} exceeds coverage {singleCap} (F={t.f}, ocg={t.ocg}); Cout > 128 requires F=4, ocg=3"
 
   -- Rule 8: Strip width (8 <= T <= 256)
   let stripW := stripWidth t
@@ -567,12 +571,18 @@ def chooseConv3x3Ocg? (target : Target) (sh : Conv3x3Shape) (f : Nat) : Option N
   | .dense =>
     let need := ceilDiv sh.cout ((1 : Nat) <<< f)
     let ocg1 := ceilLog2 need
-    if ocg1 <= 4 then
-      some ocg1
-    else if target == .h17 && sh.stride == 1 && f == 4 then
-      some 3
+    if target == .h17 && sh.stride == 1 then
+      if ocg1 <= 3 then
+        some ocg1
+      else if f == 4 then
+        some 3
+      else
+        none
     else
-      none
+      if ocg1 <= 4 then
+        some ocg1
+      else
+        none
 
 /-- Compute maximal legal `tileHeight` in O(1) for a candidate 3x3 tiling configuration. -/
 def maxTileHeight3x3 (target : Target) (sh : Conv3x3Shape) (probe : Tiling) : Nat := Id.run do
