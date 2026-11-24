@@ -152,6 +152,16 @@ private def assemblePwlLut
     (inputShiftBits : Option UInt16 := none) : Except String LutPayload :=
   assembleLut lo hi outLo outHi (Array.replicate 33 f0) ls li rs ri 0x0040 mode preScaleBits inputShiftBits
 
+/-- Validate that `v` is finite and fits within IEEE-754 binary16 finite range `[-65504, 65504]`,
+    returning its canonical-zero fp16 bit pattern. -/
+def floatToFiniteF16? (v : Float) (label : String) : Except String UInt16 := do
+  if v.isNaN || v.isInf then
+    throw s!"LUT {label}: parameter must be finite"
+  let h := floatToF16CanonicalZero v
+  if !f16IsFinite h then
+    throw s!"LUT {label}: value {v} overflows fp16 finite range [-65504, 65504]"
+  pure h
+
 /-- Mathematically generate the 128-byte hardware LUT table for any `LutSpec`. -/
 def buildLutTable (spec : LutSpec) : Except String LutPayload := do
   let f16 := floatToF16CanonicalZero
@@ -160,18 +170,17 @@ def buildLutTable (spec : LutSpec) : Except String LutPayload := do
     assemblePwlLut f16PosZero (f16 6.0) f16PosZero (f16 6.0) f16PosZero
       f16PosOne f16PosZero f16PosOne f16PosZero 0x0001
   | .clip lo hi =>
-    if lo.isNaN || hi.isNaN then
-      throw "clip: lo and hi must not be NaN"
+    let loH ← floatToFiniteF16? lo "clip.lo"
+    let hiH ← floatToFiniteF16? hi "clip.hi"
     if lo > hi then
       throw s!"clip: lo ({lo}) must be <= hi ({hi})"
-    let f0 := max lo (min hi 0.0)
-    assemblePwlLut (f16 lo) (f16 hi) (f16 lo) (f16 hi) (f16 f0)
+    let f0H ← floatToFiniteF16? (max lo (min hi 0.0)) "clip.f0"
+    assemblePwlLut loH hiH loH hiH f0H
       f16PosOne f16PosZero f16PosOne f16PosZero 0x0001
   | .leakyRelu alpha =>
-    if alpha.isNaN then
-      throw "leaky_relu: alpha must not be NaN"
+    let alphaH ← floatToFiniteF16? alpha "leaky_relu.alpha"
     assemblePwlLut f16NegInf f16PosInf f16NegInf f16PosInf f16PosZero
-      (f16 alpha) f16PosZero f16PosOne f16PosZero 0x0001
+      alphaH f16PosZero f16PosOne f16PosZero 0x0001
   | .abs =>
     assemblePwlLut f16NegInf f16PosInf f16PosInf f16PosInf f16PosZero
       f16NegOne f16PosZero f16PosOne f16PosZero 0x0021
@@ -179,65 +188,63 @@ def buildLutTable (spec : LutSpec) : Except String LutPayload := do
     assemblePwlLut f16NegMinSubnormal f16MinSubnormal f16NegOne f16PosOne f16PosZero
       f16PosZero f16PosZero f16PosZero f16PosZero 0x0001
   | .threshold a =>
-    if a.isNaN then
-      throw "threshold: threshold a must not be NaN"
-    let f0 := max 0.0 a
-    assemblePwlLut (f16 a) f16PosInf (f16 a) f16PosInf (f16 f0)
+    let aH ← floatToFiniteF16? a "threshold.a"
+    let f0H ← floatToFiniteF16? (max 0.0 a) "threshold.f0"
+    assemblePwlLut aH f16PosInf aH f16PosInf f0H
       f16PosOne f16PosZero f16PosOne f16PosZero 0x0001
   | .thresholdedRelu a =>
-    if a.isNaN then
-      throw "thresholded_relu: threshold a must not be NaN"
-    let loBits := prevF16 (f16 a)
-    assemblePwlLut loBits f16PosInf f16PosZero f16PosInf f16PosZero
+    let aH ← floatToFiniteF16? a "thresholded_relu.a"
+    assemblePwlLut aH f16PosInf f16PosZero f16PosInf f16PosZero
       f16PosOne f16PosZero f16PosOne f16PosZero 0x0001
   | .hardSigmoid alpha beta =>
     if alpha.isNaN || alpha.isInf || alpha <= 0.0 then
       throw s!"hard_sigmoid: alpha ({alpha}) must be finite and > 0"
-    if beta.isNaN || beta.isInf then
-      throw s!"hard_sigmoid: beta ({beta}) must be finite"
+    let _ ← floatToFiniteF16? beta "hard_sigmoid.beta"
     let scale := alpha / 0.2
-    let preScale := f16 scale
-    let shift? : Option UInt16 :=
-      if beta == 0.5 then none
+    let preScale ← floatToFiniteF16? scale "hard_sigmoid.preScale"
+    if preScale == f16PosZero then
+      throw s!"hard_sigmoid: alpha ({alpha}) underflows pre-LUT scale to 0"
+    let shift? : Option UInt16 ←
+      if beta == 0.5 then pure none
       else
-        let s := f16 ((5.0 * beta - 2.5) / scale)
-        if s == f16PosZero then none else some s
+        let s ← floatToFiniteF16? ((5.0 * beta - 2.5) / scale) "hard_sigmoid.inputShift"
+        pure (if s == f16PosZero then none else some s)
     assemblePwlLut (f16 (-2.5)) (f16 2.5) f16PosZero f16PosOne (f16 0.5)
       (f16 0.2) (f16 0.5) (f16 0.2) (f16 0.5) 0x0001 preScale shift?
   | .clampMax v =>
-    if v.isNaN then
-      throw "clamp_max: bound v must not be NaN"
-    let f0 := max 0.0 v
-    assemblePwlLut (f16 v) f16PosInf (f16 v) f16PosInf (f16 f0)
+    let vH ← floatToFiniteF16? v "clamp_max.v"
+    let f0H ← floatToFiniteF16? (max 0.0 v) "clamp_max.f0"
+    assemblePwlLut vH f16PosInf vH f16PosInf f0H
       f16PosOne f16PosZero f16PosOne f16PosZero 0x0001
   | .clampMin v =>
-    if v.isNaN then
-      throw "clamp_min: bound v must not be NaN"
-    let f0 := min 0.0 v
-    assemblePwlLut f16NegInf (f16 v) f16NegInf (f16 v) (f16 f0)
+    let vH ← floatToFiniteF16? v "clamp_min.v"
+    let f0H ← floatToFiniteF16? (min 0.0 v) "clamp_min.f0"
+    assemblePwlLut f16NegInf vH f16NegInf vH f0H
       f16PosOne f16PosZero f16PosOne f16PosZero 0x0001
   | .elu alpha =>
-    if alpha.isNaN || alpha.isInf then
-      throw s!"elu: alpha ({alpha}) must be finite"
+    let _ ← floatToFiniteF16? alpha "elu.alpha"
+    let negAlphaH ← floatToFiniteF16? (-alpha) "elu.-alpha"
     let samples := Array.ofFn (n := 33) fun i =>
       let u := (Float.ofNat i.val - 32.0) / 4.0
       f16 (alpha * expm1 u)
-    assembleLut (f16 (-8.0)) f16PosInf (f16 (-alpha)) f16PosInf samples
-      f16PosZero (f16 (-alpha)) f16PosOne f16PosZero 2 0x0002
+    assembleLut (f16 (-8.0)) f16PosInf negAlphaH f16PosInf samples
+      f16PosZero negAlphaH f16PosOne f16PosZero 2 0x0002
   | .tanh =>
     let samples := Array.ofFn (n := 33) fun i =>
       f16 (Float.tanh (Float.ofNat i.val / 8.0))
     assembleLut (f16 (-4.0)) (f16 4.0) f16NegOne f16PosOne samples
       f16PosZero f16NegOne f16PosZero f16PosOne 3 0x0060
   | .scaledTanh alpha beta =>
-    if alpha.isNaN || alpha.isInf || beta.isNaN || beta.isInf then
-      throw "scaled_tanh: alpha and beta must be finite"
+    let _ ← floatToFiniteF16? alpha "scaled_tanh.alpha"
+    let betaH ← floatToFiniteF16? beta "scaled_tanh.beta"
     let a := Float.abs alpha
+    let aH ← floatToFiniteF16? a "scaled_tanh.|alpha|"
+    let negAH ← floatToFiniteF16? (-a) "scaled_tanh.-|alpha|"
     let mode : UInt16 := if alpha >= 0.0 then 0x0060 else 0x00a0
     let samples := Array.ofFn (n := 33) fun i =>
       f16 (a * Float.tanh (Float.ofNat i.val / 8.0))
-    assembleLut (f16 (-4.0)) (f16 4.0) (f16 (-a)) (f16 a) samples
-      f16PosZero (f16 (-a)) f16PosZero (f16 a) 3 mode (f16 beta)
+    assembleLut (f16 (-4.0)) (f16 4.0) negAH aH samples
+      f16PosZero negAH f16PosZero aH 3 mode betaH
   | .erf =>
     let samples := Array.ofFn (n := 33) fun i =>
       f16 (erfApprox (Float.ofNat i.val / 8.0))
@@ -280,14 +287,12 @@ def buildLutTable (spec : LutSpec) : Except String LutPayload := do
   | .rsqrt eps =>
     if eps.isNaN || eps.isInf || eps < 0.0 then
       throw s!"rsqrt: eps ({eps}) must be finite and >= 0"
+    let epsH ← floatToFiniteF16? eps "rsqrt.eps"
     let samples := Array.ofFn (n := 33) fun i =>
       if i.val == 0 then f16PosZero
       else f16 (1.0 / Float.sqrt (Float.ofNat i.val / 16.0))
     let shift? : Option UInt16 :=
-      if eps == 0.0 then none
-      else
-        let s := f16 eps
-        if s == f16PosZero then none else some s
+      if eps == 0.0 || epsH == f16PosZero then none else some epsH
     assembleLut f16PosZero f16PosInf f16PosInf f16PosZero samples
       f16PosZero f16PosZero f16PosZero f16PosZero 4 0x0006 f16PosOne shift?
   | .inverse =>
@@ -443,6 +448,10 @@ def neActIsDirect (target : Target) (w : Nat) (t : NeActTiling) : Bool :=
     | .h16 => 128 >>> t.shMax
   lhs >= min 32 w
 
+/-- Direct-mode L2 output ring buffer reservation in bytes for standalone NE activation (`ocg = 0`). -/
+def neActDirectResBytes (f fat : Nat) : Nat :=
+  ((1 : Nat) <<< (f + fat)) * 512
+
 /-- L2 SRAM layout for a standalone NE activation task. -/
 structure NeActL2Layout where
   stripW : Nat
@@ -466,7 +475,7 @@ def computeNeActL2 (target : Target) (c _h w : Nat) (t : NeActTiling) : NeActL2L
   let resBase := alignUp size1 dmaLineBytes
   let drow := 2 * min (alignUp w 8) (max stripW 32)
   let du := c * drow
-  let resL2 := if direct then 0 else t.tileHeight * du
+  let resL2 := if direct then neActDirectResBytes t.f t.fat else t.tileHeight * du
   {
     stripW := stripW
     row := row
@@ -496,32 +505,39 @@ structure CompiledNeAct where
   sections : LoadSections
 
 /-- Validate standalone NE activation shape and tiling legality. -/
-def validateNeActTiling (target : Target) (c h w : Nat) (t : NeActTiling) : Except String Unit := do
+def validateNeActTiling (target : Target) (c h w : Nat) (t : NeActTiling) : Except String Unit :=
   if c == 0 || c > maxU32Nat then
-    throw s!"invalid NE activation C={c}: must be in 1..{maxU32Nat}"
-  if h == 0 || h > 65535 then
-    throw s!"invalid NE activation H={h}: must be in 1..65535"
-  if w == 0 || w > 65535 then
-    throw s!"invalid NE activation W={w}: must be in 1..65535"
-  if t.logNE > 4 then
-    throw s!"illegal NE activation tiling: logNE={t.logNE} exceeds 4"
-  if t.fat > 1 then
-    throw s!"illegal NE activation tiling: fat={t.fat} must be 0 or 1"
-  if t.f + t.fat > t.logNE then
-    throw s!"illegal NE activation tiling: F({t.f}) + fat({t.fat}) > logNE({t.logNE})"
-  if t.wu > 3 then
-    throw s!"illegal NE activation tiling: WU={t.wu} exceeds 3"
-  if t.shPref > t.shMax || t.shMax > 4 then
-    throw s!"illegal NE activation tiling: invalid shifts shPref={t.shPref}, shMax={t.shMax}"
-  let stripW := t.stripWidth
-  if stripW < 8 || stripW > 256 then
-    throw s!"illegal NE activation tiling: strip width T={stripW} outside [8, 256]"
-  if t.tileHeight == 0 || t.tileHeight > h then
-    throw s!"illegal NE activation tiling: tileHeight={t.tileHeight} out of range 1..{h}"
-  let l2 := computeNeActL2 target c h w t
-  if l2.l2UseBytes > l2CapacityBytes then
-    throw s!"illegal NE activation tiling: L2 footprint {l2.l2UseBytes}B exceeds {l2CapacityBytes}B (2 MiB)"
-  pure ()
+    .error s!"invalid NE activation C={c}: must be in 1..{maxU32Nat}"
+  else if h == 0 || h > 65535 then
+    .error s!"invalid NE activation H={h}: must be in 1..65535"
+  else if w == 0 || w > 65535 then
+    .error s!"invalid NE activation W={w}: must be in 1..65535"
+  else if t.logNE > 4 then
+    .error s!"illegal NE activation tiling: logNE={t.logNE} exceeds 4"
+  else if t.fat > 1 then
+    .error s!"illegal NE activation tiling: fat={t.fat} must be 0 or 1"
+  else if t.f + t.fat > t.logNE then
+    .error s!"illegal NE activation tiling: F({t.f}) + fat({t.fat}) > logNE({t.logNE})"
+  else if t.wu > 3 then
+    .error s!"illegal NE activation tiling: WU={t.wu} exceeds 3"
+  else if t.shPref > t.shMax then
+    .error s!"illegal NE activation tiling: invalid shifts shPref={t.shPref}, shMax={t.shMax}"
+  else if t.shMax > 4 then
+    .error s!"illegal NE activation tiling: invalid shifts shPref={t.shPref}, shMax={t.shMax}"
+  else
+    let stripW := t.stripWidth
+    if stripW < 8 || stripW > 256 then
+      .error s!"illegal NE activation tiling: strip width T={stripW} outside [8, 256]"
+    else if t.tileHeight == 0 then
+      .error s!"illegal NE activation tiling: tileHeight={t.tileHeight} out of range 1..{h}"
+    else if t.tileHeight > h then
+      .error s!"illegal NE activation tiling: tileHeight={t.tileHeight} out of range 1..{h}"
+    else
+      let l2 := computeNeActL2 target c h w t
+      if l2.l2UseBytes > l2CapacityBytes then
+        .error s!"illegal NE activation tiling: L2 footprint {l2.l2UseBytes}B exceeds {l2CapacityBytes}B (2 MiB)"
+      else
+        .ok ()
 
 /-- Deterministic O(1) tile chooser for standalone NE activations. -/
 def chooseNeActTiling (target : Target) (c h w : Nat) : Except String NeActTiling := do
@@ -542,17 +558,22 @@ def chooseNeActTiling (target : Target) (c h w : Nat) : Except String NeActTilin
     let direct := neActIsDirect target w probe
     let drow := 2 * min (alignUp w 8) (max stripW 32)
     let du := c * drow
-    let perRow := if direct then u else u + du
-    if perRow > 0 then
-      let thUpper := min h (l2CapacityBytes / perRow)
-      for dec in [:4] do
-        if thUpper > dec then
-          let th := thUpper - dec
-          if th >= 1 then
-            let cand : NeActTiling := { probe with tileHeight := th }
-            match validateNeActTiling target c h w cand with
-            | .ok () => return cand
-            | .error _ => pure ()
+    let directRes := neActDirectResBytes probe.f probe.fat
+    let thUpper : Nat :=
+      if direct then
+        if directRes >= l2CapacityBytes || u == 0 then 0
+        else min h ((l2CapacityBytes - directRes) / u)
+      else
+        let perRow := u + du
+        if perRow == 0 then 0 else min h (l2CapacityBytes / perRow)
+    for dec in [:4] do
+      if thUpper > dec then
+        let th := thUpper - dec
+        if th >= 1 then
+          let cand : NeActTiling := { probe with tileHeight := th }
+          match validateNeActTiling target c h w cand with
+          | .ok () => return cand
+          | .error _ => pure ()
   throw s!"no legal {target.name} NE activation tiling found for (C={c}, H={h}, W={w})"
 
 /-- Lower a standalone NE activation task into a `TaskDesc`. -/

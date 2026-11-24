@@ -2,6 +2,8 @@ import Vane.Binary
 import Vane.TaskStream
 import Vane.Register
 import Vane.Tiling
+import Vane.Pe
+import Vane.Lut
 
 namespace Vane.Proofs
 
@@ -9,6 +11,8 @@ open Vane.Binary
 open Vane.TaskStream
 open Vane.Register
 open Vane.Tiling
+open Vane.Pe
+open Vane.Lut
 
 -- ============================================================================
 -- 1. Alignment soundness (alignUp_ge, alignUp_dvd)
@@ -1092,5 +1096,88 @@ theorem peTile_pack_lt_256 (k m : Nat) (hk : k ≤ 9) (hm : m ≤ 5) :
   have h2 : k < 2 ^ 8 := by omega
   have hor := Nat.or_lt_two_pow h1 h2
   omega
+
+/-- Production `peTileM` is always `<= 5` whenever `k >= 4`. -/
+theorem peTileM_le_5 (twoSource : Bool) (k th : Nat) (hk : 4 ≤ k) :
+    peTileM twoSource k th ≤ 5 := by
+  unfold peTileM peMaxK
+  cases twoSource <;> dsimp <;> omega
+
+/-- Production `peDirectResBytes` always reserves at least 2048 bytes of L2 headroom. -/
+theorem peDirectResBytes_ge_2048 (outC drow th : Nat) :
+    2048 ≤ peDirectResBytes outC drow th := by
+  unfold peDirectResBytes
+  have hge := alignUp_ge (max 2048 (min (outC * drow * th) (4 * drow * th))) Vane.Program.dmaLineBytes
+  omega
+
+/-- Production `peDirectResBytes` is always 64-byte DMA-line aligned. -/
+theorem peDirectResBytes_dvd64 (outC drow th : Nat) :
+    peDirectResBytes outC drow th % 64 = 0 := by
+  unfold peDirectResBytes
+  exact alignUp_dvd _ 64 (by omega)
+
+/-- Production `neActDirectResBytes` is always strictly positive (`>= 512` bytes). -/
+theorem neActDirectResBytes_pos (f fat : Nat) :
+    0 < neActDirectResBytes f fat := by
+  unfold neActDirectResBytes
+  rw [Nat.shiftLeft_eq, Nat.one_mul]
+  have hpow : 0 < 2 ^ (f + fat) := Nat.two_pow_pos (f + fat)
+  omega
+
+/-- Any PE tiling accepted by production `validatePeTiling` satisfies the core hardware safety bounds. -/
+theorem validatePeTiling_bounds
+    (target : Target) (outDims hwSrc1 : TensorDims) (hwSrc2? : Option TensorDims) (t : PeTiling)
+    (hv : validatePeTiling target outDims hwSrc1 hwSrc2? t = .ok ()) :
+    4 ≤ t.k ∧
+    t.k ≤ peMaxK hwSrc2?.isSome ∧
+    1 ≤ t.tileHeight ∧
+    t.tileHeight ≤ outDims.h ∧
+    (computePeL2Layout target outDims hwSrc1 hwSrc2? t).l2UseBytes ≤ l2CapacityBytes := by
+  unfold validatePeTiling at hv
+  obtain ⟨⟨⟩, _, hv⟩ := except_bind_ok hv
+  obtain ⟨⟨⟩, _, hv⟩ := except_bind_ok hv
+  obtain ⟨⟨⟩, _, hv⟩ := except_bind_ok hv
+  dsimp only at hv
+  obtain ⟨hkLo, hv⟩ := except_if_err_ok hv
+  obtain ⟨hkHi, hv⟩ := except_if_err_ok hv
+  obtain ⟨hth0, hv⟩ := except_if_err_ok hv
+  obtain ⟨hthHi, hv⟩ := except_if_err_ok hv
+  obtain ⟨_, hv⟩ := except_if_err_ok hv
+  obtain ⟨_, hv⟩ := except_if_err_ok hv
+  obtain ⟨hL2, _⟩ := except_if_err_ok hv
+  have hthNe : t.tileHeight ≠ 0 := by simpa using hth0
+  exact ⟨by omega, by omega, by omega, by omega, by omega⟩
+
+/-- Any standalone NE activation tiling accepted by production `validateNeActTiling`
+    satisfies all core hardware safety bounds including L2 direct-ring capacity. -/
+theorem validateNeActTiling_bounds
+    (target : Target) (c h w : Nat) (t : NeActTiling)
+    (hv : validateNeActTiling target c h w t = .ok ()) :
+    t.logNE ≤ 4 ∧
+    t.fat ≤ 1 ∧
+    t.f + t.fat ≤ t.logNE ∧
+    t.wu ≤ 3 ∧
+    t.shPref ≤ t.shMax ∧
+    t.shMax ≤ 4 ∧
+    1 ≤ t.tileHeight ∧
+    t.tileHeight ≤ h ∧
+    (computeNeActL2 target c h w t).l2UseBytes ≤ l2CapacityBytes := by
+  unfold validateNeActTiling at hv
+  obtain ⟨_, hv⟩ := except_if_err_ok hv
+  obtain ⟨_, hv⟩ := except_if_err_ok hv
+  obtain ⟨_, hv⟩ := except_if_err_ok hv
+  obtain ⟨hLogNE, hv⟩ := except_if_err_ok hv
+  obtain ⟨hFat, hv⟩ := except_if_err_ok hv
+  obtain ⟨hFfat, hv⟩ := except_if_err_ok hv
+  obtain ⟨hWu, hv⟩ := except_if_err_ok hv
+  obtain ⟨hShPref, hv⟩ := except_if_err_ok hv
+  obtain ⟨hShMax, hv⟩ := except_if_err_ok hv
+  dsimp only at hv
+  obtain ⟨_, hv⟩ := except_if_err_ok hv
+  obtain ⟨hth0, hv⟩ := except_if_err_ok hv
+  obtain ⟨hthHi, hv⟩ := except_if_err_ok hv
+  obtain ⟨hL2, _⟩ := except_if_err_ok hv
+  have hthNe : t.tileHeight ≠ 0 := by simpa using hth0
+  exact ⟨by omega, by omega, by omega, by omega, by omega, by omega, by omega, by omega, by omega⟩
 
 end Vane.Proofs

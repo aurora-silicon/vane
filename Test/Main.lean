@@ -2458,8 +2458,12 @@ private def runAllTests : IO (Array TestResult) := do
         let s ← verifyHwxTasksSummary c.hwx c.info (requireKnownTask := true)
         if s.neAct != 1 || s.total != 1 then
           throw s!"expected 1 verified NE act task for {tgt.name}/{act.name}"
-    -- Large C test forcing shPref > 0 (C = 16384 -> T = 64 -> u = 2 MiB)
+    -- Large C test forcing shPref >= 2 to leave 512B direct-mode output ring headroom
     let cBig ← compileNeAct .h17 (.lut .tanh) 16384 4 128
+    if cBig.tiling.shPref < 2 then
+      throw s!"expected C=16384 W=128 to shrink shPref >= 2 for direct-ring headroom, got {cBig.tiling.shPref}"
+    if cBig.l2UseBytes > l2CapacityBytes then
+      throw s!"expected l2UseBytes <= 2 MiB, got {cBig.l2UseBytes}"
     let sBig ← verifyHwxTasksSummary cBig.hwx cBig.info (requireKnownTask := true)
     if sBig.neAct != 1 then throw "large C standalone NE act failed"
     pure ()
@@ -2686,6 +2690,272 @@ private def runAllTests : IO (Array TestResult) := do
     let _ ← verifyHwxTasks h3 badInfo (requireKnownTask := true)
     pure ()
   ) "exceeds chunk end")
+
+  -- =========================================================================
+  -- Milestone 3 Review Hardening Tests (B1+Q1, B2, Q4, Q3, M1, M2, M3, N1-N5)
+  -- =========================================================================
+
+  -- B1+Q1: PE & standalone NE-act direct-mode L2 output ring reservation & disjointness
+  results := results.push (checkErr "m3 rev [B1/Q1] neg (PE): direct resBase = 0 overlapping src1 rejected" (do
+    tamperGenericAndVerify basePe1.hwx basePe1.info regResBase 0
+  ) "overlapping")
+
+  results := results.push (checkErr "m3 rev [B1/Q1] neg (PE): direct resBase overlapping src2 rejected" (do
+    let fOffS2 ← findRegFileOffset basePe2.hwx basePe2.info regSrc2Base
+    let s2Base ← readU32LE basePe2.hwx fOffS2
+    tamperGenericAndVerify basePe2.hwx basePe2.info regResBase s2Base
+  ) "overlapping")
+
+  results := results.push (checkErr "m3 rev [B1/Q1] neg (PE): direct resBase = 0x200000 (insufficient headroom) rejected" (do
+    tamperGenericAndVerify basePe1.hwx basePe1.info regResBase 0x200000
+  ) "exceeds limit")
+
+  results := results.push (checkErr "m3 rev [B1/Q1] neg (PE): direct resBase = 0x1ffe00 (512B < 2048B headroom) rejected" (do
+    tamperGenericAndVerify basePe1.hwx basePe1.info regResBase 0x1ffe00
+  ) "exceeds limit")
+
+  results := results.push (checkErr "m3 rev [B1/Q1] neg (NE act): direct resBase = 0 overlapping src1 rejected" (do
+    tamperGenericAndVerify baseNeLut.hwx baseNeLut.info regResBase 0
+  ) "overlapping")
+
+  results := results.push (checkErr "m3 rev [B1/Q1] neg (NE act): direct resBase = 0x200000 (0B headroom) rejected" (do
+    tamperGenericAndVerify baseNeLut.hwx baseNeLut.info regResBase 0x200000
+  ) "exceeds limit")
+
+  results := results.push (checkErr "m3 rev [B1/Q1] neg (NE act): direct resBase = 0x1fff00 (256B < 512B headroom) rejected" (do
+    tamperGenericAndVerify baseNeLut.hwx baseNeLut.info regResBase 0x1fff00
+  ) "exceeds limit")
+
+  -- B2: Strict per-task-kind register allowlist (reject smuggled cross-engine & unknown regs)
+  results := results.push (checkErr "m3 rev [B2] neg (PE): smuggled regNeOp (0x4904) rejected" (do
+    let d : TensorDims := { c := 4, h := 8, w := 16 }
+    let t ← choosePeTiling .h17 d d none
+    let td ← lowerPeTask .h17 .abs d d none 6 none t
+    let tdBad : TaskDesc := { td with plainWrites := td.plainWrites.push { byteAddr := regNeOp, value := 0x00103c0c } }
+    let sX ← makeFp16Surface .h17 "x" "input_x" .input 4 8 16
+    let sY ← makeFp16Surface .h17 "y" "output_y" .output 4 8 16
+    let em ← emitProgram { target := .h17, surfaces := #[sX, sY], tasks := #[tdBad] }
+    let _ ← verifyHwxTasks em.hwx em.info (requireKnownTask := true)
+    pure ()
+  ) "disallowed register")
+
+  results := results.push (checkErr "m3 rev [B2] neg (PE): smuggled regLutBaseLo (0x5618) rejected" (do
+    let d : TensorDims := { c := 4, h := 8, w := 16 }
+    let t ← choosePeTiling .h17 d d none
+    let td ← lowerPeTask .h17 .abs d d none 6 none t
+    let tdBad : TaskDesc := { td with plainWrites := td.plainWrites.push { byteAddr := regLutBaseLo, value := 0 } }
+    let sX ← makeFp16Surface .h17 "x" "input_x" .input 4 8 16
+    let sY ← makeFp16Surface .h17 "y" "output_y" .output 4 8 16
+    let em ← emitProgram { target := .h17, surfaces := #[sX, sY], tasks := #[tdBad] }
+    let _ ← verifyHwxTasks em.hwx em.info (requireKnownTask := true)
+    pure ()
+  ) "disallowed register")
+
+  results := results.push (checkErr "m3 rev [B2] neg (NE act): smuggled regPeOp (0x4500) rejected" (do
+    let lp ← buildLutTable .tanh
+    let t ← chooseNeActTiling .h17 4 8 16
+    let td ← lowerNeActTask .h17 (.lut .tanh) (some lp) 4 8 16 t
+    let tdBad : TaskDesc := { td with plainWrites := td.plainWrites.push { byteAddr := regPeOp, value := peOpAbsValue } }
+    let sX ← makeFp16Surface .h17 "x" "input_x" .input 4 8 16
+    let sY ← makeFp16Surface .h17 "y" "output_y" .output 4 8 16
+    let em ← emitProgram { target := .h17, surfaces := #[sX, sY], tasks := #[tdBad], kernel := some lp.bytes }
+    let _ ← verifyHwxTasks em.hwx em.info (requireKnownTask := true)
+    pure ()
+  ) "disallowed register")
+
+  results := results.push (checkErr "m3 rev [B2] neg (NE act): smuggled regSrc2BaseLo (0x4d28) rejected" (do
+    let lp ← buildLutTable .tanh
+    let t ← chooseNeActTiling .h17 4 8 16
+    let td ← lowerNeActTask .h17 (.lut .tanh) (some lp) 4 8 16 t
+    let tdBad : TaskDesc := { td with plainWrites := td.plainWrites.push { byteAddr := regSrc2BaseLo, value := 0 } }
+    let sX ← makeFp16Surface .h17 "x" "input_x" .input 4 8 16
+    let sY ← makeFp16Surface .h17 "y" "output_y" .output 4 8 16
+    let em ← emitProgram { target := .h17, surfaces := #[sX, sY], tasks := #[tdBad], kernel := some lp.bytes }
+    let _ ← verifyHwxTasks em.hwx em.info (requireKnownTask := true)
+    pure ()
+  ) "disallowed register")
+
+  results := results.push (checkErr "m3 rev [B2] neg (conv): smuggled unknown block offset 0x4920 rejected" (do
+    let plain := baseTd1.plainWrites.push { byteAddr := 0x4920, value := 0 }
+    emitTaskAndVerify .h17 baseIn1 baseOut1 basePk1.bytes { baseTd1 with plainWrites := plain }
+  ) "disallowed register")
+
+  results := results.push (checkErr "m3 rev [B2] neg (conv): smuggled regPeOp (0x4500) rejected" (do
+    let plain := baseTd1.plainWrites.push { byteAddr := regPeOp, value := peOpAbsValue }
+    emitTaskAndVerify .h17 baseIn1 baseOut1 basePk1.bytes { baseTd1 with plainWrites := plain }
+  ) "disallowed register")
+
+  -- Q4: Symmetric whole1 full-row staging on hwSrc1 in 2-source PE (rsub with out=[128,64,512], z=[1,1,512])
+  results := results.push (checkOk "m3 rev [Q4]: PE rsub [128,64,512] - [1,1,512] activates whole1 (src1ChanStride = src1Row = 1024)" (do
+    let xDims : TensorDims := { c := 128, h := 64, w := 512 }
+    let zDims : TensorDims := { c := 1, h := 1, w := 512 }
+    let compiled ← compilePe .h17 (.binary .sub xDims zDims true) xDims
+    -- For rsub, hwSrc1 = z ([1,1,512]), hwSrc2 = x ([128,64,512]), T <= 256 < 512, th < 64 -> whole1 MUST be true!
+    let l2 := computePeL2Layout .h17 xDims zDims (some xDims) compiled.tiling
+    if !l2.whole1 then throw s!"expected whole1=true, got tiling={repr compiled.tiling}"
+    if l2.row1 != 1024 || l2.u1 != 1024 then
+      throw s!"expected whole1 src1ChanStride=src1Row=1024, got row1={l2.row1}, u1={l2.u1}"
+    let fOffChs ← findRegFileOffset compiled.hwx compiled.info regSrc1ChanStride
+    let chsVal ← readU32LE compiled.hwx fOffChs
+    if chsVal != 1024 then throw s!"encoded regSrc1ChanStride={chsVal} != 1024"
+    let s ← verifyHwxTasksSummary compiled.hwx compiled.info (requireKnownTask := true)
+    if s.peOp != 1 then throw "expected 1 verified PE task"
+    pure ()
+  ))
+
+  results := results.push (checkErr "m3 rev [Q4] neg (PE): tampering whole1 src1ChanStride/RowStride down to 512 rejected" (do
+    let xDims : TensorDims := { c := 128, h := 64, w := 512 }
+    let zDims : TensorDims := { c := 1, h := 1, w := 512 }
+    let compiled ← compilePe .h17 (.binary .sub xDims zDims true) xDims
+    let fChs ← findRegFileOffset compiled.hwx compiled.info regSrc1ChanStride
+    let fRow ← findRegFileOffset compiled.hwx compiled.info regSrc1RowStride
+    let fRowA ← findRegFileOffset compiled.hwx compiled.info regSrc1RowBytesA
+    let fRowB ← findRegFileOffset compiled.hwx compiled.info regSrc1RowBytesB
+    let h1 ← putU32LE compiled.hwx fChs 512
+    let h2 ← putU32LE h1 fRow 512
+    let h3 ← putU32LE h2 fRowA 512
+    let h4 ← putU32LE h3 fRowB 512
+    let badInfo ← validateHwx h4
+    let _ ← verifyHwxTasks h4 badInfo (requireKnownTask := true)
+    pure ()
+  ) "whole1=true")
+
+  -- Q3: thresholded_relu(a) exact boundary lo = a (prevF16(a) -> 0, a -> 0, nextF16(a) -> nextF16(a))
+  results := results.push (checkOk "m3 rev [Q3]: thresholded_relu(a) exact boundary lo = a" (do
+    for aVal in #[0.0, 1.0, -0.5, 2.25] do
+      let aBits := floatToF16CanonicalZero aVal
+      let lp ← buildLutTable (.thresholdedRelu aVal)
+      if lp.words[0]! != aBits then
+        throw s!"thresholded_relu({aVal}): lo word {toHex lp.words[0]!.toNat} != aBits {toHex aBits.toNat}"
+      let yPrev := evalLutTable lp.words lp.preScaleBits lp.inputShiftBits (prevF16 aBits)
+      let yAt := evalLutTable lp.words lp.preScaleBits lp.inputShiftBits aBits
+      let nextBits := nextF16 aBits
+      let yNext := evalLutTable lp.words lp.preScaleBits lp.inputShiftBits nextBits
+      if yPrev != f16PosZero then
+        throw s!"thresholded_relu({aVal}) at prevF16: got {toHex yPrev.toNat}, want +0"
+      if yAt != f16PosZero then
+        throw s!"thresholded_relu({aVal}) at a: got {toHex yAt.toNat}, want +0"
+      if yNext != nextBits then
+        throw s!"thresholded_relu({aVal}) at nextF16: got {toHex yNext.toNat}, want {toHex nextBits.toNat}"
+    pure ()
+  ))
+
+  -- M1: LUT control words 41 (k) and 42 (mode) validation
+  results := results.push (checkErr "m3 rev [M1] neg (LUT): k = 0xffff rejected" (do
+    let some kSec := baseNeLut.info.kernelSection | throw "missing __KERN_0"
+    let badHwx ← putU16LE baseNeLut.hwx (kSec.offset.toNat + 2 * 41) 0xffff
+    let badInfo ← validateHwx badHwx
+    let _ ← verifyHwxTasks badHwx badInfo (requireKnownTask := true)
+    pure ()
+  ) "scale word 41")
+
+  results := results.push (checkErr "m3 rev [M1] neg (LUT): k = 0x40 with base != 0x01 rejected" (do
+    -- baseNeLut is tanh (mode = 0x0060, base = 0x00 != 0x01)
+    let some kSec := baseNeLut.info.kernelSection | throw "missing __KERN_0"
+    let badHwx ← putU16LE baseNeLut.hwx (kSec.offset.toNat + 2 * 41) 0x0040
+    let badInfo ← validateHwx badHwx
+    let _ ← verifyHwxTasks badHwx badInfo (requireKnownTask := true)
+    pure ()
+  ) "scale word 41")
+
+  results := results.push (checkErr "m3 rev [M1] neg (LUT): mode = 0xffff rejected" (do
+    let some kSec := baseNeLut.info.kernelSection | throw "missing __KERN_0"
+    let badHwx ← putU16LE baseNeLut.hwx (kSec.offset.toNat + 2 * 42) 0xffff
+    let badInfo ← validateHwx badHwx
+    let _ ← verifyHwxTasks badHwx badInfo (requireKnownTask := true)
+    pure ()
+  ) "high byte")
+
+  results := results.push (checkErr "m3 rev [M1] neg (LUT): unsupported base mode 0x1f rejected" (do
+    let some kSec := baseNeLut.info.kernelSection | throw "missing __KERN_0"
+    let badHwx ← putU16LE baseNeLut.hwx (kSec.offset.toNat + 2 * 42) 0x001f
+    let badInfo ← validateHwx badHwx
+    let _ ← verifyHwxTasks badHwx badInfo (requireKnownTask := true)
+    pure ()
+  ) "unsupported base mode")
+
+  results := results.push (checkErr "m3 rev [M1] neg (LUT): unsupported symmetry flag 0x40 rejected" (do
+    let some kSec := baseNeLut.info.kernelSection | throw "missing __KERN_0"
+    let badHwx ← putU16LE baseNeLut.hwx (kSec.offset.toNat + 2 * 42) 0x0040
+    let badInfo ← validateHwx badHwx
+    let _ ← verifyHwxTasks badHwx badInfo (requireKnownTask := true)
+    pure ()
+  ) "unsupported symmetry flag")
+
+  -- M2: Fused conv + bias + shifted LUT overflow guard
+  results := results.push (checkErr "m3 rev [M2] neg (fused conv): bias + LUT shift fp16 overflow rejected" (do
+    let sh : Conv1x1Shape := { h := 4, w := 8, cin := 4, cout := 4 }
+    let mut bigBias := ByteArray.empty
+    for _ in [:4] do
+      bigBias := pushU16LE bigBias 0x7bff -- 65504 (max finite fp16)
+    -- rsqrt(eps = 32.0) shifts bias by +32 -> 65536 -> overflows fp16!
+    compileConv1x1 .h17 sh (mkTaggedWeights 4 4) (some bigBias) false none (.lut (.rsqrt 32.0))
+  ) "overflowed fp16")
+
+  -- M3: Finiteness & fp16-range validation for LUT parameters
+  results := results.push (checkErr "m3 rev [M3] neg: clip rejects Inf" (do
+    buildLutTable (.clip (-1.0) (Float.ofBits 0x7ff0000000000000))
+  ) "finite")
+
+  results := results.push (checkErr "m3 rev [M3] neg: hard_sigmoid rejects alpha = 20000 (preScale overflows fp16)" (do
+    buildLutTable (.hardSigmoid 20000.0 0.5)
+  ) "overflows fp16")
+
+  results := results.push (checkErr "m3 rev [M3] neg: hard_sigmoid rejects alpha = 1e-9 (preScale underflows to 0)" (do
+    buildLutTable (.hardSigmoid 1e-9 0.5)
+  ) "underflows")
+
+  results := results.push (checkErr "m3 rev [M3] neg: hard_sigmoid rejects beta = 1e5" (do
+    buildLutTable (.hardSigmoid 0.2 1e5)
+  ) "overflows fp16")
+
+  results := results.push (checkErr "m3 rev [M3] neg: elu(70000) rejected" (do
+    buildLutTable (.elu 70000.0)
+  ) "overflows fp16")
+
+  results := results.push (checkErr "m3 rev [M3] neg: leaky_relu(NaN) rejected" (do
+    buildLutTable (.leakyRelu (0.0 / 0.0))
+  ) "finite")
+
+  results := results.push (checkErr "m3 rev [M3] neg: scaled_tanh(70000, 1) rejected" (do
+    buildLutTable (.scaledTanh 70000.0 1.0)
+  ) "overflows fp16")
+
+  -- N1, N2, N3, N4 checks
+  results := results.push (checkOk "m3 rev [N1/N4]: parseFloat? 0e400/huge-exp & PeOp.scalarSub(+-0) canonicalization" (do
+    match parseFloat? "0e400" with
+    | some v => if v.isNaN || v != 0.0 then throw s!"parseFloat? 0e400 = {v}, want 0.0"
+    | none => throw "parseFloat? 0e400 returned none"
+    match parseFloat? "1e9999999999" with
+    | some v => if !v.isInf then throw s!"parseFloat? 1e9999999999 = {v}, want +Inf"
+    | none => throw "parseFloat? 1e9999999999 returned none"
+    if PeOp.scalarSub f16PosZero != .chain none (some f16PosZero) none then
+      throw "PeOp.scalarSub(+0) did not canonicalize to +0"
+    if PeOp.scalarSub f16NegZero != .chain none (some f16PosZero) none then
+      throw "PeOp.scalarSub(-0) did not canonicalize to +0"
+    pure ()
+  ))
+
+  results := results.push (checkErr "m3 rev [N2] neg (PE): over-wide src1ChanStride rejected (exact match)" (do
+    -- basePe1 has W=16, T>=16 -> expRow1 = 32; tamper to 64 (and matching rowStride/rowBytes)
+    let fChs ← findRegFileOffset basePe1.hwx basePe1.info regSrc1ChanStride
+    let fRow ← findRegFileOffset basePe1.hwx basePe1.info regSrc1RowStride
+    let fRowA ← findRegFileOffset basePe1.hwx basePe1.info regSrc1RowBytesA
+    let fRowB ← findRegFileOffset basePe1.hwx basePe1.info regSrc1RowBytesB
+    let fRes ← findRegFileOffset basePe1.hwx basePe1.info regResBase
+    let h1 ← putU32LE basePe1.hwx fChs 64
+    let h2 ← putU32LE h1 fRow (8 * 64)
+    let h3 ← putU32LE h2 fRowA (8 * 64)
+    let h4 ← putU32LE h3 fRowB (8 * 64)
+    let h5 ← putU32LE h4 fRes (8 * 8 * 64)
+    let badInfo ← validateHwx h5
+    let _ ← verifyHwxTasks h5 badInfo (requireKnownTask := true)
+    pure ()
+  ) "src1ChanStride (64) != expected 32")
+
+  results := results.push (checkErr "m3 rev [N3] neg (PE): scalarDiv rejects tiny subnormal whose reciprocal overflows fp16" (do
+    PeOp.scalarDiv f16MinSubnormal
+  ) "overflows fp16")
 
   pure results
 

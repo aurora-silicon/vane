@@ -33,11 +33,46 @@ private def vPeIsDirect (target : Target) (outW k : Nat) : Bool :=
     let lastStrip := if r == 0 then 0 else r - 32 * ((r - 1) / 32)
     !(k == 5 && r > 32 && lastStrip == 24)
 
-/-- Independently verify a 128-byte NE LUT table in `__KERN_0`: fits in bounds and
-    reserved words `43..63` (byte offsets `0x56..0x7f`) are all zero. -/
+private def vPeDirectResBytes (outC drow th : Nat) : Nat :=
+  alignUp (max 2048 (min (outC * drow * th) (4 * drow * th))) vDmaLineBytes
+
+private def vNeActDirectResBytes (f fat : Nat) : Nat :=
+  ((1 : Nat) <<< (f + fat)) * 512
+
+/-- Enforce that every decoded register write falls inside the mode-conditional allowlist
+    for the verified task kind. -/
+private def vCheckAllowedRegs (writes : Array DecodedWrite) (allowed : Array Nat) (prefixMsg : String) :
+    Except String Unit := do
+  for w in writes do
+    if !allowed.contains w.byteAddr then
+      throw s!"{prefixMsg}: disallowed register write at {toHex w.byteAddr}"
+  pure ()
+
+/-- Independently verify a 128-byte NE LUT table in `__KERN_0`: fits in bounds,
+    control words 41 (`k`) and 42 (`mode`) match hardware-documented modes/symmetry flags,
+    and reserved words `43..63` (byte offsets `0x56..0x7f`) are all zero. -/
 private def vVerifyLutBytes (kBytes : ByteArray) (lutStart : Nat) (label : String) : Except String Unit := do
   if lutStart + vLutBytes > kBytes.size then
     throw s!"{label}: 128-byte LUT range [{lutStart}, {lutStart + vLutBytes}) exceeds __KERN_0 size {kBytes.size}"
+  let kWord ← readU16LE kBytes (lutStart + 2 * 41)
+  let modeWord ← readU16LE kBytes (lutStart + 2 * 42)
+  if (modeWord >>> 8) != 0 then
+    throw s!"{label}: LUT mode word 42 ({toHex modeWord.toNat}) has non-zero high byte"
+  let base := modeWord &&& 0x1f
+  let validBase :=
+    base == 0x00 || base == 0x01 || base == 0x02 || base == 0x05 ||
+    base == 0x06 || base == 0x07 || base == 0x09 || base == 0x0a || base == 0x11
+  if !validBase then
+    throw s!"{label}: LUT mode word 42 ({toHex modeWord.toNat}) has unsupported base mode {toHex base.toNat}"
+  let sym := modeWord &&& 0xe0
+  let validSym :=
+    sym == 0x00 || sym == 0x20 || sym == 0x60 ||
+    sym == 0x80 || sym == 0xa0 || sym == 0xc0
+  if !validSym then
+    throw s!"{label}: LUT mode word 42 ({toHex modeWord.toNat}) has unsupported symmetry flag {toHex sym.toNat}"
+  let validK := kWord <= 15 || (base == 0x01 && kWord == 0x40)
+  if !validK then
+    throw s!"{label}: LUT scale word 41 (k={toHex kWord.toNat}) invalid for base mode {toHex base.toNat}"
   for wi in [43 : 64] do
     let w ← readU16LE kBytes (lutStart + 2 * wi)
     if w != 0 then
@@ -240,9 +275,7 @@ def classifyTask (task : DecodedTask) : TaskKind :=
   if (findDecodedWrite task.writes regConvCfg).isSome then
     .neConv
   else if (findDecodedWrite task.writes regDwGroups).isSome ||
-          ((findDecodedWrite task.writes regNeOp).isSome &&
-           ((findDecodedWrite task.writes regNeCommon).isSome ||
-            (findDecodedWrite task.writes regNeTile).isSome)) then
+          (findDecodedWrite task.writes regNeTile).isSome then
     .neAct
   else if (findDecodedWrite task.writes regPeTile).isSome then
     .peOp
@@ -250,6 +283,8 @@ def classifyTask (task : DecodedTask) : TaskKind :=
     | some w =>
       if w.value == peCommonOneSrcValue || w.value == peCommonTwoSrcValue then
         .peOp
+      else if (findDecodedWrite task.writes regNeOp).isSome then
+        .neAct
       else
         .unknown
     | none => .unknown
@@ -857,6 +892,37 @@ def verifyConvTask (info : HwxInfo) (task : DecodedTask) (kernelBytes? : Option 
   if wOut5.value != out5Value then
     throw s!"{prefixMsg}: out5 {toHex wOut5.value.toNat} != expected {toHex out5Value.toNat}"
 
+  -- 11. Strict mode-conditional register allowlist (reject smuggled cross-engine / unknown regs)
+  if let some wN := findDecodedWrite task.writes regBatchN then
+    if wN.value != 1 then
+      throw s!"{prefixMsg}: batch N (0x0024) must be 1, got {wN.value}"
+  let mut allowedConvRegs : Array Nat := #[
+    regWin, regHin, regCin, regWout, regHout, regCout, regBatchN,
+    regConvCfg, regTH, regNeCommon, regNeTile, regTargetCfg,
+    regSrc1Cfg, regSrc2Cfg, regSrc1Base, regSrc1ChanStride, regSrc1RowStride,
+    regSrc1RowBytesA, regSrc1RowBytesB, regResCfg, regResBase,
+    regNeCfg, regNeOp, regNeScale,
+    regSrc1Dep, regSrc1DmaCfg, regSrc1BaseLo, regSrc1BaseHi,
+    regSrc1DmaRowStride, regSrc1DmaPlaneStride, regSrc1Fmt,
+    regResDep, regResBaseLo, regResBaseHi,
+    regResDmaRowStride, regResDmaPlaneStride, regResFmt,
+    regKernelStage, regKernelBaseLo, regKernelBaseHi,
+    regOut0, regOut1, regOut2, regOut3, regOut4, regOut5
+  ]
+  if isDepthwise then
+    allowedConvRegs := allowedConvRegs.push regDwGroups
+  if !direct then
+    allowedConvRegs := allowedConvRegs ++ #[
+      regResChanStride, regResRowStride, regResRowBytesA, regResRowBytesB
+    ]
+  if scalarBiasMode then
+    allowedConvRegs := allowedConvRegs.push regScalarBias
+  for s in [:16] do
+    if h : s < expectedSlotMap.size then
+      if expectedSlotMap[s].isSome then
+        allowedConvRegs := allowedConvRegs ++ #[regChunkSlot s, regChunkOffset s, regChunkSize s]
+  vCheckAllowedRegs task.writes allowedConvRegs prefixMsg
+
   pure ()
 
 /-- Verify a decoded task is specifically a legal 1x1 conv task. -/
@@ -1179,9 +1245,10 @@ def verifyPeTask (info : HwxInfo) (task : DecodedTask) : Except String Unit := d
   let minAntiHang1 := 2 * min s1W stripW
   if s1C > 1 && src1Chs < minAntiHang1 then
     throw s!"{prefixMsg}: anti-hang violation: src1ChanStride ({src1Chs}) < 2 * min(W1={s1W}, T={stripW}) = {minAntiHang1}"
-  let expRow1 := 2 * min (alignUp s1W 8) stripW
-  if src1Chs < expRow1 || src1Chs % 16 != 0 then
-    throw s!"{prefixMsg}: src1ChanStride ({src1Chs}) invalid (must be >= {expRow1} and 16B-aligned)"
+  let whole1 := twoSource && s1C == 1 && s1H == 1 && s1W > 1 && outH > 1 && th < outH
+  let expRow1 := 2 * (if whole1 then alignUp s1W 8 else min (alignUp s1W 8) stripW)
+  if src1Chs != expRow1 then
+    throw s!"{prefixMsg}: src1ChanStride ({src1Chs}) != expected {expRow1} (whole1={whole1})"
   let minU1 := s1C * src1Chs
   if src1Row < minU1 || (src1Row - minU1) % 16 != 0 then
     throw s!"{prefixMsg}: src1RowStride ({src1Row}) incompatible with C1*chs={minU1}"
@@ -1212,8 +1279,8 @@ def verifyPeTask (info : HwxInfo) (task : DecodedTask) : Except String Unit := d
       throw s!"{prefixMsg}: anti-hang violation: src2ChanStride ({src2Chs}) < 2 * min(W2={s2W}, T={stripW}) = {minAntiHang2}"
     let whole2 := s2C == 1 && s2H == 1 && s2W > 1 && outH > 1 && th < outH
     let expRow2 := 2 * (if whole2 then alignUp s2W 8 else min (alignUp s2W 8) stripW)
-    if src2Chs < expRow2 || src2Chs % 16 != 0 then
-      throw s!"{prefixMsg}: src2ChanStride ({src2Chs}) invalid (must be >= {expRow2} and 16B-aligned, whole2={whole2})"
+    if src2Chs != expRow2 then
+      throw s!"{prefixMsg}: src2ChanStride ({src2Chs}) != expected {expRow2} (whole2={whole2})"
     let minU2 := s2C * src2Chs
     if src2Row < minU2 || (src2Row - minU2) % 16 != 0 then
       throw s!"{prefixMsg}: src2RowStride ({src2Row}) incompatible with C2*chs={minU2}"
@@ -1237,6 +1304,7 @@ def verifyPeTask (info : HwxInfo) (task : DecodedTask) : Except String Unit := d
   if resL2Base % vDmaLineBytes != 0 then
     throw s!"{prefixMsg}: L2 resBase {toHex resL2Base} is not {vDmaLineBytes}-byte aligned"
 
+  let expDrow := 2 * min (alignUp outW 8) stripW
   if direct then
     for (addr, nm) in #[
       (regResChanStride, "resChanStride"), (regResRowStride, "resRowStride"),
@@ -1244,14 +1312,13 @@ def verifyPeTask (info : HwxInfo) (task : DecodedTask) : Except String Unit := d
     ] do
       if (findDecodedWrite task.writes addr).isSome then
         throw s!"{prefixMsg}: direct mode must omit staged register {nm} ({toHex addr})"
-    if resL2Base > vL2CapacityBytes then
-      throw s!"{prefixMsg}: L2 resBase {toHex resL2Base} exceeds 2 MiB ({toHex vL2CapacityBytes})"
+    let resDirectBytes := vPeDirectResBytes outC expDrow th
+    l2Ranges := l2Ranges.push { label := "pe_res_direct", start := resL2Base, size := resDirectBytes }
   else
     let wResChs ← requireDecodedWrite task.writes regResChanStride "resChanStride"
     let wResRow ← requireDecodedWrite task.writes regResRowStride "resRowStride"
     let wResRowA ← requireDecodedWrite task.writes regResRowBytesA "resRowBytesA"
     let wResRowB ← requireDecodedWrite task.writes regResRowBytesB "resRowBytesB"
-    let expDrow := 2 * min (alignUp outW 8) stripW
     if wResChs.value.toNat != expDrow then
       throw s!"{prefixMsg}: staged resChanStride {wResChs.value} != expected {expDrow}"
     let minDu := outC * expDrow
@@ -1317,11 +1384,40 @@ def verifyPeTask (info : HwxInfo) (task : DecodedTask) : Except String Unit := d
   vVerifySurfaceDmaBounds task.writes outSurf resBaseOff
     regResDmaRowStride regResDmaPlaneStride "resDmaRowStride" "resDmaPlaneStride" prefixMsg
 
-  -- 8. Kernel stage (no kernel) & Output stage
+  -- 8. Kernel stage (no kernel), Output stage, & strict mode-conditional register allowlist
   let wKernStage ← requireDecodedWrite task.writes regKernelStage "kernelStage"
   if wKernStage.value != kernelStageNoKernValue then
     throw s!"{prefixMsg}: PE kernelStage (0x5500) must be {toHex kernelStageNoKernValue.toNat}, got {toHex wKernStage.value.toNat}"
   vVerifyOutputStage task.writes taskId prefixMsg
+
+  let mut allowedPeRegs : Array Nat := #[
+    regWin, regHin, regCin, regWout, regHout, regCout, regBatchN,
+    regTH, regPeCommon, regPeTile, regTargetCfg,
+    regSrc1Cfg, regSrc2Cfg, regSrc1Base, regSrc1ChanStride, regSrc1RowStride,
+    regSrc1RowBytesA, regSrc1RowBytesB, regResCfg, regResBase,
+    regSrc1Dep, regSrc1DmaCfg, regSrc1BaseLo, regSrc1BaseHi,
+    regSrc1DmaRowStride, regSrc1DmaPlaneStride, regSrc1Fmt,
+    regResDep, regResBaseLo, regResBaseHi,
+    regResDmaRowStride, regResDmaPlaneStride, regResFmt,
+    regKernelStage,
+    regOut0, regOut1, regOut2, regOut3, regOut4, regOut5
+  ]
+  if !direct then
+    allowedPeRegs := allowedPeRegs ++ #[
+      regResChanStride, regResRowStride, regResRowBytesA, regResRowBytesB
+    ]
+  if twoSource then
+    allowedPeRegs := allowedPeRegs ++ #[
+      regPeBcast, regPeOp,
+      regSrc2Base, regSrc2ChanStride, regSrc2RowStride, regSrc2RowBytesA, regSrc2RowBytesB,
+      regSrc2Dep, regSrc2DmaCfg, regSrc2BaseLo, regSrc2BaseHi,
+      regSrc2DmaRowStride, regSrc2DmaPlaneStride, regSrc2Fmt
+    ]
+  else
+    match peOpW? with
+    | some _ => allowedPeRegs := allowedPeRegs.push regPeOp
+    | none => allowedPeRegs := allowedPeRegs ++ #[regPeBias, regPeScale, regPeInScale]
+  vCheckAllowedRegs task.writes allowedPeRegs prefixMsg
 
 /-- Standalone static safety verifier for decoded NE activation / 128-byte LUT tasks.
     Operates purely on decoded HWX bytes with zero dependency on `Vane.Lut`. -/
@@ -1577,8 +1673,8 @@ def verifyNeActTask (info : HwxInfo) (task : DecodedTask) (kernelBytes? : Option
     ] do
       if (findDecodedWrite task.writes addr).isSome then
         throw s!"{prefixMsg}: direct mode must omit staged register {nm} ({toHex addr})"
-    if resL2Base > vL2CapacityBytes then
-      throw s!"{prefixMsg}: L2 resBase {toHex resL2Base} exceeds 2 MiB ({toHex vL2CapacityBytes})"
+    let resDirectBytes := vNeActDirectResBytes f fat
+    l2Ranges := l2Ranges.push { label := "ne_act_res_direct", start := resL2Base, size := resDirectBytes }
   else
     let wResChs ← requireDecodedWrite task.writes regResChanStride "resChanStride"
     let wResRow ← requireDecodedWrite task.writes regResRowStride "resRowStride"
@@ -1597,7 +1693,7 @@ def verifyNeActTask (info : HwxInfo) (task : DecodedTask) (kernelBytes? : Option
 
   checkRangesDisjoint l2Ranges s!"{prefixMsg} L2 SRAM" 0 (some vL2CapacityBytes)
 
-  -- 7. DMA deps, formats, surface bounds, and output stage
+  -- 7. DMA deps, formats, surface bounds, output stage, & strict mode-conditional allowlist
   match ← resolveBarTarget info 4 with
   | .configZero => pure ()
   | _ => throw s!"{prefixMsg}: BAR slot 4 must have VM base 0"
@@ -1633,6 +1729,31 @@ def verifyNeActTask (info : HwxInfo) (task : DecodedTask) (kernelBytes? : Option
   vVerifySurfaceDmaBounds task.writes outSurf resBaseOff
     regResDmaRowStride regResDmaPlaneStride "resDmaRowStride" "resDmaPlaneStride" prefixMsg
   vVerifyOutputStage task.writes taskId prefixMsg
+
+  let mut allowedActRegs : Array Nat := #[
+    regWin, regHin, regCin, regWout, regHout, regCout, regBatchN,
+    regDwGroups, regTH, regNeCommon, regNeTile, regTargetCfg,
+    regSrc1Cfg, regSrc2Cfg, regSrc1Base, regSrc1ChanStride, regSrc1RowStride,
+    regSrc1RowBytesA, regSrc1RowBytesB, regResCfg, regResBase,
+    regNeOp, regNeScale,
+    regSrc1Dep, regSrc1DmaCfg, regSrc1BaseLo, regSrc1BaseHi,
+    regSrc1DmaRowStride, regSrc1DmaPlaneStride, regSrc1Fmt,
+    regResDep, regResBaseLo, regResBaseHi,
+    regResDmaRowStride, regResDmaPlaneStride, regResFmt,
+    regKernelStage,
+    regOut0, regOut1, regOut2, regOut3, regOut4, regOut5
+  ]
+  if !direct then
+    allowedActRegs := allowedActRegs ++ #[
+      regResChanStride, regResRowStride, regResRowBytesA, regResRowBytesB
+    ]
+  if hasLut then
+    allowedActRegs := allowedActRegs ++ #[
+      regNeCfg, regLutCfg, regLutSize, regLutBaseLo, regLutBaseHi
+    ]
+  if noShiftBit == 0 then
+    allowedActRegs := allowedActRegs ++ #[regNeActShiftEn, regScalarBias]
+  vCheckAllowedRegs task.writes allowedActRegs prefixMsg
 
 /-- Verify all recognized tasks decoded from a validated HWX binary (`neConv`, `neAct`, `peOp`)
     and return per-kind counts. When `requireKnownTask` is `true`, rejects any `.unknown` task

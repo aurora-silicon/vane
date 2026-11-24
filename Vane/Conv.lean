@@ -206,6 +206,8 @@ private def resolveConvBias
   let effBias? ← match shiftBits? with
     | none => pure bias
     | some shiftBits =>
+      if !f16IsFinite shiftBits then
+        throw s!"fused LUT input shift {toHex shiftBits.toNat} is not finite fp16"
       let shiftF := f16ToFloat shiftBits
       match bias with
       | some b =>
@@ -213,6 +215,8 @@ private def resolveConvBias
         for o in [:sh.cout] do
           let orig ← readU16LE b (2 * o)
           let updated := floatToF16CanonicalZero (f16ToFloat orig + shiftF)
+          if (updated &&& 0x7c00) == 0x7c00 then
+            throw s!"fused LUT input shift overflowed fp16 on bias[{o}] (orig={toHex orig.toNat}, shift={toHex shiftBits.toNat})"
           shifted := pushU16LE shifted updated
         pure (some shifted)
       | none =>

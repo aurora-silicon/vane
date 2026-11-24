@@ -97,13 +97,15 @@ def scalarRSub (c : UInt16) : PeOp :=
 def scalarMul (c : UInt16) : PeOp :=
   .chain none none (some c)
 
-/-- `x / c` via 1-source PE chain (`scale = fp16(1.0 / c)`), rejecting zero or NaN divisors. -/
+/-- `x / c` via 1-source PE chain (`scale = fp16(1.0 / c)`), rejecting zero, non-finite, or overflowing reciprocals. -/
 def scalarDiv (c : UInt16) : Except String PeOp := do
+  if !f16IsFinite c then
+    throw "PE scalarDiv: divisor must be finite"
   if (c &&& 0x7fff) == 0 then
     throw "PE scalarDiv: divisor must be non-zero"
-  if f16IsNaN c then
-    throw "PE scalarDiv: divisor must not be NaN"
   let inv := floatToF16CanonicalZero (1.0 / f16ToFloat c)
+  if !f16IsFinite inv then
+    throw "PE scalarDiv: reciprocal overflows fp16 finite range"
   pure (.chain none none (some inv))
 
 def isTwoSource : PeOp → Bool
@@ -191,9 +193,15 @@ def peIsDirect (target : Target) (outW k : Nat) : Bool :=
     let lastStrip := if r == 0 then 0 else r - 32 * ((r - 1) / 32)
     !(k == 5 && r > 32 && lastStrip == 24)
 
+/-- Direct-mode L2 output ring buffer reservation in bytes for PE tasks:
+    `alignUp(max(2048, min(outC * drow * th, 4 * drow * th)), 64)`. -/
+def peDirectResBytes (outC drow th : Nat) : Nat :=
+  alignUp (max 2048 (min (outC * drow * th) (4 * drow * th))) dmaLineBytes
+
 /-- Computed L2 SRAM staging geometry for a PE task. -/
 structure PeL2Layout where
   stripW : Nat
+  whole1 : Bool
   row1 : Nat
   u1 : Nat
   size1 : Nat
@@ -216,8 +224,10 @@ def computePeL2Layout
     (outDims hwSrc1 : TensorDims)
     (hwSrc2? : Option TensorDims)
     (t : PeTiling) : PeL2Layout :=
+  let twoSource := hwSrc2?.isSome
   let stripW := peStripWidth t.k
-  let row1 := 2 * min (alignUp hwSrc1.w 8) stripW
+  let whole1 := twoSource && hwSrc1.c == 1 && hwSrc1.h == 1 && hwSrc1.w > 1 && outDims.h > 1 && t.tileHeight < outDims.h
+  let row1 := 2 * (if whole1 then alignUp hwSrc1.w 8 else min (alignUp hwSrc1.w 8) stripW)
   let u1 := hwSrc1.c * row1
   let size1 := (if hwSrc1.h > 1 then t.tileHeight else 1) * u1
   let (whole2, src2Base, row2, u2, size2, stop) :=
@@ -234,9 +244,10 @@ def computePeL2Layout
   let resBase := alignUp stop dmaLineBytes
   let drow := 2 * min (alignUp outDims.w 8) stripW
   let du := outDims.c * drow
-  let resL2 := if direct then 0 else t.tileHeight * du
+  let resL2 := if direct then peDirectResBytes outDims.c drow t.tileHeight else t.tileHeight * du
   {
     stripW := stripW
+    whole1 := whole1
     row1 := row1
     u1 := u1
     size1 := size1
@@ -255,90 +266,76 @@ def computePeL2Layout
 
 /-- Independent hard safety legality validator for PE tiling `(k, tileHeight)`.
     Enforces dimension bounds, broadcast compatibility, `k` range, `1 <= th <= out.h`,
-    2 MiB L2 capacity, and the critical `l2ChanStride >= 2 * min(src.w, T)` anti-hang rule. -/
+    2 MiB L2 capacity (including direct-mode output ring reservation and `whole1`/`whole2`),
+    and the critical `l2ChanStride >= 2 * min(src.w, T)` anti-hang rule. -/
 def validatePeTiling
     (target : Target)
     (outDims hwSrc1 : TensorDims)
     (hwSrc2? : Option TensorDims)
-    (t : PeTiling) : Except String Unit := do
-  validateTensorDims outDims "out"
-  validateTensorDims hwSrc1 "src1"
-  let twoSource := hwSrc2?.isSome
-  if let some hwSrc2 := hwSrc2? then
-    let expectedOut ← broadcastDims hwSrc1 hwSrc2
-    if expectedOut != outDims then
-      throw s!"PE out dims {repr outDims} != broadcasted dims {repr expectedOut}"
+    (t : PeTiling) : Except String Unit :=
+  validateTensorDims outDims "out" >>= fun () =>
+  validateTensorDims hwSrc1 "src1" >>= fun () =>
+  (match hwSrc2? with
+   | some hwSrc2 =>
+     broadcastDims hwSrc1 hwSrc2 >>= fun expectedOut =>
+     if expectedOut != outDims then
+       .error s!"PE out dims {repr outDims} != broadcasted dims {repr expectedOut}"
+     else .ok ()
+   | none =>
+     if hwSrc1 != outDims then
+       .error s!"PE 1-source dims {repr hwSrc1} != out dims {repr outDims}"
+     else .ok ()) >>= fun () =>
+  let maxK := peMaxK hwSrc2?.isSome
+  if t.k < 4 then
+    .error s!"illegal PE tiling: k={t.k} out of range 4..{maxK}"
+  else if t.k > maxK then
+    .error s!"illegal PE tiling: k={t.k} out of range 4..{maxK}"
+  else if t.tileHeight == 0 then
+    .error s!"illegal PE tiling: tileHeight={t.tileHeight} out of range 1..{outDims.h}"
+  else if t.tileHeight > outDims.h then
+    .error s!"illegal PE tiling: tileHeight={t.tileHeight} out of range 1..{outDims.h}"
   else
-    if hwSrc1 != outDims then
-      throw s!"PE 1-source dims {repr hwSrc1} != out dims {repr outDims}"
+    let l2 := computePeL2Layout target outDims hwSrc1 hwSrc2? t
+    let minChs1 := 2 * min hwSrc1.w l2.stripW
+    if hwSrc1.c > 1 && l2.row1 < minChs1 then
+      .error s!"illegal PE tiling (anti-hang): src1ChanStride {l2.row1} < 2 * min(W1={hwSrc1.w}, T={l2.stripW}) = {minChs1}"
+    else if (match hwSrc2? with
+      | some hwSrc2 => hwSrc2.c > 1 && l2.row2 < 2 * min hwSrc2.w l2.stripW
+      | none => false) then
+      .error s!"illegal PE tiling (anti-hang): src2ChanStride {l2.row2} below 2 * min(W2, T)"
+    else if l2.l2UseBytes > l2CapacityBytes then
+      .error s!"illegal PE tiling: L2 footprint {l2.l2UseBytes}B exceeds {l2CapacityBytes}B (2 MiB)"
+    else
+      .ok ()
 
-  let maxK := peMaxK twoSource
-  if t.k < 4 || t.k > maxK then
-    throw s!"illegal PE tiling: k={t.k} out of range 4..{maxK}"
-  if t.tileHeight == 0 || t.tileHeight > outDims.h then
-    throw s!"illegal PE tiling: tileHeight={t.tileHeight} out of range 1..{outDims.h}"
-
-  let l2 := computePeL2Layout target outDims hwSrc1 hwSrc2? t
-  let minChs1 := 2 * min hwSrc1.w l2.stripW
-  if hwSrc1.c > 1 && l2.row1 < minChs1 then
-    throw s!"illegal PE tiling (anti-hang): src1ChanStride {l2.row1} < 2 * min(W1={hwSrc1.w}, T={l2.stripW}) = {minChs1}"
-  if let some hwSrc2 := hwSrc2? then
-    let minChs2 := 2 * min hwSrc2.w l2.stripW
-    if hwSrc2.c > 1 && l2.row2 < minChs2 then
-      throw s!"illegal PE tiling (anti-hang): src2ChanStride {l2.row2} < 2 * min(W2={hwSrc2.w}, T={l2.stripW}) = {minChs2}"
-  if l2.l2UseBytes > l2CapacityBytes then
-    throw s!"illegal PE tiling: L2 footprint {l2.l2UseBytes}B exceeds {l2CapacityBytes}B (2 MiB)"
-  pure ()
-
-/-- Compute maximal legal `tileHeight in 1..outDims.h` in O(1) for a fixed `k`. -/
+/-- Compute exact maximal legal `tileHeight in 1..outDims.h` in O(log H) for a fixed `k`. -/
 private def maxPeTileHeightForK
     (target : Target)
     (outDims hwSrc1 : TensorDims)
     (hwSrc2? : Option TensorDims)
     (k : Nat) : Nat := Id.run do
-  -- First try full height (th = out.h, where whole2 = false)
+  -- First try full height (th = out.h, where whole1 = false, whole2 = false)
   let fullL2 := computePeL2Layout target outDims hwSrc1 hwSrc2? { k := k, tileHeight := outDims.h }
   if fullL2.l2UseBytes <= l2CapacityBytes then
     return outDims.h
   if outDims.h <= 1 then
     return 0
 
-  -- Solve linearly for th in 1..(out.h - 1) where whole2 may be active
-  let stripW := peStripWidth k
-  let row1 := 2 * min (alignUp hwSrc1.w 8) stripW
-  let u1 := hwSrc1.c * row1
-  let (fixedBytes, rowCostSrc2) :=
-    match hwSrc2? with
-    | none => (if hwSrc1.h > 1 then 0 else u1, 0)
-    | some hwSrc2 =>
-      let w2 := hwSrc2.c == 1 && hwSrc2.h == 1 && hwSrc2.w > 1 && outDims.h > 1
-      let r2 := 2 * (if w2 then alignUp hwSrc2.w 8 else min (alignUp hwSrc2.w 8) stripW)
-      let u2 := hwSrc2.c * r2
-      let f1 := if hwSrc1.h > 1 then 0 else u1
-      let f2 := if hwSrc2.h > 1 then 0 else u2
-      (f1 + f2, if hwSrc2.h > 1 then u2 else 0)
-  let direct := peIsDirect target outDims.w k
-  let drow := 2 * min (alignUp outDims.w 8) stripW
-  let du := outDims.c * drow
-  let rowCost := (if hwSrc1.h > 1 then u1 else 0) + rowCostSrc2 + (if direct then 0 else du)
-
-  let thUpper : Nat :=
-    if fixedBytes >= l2CapacityBytes then 0
-    else if rowCost == 0 then outDims.h - 1
-    else min (outDims.h - 1) ((l2CapacityBytes - fixedBytes) / rowCost)
-
-  if thUpper == 0 then
-    return 0
-
-  -- Alignment slack is at most 2 * 63 = 126 bytes; refine down by up to 8 rows
-  for dec in [:8] do
-    if thUpper > dec then
-      let th := thUpper - dec
-      if th >= 1 then
-        let l2 := computePeL2Layout target outDims hwSrc1 hwSrc2? { k := k, tileHeight := th }
-        if l2.l2UseBytes <= l2CapacityBytes then
-          return th
-  return 0
+  -- Binary search over 1..(out.h - 1) where whole1/whole2 are fixed and l2UseBytes is monotonic in th
+  let mut lo : Nat := 1
+  let mut hi : Nat := outDims.h - 1
+  let mut best : Nat := 0
+  while lo <= hi do
+    let mid := (lo + hi) / 2
+    let l2 := computePeL2Layout target outDims hwSrc1 hwSrc2? { k := k, tileHeight := mid }
+    if l2.l2UseBytes <= l2CapacityBytes then
+      best := mid
+      lo := mid + 1
+    else if mid == 0 then
+      break
+    else
+      hi := mid - 1
+  return best
 
 /-- Deterministic O(1) tile chooser for PE tasks.
     Iterates `k` from `maxK` down to `4`, solves maximal `th` in O(1), ranks candidates by

@@ -165,6 +165,17 @@ def prevF16 (b : UInt16) : UInt16 :=
   else
     b + 1
 
+/-- Next larger IEEE-754 binary16 bit pattern strictly above `b` (saturating at `+inf`). -/
+def nextF16 (b : UInt16) : UInt16 :=
+  if (b &&& 0x7fff) == 0 then
+    f16MinSubnormal
+  else if (b &&& 0x8000) != 0 then
+    b - 1
+  else if b >= f16PosInf then
+    f16PosInf
+  else
+    b + 1
+
 /-- Negate an IEEE-754 binary16 value, canonicalizing zero to `+0.0`. -/
 def negF16CanonicalZero (b : UInt16) : UInt16 :=
   if (b &&& 0x7fff) == 0 then f16PosZero else b ^^^ 0x8000
@@ -210,17 +221,35 @@ def ldexp (x : Float) (e : Int) : Float :=
       let scaleBits : UInt64 := ((rem + 1023).toNat.toUInt64) <<< 52
       return acc * Float.ofBits scaleBits
 
-/-- Pure-Lean error function approximation (Abramowitz & Stegun 7.1.26, max error `< 1.5e-7`). -/
+/-- Pure-Lean `erf(x)` to full IEEE-754 float64 precision:
+    positive-term series `2/sqrt(pi) * exp(-x^2) * sum 2^n x^(2n+1)/(2n+1)!!` for `|x| < 2`,
+    and Laplace continued fraction for `erfc(|x|)` for `|x| >= 2`. -/
 def erfApprox (x : Float) : Float :=
-  if x == 0.0 then
+  if x.isNaN then
+    x
+  else if x == 0.0 then
     0.0
   else
-    let sign := if x < 0.0 then -1.0 else 1.0
+    let sign : Float := if x < 0.0 then -1.0 else 1.0
     let ax := Float.abs x
-    let t := 1.0 / (1.0 + 0.3275911 * ax)
-    let poly :=
-      ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t
-    let y := 1.0 - poly * Float.exp (-(ax * ax))
+    let y : Float :=
+      if ax >= 6.0 then
+        1.0
+      else if ax < 2.0 then Id.run do
+        let twoX2 := 2.0 * ax * ax
+        let mut term := ax
+        let mut sum := ax
+        for n in [1:45] do
+          term := term * twoX2 / Float.ofNat (2 * n + 1)
+          sum := sum + term
+        return 1.12837916709551257389615890312154517 * Float.exp (-(ax * ax)) * sum
+      else Id.run do
+        let mut cf : Float := 0.0
+        for i in [0:60] do
+          let k := 60 - i
+          cf := (0.5 * Float.ofNat k) / (ax + cf)
+        let erfcVal := 0.564189583547756286948079451560772586 * Float.exp (-(ax * ax)) / (ax + cf)
+        return 1.0 - erfcVal
     sign * y
 
 /-- Pure-Lean `exp(x) - 1` avoiding catastrophic cancellation near `0`. -/
@@ -308,7 +337,8 @@ def parseFloat? (raw : String) : Option Float := Id.run do
       match cur with
       | c :: tl2 =>
         if c >= '0' && c <= '9' then
-          eMag := eMag * 10 + (c.toNat - '0'.toNat)
+          if eMag < 10000 then
+            eMag := eMag * 10 + (c.toNat - '0'.toNat)
           eDigits := eDigits + 1
           cur := tl2
         else
@@ -324,6 +354,12 @@ def parseFloat? (raw : String) : Option Float := Id.run do
     return none
 
   let mut val := intVal + fracVal / fracScale
+  if val == 0.0 then
+    return some (if neg then -0.0 else 0.0)
+  if expVal > 310 then
+    return some (Float.ofBits (if neg then (0xfff0000000000000 : UInt64) else (0x7ff0000000000000 : UInt64)))
+  if expVal < -330 then
+    return some (if neg then -0.0 else 0.0)
   if expVal != 0 then
     let eAbs := expVal.natAbs
     let mut pow10 : Float := 1.0

@@ -46,7 +46,11 @@ private def parsePosNat (flag s : String) : Except String Nat :=
 
 private def parseFloatArg (flag s : String) : Except String Float :=
   match parseFloat? s with
-  | some f => pure f
+  | some f =>
+    if f.isNaN || f.isInf then
+      throw s!"{flag} must be a finite floating-point number, got '{s}'"
+    else
+      pure f
   | none => throw s!"invalid floating-point value '{s}' for {flag}"
 
 private def parseF16Arg (flag s : String) : Except String UInt16 := do
