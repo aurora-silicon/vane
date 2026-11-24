@@ -1,5 +1,7 @@
+import Lean.Data.Json
 import Vane
 
+open Lean (Json)
 open Vane.Binary
 open Vane.Float16
 open Vane.TaskStream
@@ -12,6 +14,7 @@ open Vane.Lut
 open Vane.Conv
 open Vane.Conv1x1
 open Vane.Conv3x3
+open Vane.Graph
 
 private def usage : String :=
   "Usage:\n" ++
@@ -31,7 +34,8 @@ private def usage : String :=
   "  vane compile-lut --target <h16|h17> --act <relu|copy|relu6|clip|leaky_relu|abs|sign|threshold|thresholded_relu|hard_sigmoid|clamp_max|clamp_min|elu|tanh|scaled_tanh|erf|sigmoid|gelu|silu|exp2|exp|sqrt|rsqrt|inverse|log2>\n" ++
   "                   --h <H> --w <W> --c <C>\n" ++
   "                   [--alpha F] [--beta F] [--lo F] [--hi F] [--eps F] [--scalar F]\n" ++
-  "                   --out-dir <dir>\n"
+  "                   --out-dir <dir>\n" ++
+  "  vane compile-graph --spec <graph.json> --out-dir <dir>\n"
 
 private def requireArgValue (flag : String) (rest : List String) : Except String (String × List String) :=
   match rest with
@@ -1330,6 +1334,425 @@ private def cmdCompileLut (args : List String) : IO UInt32 := do
   )
   return 0
 
+private def jsonObjField? (j : Json) (key : String) : Option Json :=
+  match j.getObjVal? key with
+  | .ok v => if v.isNull then none else some v
+  | .error _ => none
+
+private def jsonReqStr (j : Json) (key ctx : String) : Except String String :=
+  match j.getObjValAs? String key with
+  | .ok s => pure s
+  | .error e => throw s!"{ctx}: missing or invalid string field '{key}' ({e})"
+
+private def jsonOptStr (j : Json) (key ctx : String) : Except String (Option String) :=
+  match jsonObjField? j key with
+  | none => pure none
+  | some v =>
+    match v.getStr? with
+    | .ok s => pure (some s)
+    | .error e => throw s!"{ctx}: invalid string field '{key}' ({e})"
+
+private def jsonReqPosNat (j : Json) (key ctx : String) : Except String Nat :=
+  match j.getObjValAs? Nat key with
+  | .ok n => if n == 0 then throw s!"{ctx}: field '{key}' must be >= 1" else pure n
+  | .error e => throw s!"{ctx}: missing or invalid positive integer '{key}' ({e})"
+
+private def jsonOptPosNat (j : Json) (key ctx : String) : Except String (Option Nat) :=
+  match jsonObjField? j key with
+  | none => pure none
+  | some v =>
+    match v.getNat? with
+    | .ok n => if n == 0 then throw s!"{ctx}: field '{key}' must be >= 1" else pure (some n)
+    | .error e => throw s!"{ctx}: invalid positive integer '{key}' ({e})"
+
+private def jsonOptFloat (j : Json) (key ctx : String) : Except String (Option Float) :=
+  match jsonObjField? j key with
+  | none => pure none
+  | some v =>
+    match v.getNum? with
+    | .ok num =>
+      let f := num.toFloat
+      if f.isNaN || f.isInf then
+        throw s!"{ctx}: field '{key}' must be a finite number"
+      else
+        pure (some f)
+    | .error e => throw s!"{ctx}: invalid numeric field '{key}' ({e})"
+
+private def jsonOptBool (j : Json) (key ctx : String) : Except String Bool :=
+  match jsonObjField? j key with
+  | none => pure false
+  | some v =>
+    match v.getBool? with
+    | .ok b => pure b
+    | .error e => throw s!"{ctx}: invalid boolean field '{key}' ({e})"
+
+private def jsonReqStrArray (j : Json) (key ctx : String) : Except String (Array String) :=
+  match j.getObjValAs? (Array Json) key with
+  | .error e => throw s!"{ctx}: missing or invalid array '{key}' ({e})"
+  | .ok arr => do
+    let mut out : Array String := Array.mkEmpty arr.size
+    for elem in arr do
+      match elem.getStr? with
+      | .ok s => out := out.push s
+      | .error e => throw s!"{ctx}: element in '{key}' must be a string ({e})"
+    pure out
+
+private def parseJsonActField (j : Json) (ctx : String) : Except String (Option (String × ActParamFlags)) := do
+  match jsonObjField? j "act" with
+  | none => pure none
+  | some v =>
+    match v.getStr? with
+    | .ok s => pure (some (s, {}))
+    | .error _ =>
+      let nm ← jsonReqStr v "name" s!"{ctx}.act"
+      let params : ActParamFlags := {
+        alpha := ← jsonOptFloat v "alpha" s!"{ctx}.act"
+        beta := ← jsonOptFloat v "beta" s!"{ctx}.act"
+        lo := ← jsonOptFloat v "lo" s!"{ctx}.act"
+        hi := ← jsonOptFloat v "hi" s!"{ctx}.act"
+        eps := ← jsonOptFloat v "eps" s!"{ctx}.act"
+        scalar := ← jsonOptFloat v "scalar" s!"{ctx}.act"
+      }
+      pure (some (nm, params))
+
+private def resolveSpecRelPath (specDir : System.FilePath) (raw : String) : System.FilePath :=
+  let p := System.FilePath.mk raw
+  if p.isAbsolute then p else specDir / p
+
+private def renderGraphManifestJson (compiled : CompiledGraph) : String :=
+  let info := compiled.info
+  let secs := compiled.sections
+  let nodeItems := compiled.nodes.toList.map fun nd =>
+    let engStr := match nd.engine with | .ne => "ne" | .pe => "pe"
+    "    {\n" ++
+    s!"      \"id\": \"{escapeJsonString nd.id}\",\n" ++
+    s!"      \"task_id\": {nd.taskId},\n" ++
+    s!"      \"engine\": \"{engStr}\",\n" ++
+    s!"      \"op\": \"{escapeJsonString nd.opKind}\",\n" ++
+    s!"      \"shape\": [1, {nd.outDims.c}, {nd.outDims.h}, {nd.outDims.w}],\n" ++
+    s!"      \"out_placement\": \"{nd.outLocation.placementName}\",\n" ++
+    s!"      \"direct\": {if nd.direct then "true" else "false"},\n" ++
+    s!"      \"l2_use_bytes\": {nd.l2UseBytes}\n" ++
+    "    }"
+  "{\n" ++
+  "  \"op\": \"graph\",\n" ++
+  s!"  \"target\": \"{compiled.target.name}\",\n" ++
+  "  \"hwx\": \"program.hwx\",\n" ++
+  "  \"sections\": {\n" ++
+  "    \"generic\": {\"file\": \"generic.bin\", \"size\": " ++ toString secs.generic.size ++ "},\n" ++
+  "    \"operation\": {\"file\": \"operation.bin\", \"size\": " ++ toString secs.operation.size ++ "},\n" ++
+  "    \"procedure\": {\"file\": \"procedure.bin\", \"size\": " ++ toString secs.procedure.size ++ "},\n" ++
+  "    \"text_properties\": {\"file\": \"text-properties.bin\", \"size\": " ++ toString secs.textProperties.size ++ "}\n" ++
+  "  },\n" ++
+  s!"  \"task_count\": {compiled.taskCount},\n" ++
+  s!"  \"record_count\": {info.records},\n" ++
+  s!"  \"relocation_count\": {info.relocCount},\n" ++
+  s!"  \"has_kernel\": {if info.kernelSection.isSome then "true" else "false"},\n" ++
+  s!"  \"has_scratch\": {if info.scratchSection.isSome then "true" else "false"},\n" ++
+  s!"  \"kernel_bytes\": {compiled.kernelBytes},\n" ++
+  s!"  \"scratch_bytes\": {compiled.scratchBytes},\n" ++
+  s!"  \"l2_peak_bytes\": {compiled.l2PeakBytes},\n" ++
+  "  \"nodes\": [\n" ++
+  String.intercalate ",\n" nodeItems ++ "\n" ++
+  "  ],\n" ++
+  "  \"surfaces\": [\n" ++
+  renderSurfacesJson info.surfaces ++ "\n" ++
+  "  ]\n" ++
+  "}\n"
+
+private def cmdCompileGraph (args : List String) : IO UInt32 := do
+  let mut specPath : Option String := none
+  let mut outDir : Option String := none
+  let mut rest := args
+  while !rest.isEmpty do
+    match rest with
+    | "--spec" :: tl =>
+      match requireArgValue "--spec" tl with
+      | .ok (v, tl') => specPath := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--out-dir" :: tl =>
+      match requireArgValue "--out-dir" tl with
+      | .ok (v, tl') => outDir := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | flag :: _ =>
+      IO.eprintln s!"error: unknown argument '{flag}' for compile-graph"
+      IO.eprintln usage
+      return 1
+    | [] => break
+
+  let some sPathStr := specPath
+    | do IO.eprintln "error: --spec <graph.json> is required"; return 1
+  let some dirStr := outDir
+    | do IO.eprintln "error: --out-dir <dir> is required"; return 1
+
+  let specFilePath := System.FilePath.mk sPathStr
+  let specDir := specFilePath.parent.getD (System.FilePath.mk ".")
+
+  let rawJson ← try
+    IO.FS.readFile specFilePath
+  catch e =>
+    IO.eprintln s!"error: failed to read graph spec '{sPathStr}': {e}"
+    return 1
+
+  let root ← match Json.parse rawJson with
+    | .ok j => pure j
+    | .error e => IO.eprintln s!"error: invalid JSON in '{sPathStr}': {e}"; return 1
+
+  let target ← match (do
+      let tStr ← jsonReqStr root "target" "graph"
+      match Target.parse? tStr with
+      | some t => pure t
+      | none => throw s!"unknown target '{tStr}' (expected h16 or h17)") with
+    | .ok t => pure t
+    | .error e => IO.eprintln s!"error: {e}"; return 1
+
+  let defaultPlacement ← match (do
+      match ← jsonOptStr root "placement" "graph" with
+      | none => pure EdgePlacementMode.auto
+      | some pStr =>
+        match EdgePlacementMode.parse? pStr with
+        | some m => pure m
+        | none => throw s!"unknown placement '{pStr}' (expected auto, l2, or dram)") with
+    | .ok p => pure p
+    | .error e => IO.eprintln s!"error: {e}"; return 1
+
+  let inputsArr ← match root.getObjValAs? (Array Json) "inputs" with
+    | .ok a => pure a
+    | .error e => IO.eprintln s!"error: graph missing 'inputs' array ({e})"; return 1
+
+  let mut graphInputs : Array GraphInput := #[]
+  let mut knownShapes : Array (String × TensorDims) := #[]
+  for idx in [:inputsArr.size] do
+    let ij := inputsArr[idx]!
+    let ctx := s!"inputs[{idx}]"
+    let gi ← match (do
+        let nm ← jsonReqStr ij "name" ctx
+        let c ← jsonReqPosNat ij "c" ctx
+        let h ← jsonReqPosNat ij "h" ctx
+        let w ← jsonReqPosNat ij "w" ctx
+        let sn := (← jsonOptStr ij "short_name" ctx).getD ""
+        pure ({ name := nm, shape := { c := c, h := h, w := w }, shortName := sn } : GraphInput)) with
+      | .ok g => pure g
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    graphInputs := graphInputs.push gi
+    knownShapes := knownShapes.push (gi.name, gi.shape)
+
+  let nodesArr ← match root.getObjValAs? (Array Json) "nodes" with
+    | .ok a => pure a
+    | .error e => IO.eprintln s!"error: graph missing 'nodes' array ({e})"; return 1
+
+  let mut graphNodes : Array GraphNode := #[]
+  for idx in [:nodesArr.size] do
+    let nj := nodesArr[idx]!
+    let ctx := s!"nodes[{idx}]"
+    let (ndId, ndOpStr, ndInputs, ndOutPlace?) ← match (do
+        let id ← jsonReqStr nj "id" ctx
+        let opStr ← jsonReqStr nj "op" ctx
+        let inps ← jsonReqStrArray nj "inputs" ctx
+        let op? ← match ← jsonOptStr nj "out_placement" ctx with
+          | none => pure none
+          | some pStr =>
+            match EdgePlacementMode.parse? pStr with
+            | some m => pure (some m)
+            | none => throw s!"{ctx}: unknown out_placement '{pStr}'"
+        pure (id, opStr.toLower, inps, op?)) with
+      | .ok v => pure v
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+
+    let lookupShape := fun (nm : String) =>
+      knownShapes.find? (fun (k, _) => k == nm) |>.map Prod.snd
+
+    let (nodeOp, inferredDims) ← match ndOpStr with
+      | "conv1x1" =>
+        let parsed ← match (do
+            if ndInputs.size != 1 then throw s!"{ctx} (conv1x1): expected 1 input"
+            let some inDims := lookupShape ndInputs[0]!
+              | throw s!"{ctx} (conv1x1): unknown input '{ndInputs[0]!}'"
+            let cin := (← jsonOptPosNat nj "cin" ctx).getD inDims.c
+            let cout ← jsonReqPosNat nj "cout" ctx
+            let wRel ← jsonReqStr nj "weights" ctx
+            let bRel? ← jsonOptStr nj "bias" ctx
+            let reluFlag ← jsonOptBool nj "relu" ctx
+            let actInfo? ← parseJsonActField nj ctx
+            let act ← match actInfo? with
+              | none => parseConvAct reluFlag none {}
+              | some (nm, p) => parseConvAct reluFlag (some nm) p
+            pure (cin, cout, wRel, bRel?, act, { c := cout, h := inDims.h, w := inDims.w : TensorDims })) with
+          | .ok v => pure v
+          | .error e => IO.eprintln s!"error: {e}"; return 1
+        let (cin, cout, wRel, bRel?, act, outDims) := parsed
+        let wPath := resolveSpecRelPath specDir wRel
+        let weightsBytes ← try IO.FS.readBinFile wPath catch e =>
+          IO.eprintln s!"error: {ctx}: failed to read weights '{wPath}': {e}"; return 1
+        let biasBytes? ← match bRel? with
+          | none => pure none
+          | some bRel =>
+            let bPath := resolveSpecRelPath specDir bRel
+            try some <$> IO.FS.readBinFile bPath catch e =>
+              IO.eprintln s!"error: {ctx}: failed to read bias '{bPath}': {e}"; return 1
+        pure (NodeOp.conv1x1 cin cout weightsBytes biasBytes? act, outDims)
+
+      | "conv3x3" =>
+        let parsed ← match (do
+            if ndInputs.size != 1 then throw s!"{ctx} (conv3x3): expected 1 input"
+            let some inDims := lookupShape ndInputs[0]!
+              | throw s!"{ctx} (conv3x3): unknown input '{ndInputs[0]!}'"
+            let modeStr := (← jsonOptStr nj "mode" ctx).getD "dense"
+            let some mode := Conv3x3Mode.parse? modeStr
+              | throw s!"{ctx}: unknown conv3x3 mode '{modeStr}'"
+            let cin := (← jsonOptPosNat nj "cin" ctx).getD inDims.c
+            let cout ← match ← jsonOptPosNat nj "cout" ctx with
+              | some co => pure co
+              | none => if mode == Conv3x3Mode.depthwise then pure cin else throw s!"{ctx}: missing required field 'cout'"
+            let stride := (← jsonOptPosNat nj "stride" ctx).getD 1
+            let padStr := (← jsonOptStr nj "pad" ctx).getD "same"
+            let some padMode := PadMode.parse? padStr
+              | throw s!"{ctx}: unknown conv3x3 pad '{padStr}'"
+            let wRel ← jsonReqStr nj "weights" ctx
+            let bRel? ← jsonOptStr nj "bias" ctx
+            let reluFlag ← jsonOptBool nj "relu" ctx
+            let actInfo? ← parseJsonActField nj ctx
+            let act ← match actInfo? with
+              | none => parseConvAct reluFlag none {}
+              | some (nm, p) => parseConvAct reluFlag (some nm) p
+            let sh : ConvSpec := {
+              kernelSize := 3, mode := mode, h := inDims.h, w := inDims.w,
+              cin := cin, cout := cout, stride := stride, pad := padMode
+            }
+            validateConvShape sh
+            pure (mode, cin, cout, stride, padMode, wRel, bRel?, act, { c := cout, h := sh.outH, w := sh.outW : TensorDims })) with
+          | .ok v => pure v
+          | .error e => IO.eprintln s!"error: {e}"; return 1
+        let (mode, cin, cout, stride, padMode, wRel, bRel?, act, outDims) := parsed
+        let wPath := resolveSpecRelPath specDir wRel
+        let weightsBytes ← try IO.FS.readBinFile wPath catch e =>
+          IO.eprintln s!"error: {ctx}: failed to read weights '{wPath}': {e}"; return 1
+        let biasBytes? ← match bRel? with
+          | none => pure none
+          | some bRel =>
+            let bPath := resolveSpecRelPath specDir bRel
+            try some <$> IO.FS.readBinFile bPath catch e =>
+              IO.eprintln s!"error: {ctx}: failed to read bias '{bPath}': {e}"; return 1
+        pure (NodeOp.conv3x3 mode cin cout stride padMode weightsBytes biasBytes? act, outDims)
+
+      | "pe" =>
+        let parsed ← match (do
+            let peOpStr := (← jsonReqStr nj "pe_op" ctx).toLower
+            let optF16 := fun (key : String) => do
+              match ← jsonOptFloat nj key ctx with
+              | none => pure none
+              | some f => pure (some (floatToF16CanonicalZero f))
+            match peOpStr with
+            | "abs" | "square" | "linear" | "chain" | "sadd" | "ssub" | "srsub" | "smul" | "sdiv" =>
+              if ndInputs.size != 1 then throw s!"{ctx} (pe {peOpStr}): expected 1 input"
+              let some inDims := lookupShape ndInputs[0]!
+                | throw s!"{ctx}: unknown input '{ndInputs[0]!}'"
+              let op ← match peOpStr with
+                | "abs" => pure PeOp.abs
+                | "square" => pure PeOp.square
+                | "linear" =>
+                  let a := (← optF16 "alpha").getD f16PosOne
+                  let b := (← optF16 "beta").getD f16PosZero
+                  pure (PeOp.linearActivation a b)
+                | "chain" =>
+                  let ins ← optF16 "in_scale"
+                  let b ← optF16 "bias"
+                  let sc ← optF16 "scale"
+                  pure (PeOp.chain ins b sc)
+                | "sadd" =>
+                  let some s ← optF16 "scalar" | throw s!"{ctx}: sadd requires 'scalar'"
+                  pure (PeOp.scalarAdd s)
+                | "ssub" =>
+                  let some s ← optF16 "scalar" | throw s!"{ctx}: ssub requires 'scalar'"
+                  pure (PeOp.scalarSub s)
+                | "srsub" =>
+                  let some s ← optF16 "scalar" | throw s!"{ctx}: srsub requires 'scalar'"
+                  pure (PeOp.scalarRSub s)
+                | "smul" =>
+                  let some s ← optF16 "scalar" | throw s!"{ctx}: smul requires 'scalar'"
+                  pure (PeOp.scalarMul s)
+                | "sdiv" =>
+                  let some s ← optF16 "scalar" | throw s!"{ctx}: sdiv requires 'scalar'"
+                  PeOp.scalarDiv s
+                | _ => throw s!"{ctx}: unsupported PE op '{peOpStr}'"
+              pure (NodeOp.pe1 op, inDims)
+            | "add" | "sub" | "rsub" | "mul" | "max" | "min" =>
+              if ndInputs.size != 2 then throw s!"{ctx} (pe {peOpStr}): expected 2 inputs"
+              let some d1 := lookupShape ndInputs[0]!
+                | throw s!"{ctx}: unknown input '{ndInputs[0]!}'"
+              let some d2 := lookupShape ndInputs[1]!
+                | throw s!"{ctx}: unknown input '{ndInputs[1]!}'"
+              let outDims ← broadcastDims d1 d2
+              let (binOp, rev) := match peOpStr with
+                | "add" => (PeBinOp.add, false)
+                | "sub" => (PeBinOp.sub, false)
+                | "rsub" => (PeBinOp.sub, true)
+                | "mul" => (PeBinOp.mul, false)
+                | "max" => (PeBinOp.max, false)
+                | _ => (PeBinOp.min, false)
+              pure (NodeOp.pe2 binOp rev, outDims)
+            | other => throw s!"{ctx}: unknown pe_op '{other}'") with
+          | .ok v => pure v
+          | .error e => IO.eprintln s!"error: {e}"; return 1
+        pure parsed
+
+      | "lut" =>
+        let parsed ← match (do
+            if ndInputs.size != 1 then throw s!"{ctx} (lut): expected 1 input"
+            let some inDims := lookupShape ndInputs[0]!
+              | throw s!"{ctx}: unknown input '{ndInputs[0]!}'"
+            let some (actName, params) ← parseJsonActField nj ctx
+              | throw s!"{ctx} (lut): missing required 'act' field"
+            let neAct ← parseNeActSpec actName params
+            pure (NodeOp.lut neAct, inDims)) with
+          | .ok v => pure v
+          | .error e => IO.eprintln s!"error: {e}"; return 1
+        pure parsed
+
+      | other =>
+        IO.eprintln s!"error: {ctx}: unsupported node op '{other}' (expected conv1x1, conv3x3, pe, or lut)"
+        return 1
+
+    graphNodes := graphNodes.push {
+      id := ndId
+      inputs := ndInputs
+      op := nodeOp
+      outPlacement := ndOutPlace?
+    }
+    knownShapes := knownShapes.push (ndId, inferredDims)
+
+  let graphSpec : GraphSpec := {
+    target := target
+    inputs := graphInputs
+    nodes := graphNodes
+    defaultPlacement := defaultPlacement
+  }
+
+  let compiled ← match compileGraph graphSpec with
+    | .ok c => pure c
+    | .error e => IO.eprintln s!"error: compile-graph failed: {e}"; return 1
+
+  let manifest := renderGraphManifestJson compiled
+  let dir := System.FilePath.mk dirStr
+  try
+    IO.FS.createDirAll dir
+    IO.FS.writeBinFile (dir / "program.hwx") compiled.hwx
+    IO.FS.writeBinFile (dir / "generic.bin") compiled.sections.generic
+    IO.FS.writeBinFile (dir / "operation.bin") compiled.sections.operation
+    IO.FS.writeBinFile (dir / "procedure.bin") compiled.sections.procedure
+    IO.FS.writeBinFile (dir / "text-properties.bin") compiled.sections.textProperties
+    IO.FS.writeFile (dir / "manifest.json") manifest
+  catch e =>
+    IO.eprintln s!"error: failed to write graph outputs to '{dirStr}': {e}"
+    return 1
+
+  IO.println (
+    s!"compiled {target.name} graph ({compiled.taskCount} tasks, placement={defaultPlacement.name}) " ++
+    s!"to {dirStr}: hwx={compiled.hwx.size}B kernel={compiled.kernelBytes}B " ++
+    s!"scratch={compiled.scratchBytes}B l2_peak={compiled.l2PeakBytes}B"
+  )
+  return 0
+
 def main (args : List String) : IO UInt32 := do
   match args with
   | "validate" :: rest => cmdValidate rest
@@ -1339,6 +1762,7 @@ def main (args : List String) : IO UInt32 := do
   | "compile-conv3x3" :: rest => cmdCompileConv3x3 rest
   | "compile-pe" :: rest => cmdCompilePe rest
   | "compile-lut" :: rest => cmdCompileLut rest
+  | "compile-graph" :: rest => cmdCompileGraph rest
   | "--help" :: _ | "-h" :: _ | [] =>
     IO.println usage
     return 0

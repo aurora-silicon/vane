@@ -1702,26 +1702,18 @@ private def runAllTests : IO (Array TestResult) := do
   ))
 
   results := results.push (checkOk "m2.5: generic emitProgram supports multi-task ProgramSpec (1x1 + 3x3 verified)" (do
-    let sh1 : ConvSpec := { kernelSize := 1, h := 8, w := 16, cin := 16, cout := 16 }
-    let sh3 : ConvSpec := { kernelSize := 3, h := 8, w := 16, cin := 16, cout := 16, stride := 1, pad := .same }
-    let t1 ← chooseConvTiling .h17 sh1
-    let t3 ← chooseConvTiling .h17 sh3
-    let pk1 ← packConvKernelChunks .h17 sh1 t1 (mkTaggedWeights 16 16) none
-    let pk3 ← packConvKernelChunks .h17 sh3 t3 (mkTaggedWeights3x3 16 16) none
-    -- Share one __KERN_0 buffer large enough for both tasks (task 0 uses [0, pk1.size), task 1 uses [0, pk3.size))
-    let td0 ← lowerConvTask .h17 sh1 t1 pk1 false (taskId := 0)
-    let td1 ← lowerConvTask .h17 sh3 t3 pk3 true (taskId := 1)
-    let inSurf ← makeFp16Surface .h17 "x" "input_x" .input 16 8 16
-    let outSurf ← makeFp16Surface .h17 "y" "output_y" .output 16 8 16
-    let emitted ← emitProgram {
+    let spec : Vane.Graph.GraphSpec := {
       target := .h17
-      surfaces := #[inSurf, outSurf]
-      tasks := #[td0, td1]
-      kernel := some (if pk3.bytes.size >= pk1.bytes.size then pk3.bytes else pk1.bytes)
+      inputs := #[{ name := "x", shape := { c := 16, h := 8, w := 16 } }]
+      nodes := #[
+        { id := "c1", inputs := #["x"], op := .conv1x1 16 16 (mkTaggedWeights 16 16) none .none },
+        { id := "c2", inputs := #["c1"], op := .conv3x3 .dense 16 16 1 .same (mkTaggedWeights3x3 16 16) none .relu }
+      ]
     }
-    if emitted.info.taskStream.taskCount != 2 then
-      throw s!"expected 2 tasks, got {emitted.info.taskStream.taskCount}"
-    let nChecked ← verifyConvHwxTasks emitted.hwx emitted.info (requireConvTask := true)
+    let compiled ← Vane.Graph.compileGraph spec
+    if compiled.info.taskStream.taskCount != 2 then
+      throw s!"expected 2 tasks, got {compiled.info.taskStream.taskCount}"
+    let nChecked ← verifyConvHwxTasks compiled.hwx compiled.info (requireConvTask := true)
     if nChecked != 2 then throw s!"expected 2 verified conv tasks, got {nChecked}"
     pure ()
   ))
@@ -2959,8 +2951,609 @@ private def runAllTests : IO (Array TestResult) := do
 
   pure results
 
+private def runM4Tests : IO (Array TestResult) := do
+  let mut results : Array TestResult := #[]
+
+  -- =========================================================================
+  -- Milestone 4: Vane.Alloc & Vane.Reach Unit Tests
+  -- =========================================================================
+
+  results := results.push (checkOk "m4 unit: Vane.Alloc overlapping disjointness, reuse, capacity, 64B alignment" (do
+    -- 4 buffers: b0 [0,1], b1 [1,2], b2 [2,3], b3 [0,3] (skip connection live across all)
+    let bufs : List Vane.Alloc.LiveBuf := [
+      { id := 0, bytes := 1024, first := 0, last := 1, priority := 1 },
+      { id := 1, bytes := 1024, first := 1, last := 2, priority := 1 },
+      { id := 2, bytes := 1024, first := 2, last := 3, priority := 1 },
+      { id := 3, bytes := 2048, first := 0, last := 3, priority := 3 }
+    ]
+    let placed := Vane.Alloc.allocate true bufs
+    if placed.length != 4 then throw s!"expected 4 placed buffers, got {placed.length}"
+    for p in placed do
+      if p.base % 64 != 0 then throw s!"buffer {p.id} base {p.base} not 64B aligned"
+    -- Total sum is 5120B, but b0 [0,1] and b2 [2,3] don't overlap so topOf must reuse space (<= 4096B)
+    let top := Vane.Alloc.topOf placed
+    if top > 4096 then throw s!"expected reuse top <= 4096, got {top}"
+    -- Pairwise disjoint whenever live intervals overlap
+    for a in placed do
+      for b in placed do
+        if a.id != b.id && a.first <= b.last && b.first <= a.last then
+          if a.base < b.hi && b.base < a.hi then
+            throw s!"overlapping live buffers {a.id} and {b.id}"
+    -- findFreeOffset places cleanly and returns none when full
+    let occ := Vane.Alloc.liveAt placed 1
+    match Vane.Alloc.findFreeOffset occ 512 (2 * 1024 * 1024) with
+    | none => throw "findFreeOffset unexpectedly returned none"
+    | some off =>
+      if off % 64 != 0 then throw s!"findFreeOffset {off} not 64B aligned"
+      for r in occ do
+        if off < r.hi && r.base < off + 512 then
+          throw s!"findFreeOffset {off} overlapped live range [{r.base}, {r.hi})"
+    match Vane.Alloc.findFreeOffset [{ base := 0, bytes := 2 * 1024 * 1024 }] 64 (2 * 1024 * 1024) with
+    | some off => throw s!"expected none when L2 full, got {off}"
+    | none => pure ()
+  ))
+
+  results := results.push (checkOk "m4 unit: Vane.Reach DAG transitive closure (diamond, chain, disconnected)" (do
+    -- 5-node DAG: 0->1, 0->2, 1->3, 2->3; node 4 isolated
+    let step : Nat → Nat → Bool
+      | 0, 1 => true
+      | 0, 2 => true
+      | 1, 3 => true
+      | 2, 3 => true
+      | _, _ => false
+    let tbl := Vane.Reach.reachTable step 5
+    if !(Vane.Reach.reachB tbl 0 3) then throw "expected reachB 0 3 = true"
+    if !(Vane.Reach.reachB tbl 0 1) then throw "expected reachB 0 1 = true"
+    if Vane.Reach.reachB tbl 1 2 then throw "expected reachB 1 2 = false"
+    if Vane.Reach.reachB tbl 3 0 then throw "expected reachB 3 0 = false"
+    if Vane.Reach.reachB tbl 0 4 then throw "expected reachB 0 4 = false"
+    if Vane.Reach.reachB tbl 2 2 then throw "expected reachB 2 2 = false"
+    pure ()
+  ))
+
+  -- =========================================================================
+  -- Milestone 4: End-to-End Multi-Task Graph Compilation (H17 & H16)
+  -- =========================================================================
+
+  let mkGraphW1x1 (cin cout : Nat) (seed : Nat := 1) : ByteArray := Id.run do
+    let mut b := ByteArray.empty
+    for o in [:cout] do
+      for i in [:cin] do
+        let v := if (o + i + seed) % 3 == 0 then 0x3800 else 0x3400 -- 0.5 or 0.25
+        b := pushU16LE b v
+    return b
+
+  let mkGraphW3x3 (cin cout : Nat) (dw : Bool := false) : ByteArray := Id.run do
+    let k := if dw then cout * 9 else cout * cin * 9
+    let mut b := ByteArray.empty
+    for i in [:k] do
+      b := pushU16LE b (if i % 9 == 4 then 0x3c00 else 0x3000)
+    return b
+
+  let mkGraphBias (cout : Nat) : ByteArray := Id.run do
+    let mut b := ByteArray.empty
+    for i in [:cout] do
+      b := pushU16LE b (if i % 2 == 0 then 0x3400 else 0xb400)
+    return b
+
+  let verifyCompiledGraph (g : Vane.Graph.CompiledGraph) (expTasks : Nat) : Except String TaskVerifySummary := do
+    if g.taskCount != expTasks then
+      throw s!"expected {expTasks} tasks, got {g.taskCount}"
+    if g.info.taskStream.taskCount != expTasks then
+      throw s!"HWX stream taskCount {g.info.taskStream.taskCount} != {expTasks}"
+    validateSections g.hwx g.sections
+    let s ← verifyHwxTasksSummary g.hwx g.info (requireKnownTask := true)
+    if s.total != expTasks then
+      throw s!"verified task count {s.total} != {expTasks}"
+    pure s
+
+  -- M4 E2E 1: 2-layer & 4-layer conv chains in L2, DRAM (verifying scratch reuse!), and auto on H17 & H16
+  for tgt in #[Target.h17, Target.h16] do
+    results := results.push (checkOk s!"m4 ({tgt.name}): 4-layer conv chain (1x1+3x3 dense+dw+stride2) in L2, DRAM (with reuse), and auto" (do
+      let makeChain (mode : Vane.Graph.EdgePlacementMode) : Vane.Graph.GraphSpec := {
+        target := tgt
+        defaultPlacement := mode
+        inputs := #[{ name := "x", shape := { c := 16, h := 16, w := 16 } }]
+        nodes := #[
+          { id := "c1", inputs := #["x"], op := .conv1x1 16 16 (mkGraphW1x1 16 16 1) (some (mkGraphBias 16)) .relu },
+          { id := "c2", inputs := #["c1"], op := .conv3x3 .depthwise 16 16 1 .same (mkGraphW3x3 16 16 true) none .none },
+          { id := "c3", inputs := #["c2"], op := .conv3x3 .dense 16 32 2 .same (mkGraphW3x3 16 32 false) (some (mkGraphBias 32)) .relu },
+          { id := "c4", inputs := #["c3"], op := .conv1x1 32 16 (mkGraphW1x1 32 16 2) none .none }
+        ]
+      }
+      -- L2 mode
+      let gL2 ← Vane.Graph.compileGraph (makeChain .l2)
+      let sL2 ← verifyCompiledGraph gL2 4
+      if sL2.neConv != 4 then throw s!"L2 chain: expected 4 conv tasks, got {sL2.neConv}"
+      if gL2.scratchBytes != 0 then throw s!"L2 chain: expected 0 scratchBytes, got {gL2.scratchBytes}"
+
+      -- DRAM mode: verify scratch reuse!
+      -- Intermediates: c1 [16,16,16] = 16*16*64 = 16384B, c2 [16,16,16] = 16384B, c3 [32,8,8] = 32*8*64 = 16384B
+      -- Sum = 49152B, but only 2 buffers are ever live simultaneously (max live = 32768B)!
+      let gDram ← Vane.Graph.compileGraph (makeChain .dram)
+      let _ ← verifyCompiledGraph gDram 4
+      let sumInterm := 16384 + 16384 + 16384
+      if gDram.scratchBytes == 0 then throw "DRAM chain: expected scratchBytes > 0"
+      if gDram.scratchBytes >= sumInterm then
+        throw s!"DRAM chain: expected scratch reuse (< {sumInterm}B), got {gDram.scratchBytes}B"
+      if gDram.info.scratchSection.isNone then throw "DRAM chain: missing __DATA,__bss scratch section"
+
+      -- Auto mode
+      let gAuto ← Vane.Graph.compileGraph (makeChain .auto)
+      let _ ← verifyCompiledGraph gAuto 4
+      pure ()
+    ))
+
+    -- M4 E2E 2: Mixed NE + PE + standalone LUT pipelines + fused LUT conv
+    results := results.push (checkOk s!"m4 ({tgt.name}): mixed conv -> pe1 -> lut(silu) -> conv & fused conv+gelu -> pe2(add)" (do
+      let spec1 : Vane.Graph.GraphSpec := {
+        target := tgt
+        defaultPlacement := .auto
+        inputs := #[{ name := "x", shape := { c := 16, h := 8, w := 16 } }]
+        nodes := #[
+          { id := "c1", inputs := #["x"], op := .conv1x1 16 16 (mkGraphW1x1 16 16 3) none .none },
+          { id := "p1", inputs := #["c1"], op := .pe1 (.chain (some 0x3800) (some 0x3400) none) },
+          { id := "l1", inputs := #["p1"], op := .lut (.lut .silu) },
+          { id := "c2", inputs := #["l1"], op := .conv1x1 16 16 (mkGraphW1x1 16 16 4) none .relu }
+        ]
+      }
+      let g1 ← Vane.Graph.compileGraph spec1
+      let s1 ← verifyCompiledGraph g1 4
+      if s1.neConv != 2 || s1.peOp != 1 || s1.neAct != 1 then
+        throw s!"unexpected summary {repr s1}"
+
+      -- Also run same mixed pipeline in DRAM mode (exercises cross-engine DRAM RAW + WAR)
+      let g1Dram ← Vane.Graph.compileGraph { spec1 with defaultPlacement := .dram }
+      let _ ← verifyCompiledGraph g1Dram 4
+
+      -- Fused conv+LUT -> PE add with skip
+      let spec2 : Vane.Graph.GraphSpec := {
+        target := tgt
+        defaultPlacement := .auto
+        inputs := #[{ name := "x", shape := { c := 16, h := 8, w := 16 } }]
+        nodes := #[
+          { id := "c1", inputs := #["x"], op := .conv1x1 16 16 (mkGraphW1x1 16 16 5) (some (mkGraphBias 16)) (.lut .gelu) },
+          { id := "add", inputs := #["c1", "x"], op := .pe2 .add false }
+        ]
+      }
+      let g2 ← Vane.Graph.compileGraph spec2
+      let s2 ← verifyCompiledGraph g2 2
+      if s2.neConv != 1 || s2.peOp != 1 then
+        throw s!"unexpected fused+pe summary {repr s2}"
+      pure ()
+    ))
+
+    -- M4 E2E 3: Residual blocks (L2, DRAM, hybrid L2+DRAM), 2-input graph, and broadcast skip
+    results := results.push (checkOk s!"m4 ({tgt.name}): residual block (L2, DRAM, hybrid), 2-input graph, and broadcast skip" (do
+      -- Residual: conv3x3 -> conv1x1 -> pe add(c2, x) in L2, DRAM, and hybrid (c1=l2, c2=dram)
+      let mkRes (p1 p2 : Option Vane.Graph.EdgePlacementMode) (defP : Vane.Graph.EdgePlacementMode) : Vane.Graph.GraphSpec := {
+        target := tgt
+        defaultPlacement := defP
+        inputs := #[{ name := "x", shape := { c := 16, h := 8, w := 16 } }]
+        nodes := #[
+          { id := "c1", inputs := #["x"], op := .conv3x3 .dense 16 16 1 .same (mkGraphW3x3 16 16 false) none .relu, outPlacement := p1 },
+          { id := "c2", inputs := #["c1"], op := .conv1x1 16 16 (mkGraphW1x1 16 16 6) none .none, outPlacement := p2 },
+          { id := "res", inputs := #["c2", "x"], op := .pe2 .add false }
+        ]
+      }
+      let _ ← verifyCompiledGraph (← Vane.Graph.compileGraph (mkRes none none .l2)) 3
+      let _ ← verifyCompiledGraph (← Vane.Graph.compileGraph (mkRes none none .dram)) 3
+      let gHyb ← Vane.Graph.compileGraph (mkRes (some .l2) (some .dram) .auto)
+      let _ ← verifyCompiledGraph gHyb 3
+      if gHyb.nodes[0]!.outLocation.placementName != "l2" || gHyb.nodes[1]!.outLocation.placementName != "dram" then
+        throw "hybrid residual placement mismatch"
+
+      -- Residual where skip is an intermediate node (c0 -> c1 -> add(c1, c0))
+      let specSkipInterm : Vane.Graph.GraphSpec := {
+        target := tgt
+        defaultPlacement := .l2
+        inputs := #[{ name := "x", shape := { c := 16, h := 8, w := 16 } }]
+        nodes := #[
+          { id := "c0", inputs := #["x"], op := .conv1x1 16 16 (mkGraphW1x1 16 16 7) none .relu },
+          { id := "c1", inputs := #["c0"], op := .conv1x1 16 16 (mkGraphW1x1 16 16 8) none .none },
+          { id := "add", inputs := #["c1", "c0"], op := .pe2 .add false }
+        ]
+      }
+      let _ ← verifyCompiledGraph (← Vane.Graph.compileGraph specSkipInterm) 3
+      let _ ← verifyCompiledGraph (← Vane.Graph.compileGraph { specSkipInterm with defaultPlacement := .dram }) 3
+
+      -- 2-network-input graph + broadcast skip [C, 1, 1]
+      let spec2In : Vane.Graph.GraphSpec := {
+        target := tgt
+        defaultPlacement := .auto
+        inputs := #[
+          { name := "x", shape := { c := 16, h := 8, w := 16 } },
+          { name := "z", shape := { c := 16, h := 1, w := 1 } }
+        ]
+        nodes := #[
+          { id := "c1", inputs := #["x"], op := .conv1x1 16 16 (mkGraphW1x1 16 16 9) none .relu },
+          { id := "add", inputs := #["c1", "z"], op := .pe2 .add false }
+        ]
+      }
+      let g2In ← Vane.Graph.compileGraph spec2In
+      let _ ← verifyCompiledGraph g2In 2
+      if g2In.info.surfaces.size != 3 then throw s!"expected 3 surfaces, got {g2In.info.surfaces.size}"
+      pure ()
+    ))
+
+  -- M4 E2E 4: Auto-spill from L2 to DRAM when simultaneous live tensors exceed 2 MiB
+  results := results.push (checkOk "m4: auto-spill moves oversized live intermediate from L2 to DRAM scratch" (do
+    -- Shape [64, 128, 128]: 1 tensor = 64 * 128 * 256 = 2,097,152B (2 MiB exactly -> ineligible/spilled!)
+    -- Use [32, 128, 128]: 1 tensor = 32 * 128 * 256 = 1,048,576B (1 MiB) -> 2 simultaneous live tensors (c0 + c1)
+    -- plus staging exceed 2 MiB, forcing auto-spill of at least one to DRAM!
+    let specSpill : Vane.Graph.GraphSpec := {
+      target := .h17
+      defaultPlacement := .auto
+      inputs := #[{ name := "x", shape := { c := 32, h := 128, w := 128 } }]
+      nodes := #[
+        { id := "p0", inputs := #["x"], op := .pe1 .abs },
+        { id := "p1", inputs := #["p0"], op := .pe1 (.chain (some 0x3800) none none) },
+        { id := "add", inputs := #["p1", "p0"], op := .pe2 .add false }
+      ]
+    }
+    let gSpill ← Vane.Graph.compileGraph specSpill
+    let _ ← verifyCompiledGraph gSpill 3
+    if gSpill.scratchBytes == 0 then
+      throw "expected auto-spill to allocate DRAM scratch > 0"
+    let spilledCount := (gSpill.nodes.filter fun nd => nd.outLocation.placementName == "dram").size
+    if spilledCount == 0 then
+      throw "expected at least one spilled DRAM intermediate"
+    pure ()
+  ))
+
+  -- M4 E2E 5: PE [DL] rule forces staged mode when k = 4, W > 16 (e.g. W = 64, stripW = 16)
+  results := results.push (checkOk "m4: PE [DL] forces staged mode for W=64 (k=4, stripW=16 % 32 != 0)" (do
+    -- Shape [16, 4, 64] on H17/H16: W=64, 64 > 16 and stripW(k=4)=16 % 32 != 0 -> direct MUST be false!
+    -- Wait: choosePeTiling prefers k=5 (stripW=32) when it fits! To hit k=4 (stripW=16) naturally,
+    -- make C large enough that k=5 staging exceeds 2 MiB or use compilePe with W=64 and C=32768?
+    -- Actually check peIsDirect directly AND verify a multi-task graph where PE has W=64, C=64, H=4.
+    if peIsDirect .h17 64 4 then
+      throw "peIsDirect .h17 64 4 should be false under [DL]"
+    if peIsDirect .h16 64 4 then
+      throw "peIsDirect .h16 64 4 should be false under [DL]"
+    if !(peIsDirect .h17 16 4) then
+      throw "peIsDirect .h17 16 4 should be true (outW <= stripW)"
+    if !(peIsDirect .h17 64 5) then
+      throw "peIsDirect .h17 64 5 should be true (stripW=32 % 32 == 0)"
+    -- Also test large C where k=4 is forced (or any multi-task PE with W=64 passes verifyHwxTasksSummary)
+    let specW64 : Vane.Graph.GraphSpec := {
+      target := .h17
+      defaultPlacement := .auto
+      inputs := #[{ name := "x", shape := { c := 8, h := 4, w := 64 } }]
+      nodes := #[
+        { id := "p1", inputs := #["x"], op := .pe1 .abs },
+        { id := "p2", inputs := #["p1"], op := .pe1 (.chain (some 0x3800) none none) }
+      ]
+    }
+    let gW64 ← Vane.Graph.compileGraph specW64
+    let _ ← verifyCompiledGraph gW64 2
+    pure ()
+  ))
+
+  -- =========================================================================
+  -- Milestone 4: All 11 Mandatory Negative Multi-Task Verifier Tests
+  -- =========================================================================
+
+  let findTaskRegFileOffset (hwx : ByteArray) (info : HwxInfo) (taskIdx regAddr : Nat) : Except String Nat := do
+    let textBytes ← readSlice hwx info.textSection.offset.toNat info.textSection.size.toNat
+    let tasks ← decodeTaskStream info.target textBytes
+    let some t := tasks[taskIdx]? | throw s!"no task {taskIdx}"
+    let some w := t.writes.find? (fun w => w.byteAddr == regAddr)
+      | throw s!"task {taskIdx}: register {toHex regAddr} not found"
+    pure (info.textSection.offset.toNat + w.payloadOffset)
+
+  let tamperTaskRegAndVerify (hwx : ByteArray) (info : HwxInfo) (taskIdx regAddr : Nat) (newVal : UInt32) :
+      Except String Unit := do
+    let fOff ← findTaskRegFileOffset hwx info taskIdx regAddr
+    let badHwx ← putU32LE hwx fOff newVal
+    let badInfo ← validateHwx badHwx
+    let _ ← verifyHwxTasks badHwx badInfo (requireKnownTask := true)
+    pure ()
+
+  let tamperTaskHeaderAndVerify (hwx : ByteArray) (info : HwxInfo) (taskIdx wordIdx : Nat) (newVal : UInt32) :
+      Except String Unit := do
+    let textBytes ← readSlice hwx info.textSection.offset.toNat info.textSection.size.toNat
+    let tasks ← decodeTaskStream info.target textBytes
+    let some t := tasks[taskIdx]? | throw s!"no task {taskIdx}"
+    let fOff := info.textSection.offset.toNat + t.startOffset + 4 * wordIdx
+    let badHwx ← putU32LE hwx fOff newVal
+    let badInfo ← validateHwx badHwx
+    let _ ← verifyHwxTasks badHwx badInfo (requireKnownTask := true)
+    pure ()
+
+  -- Baseline compiled multi-task fixtures for the 11 negative tests
+  let base2DramConv ← match Vane.Graph.compileGraph {
+      target := .h17, defaultPlacement := .dram
+      inputs := #[{ name := "x", shape := { c := 16, h := 8, w := 16 } }]
+      nodes := #[
+        { id := "c1", inputs := #["x"], op := .conv1x1 16 16 (mkGraphW1x1 16 16 1) none .none },
+        { id := "c2", inputs := #["c1"], op := .conv1x1 16 16 (mkGraphW1x1 16 16 2) none .none }
+      ]
+    } with
+    | .ok g => pure g
+    | .error e => throw (IO.userError s!"base2DramConv setup failed: {e}")
+
+  let base3DramConv ← match Vane.Graph.compileGraph {
+      target := .h17, defaultPlacement := .dram
+      inputs := #[{ name := "x", shape := { c := 16, h := 8, w := 16 } }]
+      nodes := #[
+        { id := "c1", inputs := #["x"], op := .conv1x1 16 16 (mkGraphW1x1 16 16 1) none .none },
+        { id := "c2", inputs := #["c1"], op := .conv1x1 16 16 (mkGraphW1x1 16 16 2) none .none },
+        { id := "c3", inputs := #["c2"], op := .conv1x1 16 16 (mkGraphW1x1 16 16 3) none .none }
+      ]
+    } with
+    | .ok g => pure g
+    | .error e => throw (IO.userError s!"base3DramConv setup failed: {e}")
+
+  let baseNeToPe ← match Vane.Graph.compileGraph {
+      target := .h17, defaultPlacement := .dram
+      inputs := #[{ name := "x", shape := { c := 16, h := 8, w := 16 } }]
+      nodes := #[
+        { id := "c1", inputs := #["x"], op := .conv1x1 16 16 (mkGraphW1x1 16 16 1) none .none },
+        { id := "p1", inputs := #["c1"], op := .pe1 .abs }
+      ]
+    } with
+    | .ok g => pure g
+    | .error e => throw (IO.userError s!"baseNeToPe setup failed: {e}")
+
+  let basePeToNe ← match Vane.Graph.compileGraph {
+      target := .h17, defaultPlacement := .l2
+      inputs := #[{ name := "x", shape := { c := 16, h := 8, w := 16 } }]
+      nodes := #[
+        { id := "p1", inputs := #["x"], op := .pe1 .abs },
+        { id := "c1", inputs := #["p1"], op := .conv1x1 16 16 (mkGraphW1x1 16 16 1) none .none }
+      ]
+    } with
+    | .ok g => pure g
+    | .error e => throw (IO.userError s!"basePeToNe setup failed: {e}")
+
+  let basePeSrc2 ← match Vane.Graph.compileGraph {
+      target := .h17, defaultPlacement := .dram
+      inputs := #[{ name := "x", shape := { c := 16, h := 8, w := 16 } }]
+      nodes := #[
+        { id := "p0", inputs := #["x"], op := .pe1 .abs },
+        { id := "add", inputs := #["x", "p0"], op := .pe2 .add false }
+      ]
+    } with
+    | .ok g => pure g
+    | .error e => throw (IO.userError s!"basePeSrc2 setup failed: {e}")
+
+  let mkSrcDepWord (name : String) (code taskId depDist depKind : UInt32) : Except String UInt32 :=
+    encodeWord (srcDepMultiLayout name) #[
+      ("code", code),
+      ("task", taskId),
+      ("depDist", depDist),
+      ("depKind", depKind)
+    ]
+
+  -- Neg #1: Missing 0x4d00 depKind on NE task reading DRAM scratch written by i-1 (srcReadNE)
+  results := results.push (checkErr "m4 neg #1: missing 0x4d00 depKind on NE DRAM RAW (srcReadNE) rejected" (do
+    let fDep ← findTaskRegFileOffset base2DramConv.hwx base2DramConv.info 1 regSrc1Dep
+    let origCode := (← readU32LE base2DramConv.hwx fDep) &&& 0xff
+    let wNoDep ← mkSrcDepWord "src1Dep" origCode 1 0 0
+    tamperTaskRegAndVerify base2DramConv.hwx base2DramConv.info 1 regSrc1Dep wNoDep
+  ) "srcReadNE")
+
+  -- Neg #2: Non-zero depDist = 1 on 0x4d00 without intervening HB
+  results := results.push (checkErr "m4 neg #2: non-zero depDist=1 on 0x4d00 without intervening HB rejected" (do
+    let fDep ← findTaskRegFileOffset base3DramConv.hwx base3DramConv.info 2 regSrc1Dep
+    let origCode := (← readU32LE base3DramConv.hwx fDep) &&& 0xff
+    let wBad ← mkSrcDepWord "src1Dep" origCode 2 1 2
+    tamperTaskRegAndVerify base3DramConv.hwx base3DramConv.info 2 regSrc1Dep wBad
+  ) "srcReadNE")
+
+  -- Neg #3: Missing bit 5 on PE task reading NE's DRAM scratch / overlapping NE L2 ([XE] / DRAM RAW)
+  results := results.push (checkErr "m4 neg #3: missing bit 5 on PE task after NE ([XE] / DRAM RAW) rejected" (do
+    let fCfg ← findTaskRegFileOffset baseNeToPe.hwx baseNeToPe.info 1 regSrc1Cfg
+    let orig ← readU32LE baseNeToPe.hwx fCfg
+    let stripped := orig &&& (~~~(cfgBitWaitNe5 ||| cfgBitWaitNe4))
+    let h1 ← putU32LE baseNeToPe.hwx fCfg stripped
+    let h2 ← match findTaskRegFileOffset h1 baseNeToPe.info 1 regSrc1Dep with
+      | .ok fDep =>
+        let origCode := (← readU32LE h1 fDep) &&& 0xff
+        let wNoDep ← mkSrcDepWord "src1Dep" origCode 1 0 0
+        putU32LE h1 fDep wNoDep
+      | .error _ => pure h1
+    let badInfo ← validateHwx h2
+    let _ ← verifyHwxTasks h2 badInfo (requireKnownTask := true)
+    pure ()
+  ) "S5")
+
+  -- Neg #4: Missing bit 22 on NE task reading PE's L2 / overlapping PE L2 ([XE] / L2 RAW)
+  results := results.push (checkErr "m4 neg #4: missing bit 22 on NE task after PE ([XE] / L2 RAW) rejected" (do
+    let fCfg ← findTaskRegFileOffset basePeToNe.hwx basePeToNe.info 1 regSrc1Cfg
+    let orig ← readU32LE basePeToNe.hwx fCfg
+    let stripped := orig &&& (~~~(cfgBitWaitPe22 ||| cfgBitWaitPe20 ||| cfgBitHandoffPe))
+    tamperTaskRegAndVerify basePeToNe.hwx basePeToNe.info 1 regSrc1Cfg stripped
+  ) "S5 L2 hazard")
+
+  -- Neg #5: Missing src2 wait (bit 22 / 0x4d04 depKind) on 2-source PE whose src2 reads scratch (src2AheadPE)
+  results := results.push (checkErr "m4 neg #5: missing src2 wait on 2-source PE reading scratch (src2AheadPE) rejected" (do
+    let fCfg1 ← findTaskRegFileOffset basePeSrc2.hwx basePeSrc2.info 1 regSrc1Cfg
+    let fCfg2 ← findTaskRegFileOffset basePeSrc2.hwx basePeSrc2.info 1 regSrc2Cfg
+    let v1 ← readU32LE basePeSrc2.hwx fCfg1
+    let v2 ← readU32LE basePeSrc2.hwx fCfg2
+    let mask := ~~~(cfgBitWaitPe22 ||| cfgBitWaitPe20 ||| cfgBitWaitNe5 ||| cfgBitWaitNe4)
+    let h1 ← putU32LE basePeSrc2.hwx fCfg1 (v1 &&& mask)
+    let h2 ← putU32LE h1 fCfg2 (v2 &&& mask)
+    let h3 ← match findTaskRegFileOffset h2 basePeSrc2.info 1 regSrc2Dep with
+      | .ok fDep2 =>
+        let origCode := (← readU32LE h2 fDep2) &&& 0xff
+        let wNoDep2 ← mkSrcDepWord "src2Dep" origCode 1 0 0
+        putU32LE h2 fDep2 wNoDep2
+      | .error _ => pure h2
+    let h4 ← match findTaskRegFileOffset h3 basePeSrc2.info 1 regSrc1Dep with
+      | .ok fDep1 =>
+        let origCode := (← readU32LE h3 fDep1) &&& 0xff
+        let wNoDep1 ← mkSrcDepWord "src1Dep" origCode 1 0 0
+        putU32LE h3 fDep1 wNoDep1
+      | .error _ => pure h3
+    let badInfo ← validateHwx h4
+    let _ ← verifyHwxTasks h4 badInfo (requireKnownTask := true)
+    pure ()
+  ) "src2AheadPE")
+
+  -- Neg #6: Missing whole-task wait on task reusing DRAM scratch read by earlier task (DRAM WAR)
+  results := results.push (checkErr "m4 neg #6: missing whole-task wait on DRAM scratch reuse (DRAM WAR) rejected" (do
+    -- c0 (NE conv) writes slot 0, p1 (PE abs) reads slot 0 & writes slot 1,
+    -- c2 (NE conv) reads slot 1 (via 0x4d00) & REUSES slot 0!
+    -- programOrderNEcompute gives HB(0, 2) (so WAW between c0 & c2 is ordered),
+    -- shifting c2's L2 bases to +0x40000 avoids L2 overlap with p1,
+    -- 0x4d00 orders DRAM RAW on slot 1, so clearing bit 22 on c2 isolates DRAM WAR with p1!
+    let gWar ← Vane.Graph.compileGraph {
+      target := .h17, defaultPlacement := .dram
+      inputs := #[{ name := "x", shape := { c := 16, h := 8, w := 16 } }]
+      nodes := #[
+        { id := "c0", inputs := #["x"], op := .conv1x1 16 16 (mkGraphW1x1 16 16 1) none .none },
+        { id := "p1", inputs := #["c0"], op := .pe1 .abs },
+        { id := "c2", inputs := #["p1"], op := .conv1x1 16 16 (mkGraphW1x1 16 16 2) none .none },
+        { id := "c3", inputs := #["c2"], op := .conv1x1 16 16 (mkGraphW1x1 16 16 3) none .none }
+      ]
+    }
+    let fCfg ← findTaskRegFileOffset gWar.hwx gWar.info 2 regSrc1Cfg
+    let origCfg ← readU32LE gWar.hwx fCfg
+    let stripped := origCfg &&& (~~~(cfgBitWaitPe22 ||| cfgBitWaitPe20))
+    let fSrc1 ← findTaskRegFileOffset gWar.hwx gWar.info 2 regSrc1Base
+    let fRes ← findTaskRegFileOffset gWar.hwx gWar.info 2 regResBase
+    let s1Base ← readU32LE gWar.hwx fSrc1
+    let rBase ← readU32LE gWar.hwx fRes
+    let h1 ← putU32LE gWar.hwx fCfg stripped
+    let h2 ← putU32LE h1 fSrc1 (s1Base + 0x40000)
+    let h3 ← putU32LE h2 fRes (rBase + 0x40000)
+    let badInfo ← validateHwx h3
+    let _ ← verifyHwxTasks h3 badInfo (requireKnownTask := true)
+    pure ()
+  ) "DRAM WAR")
+
+  -- Helper to rebuild a TaskDesc from a DecodedTask (with optional plain-write filter/append)
+  let decodedTaskToDesc (t : DecodedTask) (ws : Array DecodedWrite) (isFirst isLast : Bool) : Except String TaskDesc := do
+    let mut plain : Array RegWrite := #[]
+    let mut barW : Array BarRegWrite := #[]
+    let mut relocs : Array TaskReloc := #[]
+    for w in ws do
+      match w.barSlot with
+      | none => plain := plain.push { byteAddr := w.byteAddr, value := w.value }
+      | some s =>
+        let recIdx := barW.size
+        barW := barW.push { baseByteAddr := w.byteAddr, barSlot := s, values := #[w.value] }
+        if w.byteAddr == regKernelBaseLo || w.byteAddr == regLutBaseLo then
+          relocs := relocs.push { barRecIndex := recIdx, payloadWordIndex := 0 }
+    let ene ← decodeFieldChecked taskHeader8MultiLayout t.header[8]! "ene"
+    pure {
+      taskId := t.taskIndex
+      eneOverride := some ene.toNat
+      plainWrites := plain
+      barWrites := barW
+      kernelRelocs := relocs
+      isFirst := isFirst
+      isLast := isLast
+      liveL2Mask := t.header[7]!
+    }
+
+  -- Neg #7: Omitted disabled chunk slot 0x5520+4*s on NE conv task with taskId > 0 (chunk-slot carry-over)
+  results := results.push (checkErr "m4 neg #7: omitted disabled chunk slot on NE conv taskId > 0 rejected" (do
+    let sh0 : ConvSpec := { kernelSize := 1, h := 8, w := 16, cin := 16, cout := 16 }
+    let sh1 : ConvSpec := { kernelSize := 1, h := 8, w := 16, cin := 16, cout := 1 }
+    let g2 ← Vane.Graph.compileGraph {
+      target := .h17, defaultPlacement := .l2
+      inputs := #[{ name := "x", shape := { c := 16, h := 8, w := 16 } }]
+      nodes := #[
+        { id := "c1", inputs := #["x"], op := .conv1x1 16 16 (mkGraphW1x1 16 16 1) none .none },
+        { id := "c2", inputs := #["c1"], op := .conv1x1 16 1 (mkGraphW1x1 16 1 2) none .none }
+      ]
+    }
+    let textBytes ← readSlice g2.hwx g2.info.textSection.offset.toNat g2.info.textSection.size.toNat
+    let tasks ← decodeTaskStream .h17 textBytes
+    let t0 ← match tasks[0]? with | some t => pure t | none => throw "missing task 0"
+    let t1 ← match tasks[1]? with | some t => pure t | none => throw "missing task 1"
+    let td0 ← decodedTaskToDesc t0 t0.writes true false
+    let w1NoSlot15 := t1.writes.filter (fun w => w.byteAddr != regChunkSlot 15)
+    let td1 ← decodedTaskToDesc t1 w1NoSlot15 false true
+    let sIn ← makeFp16Surface .h17 "x" "input_x" .input sh0.cin sh0.h sh0.w
+    let sOut ← makeFp16Surface .h17 "y" "output_c2" .output sh1.cout sh1.h sh1.w
+    let some kSec := g2.info.kernelSection | throw "missing __KERN_0"
+    let kernBytes ← readSlice g2.hwx kSec.offset.toNat kSec.size.toNat
+    let em ← emitProgram { target := .h17, surfaces := #[sIn, sOut], kernel := some kernBytes, tasks := #[td0, td1] }
+    let _ ← verifyHwxTasks em.hwx em.info (requireKnownTask := true)
+    pure ()
+  ) "carry-over")
+
+  -- Neg #8: Scratch DMA offset out of bounds of __DATA,__bss section size
+  results := results.push (checkErr "m4 neg #8: scratch DMA offset out of bounds of __DATA,__bss rejected" (do
+    let some scSec := base2DramConv.info.scratchSection | throw "missing scratch section"
+    tamperTaskRegAndVerify base2DramConv.hwx base2DramConv.info 0 regResBaseLo scSec.size.toUInt32
+  ) "exceeds")
+
+  -- Neg #9: L2-resident tensor overwritten by an unrelated intermediate task while still live
+  results := results.push (checkErr "m4 neg #9: live L2-resident tensor overwritten by intermediate task rejected" (do
+    let gLive ← Vane.Graph.compileGraph {
+      target := .h17, defaultPlacement := .l2
+      inputs := #[{ name := "x", shape := { c := 16, h := 8, w := 16 } }]
+      nodes := #[
+        { id := "c0", inputs := #["x"], op := .conv1x1 16 16 (mkGraphW1x1 16 16 1) none .none },
+        { id := "c1", inputs := #["x"], op := .conv1x1 16 16 (mkGraphW1x1 16 16 2) none .none },
+        { id := "add", inputs := #["c0", "c1"], op := .pe2 .add false }
+      ]
+    }
+    let fC0Res ← findTaskRegFileOffset gLive.hwx gLive.info 0 regResBase
+    let c0Base ← readU32LE gLive.hwx fC0Res
+    tamperTaskRegAndVerify gLive.hwx gLive.info 1 regResBase c0Base
+  ) "overwritten while live")
+
+  -- Neg #10: Wrong multi-task header[2]/header[8] flags, 0x5900 on non-last task, dangling bit 22
+  results := results.push (checkErr "m4 neg #10a: wrong header[8] isLast=1 on non-last task rejected" (do
+    let textBytes ← readSlice base2DramConv.hwx base2DramConv.info.textSection.offset.toNat base2DramConv.info.textSection.size.toNat
+    let tasks ← decodeTaskStream .h17 textBytes
+    let h8 ← match tasks[0]? with | some t => pure t.header[8]! | none => throw "missing task 0"
+    let badH8 := h8 ||| ((1 : UInt32) <<< 3)
+    tamperTaskHeaderAndVerify base2DramConv.hwx base2DramConv.info 0 8 badH8
+  ) "isLast")
+
+  results := results.push (checkErr "m4 neg #10b: 0x5900 output stage emitted on non-last task rejected" (do
+    let textBytes ← readSlice base2DramConv.hwx base2DramConv.info.textSection.offset.toNat base2DramConv.info.textSection.size.toNat
+    let tasks ← decodeTaskStream .h17 textBytes
+    let t0 ← match tasks[0]? with | some t => pure t | none => throw "missing task 0"
+    let t1 ← match tasks[1]? with | some t => pure t | none => throw "missing task 1"
+    let td0Base ← decodedTaskToDesc t0 t0.writes true false
+    let td0Bad := { td0Base with plainWrites := td0Base.plainWrites.push { byteAddr := regOut0, value := out0Value } }
+    let td1 ← decodedTaskToDesc t1 t1.writes false true
+    let sIn ← makeFp16Surface .h17 "x" "input_x" .input 16 8 16
+    let sOut ← makeFp16Surface .h17 "y" "output_c2" .output 16 8 16
+    let some kSec := base2DramConv.info.kernelSection | throw "missing __KERN_0"
+    let some scSec := base2DramConv.info.scratchSection | throw "missing __DATA,__bss"
+    let kernBytes ← readSlice base2DramConv.hwx kSec.offset.toNat kSec.size.toNat
+    let em ← emitProgram {
+      target := .h17, surfaces := #[sIn, sOut], kernel := some kernBytes
+      scratch := some { size := scSec.size, usable := scSec.size.toUInt32 }, tasks := #[td0Bad, td1]
+    }
+    let _ ← verifyHwxTasks em.hwx em.info (requireKnownTask := true)
+    pure ()
+  ) "non-last task")
+
+  results := results.push (checkErr "m4 neg #10c: dangling bit 22 (waitPe22) when no prior PE task exists rejected" (do
+    let fCfg ← findTaskRegFileOffset base2DramConv.hwx base2DramConv.info 1 regSrc1Cfg
+    let orig ← readU32LE base2DramConv.hwx fCfg
+    tamperTaskRegAndVerify base2DramConv.hwx base2DramConv.info 1 regSrc1Cfg (orig ||| cfgBitWaitPe22)
+  ) "bit 22")
+
+  -- Neg #11: PE direct write with k=4, outW > 16 ([DL] violation)
+  results := results.push (checkErr "m4 neg #11: PE direct write with k=4, outW=64 > 16 ([DL]) rejected" (do
+    let d : TensorDims := { c := 4, h := 4, w := 64 }
+    let t : PeTiling := { k := 4, tileHeight := 4 }
+    let td ← lowerPeTask .h17 .abs d d none 6 none t
+    let sX ← makeFp16Surface .h17 "x" "input_x" .input 4 4 64
+    let sY ← makeFp16Surface .h17 "y" "output_y" .output 4 4 64
+    let em ← emitProgram { target := .h17, surfaces := #[sX, sY], tasks := #[td] }
+    let _ ← verifyHwxTasks em.hwx em.info (requireKnownTask := true)
+    let fResCfg ← findTaskRegFileOffset em.hwx em.info 0 regResCfg
+    let origCfg ← readU32LE em.hwx fResCfg
+    tamperTaskRegAndVerify em.hwx em.info 0 regResCfg (origCfg ||| ((1 : UInt32) <<< 3))
+  ) "[DL]")
+
+  pure results
+
 def main : IO UInt32 := do
-  let results ← runAllTests
+  let results := (← runAllTests) ++ (← runM4Tests)
   let mut passed := 0
   let mut failed := 0
   for r in results do

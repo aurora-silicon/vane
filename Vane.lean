@@ -4,6 +4,8 @@ import Vane.TaskStream
 import Vane.Hwx
 import Vane.Sections
 import Vane.Register
+import Vane.Reach
+import Vane.Alloc
 import Vane.Tiling
 import Vane.Program
 import Vane.Verify
@@ -12,4 +14,5 @@ import Vane.Lut
 import Vane.Conv
 import Vane.Conv1x1
 import Vane.Conv3x3
+import Vane.Graph
 import Vane.Proofs
