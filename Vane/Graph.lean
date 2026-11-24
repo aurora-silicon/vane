@@ -1267,6 +1267,17 @@ private def computeSynchronization (pre : Array PreLoweredTask) : Array TaskSync
                     if !syncs[i]!.src2WaitPe22 then
                       syncs := syncs.set! i { syncs[i]! with src2WaitPe22 := true }
                       changed := true
+              else if ti.engine == .ne && b.role == .src1Stage && a.role == .resStage then
+                -- neSrcStageAhead: plain HBL/HB does NOT order NE DMA src1Stage fill over draining resStage
+                if !(src2Wait5 || src2Wait22) then
+                  if tk.engine == .ne then
+                    if !syncs[i]!.src1WaitNe5 then
+                      syncs := syncs.set! i { syncs[i]! with src1WaitNe5 := true, src1HandoffNe := false }
+                      changed := true
+                  else
+                    if !syncs[i]!.src1WaitPe22 then
+                      syncs := syncs.set! i { syncs[i]! with src1WaitPe22 := true, src1HandoffPe := false }
+                      changed := true
               else
                 if !(hbl k i || handoff2 || handoff3) then
                   if tk.engine == .ne then

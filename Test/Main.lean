@@ -3754,6 +3754,39 @@ private def runM4Tests : IO (Array TestResult) := do
     pure ()
   ) "scratch coherence")
 
+  -- =========================================================================
+  -- Milestone 4 neSrcStageAhead: NE DMA src1Stage fill over draining resStage
+  -- =========================================================================
+
+  let baseNeSrcStageAhead ← match Vane.Graph.compileGraph {
+      target := .h17, defaultPlacement := .dram
+      inputs := #[{ name := "x", shape := { c := 3, h := 32, w := 64 } }]
+      nodes := #[
+        { id := "c0", inputs := #["x"], op := .conv3x3 .dense 3 64 1 .same (mkGraphW3x3 3 64 false) none .relu },
+        { id := "c1", inputs := #["c0"], op := .conv3x3 .dense 64 3 1 .same (mkGraphW3x3 64 3 false) none .none }
+      ]
+    } with
+    | .ok g => pure g
+    | .error e => throw (IO.userError s!"baseNeSrcStageAhead setup failed: {e}")
+
+  results := results.push (checkOk "m4 neSrcStageAhead: NE->NE DRAM conv3x3 (3->64->3) sets 0x4104 bit 5 and passes verifier" (do
+    let s ← verifyCompiledGraph baseNeSrcStageAhead 2
+    if s.neConv != 2 then
+      throw s!"expected 2 conv tasks, got {s.neConv}"
+    let fCfg1 ← findTaskRegFileOffset baseNeSrcStageAhead.hwx baseNeSrcStageAhead.info 1 regSrc1Cfg
+    let wCfg1 ← readU32LE baseNeSrcStageAhead.hwx fCfg1
+    if (wCfg1 &&& cfgBitWaitNe5) == 0 then
+      throw s!"expected task 1 0x4104 to set bit 5 (0x20), got {toHex wCfg1.toNat}"
+    pure ()
+  ))
+
+  results := results.push (checkErr "m4 neSrcStageAhead neg: clearing 0x4104 bit 5 on NE->NE overlapping src1Stage/resStage rejected" (do
+    let fCfg1 ← findTaskRegFileOffset baseNeSrcStageAhead.hwx baseNeSrcStageAhead.info 1 regSrc1Cfg
+    let orig ← readU32LE baseNeSrcStageAhead.hwx fCfg1
+    let stripped := orig &&& (~~~cfgBitWaitNe5)
+    tamperTaskRegAndVerify baseNeSrcStageAhead.hwx baseNeSrcStageAhead.info 1 regSrc1Cfg stripped
+  ) "neSrcStageAhead")
+
   pure results
 
 def main : IO UInt32 := do

@@ -2456,13 +2456,17 @@ def verifyProgramHazards (fps : Array VerifiedTaskFootprint) : Except String Uni
                 -- src2AheadPE: plain HB/HBL does NOT order PE src2 staging fill or L2 read
                 src2Wait22 || src2Wait5 || src2Kind ||
                   (b.role == .src2L2 && handoff2)
+              else if ti.engine == .ne && b.role == .src1Stage && a.role == .resStage then
+                -- neSrcStageAhead: plain HBL/HB does NOT order NE DMA src1Stage fill over draining resStage
+                src2Wait5 || src2Wait22
               else
                 hbl k i || handoff2 || handoff3
 
             if !ordered then
               let xeTag := if tk.engine != ti.engine then " [XE cross-engine]" else ""
               let src2Tag := if ti.engine == .pe && (b.role == .src2Stage || b.role == .src2L2) then " [src2AheadPE]" else ""
-              throw s!"S5 L2 hazard{xeTag}{src2Tag}: unordered conflict between task {k} ({a.role.name} [{toHex a.lo}, {toHex a.hi})) and task {i} ({b.role.name} [{toHex b.lo}, {toHex b.hi}))"
+              let neStageTag := if ti.engine == .ne && b.role == .src1Stage && a.role == .resStage then " [neSrcStageAhead]" else ""
+              throw s!"S5 L2 hazard{xeTag}{src2Tag}{neStageTag}: unordered conflict between task {k} ({a.role.name} [{toHex a.lo}, {toHex a.hi})) and task {i} ({b.role.name} [{toHex b.lo}, {toHex b.hi}))"
 
       -- B. Check all conflicting DRAM pairs
       for a in tk.dramAccesses do
