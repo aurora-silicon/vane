@@ -2,6 +2,7 @@ package ref
 
 import (
 	"encoding/json"
+	"math"
 	"testing"
 
 	"github.com/niteria/vane/internal/fp16"
@@ -129,5 +130,32 @@ func TestEvalGraphMixedNePeLutAndBroadcast(t *testing.T) {
 	res, err := CompareFP16(gotQ.Data, gotF.Data, 3e-2, 3e-2, nil)
 	if err != nil || !res.Passed {
 		t.Fatalf("mixed Q15.16 vs F64 mismatch: err=%v passed=%t maxAbs=%g", err, res.Passed, res.MaxAbsErr)
+	}
+}
+
+func TestResolvePe1ChainSmulSdivPlacementAndGuards(t *testing.T) {
+	f2 := 2.0
+	inSc, b, sc, err := resolvePe1ChainParams(GraphNodeSpec{ID: "m", Op: "pe", PeOp: "smul", Scalar: &f2})
+	if err != nil {
+		t.Fatalf("smul failed: %v", err)
+	}
+	if inSc != nil || b != nil || sc == nil || *sc != fp16.FromFloat64(2.0) {
+		t.Fatalf("smul expected scale=2.0 (inScale=nil, bias=nil), got inScale=%v bias=%v scale=%v", inSc, b, sc)
+	}
+
+	inSc, b, sc, err = resolvePe1ChainParams(GraphNodeSpec{ID: "d", Op: "pe", PeOp: "sdiv", Scalar: &f2})
+	if err != nil {
+		t.Fatalf("sdiv failed: %v", err)
+	}
+	if inSc != nil || b != nil || sc == nil || *sc != fp16.FromFloat64(0.5) {
+		t.Fatalf("sdiv expected scale=0.5 (inScale=nil, bias=nil), got inScale=%v bias=%v scale=%v", inSc, b, sc)
+	}
+
+	// Non-finite fp16 divisors (+Inf, -Inf, NaN, and finite float64 overflowing fp16) must be rejected
+	for _, bad := range []float64{math.Inf(1), math.Inf(-1), math.NaN(), 1e5, -1e5} {
+		v := bad
+		if _, _, _, err := resolvePe1ChainParams(GraphNodeSpec{ID: "bad", Op: "pe", PeOp: "sdiv", Scalar: &v}); err == nil {
+			t.Fatalf("expected sdiv with scalar=%v to fail", bad)
+		}
 	}
 }

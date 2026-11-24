@@ -1394,10 +1394,11 @@ func cmdGenGraph(args []string, stdout, stderr io.Writer) int {
 				fmt.Fprintf(stderr, "error: node %q: unknown input %q\n", nd.ID, nd.Inputs[0])
 				return 1
 			}
-			cin := inD.c
-			if nd.Cin != 0 {
-				cin = nd.Cin
+			if nd.Cin != 0 && nd.Cin != inD.c {
+				fmt.Fprintf(stderr, "error: node %q (conv1x1): cin %d != input channels %d\n", nd.ID, nd.Cin, inD.c)
+				return 1
 			}
+			cin := inD.c
 			if nd.Cout <= 0 {
 				fmt.Fprintf(stderr, "error: node %q (conv1x1): cout must be > 0\n", nd.ID)
 				return 1
@@ -1454,10 +1455,11 @@ func cmdGenGraph(args []string, stdout, stderr io.Writer) int {
 			if mode == "" {
 				mode = "dense"
 			}
-			cin := inD.c
-			if nd.Cin != 0 {
-				cin = nd.Cin
+			if nd.Cin != 0 && nd.Cin != inD.c {
+				fmt.Fprintf(stderr, "error: node %q (conv3x3): cin %d != input channels %d\n", nd.ID, nd.Cin, inD.c)
+				return 1
 			}
+			cin := inD.c
 			cout := nd.Cout
 			groups := 1
 			if mode == "depthwise" {
@@ -1538,13 +1540,34 @@ func cmdGenGraph(args []string, stdout, stderr io.Writer) int {
 					fmt.Fprintf(stderr, "error: node %q: unknown input in %v\n", nd.ID, nd.Inputs)
 					return 1
 				}
-				bcast := func(a, b int) int {
-					if a == 1 {
-						return b
+				bcast := func(a, b int, axis string) (int, error) {
+					if a == b {
+						return a, nil
 					}
-					return a
+					if a == 1 {
+						return b, nil
+					}
+					if b == 1 {
+						return a, nil
+					}
+					return 0, fmt.Errorf("node %q (pe): incompatible broadcast on %s: %d vs %d", nd.ID, axis, a, b)
 				}
-				shapes[nd.ID] = dims3{bcast(d1.c, d2.c), bcast(d1.h, d2.h), bcast(d1.w, d2.w)}
+				bc, err := bcast(d1.c, d2.c, "C")
+				if err != nil {
+					fmt.Fprintf(stderr, "error: %v\n", err)
+					return 1
+				}
+				bh, err := bcast(d1.h, d2.h, "H")
+				if err != nil {
+					fmt.Fprintf(stderr, "error: %v\n", err)
+					return 1
+				}
+				bw, err := bcast(d1.w, d2.w, "W")
+				if err != nil {
+					fmt.Fprintf(stderr, "error: %v\n", err)
+					return 1
+				}
+				shapes[nd.ID] = dims3{bc, bh, bw}
 			} else {
 				fmt.Fprintf(stderr, "error: node %q (pe): expected 1 or 2 inputs\n", nd.ID)
 				return 1

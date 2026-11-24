@@ -1641,7 +1641,11 @@ private def cmdCompileGraph (args : List String) : IO UInt32 := do
             let optF16 := fun (key : String) => do
               match ← jsonOptFloat nj key ctx with
               | none => pure none
-              | some f => pure (some (floatToF16CanonicalZero f))
+              | some f =>
+                let bits := floatToF16CanonicalZero f
+                if !f16IsFinite bits then
+                  throw s!"{ctx}: '{key}' value {f} overflows finite fp16 range"
+                pure (some bits)
             match peOpStr with
             | "abs" | "square" | "linear" | "chain" | "sadd" | "ssub" | "srsub" | "smul" | "sdiv" =>
               if ndInputs.size != 1 then throw s!"{ctx} (pe {peOpStr}): expected 1 input"

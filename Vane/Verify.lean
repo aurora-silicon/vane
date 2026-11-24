@@ -352,6 +352,7 @@ structure VerifiedTaskFootprint where
   kind : TaskKind
   engine : Engine
   isNeCompute : Bool
+  liveL2Mask : UInt32 := 0
   l2Accesses : Array VerifiedL2Access
   dramAccesses : Array VerifiedDramAccess
   sync : TaskSyncInfo
@@ -460,14 +461,14 @@ private def vCheckNoDuplicateWrites (writes : Array DecodedWrite) (prefixMsg : S
     seen := seen.push w.byteAddr
   pure ()
 
-/-- Verify 9-word single-task or multi-task header and return `(taskId, ene)`. -/
+/-- Verify 9-word single-task or multi-task header and return `(taskId, ene, h7)`. -/
 private def vVerifyTaskHeader9
     (target : Target)
     (task : DecodedTask)
     (taskCount : Nat)
     (expectPe : Bool)
     (allowCopyH4 : Bool)
-    (prefixMsg : String) : Except String (Nat × Nat) := do
+    (prefixMsg : String) : Except String (Nat × Nat × UInt32) := do
   if taskCount == 0 || taskCount > vMaxTasks then
     throw s!"{prefixMsg}: taskCount={taskCount} out of range 1..{vMaxTasks}"
   let isFirst := task.taskIndex == 0
@@ -519,7 +520,7 @@ private def vVerifyTaskHeader9
   else
     if ene < 1 || ene > 5 then
       throw s!"{prefixMsg}: header[8] ene={ene} out of range 1..5"
-  pure (taskId, ene.toNat)
+  pure (taskId, ene.toNat, h7)
 
 private structure DecodedSrcPortCfg where
   isL2 : Bool
@@ -790,7 +791,7 @@ def verifyConvTaskMulti
   let isLast := task.taskIndex + 1 == taskCount
 
   -- 1. Verify 9-word multi-task header
-  let (taskId, ene) ← vVerifyTaskHeader9 target task taskCount false false prefixMsg
+  let (taskId, ene, h7) ← vVerifyTaskHeader9 target task taskCount false false prefixMsg
   let logNE := ene - 1
 
   -- 2. Reject duplicate register writes
@@ -1342,6 +1343,7 @@ def verifyConvTaskMulti
     kind := .neConv
     engine := .ne
     isNeCompute := true
+    liveL2Mask := h7
     l2Accesses := l2Accs
     dramAccesses := dramAccs
     sync := sync
@@ -1389,7 +1391,7 @@ def verifyPeTaskMulti
   let isLast := task.taskIndex + 1 == taskCount
 
   -- 1. Verify 9-word header with ene == 0
-  let (taskId, _) ← vVerifyTaskHeader9 target task taskCount true false prefixMsg
+  let (taskId, _, h7) ← vVerifyTaskHeader9 target task taskCount true false prefixMsg
 
   -- 2. Reject duplicate register writes
   vCheckNoDuplicateWrites task.writes prefixMsg
@@ -1867,6 +1869,7 @@ def verifyPeTaskMulti
     kind := .peOp
     engine := .pe
     isNeCompute := false
+    liveL2Mask := h7
     l2Accesses := l2Accs
     dramAccesses := dramAccs
     sync := sync
@@ -1893,7 +1896,7 @@ def verifyNeActTaskMulti
   let isLast := task.taskIndex + 1 == taskCount
 
   -- 1. Verify 9-word header
-  let (taskId, ene) ← vVerifyTaskHeader9 target task taskCount false true prefixMsg
+  let (taskId, ene, h7) ← vVerifyTaskHeader9 target task taskCount false true prefixMsg
   let logNE := ene - 1
 
   -- 2. Reject duplicate writes
@@ -2264,6 +2267,7 @@ def verifyNeActTaskMulti
     kind := .neAct
     engine := .ne
     isNeCompute := hasLut
+    liveL2Mask := h7
     l2Accesses := l2Accs
     dramAccesses := dramAccs
     sync := sync
@@ -2339,8 +2343,16 @@ def verifyProgramHazards (fps : Array VerifiedTaskFootprint) : Except String Uni
   let hbEq := fun a b => a == b || hb a b
   let hblEq := fun a b => a == b || hbl a b
 
-  -- 1. Live L2-resident integrity: every L2-resident read must match an intact prior resL2 write
-  --    that was not clobbered by any intermediate task's L2 write (staging or result).
+  -- 1. Live L2-resident integrity & exact header[7] (liveL2Mask) validation (Clauses S2 & S5):
+  --    Every L2-resident read must match an intact prior resL2 write that was not clobbered by any
+  --    intermediate task's L2 write; every resL2 write must have at least one matching consumer;
+  --    and every non-last task's header[7] must equal the exact 64 KiB block mask of live L2 tensors.
+  let mut resL2Spans : Array (Nat × Nat × Nat × Option Nat) := #[]
+  for i in [:n] do
+    for a in fps[i]!.l2Accesses do
+      if a.role == .resL2 then
+        resL2Spans := resL2Spans.push (i, a.lo, a.hi, none)
+
   for i in [:n] do
     let ti := fps[i]!
     for b in ti.l2Accesses do
@@ -2357,6 +2369,29 @@ def verifyProgramHazards (fps : Array VerifiedTaskFootprint) : Except String Uni
         | some (p, a) =>
           if a.role != .resL2 || a.lo != b.lo || a.hi != b.hi then
             throw s!"S5 L2 integrity: task {i} {b.role.name} [{toHex b.lo}, {toHex b.hi}) was overwritten while live by task {p} {a.role.name} [{toHex a.lo}, {toHex a.hi})"
+          for idx in [:resL2Spans.size] do
+            let (rp, rlo, rhi, rlast?) := resL2Spans[idx]!
+            if rp == p && rlo == a.lo && rhi == a.hi then
+              let newLast := match rlast? with | some prev => max prev i | none => i
+              resL2Spans := resL2Spans.set! idx (rp, rlo, rhi, some newLast)
+
+  let mut liveL2Intervals : Array (Nat × Nat × Nat × Nat) := #[]
+  for (rp, rlo, rhi, rlast?) in resL2Spans do
+    match rlast? with
+    | none =>
+      throw s!"S2/S5 dead L2-resident write: task {rp} resL2 [{toHex rlo}, {toHex rhi}) has no matching L2 consumer"
+    | some lastC =>
+      liveL2Intervals := liveL2Intervals.push (rp, rlo, rhi, lastC)
+
+  if n > 1 then
+    for i in [:n - 1] do
+      let mut expMask : UInt32 := 0
+      for (rp, rlo, rhi, lastC) in liveL2Intervals do
+        if rp <= i && i <= lastC then
+          expMask := expMask ||| l2BlockMask rlo rhi
+      let gotMask := fps[i]!.liveL2Mask
+      if gotMask != expMask then
+        throw s!"S2 header[7] liveL2Mask mismatch on task {i}: got {toHex gotMask.toNat}, expected {toHex expMask.toNat}"
 
   -- 2. Pairwise hazard verification across all 0 <= k < i < n
   for i in [1 : n] do
@@ -2463,6 +2498,30 @@ def verifyProgramHazards (fps : Array VerifiedTaskFootprint) : Except String Uni
                 throw s!"S5 DRAM scratch coherence: task {i} src1Dma reading scratch [{toHex b.lo}, {toHex b.hi}) written by task {k} must set 0x4d00 depKind to 1 or 2 (got {ti.sync.src1DepKind})"
               if b.port == .src2Dma && !(ti.sync.src2DepKind == 1 || ti.sync.src2DepKind == 2) then
                 throw s!"S5 DRAM scratch coherence: task {i} src2Dma reading scratch [{toHex b.lo}, {toHex b.hi}) written by task {k} must set 0x4d04 depKind to 1 or 2 (got {ti.sync.src2DepKind})"
+
+  -- 3. BAR 3 DRAM-scratch read integrity (Clause S5):
+  --    Every task reading BAR 3 scratch must (a) unconditionally set depKind in {1, 2} on its reading
+  --    port (even with no prior overlapping write), and (b) have a latest prior overlapping resDma
+  --    write on scratch that fully covers [b.lo, b.hi) (rejecting uninitialized or partial reads).
+  for i in [:n] do
+    let ti := fps[i]!
+    for b in ti.dramAccesses do
+      if b.resource == .scratch && !b.isWrite then
+        if b.port == .src1Dma && !(ti.sync.src1DepKind == 1 || ti.sync.src1DepKind == 2) then
+          throw s!"S5 DRAM scratch coherence: task {i} src1Dma reading scratch [{toHex b.lo}, {toHex b.hi}) must set 0x4d00 depKind to 1 or 2 (got {ti.sync.src1DepKind})"
+        if b.port == .src2Dma && !(ti.sync.src2DepKind == 1 || ti.sync.src2DepKind == 2) then
+          throw s!"S5 DRAM scratch coherence: task {i} src2Dma reading scratch [{toHex b.lo}, {toHex b.hi}) must set 0x4d04 depKind to 1 or 2 (got {ti.sync.src2DepKind})"
+        let mut latestScratchWriter? : Option (Nat × VerifiedDramAccess) := none
+        for k in [:i] do
+          for a in fps[k]!.dramAccesses do
+            if a.resource == .scratch && a.port == .resDma && a.isWrite && vIntervalsOverlap a.lo a.hi b.lo b.hi then
+              latestScratchWriter? := some (k, a)
+        match latestScratchWriter? with
+        | none =>
+          throw s!"S5 DRAM scratch integrity: task {i} {b.port.name} reads uninitialized scratch [{toHex b.lo}, {toHex b.hi}) with no prior overlapping resDma write"
+        | some (p, a) =>
+          if !(a.lo <= b.lo && b.hi <= a.hi) then
+            throw s!"S5 DRAM scratch integrity: task {i} {b.port.name} scratch read [{toHex b.lo}, {toHex b.hi}) is only partially covered by latest writer task {p} resDma [{toHex a.lo}, {toHex a.hi})"
 
   pure ()
 

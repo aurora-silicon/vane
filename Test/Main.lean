@@ -3707,6 +3707,53 @@ private def runM4Tests : IO (Array TestResult) := do
     pure ()
   ) "64B DMA line floor")
 
+  -- =========================================================================
+  -- Milestone 4 Review Hardening Tests (M1 header[7] liveL2Mask, M2 uninit scratch)
+  -- =========================================================================
+
+  -- M1a: Clearing a required bit in header[7] (to 0) on a non-last L2-chained task is rejected
+  results := results.push (checkErr "m4 rev [M1] neg: clearing header[7] liveL2Mask to 0 on L2-chained task rejected" (do
+    tamperTaskHeaderAndVerify basePeToNe.hwx basePeToNe.info 0 7 0
+  ) "header[7] liveL2Mask")
+
+  -- M1b: Setting an extra bit in header[7] on a non-last L2-chained task is rejected
+  results := results.push (checkErr "m4 rev [M1] neg: extra bit in header[7] liveL2Mask on L2-chained task rejected" (do
+    let textBytes ← readSlice basePeToNe.hwx basePeToNe.info.textSection.offset.toNat basePeToNe.info.textSection.size.toNat
+    let tasks ← decodeTaskStream .h17 textBytes
+    let h7 ← match tasks[0]? with | some t => pure t.header[7]! | none => throw "missing task 0"
+    tamperTaskHeaderAndVerify basePeToNe.hwx basePeToNe.info 0 7 (h7 ||| ((1 : UInt32) <<< 31))
+  ) "header[7] liveL2Mask")
+
+  -- M1c: Non-zero header[7] (e.g. 0xdeadbeef) on a non-last pure-DRAM task is rejected
+  results := results.push (checkErr "m4 rev [M1] neg: non-zero header[7] on pure-DRAM non-last task rejected" (do
+    tamperTaskHeaderAndVerify base2DramConv.hwx base2DramConv.info 0 7 0xdeadbeef
+  ) "header[7] liveL2Mask")
+
+  -- M2a: Reading uninitialized BAR 3 scratch offset (never written by prior task) with depKind=2 rejected
+  results := results.push (checkErr "m4 rev [M2] neg: uninitialized BAR 3 scratch read (depKind=2) rejected" (do
+    -- In base3DramConv (c1 -> c2 -> c3, all DRAM [16,8,16], slot size 0x2000):
+    -- scratch size is 0x4000; task 0 writes [0, 0x2000), task 1 writes [0x2000, 0x4000).
+    -- Tamper task 1's src1BaseLo from 0 to 0x2000 -> reads [0x2000, 0x4000) which task 0 never wrote!
+    let fT1Res ← findTaskRegFileOffset base3DramConv.hwx base3DramConv.info 1 regResBaseLo
+    let slot1Off ← readU32LE base3DramConv.hwx fT1Res
+    tamperTaskRegAndVerify base3DramConv.hwx base3DramConv.info 1 regSrc1BaseLo slot1Off
+  ) "uninitialized scratch")
+
+  -- M2b: Reading uninitialized BAR 3 scratch offset with depKind=0 rejected by unconditional coherence check
+  results := results.push (checkErr "m4 rev [M2] neg: uninitialized BAR 3 scratch read (depKind=0) rejected" (do
+    let fT1Res ← findTaskRegFileOffset base3DramConv.hwx base3DramConv.info 1 regResBaseLo
+    let slot1Off ← readU32LE base3DramConv.hwx fT1Res
+    let fT1Src ← findTaskRegFileOffset base3DramConv.hwx base3DramConv.info 1 regSrc1BaseLo
+    let fT1Dep ← findTaskRegFileOffset base3DramConv.hwx base3DramConv.info 1 regSrc1Dep
+    let origCode := (← readU32LE base3DramConv.hwx fT1Dep) &&& 0xff
+    let wNoDep ← mkSrcDepWord "src1Dep" origCode 1 0 0
+    let h1 ← putU32LE base3DramConv.hwx fT1Src slot1Off
+    let h2 ← putU32LE h1 fT1Dep wNoDep
+    let badInfo ← validateHwx h2
+    let _ ← verifyHwxTasks h2 badInfo (requireKnownTask := true)
+    pure ()
+  ) "scratch coherence")
+
   pure results
 
 def main : IO UInt32 := do

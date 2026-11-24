@@ -851,6 +851,9 @@ func ExecuteProgram(
 
 	var resolvedAltInputs [][]byte
 	if len(opts.AltInputs) > 0 {
+		if runs < 2 {
+			return nil, RunReport{}, fmt.Errorf("--alt-input requires --runs >= 2, got %d", runs)
+		}
 		if len(opts.AltInputs) != len(inIndices) {
 			return nil, RunReport{}, fmt.Errorf("provided %d alt-input buffers, program expects %d", len(opts.AltInputs), len(inIndices))
 		}

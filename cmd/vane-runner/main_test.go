@@ -1143,4 +1143,64 @@ func TestRunAltInputMockTransport(t *testing.T) {
 	if rc == 0 || !strings.Contains(stderr.String(), "non-deterministic alt-input") {
 		t.Fatalf("expected non-deterministic alt-input failure, got rc=%d stderr=%s", rc, stderr.String())
 	}
+
+	// 3. [N4] --alt-input with --runs 1 must fail cleanly instead of silently skipping alt input
+	stdout.Reset()
+	stderr.Reset()
+	rc = runCLI([]string{
+		"run",
+		"--hwx", filepath.Join(demoDir, "program.hwx"),
+		"--sections-dir", demoDir,
+		"--input", inAPath,
+		"--alt-input", inBPath,
+		"--runs", "1",
+	}, badTr, &stdout, &stderr)
+	if rc == 0 || !strings.Contains(stderr.String(), "--alt-input requires --runs >= 2") {
+		t.Fatalf("expected --alt-input --runs 1 failure, got rc=%d stderr=%s", rc, stderr.String())
+	}
+}
+
+func TestGraphCliValidationGuards(t *testing.T) {
+	vaneBin := findVaneBin(t)
+	tmp := t.TempDir()
+
+	// [N2a] gen-graph rejects mismatched explicit cin on conv1x1/conv3x3
+	badCinSpec := filepath.Join(tmp, "bad_cin.json")
+	_ = os.WriteFile(badCinSpec, []byte(`{
+		"target": "h17",
+		"inputs": [{"name": "x", "c": 8, "h": 4, "w": 8}],
+		"nodes": [{"id": "c1", "op": "conv1x1", "inputs": ["x"], "cin": 16, "cout": 8}]
+	}`), 0o644)
+	var stdout, stderr bytes.Buffer
+	if rc := runCLI([]string{"gen-graph", "--spec", badCinSpec, "--out-dir", filepath.Join(tmp, "out_cin")}, nil, &stdout, &stderr); rc == 0 || !strings.Contains(stderr.String(), "cin 16 != input channels 8") {
+		t.Fatalf("expected gen-graph cin mismatch error, got rc=%d stderr=%s", rc, stderr.String())
+	}
+
+	// [N2b] gen-graph rejects incompatible PE broadcast dimensions
+	badBcastSpec := filepath.Join(tmp, "bad_bcast.json")
+	_ = os.WriteFile(badBcastSpec, []byte(`{
+		"target": "h17",
+		"inputs": [
+			{"name": "x", "c": 8, "h": 4, "w": 8},
+			{"name": "z", "c": 4, "h": 4, "w": 8}
+		],
+		"nodes": [{"id": "p1", "op": "pe", "pe_op": "add", "inputs": ["x", "z"]}]
+	}`), 0o644)
+	stderr.Reset()
+	if rc := runCLI([]string{"gen-graph", "--spec", badBcastSpec, "--out-dir", filepath.Join(tmp, "out_bcast")}, nil, &stdout, &stderr); rc == 0 || !strings.Contains(stderr.String(), "incompatible broadcast") {
+		t.Fatalf("expected gen-graph broadcast mismatch error, got rc=%d stderr=%s", rc, stderr.String())
+	}
+
+	// [N3] vane compile-graph rejects PE scalar/chain float that overflows finite fp16 range
+	badF16Spec := filepath.Join(tmp, "bad_f16.json")
+	_ = os.WriteFile(badF16Spec, []byte(`{
+		"target": "h17",
+		"inputs": [{"name": "x", "c": 4, "h": 4, "w": 8}],
+		"nodes": [{"id": "p1", "op": "pe", "pe_op": "smul", "inputs": ["x"], "scalar": 100000.0}]
+	}`), 0o644)
+	cmd := exec.Command(vaneBin, "compile-graph", "--spec", badF16Spec, "--out-dir", filepath.Join(tmp, "out_f16"))
+	outBytes, err := cmd.CombinedOutput()
+	if err == nil || !strings.Contains(string(outBytes), "overflows finite fp16") {
+		t.Fatalf("expected compile-graph fp16 overflow error, got err=%v output=%s", err, string(outBytes))
+	}
 }

@@ -307,12 +307,16 @@ func resolvePe1ChainParams(nd GraphNodeSpec) (inScale, bias, scale *uint16, err 
 			return nil, nil, nil, fmt.Errorf("node %q: smul requires scalar", nd.ID)
 		}
 		a := graphF16CanonZero(*nd.Scalar)
-		return &a, nil, nil, nil
+		return nil, nil, &a, nil
 	case "sdiv":
 		if nd.Scalar == nil {
 			return nil, nil, nil, fmt.Errorf("node %q: sdiv requires scalar", nd.ID)
 		}
-		sv := fp16.ToFloat64(graphF16CanonZero(*nd.Scalar))
+		raw := graphF16CanonZero(*nd.Scalar)
+		if !fp16.IsFinite(raw) {
+			return nil, nil, nil, fmt.Errorf("node %q: sdiv scalar must be finite fp16", nd.ID)
+		}
+		sv := fp16.ToFloat64(raw)
 		if sv == 0 {
 			return nil, nil, nil, fmt.Errorf("node %q: sdiv scalar cannot be zero", nd.ID)
 		}
@@ -321,7 +325,7 @@ func resolvePe1ChainParams(nd GraphNodeSpec) (inScale, bias, scale *uint16, err 
 		if !fp16.IsFinite(u) {
 			return nil, nil, nil, fmt.Errorf("node %q: sdiv reciprocal overflows fp16", nd.ID)
 		}
-		return &u, nil, nil, nil
+		return nil, nil, &u, nil
 	default:
 		return nil, nil, nil, fmt.Errorf("node %q: unknown PE chain op %q", nd.ID, nd.PeOp)
 	}
