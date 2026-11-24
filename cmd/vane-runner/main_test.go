@@ -338,6 +338,170 @@ func TestConv1x1EndToEndCLIAndCompare(t *testing.T) {
 	}
 }
 
+func TestConv3x3EndToEndCLIAndCompare(t *testing.T) {
+	vaneBin := findVaneBin(t)
+
+	cases := []struct {
+		name   string
+		target string
+		mode   string
+		h, w   int
+		cin    int
+		cout   int
+		stride int
+		pad    string
+		bias   bool
+		relu   bool
+	}{
+		{"h17_dense_s1_same_bias_relu", "h17", "dense", 8, 16, 16, 16, 1, "same", true, true},
+		{"h17_dense_s2_same_even", "h17", "dense", 16, 16, 8, 16, 2, "same", true, false},
+		{"h17_dense_s2_same_odd", "h17", "dense", 11, 13, 7, 9, 2, "same", false, true},
+		{"h17_dense_s1_valid_cout1", "h17", "dense", 9, 11, 8, 1, 1, "valid", true, true},
+		{"h17_dense_s2_valid_prime", "h17", "dense", 13, 17, 5, 11, 2, "valid", true, false},
+		{"h17_dw_c1_s1_same", "h17", "depthwise", 8, 8, 1, 1, 1, "same", true, true},
+		{"h17_dw_c1_s2_same", "h17", "depthwise", 8, 8, 1, 1, 2, "same", true, false},
+		{"h17_dw_c29_s1_valid", "h17", "depthwise", 11, 13, 29, 29, 1, "valid", true, true},
+		{"h17_dw_c24_s2_same", "h17", "depthwise", 12, 14, 24, 24, 2, "same", true, false},
+		{"h16_dense_s1_same_bias", "h16", "dense", 8, 16, 16, 16, 1, "same", true, true},
+		{"h16_dense_s2_same_odd", "h16", "dense", 9, 11, 5, 7, 2, "same", true, false},
+		{"h16_dense_s2_valid_cout1", "h16", "dense", 10, 12, 6, 1, 2, "valid", false, true},
+		{"h16_dw_c1_s1_same", "h16", "depthwise", 8, 8, 1, 1, 1, "same", true, false},
+		{"h16_dw_c16_s2_valid", "h16", "depthwise", 10, 12, 16, 16, 2, "valid", true, true},
+	}
+
+	for idx, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			vecDir := filepath.Join(tmp, "vec")
+			compDir := filepath.Join(tmp, "compiled")
+
+			// 1. Generate deterministic 3x3 test vectors with vane-runner gen-conv3x3
+			genArgs := []string{
+				"gen-conv3x3",
+				"--mode", tc.mode,
+				"--h", itoa(tc.h),
+				"--w", itoa(tc.w),
+				"--cin", itoa(tc.cin),
+				"--cout", itoa(tc.cout),
+				"--stride", itoa(tc.stride),
+				"--pad", tc.pad,
+				"--seed", itoa(idx + 200),
+				"--out-dir", vecDir,
+				"--json",
+			}
+			if tc.bias {
+				genArgs = append(genArgs, "--bias")
+			}
+			if tc.relu {
+				genArgs = append(genArgs, "--relu")
+			}
+			var stdout, stderr bytes.Buffer
+			if rc := runCLI(genArgs, nil, &stdout, &stderr); rc != 0 {
+				t.Fatalf("gen-conv3x3 failed rc=%d stderr=%s", rc, stderr.String())
+			}
+			var genSummary struct {
+				Ho int `json:"ho"`
+				Wo int `json:"wo"`
+			}
+			if err := json.Unmarshal(stdout.Bytes(), &genSummary); err != nil {
+				t.Fatalf("parse gen-conv3x3 JSON: %v\n%s", err, stdout.String())
+			}
+
+			// 2. Compile with Lean `vane compile-conv3x3`
+			compileArgs := []string{
+				"compile-conv3x3",
+				"--target", tc.target,
+				"--mode", tc.mode,
+				"--h", itoa(tc.h),
+				"--w", itoa(tc.w),
+				"--cin", itoa(tc.cin),
+				"--cout", itoa(tc.cout),
+				"--stride", itoa(tc.stride),
+				"--pad", tc.pad,
+				"--weights", filepath.Join(vecDir, "weights.bin"),
+				"--out-dir", compDir,
+			}
+			if tc.bias {
+				compileArgs = append(compileArgs, "--bias", filepath.Join(vecDir, "bias.bin"))
+			}
+			if tc.relu {
+				compileArgs = append(compileArgs, "--relu")
+			}
+			runVane(t, vaneBin, compileArgs...)
+
+			// 3. Validate with unified `vane validate --check-tasks`
+			valOut := runVane(t, vaneBin, "validate",
+				"--hwx", filepath.Join(compDir, "program.hwx"),
+				"--sections", compDir,
+				"--check-tasks",
+			)
+			if !strings.Contains(valOut, "status: ok") || !strings.Contains(valOut, "verified_conv_tasks: 1") {
+				t.Fatalf("unexpected validate output:\n%s", valOut)
+			}
+
+			// 4. Verify Go `BuildSectionsFromHWX` matches Lean sections byte-for-byte
+			hwxBytes, err := os.ReadFile(filepath.Join(compDir, "program.hwx"))
+			if err != nil {
+				t.Fatalf("read hwx: %v", err)
+			}
+			goSecs, err := ane.BuildSectionsFromHWX(hwxBytes)
+			if err != nil {
+				t.Fatalf("BuildSectionsFromHWX failed: %v", err)
+			}
+			for kind, fname := range ane.SectionFilenames {
+				leanBytes, err := os.ReadFile(filepath.Join(compDir, fname))
+				if err != nil {
+					t.Fatalf("read %s: %v", fname, err)
+				}
+				if !bytes.Equal(goSecs[kind], leanBytes) {
+					t.Fatalf("section %s mismatch between Go and Lean", fname)
+				}
+			}
+
+			// 5. Verify `compare-conv` passes on expected_q1516 vs expected_f64 with poisoned padding bytes
+			actBytes, err := os.ReadFile(filepath.Join(vecDir, "expected_q1516.bin"))
+			if err != nil {
+				t.Fatalf("read expected_q1516.bin: %v", err)
+			}
+			outRowStride := ref.AlignUp(2*genSummary.Wo, 64)
+			poisoned := make([]byte, len(actBytes))
+			copy(poisoned, actBytes)
+			for c := 0; c < tc.cout; c++ {
+				for h := 0; h < genSummary.Ho; h++ {
+					rowOff := (c*genSummary.Ho + h) * outRowStride
+					for p := 2 * genSummary.Wo; p < outRowStride; p++ {
+						poisoned[rowOff+p] = 0xfe
+					}
+				}
+			}
+			poisonPath := filepath.Join(tmp, "actual_poisoned_pad.bin")
+			_ = os.WriteFile(poisonPath, poisoned, 0o644)
+
+			stdout.Reset()
+			stderr.Reset()
+			rc := runCLI([]string{
+				"compare-conv",
+				"--manifest", filepath.Join(compDir, "manifest.json"),
+				"--actual", poisonPath,
+				"--expected", filepath.Join(vecDir, "expected_f64.bin"),
+				"--atol", "1e-2",
+				"--rtol", "1e-2",
+				"--json",
+			}, nil, &stdout, &stderr)
+			if rc != 0 {
+				t.Fatalf("compare-conv failed rc=%d stdout=%s stderr=%s", rc, stdout.String(), stderr.String())
+			}
+			var comp map[string]any
+			if err := json.Unmarshal(stdout.Bytes(), &comp); err != nil {
+				t.Fatalf("parse compare JSON: %v", err)
+			}
+			if comp["passed"] != true {
+				t.Fatalf("expected passed=true, got %v", comp)
+			}
+		})
+	}
+}
+
 func itoa(n int) string {
 	return string(bytes.TrimSpace([]byte(jsonNumber(n))))
 }

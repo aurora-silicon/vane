@@ -1,5 +1,5 @@
 // Command vane-runner provides Linux accel/ane ABI v3 device probing, HWX execution,
-// deterministic 1x1 conv test vector generation, and strided surface comparison.
+// deterministic conv test vector generation, and strided surface comparison.
 package main
 
 import (
@@ -37,6 +37,8 @@ func usage(w io.Writer) {
 	fmt.Fprintln(w, "                  [--expected PATH] [--runs N] [--in-place] [--atol F] [--rtol F]")
 	fmt.Fprintln(w, "                  [--max-ulp N] [--device PATH] [--json] [--json-out PATH]")
 	fmt.Fprintln(w, "  vane-runner gen-conv1x1 --h H --w W --cin C --cout O [--bias] [--relu] [--seed N] --out-dir DIR [--json]")
+	fmt.Fprintln(w, "  vane-runner gen-conv3x3 --mode <dense|depthwise> --h H --w W --cin C --cout O --stride <1|2> --pad <same|valid> [--bias] [--relu] [--seed N] --out-dir DIR [--json]")
+	fmt.Fprintln(w, "  vane-runner compare-conv --manifest PATH --actual PATH --expected PATH [--atol F] [--rtol F] [--max-ulp N] [--json]")
 	fmt.Fprintln(w, "  vane-runner compare-conv1x1 --manifest PATH --actual PATH --expected PATH [--atol F] [--rtol F] [--max-ulp N] [--json]")
 }
 
@@ -52,8 +54,12 @@ func runCLI(args []string, tr ane.Transport, stdout, stderr io.Writer) int {
 		return cmdRun(args[1:], tr, stdout, stderr)
 	case "gen-conv1x1":
 		return cmdGenConv1x1(args[1:], stdout, stderr)
+	case "gen-conv3x3":
+		return cmdGenConv3x3(args[1:], stdout, stderr)
+	case "compare-conv":
+		return cmdCompareConv("compare-conv", args[1:], stdout, stderr)
 	case "compare-conv1x1":
-		return cmdCompareConv1x1(args[1:], stdout, stderr)
+		return cmdCompareConv("compare-conv1x1", args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "error: unknown subcommand %q\n", args[0])
 		usage(stderr)
@@ -399,6 +405,188 @@ func cmdGenConv1x1(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
+func cmdGenConv3x3(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("gen-conv3x3", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	mode := fs.String("mode", "", "Convolution mode: dense or depthwise")
+	h := fs.Int("h", 0, "Spatial height H")
+	w := fs.Int("w", 0, "Spatial width W")
+	cin := fs.Int("cin", 0, "Input channels Cin")
+	cout := fs.Int("cout", 0, "Output channels Cout")
+	stride := fs.Int("stride", 1, "Spatial stride (1 or 2)")
+	pad := fs.String("pad", "", "Padding mode: same or valid")
+	withBias := fs.Bool("bias", false, "Generate bias vector")
+	relu := fs.Bool("relu", false, "Apply ReLU to expected output")
+	seed := fs.Uint64("seed", 1, "Deterministic PRNG seed")
+	outDir := fs.String("out-dir", "", "Output directory for generated test vectors")
+	asJSON := fs.Bool("json", false, "Emit JSON summary")
+
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	if *mode != "dense" && *mode != "depthwise" {
+		fmt.Fprintf(stderr, "error: --mode must be dense or depthwise, got %q\n", *mode)
+		return 1
+	}
+	if *h <= 0 || *w <= 0 || *cin <= 0 || *cout <= 0 {
+		fmt.Fprintln(stderr, "error: --h, --w, --cin, and --cout must all be positive integers")
+		return 1
+	}
+	if *mode == "depthwise" && *cin != *cout {
+		fmt.Fprintf(stderr, "error: depthwise mode requires --cin == --cout (got %d vs %d)\n", *cin, *cout)
+		return 1
+	}
+	if *stride != 1 && *stride != 2 {
+		fmt.Fprintf(stderr, "error: --stride must be 1 or 2, got %d\n", *stride)
+		return 1
+	}
+	if *pad != "same" && *pad != "valid" {
+		fmt.Fprintf(stderr, "error: --pad must be same or valid, got %q\n", *pad)
+		return 1
+	}
+	if *outDir == "" {
+		fmt.Fprintln(stderr, "error: --out-dir DIR is required")
+		return 1
+	}
+
+	ho, wo, padTop, padLeft, err := ref.Conv3x3Geometry(*h, *w, *stride, *pad)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+
+	groups := 1
+	cinPerGroup := *cin
+	if *mode == "depthwise" {
+		groups = *cin
+		cinPerGroup = 1
+	}
+
+	rng := rand.New(rand.NewPCG(*seed, *seed^0x9e3779b97f4a7c15))
+
+	x, err := ref.NewTensor(1, *cin, *h, *w)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	for i := range x.Data {
+		x.Data[i] = fp16.FromFloat64(rng.Float64()*2.0 - 1.0)
+	}
+
+	wScale := math.Min(0.5, 2.0/math.Sqrt(float64(9*cinPerGroup)))
+	weights := make([]uint16, (*cout)*cinPerGroup*9)
+	for i := range weights {
+		weights[i] = fp16.FromFloat64((rng.Float64()*2.0 - 1.0) * wScale)
+	}
+
+	var bias []uint16
+	if *withBias {
+		bias = make([]uint16, *cout)
+		for i := range bias {
+			bias[i] = fp16.FromFloat64(rng.Float64() - 0.5)
+		}
+	}
+
+	yF64, err := ref.Conv2d3x3Pad(x, weights, *cout, bias, *stride, *pad, groups, *relu)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: float64 reference failed: %v\n", err)
+		return 1
+	}
+	yQ1516, err := ref.Conv2d3x3Q1516(x, weights, *cout, bias, *stride, *pad, groups, *relu)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: Q15.16 reference failed: %v\n", err)
+		return 1
+	}
+
+	inRowStride := ref.AlignUp(2*(*w), 64)
+	inPlaneStride := (*h) * inRowStride
+	inBatchStride := (*cin) * inPlaneStride
+
+	outRowStride := ref.AlignUp(2*wo, 64)
+	outPlaneStride := ho * outRowStride
+	outBatchStride := (*cout) * outPlaneStride
+
+	inSurface, err := ref.PackSurface(x, inBatchStride, inPlaneStride, inRowStride, inBatchStride)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: pack input surface: %v\n", err)
+		return 1
+	}
+	expF64Surface, err := ref.PackSurface(yF64, outBatchStride, outPlaneStride, outRowStride, outBatchStride)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: pack expected_f64 surface: %v\n", err)
+		return 1
+	}
+	expQSurface, err := ref.PackSurface(yQ1516, outBatchStride, outPlaneStride, outRowStride, outBatchStride)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: pack expected_q1516 surface: %v\n", err)
+		return 1
+	}
+
+	if err := os.MkdirAll(*outDir, 0o755); err != nil {
+		fmt.Fprintf(stderr, "error: create out-dir: %v\n", err)
+		return 1
+	}
+	writeFile := func(name string, data []byte) error {
+		return os.WriteFile(filepath.Join(*outDir, name), data, 0o644)
+	}
+	if err := writeFile("input.bin", inSurface); err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	if err := writeFile("weights.bin", fp16.EncodeLE(weights)); err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	if *withBias {
+		if err := writeFile("bias.bin", fp16.EncodeLE(bias)); err != nil {
+			fmt.Fprintf(stderr, "error: %v\n", err)
+			return 1
+		}
+	}
+	if err := writeFile("expected_f64.bin", expF64Surface); err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	if err := writeFile("expected_q1516.bin", expQSurface); err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+
+	summary := map[string]any{
+		"mode":             *mode,
+		"h":                *h,
+		"w":                *w,
+		"cin":              *cin,
+		"cout":             *cout,
+		"ho":               ho,
+		"wo":               wo,
+		"stride":           *stride,
+		"pad":              *pad,
+		"pt":               padTop,
+		"pl":               padLeft,
+		"bias":             *withBias,
+		"relu":             *relu,
+		"seed":             *seed,
+		"in_row_stride":    inRowStride,
+		"in_plane_stride":  inPlaneStride,
+		"out_row_stride":   outRowStride,
+		"out_plane_stride": outPlaneStride,
+		"in_bytes":         len(inSurface),
+		"out_bytes":        len(expF64Surface),
+		"weights_bytes":    len(weights) * 2,
+		"bias_bytes":       len(bias) * 2,
+		"out_dir":          *outDir,
+	}
+	if *asJSON {
+		raw, _ := json.MarshalIndent(summary, "", "  ")
+		fmt.Fprintln(stdout, string(raw))
+	} else {
+		fmt.Fprintf(stdout, "generated conv3x3 %s (%dx%d->%dx%d, %d->%d, s=%d, pad=%s, bias=%t, relu=%t, seed=%d) in %s (in=%dB out=%dB weights=%dB)\n",
+			*mode, *h, *w, ho, wo, *cin, *cout, *stride, *pad, *withBias, *relu, *seed, *outDir, len(inSurface), len(expF64Surface), len(weights)*2)
+	}
+	return 0
+}
+
 type manifestSurface struct {
 	ShortName string `json:"short_name"`
 	Direction string `json:"direction"`
@@ -411,10 +599,10 @@ type manifestDoc struct {
 	Surfaces []manifestSurface `json:"surfaces"`
 }
 
-func cmdCompareConv1x1(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("compare-conv1x1", flag.ContinueOnError)
+func cmdCompareConv(cmdName string, args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet(cmdName, flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	manifestPath := fs.String("manifest", "", "Path to manifest.json emitted by vane compile-conv1x1")
+	manifestPath := fs.String("manifest", "", "Path to manifest.json emitted by vane compile-conv1x1 or compile-conv3x3")
 	actualPath := fs.String("actual", "", "Path to actual output surface binary")
 	expectedPath := fs.String("expected", "", "Path to expected output surface binary")
 	atol := fs.Float64("atol", 1e-3, "Absolute tolerance")

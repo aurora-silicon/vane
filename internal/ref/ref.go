@@ -483,6 +483,254 @@ func Conv2d3x3(x Tensor, weight []uint16, cout int, bias []uint16, strideH, stri
 	return out, nil
 }
 
+// Conv3x3Geometry computes output spatial dimensions (ho, wo) and top/left padding
+// (padTop, padLeft) for a 3x3 convolution with dilation 1, stride in {1, 2},
+// and pad in {"same", "valid"}.
+func Conv3x3Geometry(h, w, stride int, pad string) (ho, wo, padTop, padLeft int, err error) {
+	if h <= 0 || w <= 0 {
+		return 0, 0, 0, 0, fmt.Errorf("invalid spatial dims (%d, %d): must be > 0", h, w)
+	}
+	if stride != 1 && stride != 2 {
+		return 0, 0, 0, 0, fmt.Errorf("unsupported stride %d (expected 1 or 2)", stride)
+	}
+	switch pad {
+	case "same":
+		ho = (h + stride - 1) / stride
+		wo = (w + stride - 1) / stride
+		padTop = ((ho-1)*stride + 3 - h) / 2
+		padLeft = ((wo-1)*stride + 3 - w) / 2
+		return ho, wo, padTop, padLeft, nil
+	case "valid":
+		if h < 3 || w < 3 {
+			return 0, 0, 0, 0, fmt.Errorf("valid-padded 3x3 requires H >= 3 and W >= 3, got (%d, %d)", h, w)
+		}
+		ho = (h-3)/stride + 1
+		wo = (w-3)/stride + 1
+		return ho, wo, 0, 0, nil
+	default:
+		return 0, 0, 0, 0, fmt.Errorf("unsupported pad mode %q (expected same or valid)", pad)
+	}
+}
+
+// Conv2d3x3Pad computes a dense, grouped, or depthwise 3x3 convolution in float64 -> fp16
+// with asymmetric same/valid padding and stride in {1, 2}.
+// weight has shape (cout, x.C/groups, 3, 3) in row-major order.
+func Conv2d3x3Pad(x Tensor, weight []uint16, cout int, bias []uint16, stride int, pad string, groups int, relu bool) (Tensor, error) {
+	if err := x.Validate(); err != nil {
+		return Tensor{}, err
+	}
+	if cout <= 0 {
+		return Tensor{}, fmt.Errorf("cout must be > 0, got %d", cout)
+	}
+	if groups <= 0 {
+		return Tensor{}, fmt.Errorf("groups must be > 0, got %d", groups)
+	}
+	if x.C%groups != 0 || cout%groups != 0 {
+		return Tensor{}, fmt.Errorf("Cin=%d and Cout=%d must be divisible by groups=%d", x.C, cout, groups)
+	}
+	cinPerG := x.C / groups
+	coutPerG := cout / groups
+	if len(weight) != cout*cinPerG*9 {
+		return Tensor{}, fmt.Errorf("weight length %d != cout*(cin/groups)*9 (%d)", len(weight), cout*cinPerG*9)
+	}
+	if bias != nil && len(bias) != cout {
+		return Tensor{}, fmt.Errorf("bias length %d != cout (%d)", len(bias), cout)
+	}
+	hout, wout, padTop, padLeft, err := Conv3x3Geometry(x.H, x.W, stride, pad)
+	if err != nil {
+		return Tensor{}, err
+	}
+
+	out, err := NewTensor(x.N, cout, hout, wout)
+	if err != nil {
+		return Tensor{}, err
+	}
+
+	for n := 0; n < x.N; n++ {
+		for g := 0; g < groups; g++ {
+			cinStart := g * cinPerG
+			coutStart := g * coutPerG
+			for og := 0; og < coutPerG; og++ {
+				o := coutStart + og
+				bVal := 0.0
+				if bias != nil {
+					bVal = fp16.ToFloat64(bias[o])
+				}
+				for oh := 0; oh < hout; oh++ {
+					for ow := 0; ow < wout; ow++ {
+						acc := bVal
+						for cg := 0; cg < cinPerG; cg++ {
+							c := cinStart + cg
+							wBase := (o*cinPerG + cg) * 9
+							for kh := 0; kh < 3; kh++ {
+								ih := oh*stride + kh - padTop
+								if ih < 0 || ih >= x.H {
+									continue
+								}
+								for kw := 0; kw < 3; kw++ {
+									iw := ow*stride + kw - padLeft
+									if iw < 0 || iw >= x.W {
+										continue
+									}
+									xv := fp16.ToFloat64(x.Data[x.Index(n, c, ih, iw)])
+									wv := fp16.ToFloat64(weight[wBase+kh*3+kw])
+									acc += xv * wv
+								}
+							}
+						}
+						if relu && acc < 0 {
+							acc = 0
+						}
+						out.Data[out.Index(n, o, oh, ow)] = fp16.FromFloat64(acc)
+					}
+				}
+			}
+		}
+	}
+	return out, nil
+}
+
+// Conv2d3x3Q1516 evaluates the exact Q15.16 fixed-point NE 3x3 convolution arithmetic model
+// for dense, grouped, or depthwise convolutions with same/valid padding and stride in {1, 2}.
+func Conv2d3x3Q1516(x Tensor, weight []uint16, cout int, bias []uint16, stride int, pad string, groups int, relu bool) (Tensor, error) {
+	if err := x.Validate(); err != nil {
+		return Tensor{}, err
+	}
+	if cout <= 0 {
+		return Tensor{}, fmt.Errorf("cout must be > 0, got %d", cout)
+	}
+	if groups <= 0 {
+		return Tensor{}, fmt.Errorf("groups must be > 0, got %d", groups)
+	}
+	if x.C%groups != 0 || cout%groups != 0 {
+		return Tensor{}, fmt.Errorf("Cin=%d and Cout=%d must be divisible by groups=%d", x.C, cout, groups)
+	}
+	cinPerG := x.C / groups
+	coutPerG := cout / groups
+	if len(weight) != cout*cinPerG*9 {
+		return Tensor{}, fmt.Errorf("weight length %d != cout*(cin/groups)*9 (%d)", len(weight), cout*cinPerG*9)
+	}
+	if bias != nil && len(bias) != cout {
+		return Tensor{}, fmt.Errorf("bias length %d != cout (%d)", len(bias), cout)
+	}
+	hout, wout, padTop, padLeft, err := Conv3x3Geometry(x.H, x.W, stride, pad)
+	if err != nil {
+		return Tensor{}, err
+	}
+
+	out, err := NewTensor(x.N, cout, hout, wout)
+	if err != nil {
+		return Tensor{}, err
+	}
+
+	const qMin int64 = -(1 << 31)
+	const qMax int64 = (1 << 31) - 1
+
+	for n := 0; n < x.N; n++ {
+		for g := 0; g < groups; g++ {
+			cinStart := g * cinPerG
+			coutStart := g * coutPerG
+			for og := 0; og < coutPerG; og++ {
+				o := coutStart + og
+				for oh := 0; oh < hout; oh++ {
+					for ow := 0; ow < wout; ow++ {
+						var acc int64
+						stickyInf := 0
+
+						for cg := 0; cg < cinPerG; cg++ {
+							c := cinStart + cg
+							wBase := (o*cinPerG + cg) * 9
+							for kh := 0; kh < 3; kh++ {
+								ih := oh*stride + kh - padTop
+								if ih < 0 || ih >= x.H {
+									continue
+								}
+								for kw := 0; kw < 3; kw++ {
+									iw := ow*stride + kw - padLeft
+									if iw < 0 || iw >= x.W {
+										continue
+									}
+									xh := x.Data[x.Index(n, c, ih, iw)]
+									wh := weight[wBase+kh*3+kw]
+									if (xh&0x7fff) == 0 || (wh&0x7fff) == 0 {
+										continue
+									}
+									if !fp16.IsFinite(xh) || !fp16.IsFinite(wh) {
+										prod := fp16.ToFloat64(xh) * fp16.ToFloat64(wh)
+										if math.IsInf(prod, 1) {
+											stickyInf, acc = combineStickyInf(stickyInf, acc, 1)
+										} else if math.IsInf(prod, -1) {
+											stickyInf, acc = combineStickyInf(stickyInf, acc, -1)
+										}
+										continue
+									}
+									if fp16.UnbiasedExp(xh)+fp16.UnbiasedExp(wh) < -16 {
+										continue
+									}
+									prod := fp16.ToFloat64(xh) * fp16.ToFloat64(wh)
+									q, ov := roundToQ1516(prod)
+									if ov != 0 {
+										stickyInf, acc = combineStickyInf(stickyInf, acc, ov)
+									} else if stickyInf == 0 {
+										acc += q
+										if acc > qMax {
+											stickyInf, acc = 1, 0
+										} else if acc < qMin {
+											stickyInf, acc = -1, 0
+										}
+									}
+								}
+							}
+						}
+
+						if bias != nil {
+							bh := bias[o]
+							if (bh & 0x7fff) != 0 {
+								q, ov := roundToQ1516(fp16.ToFloat64(bh))
+								if ov != 0 {
+									stickyInf, acc = combineStickyInf(stickyInf, acc, ov)
+								} else if stickyInf == 0 {
+									acc += q
+									if acc > qMax {
+										stickyInf, acc = 1, 0
+									} else if acc < qMin {
+										stickyInf, acc = -1, 0
+									}
+								}
+							}
+						}
+
+						var res uint16
+						if stickyInf > 0 {
+							res = fp16.PosInf
+						} else if stickyInf < 0 {
+							if relu {
+								res = fp16.PosZero
+							} else {
+								res = fp16.NegInf
+							}
+						} else {
+							if relu && acc < 0 {
+								acc = 0
+							}
+							if acc == 0 {
+								res = fp16.PosZero
+							} else {
+								res = fp16.FromFloat64TiesAway(float64(acc) / 65536.0)
+								if res == fp16.NegZero {
+									res = fp16.PosZero
+								}
+							}
+						}
+						out.Data[out.Index(n, o, oh, ow)] = res
+					}
+				}
+			}
+		}
+	}
+	return out, nil
+}
+
 // Elementwise evaluates a two-source elementwise op (add, sub, mul, max, min) in float64 -> fp16.
 func Elementwise(op string, a, b Tensor) (Tensor, error) {
 	if err := a.Validate(); err != nil {

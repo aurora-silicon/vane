@@ -47,11 +47,22 @@ vane compile-conv1x1 \
   --relu \
   --out-dir out/
 
-# Validate an HWX container, LOAD sections, and decoded task legality
-vane validate --hwx out/program.hwx --sections out/ --check-tasks
+# Compile a single-task fp16 dense or depthwise 3x3 convolution (stride 1 or 2, same or valid)
+vane compile-conv3x3 \
+  --target h17 \
+  --mode dense \
+  --h 16 --w 32 --cin 64 --cout 64 \
+  --stride 1 --pad same \
+  --weights weights.bin \
+  --bias bias.bin \
+  --relu \
+  --out-dir out3x3/
+
+# Validate an HWX container, LOAD sections, and decoded 1x1/3x3 task legality
+vane validate --hwx out3x3/program.hwx --sections out3x3/ --check-tasks
 
 # Derive the 4 host-built LOAD sections from an HWX container
-vane sections --hwx out/program.hwx --out-dir sections/
+vane sections --hwx out3x3/program.hwx --out-dir sections/
 
 # Emit a minimal demo container
 vane emit-demo --target h17 --out-dir demo/ --with-kernel --with-scratch
@@ -66,22 +77,27 @@ vane-runner probe --json
 # Generate deterministic fp16 1x1 conv inputs, weights, optional bias, and reference outputs
 vane-runner gen-conv1x1 --h 16 --w 32 --cin 64 --cout 64 --bias --relu --seed 1 --out-dir vec/
 
+# Generate deterministic fp16 dense or depthwise 3x3 conv test vectors and reference outputs
+vane-runner gen-conv3x3 \
+  --mode dense --h 16 --w 32 --cin 64 --cout 64 \
+  --stride 1 --pad same --bias --relu --seed 1 --out-dir vec3x3/
+
 # Execute an HWX program on Linux accel/ane (copy mode or 16 KiB --in-place mmap mode)
 vane-runner run \
-  --hwx out/program.hwx \
-  --sections-dir out/ \
-  --input vec/input.bin \
+  --hwx out3x3/program.hwx \
+  --sections-dir out3x3/ \
+  --input vec3x3/input.bin \
   --output-out actual.bin \
   --runs 3
 
-# Compare strided fp16 outputs using manifest.json geometry (ignoring row padding)
-vane-runner compare-conv1x1 \
-  --manifest out/manifest.json \
+# Compare strided fp16 conv outputs using manifest.json geometry (ignoring row padding)
+vane-runner compare-conv \
+  --manifest out3x3/manifest.json \
   --actual actual.bin \
-  --expected vec/expected_f64.bin \
+  --expected vec3x3/expected_f64.bin \
   --atol 1e-2 --rtol 1e-2 --json
 ```
 
 ## Status
 
-Milestone 1 (single-task fp16 1×1 convolution compiler, explicit register schema, independent tile chooser, static task verifier, and Go tooling). See [ROADMAP.md](ROADMAP.md) for upcoming milestones.
+Milestone 2 (single-task fp16 1×1, dense 3×3, and depthwise 3×3 convolution compiler with dense/sparse kernel packing, explicit register schema, independent O(1) tile chooser, unified static task verifier, and Go tooling). See [ROADMAP.md](ROADMAP.md) for upcoming milestones.
