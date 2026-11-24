@@ -1401,8 +1401,6 @@ private def runAllTests : IO (Array TestResult) := do
       (.h17, { mode := .dense, h := 14, w := 18, cin := 6, cout := 12, stride := 2, pad := .valid }, true, true),
       (.h17, { mode := .dense, h := 8, w := 16, cin := 16, cout := 320, stride := 1, pad := .same }, true, true),
       (.h17, { mode := .dense, h := 16, w := 16, cin := 64, cout := 256, stride := 1, pad := .same }, true, false),
-      -- H17 dense s=1 with maxBlockSlots > 32768*rep => wide3x3 must be false (Cin=460, Cout=128 => 460*9*8=33120 > 32768)
-      (.h17, { mode := .dense, h := 4, w := 8, cin := 460, cout := 128, stride := 1, pad := .same }, false, false),
       -- H17 depthwise C=1 (lowered to dense), C=7, C=16, C=29, s=1 & s=2, same & valid
       (.h17, { mode := .depthwise, h := 8, w := 8, cin := 1, cout := 1, stride := 1, pad := .same }, true, true),
       (.h17, { mode := .depthwise, h := 8, w := 8, cin := 1, cout := 1, stride := 2, pad := .same }, true, false),
@@ -1446,18 +1444,55 @@ private def runAllTests : IO (Array TestResult) := do
           if surf.sect.size != surf.span then
             throw s!"H17 surface '{surf.shortName}' section size {surf.sect.size} != span {surf.span}"
 
-    -- Specifically assert the large-Cin H17 case had wide3x3=false (maxBlockSlots = 460*9*8 = 33120 > 32768)
-    let shNoWide : Conv3x3Shape := { mode := .dense, h := 4, w := 8, cin := 460, cout := 128, stride := 1, pad := .same }
-    let cNoWide ← compileConv3x3 .h17 shNoWide (mkTaggedWeights3x3 128 460) none false
-    if cNoWide.wide3x3 then
-      throw "expected wide3x3=false for Cin=460, Cout=128 (maxBlockSlots=33120 > 32768)"
     -- Assert H17 dense s=1 (16x16, Cin=64, Cout=256) compiles with F=4, ocg=3
     let sh256 : Conv3x3Shape := { mode := .dense, h := 16, w := 16, cin := 64, cout := 256, stride := 1, pad := .same }
     let c256 ← compileConv3x3 .h17 sh256 (mkTaggedWeights3x3 256 64) none false
     if c256.tiling.f != 4 || c256.tiling.ocg != 3 then
       throw s!"expected H17 dense s=1 Cout=256 to compile with F=4, ocg=3, got F={c256.tiling.f}, ocg={c256.tiling.ocg}"
+
+    -- Exact 64 KiB chunk boundary (F=4): (4x8, Cin=455, Cout=128, s=1, same, bias+relu)
+    let sh455 : Conv3x3Shape := { mode := .dense, h := 4, w := 8, cin := 455, cout := 128, stride := 1, pad := .same }
+    let c455 ← compileConv3x3 .h17 sh455 (mkTaggedWeights3x3 128 455) (some (mkTaggedBias 128)) true
+    if !c455.wide3x3 then throw "expected wide3x3=true for (4x8, 455->128)"
+    if c455.tiling.f != 4 || c455.tiling.ocg != 3 then
+      throw s!"expected F=4, ocg=3 for (4x8, 455->128), got F={c455.tiling.f}, ocg={c455.tiling.ocg}"
+    if c455.kernelBytes != 16 * maxKernelChunkBytes then
+      throw s!"expected 16*65536B kernel for (4x8, 455->128), got {c455.kernelBytes}"
+
+    -- Exact 64 KiB chunk boundary (F=0): (4x8, Cin=3640, Cout=1, s=1, same, bias+relu)
+    let sh3640 : Conv3x3Shape := { mode := .dense, h := 4, w := 8, cin := 3640, cout := 1, stride := 1, pad := .same }
+    let c3640 ← compileConv3x3 .h17 sh3640 (mkTaggedWeights3x3 1 3640) (some (mkTaggedBias 1)) true
+    if !c3640.wide3x3 then throw "expected wide3x3=true for (4x8, 3640->1)"
+    if c3640.tiling.f != 0 then throw s!"expected F=0 for (4x8, 3640->1), got F={c3640.tiling.f}"
+    if c3640.kernelBytes != maxKernelChunkBytes then
+      throw s!"expected exact 65536B chunk for (4x8, 3640->1), got {c3640.kernelBytes}"
+
+    -- Staged-mode (direct=false) depthwise 3x3: (3x128, C=5500, s=1, valid, bias+relu)
+    let shStgDw : Conv3x3Shape := { mode := .depthwise, h := 3, w := 128, cin := 5500, cout := 5500, stride := 1, pad := .valid }
+    let cStgDw ← compileConv3x3 .h17 shStgDw (mkTaggedWeights3x3 5500 1) (some (mkTaggedBias 5500)) true
+    if cStgDw.direct then throw "expected direct=false (staged mode) for depthwise (3x128, C=5500)"
+    if cStgDw.l2UseBytes > l2CapacityBytes then
+      throw s!"expected l2 <= 2 MiB for depthwise (3x128, C=5500), got {cStgDw.l2UseBytes}"
+    if cStgDw.wide3x3 then throw "expected wide3x3=false for depthwise (3x128, C=5500)"
     pure ()
   ))
+
+  -- Rule 13 & Rule 14 negative tests (64 KiB chunk cap and H17 wide3x3 slot limit)
+  results := results.push (checkErr "m2 neg: H17 rejects (4x8, Cin=460, Cout=128, s=1, same) (> 64 KiB chunk / > 32768*rep slots)" (do
+    let sh460 : Conv3x3Shape := { mode := .dense, h := 4, w := 8, cin := 460, cout := 128, stride := 1, pad := .same }
+    compileConv3x3 .h17 sh460 (mkTaggedWeights3x3 128 460) none false
+  ) "no legal")
+
+  results := results.push (checkErr "m2 neg: H17 rejects (4x8, Cin=4900, Cout=1, s=1, same) (> 64 KiB chunk)" (do
+    let sh4900 : Conv3x3Shape := { mode := .dense, h := 4, w := 8, cin := 4900, cout := 1, stride := 1, pad := .same }
+    compileConv3x3 .h17 sh4900 (mkTaggedWeights3x3 1 4900) none false
+  ) "no legal")
+
+  results := results.push (checkErr "m2 neg: 3x3 validator rejects Rule 13 (> 64 KiB dense chunk)" (do
+    let sh4900 : Conv3x3Shape := { mode := .dense, h := 4, w := 8, cin := 4900, cout := 1, stride := 1, pad := .same }
+    let t : Tiling := { logNE := 4, f := 0, fat := 1, ocg := 0, shPref := 0, shMax := 4, tileHeight := 4 }
+    validateConv3x3Tiling .h17 sh4900 t
+  ) "64 KiB")
 
   -- =========================================================================
   -- M2 Tampered-Task Negative Verifier Tests
@@ -1479,9 +1514,9 @@ private def runAllTests : IO (Array TestResult) := do
     { mode := .dense, h := 8, w := 16, cin := 16, cout := 16, stride := 1, pad := .same }
     (mkTaggedWeights3x3 16 16) none false)
 
-  let base3LargeBlock ← unwrap "base3LargeBlock" (compileConv3x3 .h17
-    { mode := .dense, h := 4, w := 8, cin := 460, cout := 128, stride := 1, pad := .same }
-    (mkTaggedWeights3x3 128 460) none false)
+  let base3Boundary455 ← unwrap "base3Boundary455" (compileConv3x3 .h17
+    { mode := .dense, h := 4, w := 8, cin := 455, cout := 128, stride := 1, pad := .same }
+    (mkTaggedWeights3x3 128 455) (some (mkTaggedBias 128)) true)
 
   results := results.push (checkErr "m2 neg verifier: sparse mismatch (neCfg=1 vs kernelStage=0 on s=1)" (do
     tamperReg3x3AndVerify base3DenseS1 regNeCfg 0x10000182
@@ -1509,11 +1544,17 @@ private def runAllTests : IO (Array TestResult) := do
     tamperReg3x3AndVerify base3Dw regNeCommon (cur ||| ((1 : UInt32) <<< 27))
   ) "wide3x3")
 
-  results := results.push (checkErr "m2 neg verifier: wide3x3=1 exceeding maxBlockSlots rejected" (do
-    let fOff ← findRegFileOffset base3LargeBlock.hwx base3LargeBlock.info regNeCommon
-    let cur ← readU32LE base3LargeBlock.hwx fOff
-    tamperReg3x3AndVerify base3LargeBlock regNeCommon (cur ||| ((1 : UInt32) <<< 27))
-  ) "maxBlockSlots")
+  results := results.push (checkErr "m2 neg verifier: wide3x3=0 on H17 dense stride-1 rejected" (do
+    let fOff ← findRegFileOffset base3DenseS1.hwx base3DenseS1.info regNeCommon
+    let cur ← readU32LE base3DenseS1.hwx fOff
+    tamperReg3x3AndVerify base3DenseS1 regNeCommon (cur &&& (~~~((1 : UInt32) <<< 27)))
+  ) "wide3x3")
+
+  results := results.push (checkErr "m2 neg verifier: chunkSize > 65536 rejected (even within __KERN_0 bounds)" (do
+    -- base3Boundary455 has kernelBytes = 16 * 65536, so chunk 0 at offset 0 with size 65600 fits in __KERN_0
+    -- yet violates the 64 KiB per-chunk hardware cap.
+    tamperReg3x3AndVerify base3Boundary455 (regChunkSize 0) (maxKernelChunkBytes + 64).toUInt32
+  ) "64 KiB")
 
   results := results.push (checkErr "m2 neg verifier: H17 dense s=1 ocg=4 rejected" (do
     let fOff ← findRegFileOffset base3DenseS1.hwx base3DenseS1.info regNeTile

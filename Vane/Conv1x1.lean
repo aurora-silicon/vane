@@ -49,25 +49,6 @@ structure CompiledConv1x1 where
   info : HwxInfo
   sections : LoadSections
 
-/-- Compute the output channel blocks `(o0, count)` assigned to group `g` (`0 <= g < 2^F`). -/
-def groupOutputBlocks (cout f ocg g : Nat) : Array (Nat × Nat) := Id.run do
-  let groups := (1 : Nat) <<< f
-  let blk := (1 : Nat) <<< ocg
-  let round := groups * blk
-  let full := cout / round
-  let rem := cout % round
-  let mut blocks : Array (Nat × Nat) := #[]
-  for r in [:full] do
-    blocks := blocks.push (r * round + g * blk, blk)
-  if rem > 0 then
-    let base := rem / groups
-    let extra := rem % groups
-    let lastSize := base + (if g < extra then 1 else 0)
-    let lastStart := g * base + min g extra
-    if lastSize > 0 then
-      blocks := blocks.push (full * round + lastStart, lastSize)
-  return blocks
-
 /-- Pack little-endian fp16 weights `(Cout, Cin)` row-major and optional bias `(Cout,)` into `__KERN_0`. -/
 def packKernelChunks
     (target : Target)

@@ -125,36 +125,8 @@ def decodeSparseStream (bs : ByteArray) (offset : Nat := 0) : Except String (Arr
   pure (decoded, 3 + bodyBytes)
 
 -- ============================================================================
--- Output-block assignment, wide3x3 condition, and 3x3 kernel chunk packer
+-- wide3x3 condition and 3x3 kernel chunk packer
 -- ============================================================================
-
-/-- Compute the output channel blocks `(o0, n)` assigned to group `g` (`0 <= g < 2^F`).
-    True depthwise with `F == 4` assigns `o % 16 == g` as `(o, 1)` blocks in ascending order;
-    all other cases use the standard round-blocking formula with `(Cout, F, effOcg)`. -/
-def groupOutputBlocks3x3 (sh : Conv3x3Shape) (t : Tiling) (g : Nat) : Array (Nat × Nat) :=
-  if sh.effMode == .depthwise && t.f == 4 then
-    Id.run do
-      let mut blocks : Array (Nat × Nat) := #[]
-      let mut o := g
-      while o < sh.cout do
-        blocks := blocks.push (o, 1)
-        o := o + 16
-      return blocks
-  else
-    groupOutputBlocks sh.cout t.f (effOcg sh t) g
-
-/-- Compute `maxBlockSlots` across all output blocks of all groups `g in 0..2^F-1` for stride-1 3x3:
-    `blockSlots(n) = Cin * 9 * align_up(n, 2)`. -/
-def maxBlockSlots3x3 (sh : Conv3x3Shape) (t : Tiling) : Nat := Id.run do
-  let groups := (1 : Nat) <<< t.f
-  let mut best := 0
-  for g in [:groups] do
-    let blocks := groupOutputBlocks3x3 sh t g
-    for (_, n) in blocks do
-      let slots := sh.cin * 9 * alignUp n 2
-      if slots > best then
-        best := slots
-  return best
 
 /-- Compute `neCommon` bit 27 (`wide3x3`): `true` iff `target == h17`, `effMode == dense`,
     `stride == 1`, and `maxBlockSlots <= 32768 * rep`. -/
@@ -255,6 +227,8 @@ def packConv3x3KernelChunks
           chunk := chunk ++ encoded
 
       chunk := padToAlign chunk dmaLineBytes
+      if chunk.size > maxKernelChunkBytes then
+        throw s!"3x3 kernel group {g} chunk size {chunk.size}B exceeds maximum {maxKernelChunkBytes}B (64 KiB)"
 
       match target with
       | .h17 =>
@@ -471,18 +445,22 @@ def verifyConv3x3Task (info : HwxInfo) (task : DecodedTask) : Except String Unit
     resSkew := 0
   }
 
-  -- Verify wide3x3 bit 27 consistency
-  if wide3x3Bit == 1 then
-    if target != .h17 then
-      throw s!"{prefixMsg}: neCommon wide3x3=1 is illegal on {target.name}"
-    if shape.effMode != .dense then
-      throw s!"{prefixMsg}: neCommon wide3x3=1 is illegal for depthwise 3x3 conv"
-    if stride != 1 then
-      throw s!"{prefixMsg}: neCommon wide3x3=1 is illegal for stride-{stride} 3x3 conv"
+  -- Verify wide3x3 bit 27 consistency (Rule 14: 1 iff H17 dense stride-1, 0 otherwise)
+  let expectWide3x3 := target == .h17 && shape.effMode == .dense && stride == 1
+  if expectWide3x3 then
+    if wide3x3Bit != 1 then
+      throw s!"{prefixMsg}: neCommon wide3x3 must be 1 for h17 dense stride-1 3x3 conv (got {wide3x3Bit})"
     let rep := ((1 : Nat) <<< logNE) >>> f
     let mbs := maxBlockSlots3x3 shape probeTiling
     if mbs > 32768 * rep then
       throw s!"{prefixMsg}: neCommon wide3x3=1 illegal because maxBlockSlots={mbs} > 32768*rep={32768 * rep}"
+  else if wide3x3Bit != 0 then
+    if target != .h17 then
+      throw s!"{prefixMsg}: neCommon wide3x3=1 is illegal on {target.name}"
+    else if shape.effMode != .dense then
+      throw s!"{prefixMsg}: neCommon wide3x3=1 is illegal for depthwise 3x3 conv"
+    else
+      throw s!"{prefixMsg}: neCommon wide3x3=1 is illegal for stride-{stride} 3x3 conv"
 
   -- 6. Decode L2 staging registers & verify exact srcPx and non-overlapping [0, 2 MiB) ranges
   let wSrc1Cfg ← requireDecodedWrite task.writes regSrc1Cfg "src1Cfg"
@@ -627,6 +605,8 @@ def verifyConv3x3Task (info : HwxInfo) (task : DecodedTask) : Except String Unit
       let cSz := szw.value.toNat
       if cSz == 0 || cSz % dmaLineBytes != 0 then
         throw s!"{prefixMsg}: chunk slot {s} size {cSz} must be a positive multiple of {dmaLineBytes}"
+      if cSz > maxKernelChunkBytes then
+        throw s!"{prefixMsg}: chunk slot {s} size {cSz}B exceeds maximum {maxKernelChunkBytes}B (64 KiB)"
       if cOff + cSz > kSec.size.toNat then
         throw s!"{prefixMsg}: chunk slot {s} range [{cOff}, {cOff + cSz}) exceeds kernel size {kSec.size}"
       activeChunks := activeChunks + 1
