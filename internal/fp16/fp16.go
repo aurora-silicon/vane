@@ -183,6 +183,79 @@ func FromFloat64TiesAway(f float64) uint16 {
 	return fromFloat64Rounded(f, true)
 }
 
+// ValInH17 decodes an fp16 bit pattern using H17 PE datapath semantics:
+// standard binary16 for exp in 0..30, and finite extended binade
+// +-(1 + mantissa/1024)*2^16 for exp == 31 (0x7c00..0x7fff and 0xfc00..0xffff).
+func ValInH17(h uint16) float64 {
+	if (h & 0x7c00) != 0x7c00 {
+		return ToFloat64(h)
+	}
+	frac := float64(h & 0x03ff)
+	mag := (1.0 + frac/1024.0) * 65536.0
+	if (h & 0x8000) != 0 {
+		return -mag
+	}
+	return mag
+}
+
+// RNA16 rounds a float64 to binary16 using PE hardware rna16 semantics:
+// 11-bit ties-away-from-zero, subnormals ties-away, overflow >= 65520 -> +-inf,
+// -0.0 -> +0.0, and NaN -> +0.0.
+func RNA16(x float64) uint16 {
+	if math.IsNaN(x) {
+		return PosZero
+	}
+	h := FromFloat64TiesAway(x)
+	if h == NegZero {
+		return PosZero
+	}
+	return h
+}
+
+// RNA16Step models H17 1-source PE chain intermediate rounding:
+// identical to RNA16 for |x| < 65520, and preserves the extended exponent-31
+// binade [65520, 131072) with 11-bit ties-away rounding (step 64) before saturating
+// to +-inf at >= 131040 (halfway to 131072).
+func RNA16Step(x float64) float64 {
+	if math.IsNaN(x) {
+		return 0.0
+	}
+	if math.IsInf(x, 0) {
+		return x
+	}
+	mag := math.Abs(x)
+	if mag < 65520.0 {
+		return ToFloat64(RNA16(x))
+	}
+	sign := 1.0
+	if x < 0 {
+		sign = -1.0
+	}
+	if mag < 65536.0 {
+		return sign * 65536.0
+	}
+	q := math.Floor(mag/64.0 + 0.5)
+	if q >= 2048.0 {
+		return math.Inf(int(sign))
+	}
+	return sign * q * 64.0
+}
+
+// PrevF16 returns the next smaller IEEE-754 binary16 bit pattern strictly below b,
+// saturating at -inf (0xfc00).
+func PrevF16(b uint16) uint16 {
+	if (b & 0x7fff) == 0 {
+		return 0x8001 // -2^-24
+	}
+	if (b & 0x8000) == 0 {
+		return b - 1
+	}
+	if b >= NegInf {
+		return NegInf
+	}
+	return b + 1
+}
+
 // OrderedInt maps a finite IEEE-754 binary16 value onto a monotonic int32 ULP lattice
 // where -0.0 and +0.0 both map to 0.
 func OrderedInt(h uint16) int32 {

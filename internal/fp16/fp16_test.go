@@ -118,3 +118,77 @@ func TestULPLattice(t *testing.T) {
 		t.Fatalf("ULPDistance(0x03ff, 0x0400) != 1")
 	}
 }
+
+func TestValInH17AndRNA16(t *testing.T) {
+	// Extended exponent-31 binade on H17
+	if v := ValInH17(0x7c00); v != 65536.0 {
+		t.Fatalf("ValInH17(0x7c00) = %g, want 65536", v)
+	}
+	if v := ValInH17(0x7d00); v != 81920.0 {
+		t.Fatalf("ValInH17(0x7d00) = %g, want 81920", v)
+	}
+	if v := ValInH17(0x7e00); v != 98304.0 {
+		t.Fatalf("ValInH17(0x7e00) = %g, want 98304", v)
+	}
+	if v := ValInH17(0x7fff); v != 131008.0 {
+		t.Fatalf("ValInH17(0x7fff) = %g, want 131008", v)
+	}
+	if v := ValInH17(0xfc00); v != -65536.0 {
+		t.Fatalf("ValInH17(0xfc00) = %g, want -65536", v)
+	}
+	if v := ValInH17(0xffff); v != -131008.0 {
+		t.Fatalf("ValInH17(0xffff) = %g, want -131008", v)
+	}
+	// Normal values unchanged
+	if v := ValInH17(0x3c00); v != 1.0 {
+		t.Fatalf("ValInH17(0x3c00) = %g, want 1.0", v)
+	}
+
+	// RNA16 semantics
+	if got := RNA16(math.NaN()); got != PosZero {
+		t.Fatalf("RNA16(NaN) = 0x%04x, want +0", got)
+	}
+	if got := RNA16(math.Copysign(0, -1)); got != PosZero {
+		t.Fatalf("RNA16(-0) = 0x%04x, want +0", got)
+	}
+	if got := RNA16(1.0 + math.Ldexp(1.0, -11)); got != 0x3c01 {
+		t.Fatalf("RNA16(1+2^-11) = 0x%04x, want 0x3c01 (ties away)", got)
+	}
+	if got := RNA16(math.Ldexp(1.0, -25)); got != 0x0001 {
+		t.Fatalf("RNA16(2^-25) = 0x%04x, want 0x0001 (subnormal ties away)", got)
+	}
+	if got := RNA16(65520.0); got != PosInf {
+		t.Fatalf("RNA16(65520) = 0x%04x, want +inf", got)
+	}
+	if got := RNA16(-65520.0); got != NegInf {
+		t.Fatalf("RNA16(-65520) = 0x%04x, want -inf", got)
+	}
+	if got := RNA16(65519.0); got != 0x7bff {
+		t.Fatalf("RNA16(65519) = 0x%04x, want 0x7bff", got)
+	}
+
+	// RNA16Step preserves extended [65520, 131040) binade
+	if got := RNA16Step(65520.0); got != 65536.0 {
+		t.Fatalf("RNA16Step(65520) = %g, want 65536", got)
+	}
+	if got := RNA16Step(98304.0); got != 98304.0 {
+		t.Fatalf("RNA16Step(98304) = %g, want 98304", got)
+	}
+	if got := RNA16Step(98336.0); got != 98368.0 { // halfway 98304 + 32 -> ties away to 98368
+		t.Fatalf("RNA16Step(98336) = %g, want 98368", got)
+	}
+	if got := RNA16Step(131040.0); !math.IsInf(got, 1) {
+		t.Fatalf("RNA16Step(131040) = %g, want +Inf", got)
+	}
+
+	// PrevF16
+	if PrevF16(0x0000) != 0x8001 || PrevF16(0x8000) != 0x8001 {
+		t.Fatalf("PrevF16(+-0) != 0x8001")
+	}
+	if PrevF16(0x0001) != 0x0000 || PrevF16(0x3c00) != 0x3bff {
+		t.Fatalf("PrevF16 positive mismatch")
+	}
+	if PrevF16(0x8001) != 0x8002 || PrevF16(0xfbff) != 0xfc00 || PrevF16(0xfc00) != 0xfc00 {
+		t.Fatalf("PrevF16 negative mismatch")
+	}
+}

@@ -510,3 +510,235 @@ func jsonNumber(n int) string {
 	b, _ := json.Marshal(n)
 	return string(b)
 }
+
+func TestPeEndToEndCLIAndCompare(t *testing.T) {
+	vaneBin := findVaneBin(t)
+
+	cases := []struct {
+		name      string
+		target    string
+		op        string
+		c, h, w   int
+		zc, zh, zw int
+		extraGen  []string
+		extraComp []string
+	}{
+		{"h17_abs", "h17", "abs", 4, 8, 16, 0, 0, 0, nil, nil},
+		{"h17_square_edge", "h17", "square", 1, 2, 16, 0, 0, 0, []string{"--edge-values"}, nil},
+		{"h17_chain3", "h17", "chain", 4, 8, 16, 0, 0, 0,
+			[]string{"--in-scale", "1.5", "--bias", "-0.25", "--scale", "0.5"},
+			[]string{"--in-scale", "1.5", "--bias", "-0.25", "--scale", "0.5"}},
+		{"h17_sdiv", "h17", "sdiv", 4, 8, 16, 0, 0, 0, []string{"--scalar", "4"}, []string{"--scalar", "4"}},
+		{"h17_add_bcast_c11", "h17", "add", 4, 8, 16, 4, 1, 1, nil, nil},
+		{"h17_rsub_bcast_1hw", "h17", "rsub", 4, 8, 16, 1, 8, 16, nil, nil},
+		{"h16_mul_bcast_11w", "h16", "mul", 4, 8, 16, 1, 1, 16, nil, nil},
+	}
+
+	for idx, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			vecDir := filepath.Join(tmp, "vec")
+			compDir := filepath.Join(tmp, "comp")
+
+			genArgs := []string{"gen-pe", "--op", tc.op, "--c", itoa(tc.c), "--h", itoa(tc.h), "--w", itoa(tc.w), "--seed", itoa(idx + 300), "--out-dir", vecDir, "--json"}
+			compArgs := []string{"compile-pe", "--target", tc.target, "--op", tc.op, "--c", itoa(tc.c), "--h", itoa(tc.h), "--w", itoa(tc.w), "--out-dir", compDir}
+			if tc.zc > 0 {
+				genArgs = append(genArgs, "--z-c", itoa(tc.zc), "--z-h", itoa(tc.zh), "--z-w", itoa(tc.zw))
+				compArgs = append(compArgs, "--z-c", itoa(tc.zc), "--z-h", itoa(tc.zh), "--z-w", itoa(tc.zw))
+			}
+			genArgs = append(genArgs, tc.extraGen...)
+			compArgs = append(compArgs, tc.extraComp...)
+
+			var stdout, stderr bytes.Buffer
+			if rc := runCLI(genArgs, nil, &stdout, &stderr); rc != 0 {
+				t.Fatalf("gen-pe failed rc=%d stderr=%s", rc, stderr.String())
+			}
+
+			runVane(t, vaneBin, compArgs...)
+
+			valOut := runVane(t, vaneBin, "validate",
+				"--hwx", filepath.Join(compDir, "program.hwx"),
+				"--sections", compDir,
+				"--check-tasks",
+			)
+			if !strings.Contains(valOut, "status: ok") || !strings.Contains(valOut, "pe=1") {
+				t.Fatalf("unexpected PE validate output:\n%s", valOut)
+			}
+
+			// Verify Go BuildSectionsFromHWX matches Lean sections byte-for-byte
+			hwxBytes, err := os.ReadFile(filepath.Join(compDir, "program.hwx"))
+			if err != nil {
+				t.Fatalf("read hwx: %v", err)
+			}
+			goSecs, err := ane.BuildSectionsFromHWX(hwxBytes)
+			if err != nil {
+				t.Fatalf("BuildSectionsFromHWX: %v", err)
+			}
+			for kind, fname := range ane.SectionFilenames {
+				leanBytes, _ := os.ReadFile(filepath.Join(compDir, fname))
+				if !bytes.Equal(goSecs[kind], leanBytes) {
+					t.Fatalf("PE section %s mismatch between Go and Lean", fname)
+				}
+			}
+
+			// compare-surface works on PE manifest
+			if len(tc.extraGen) == 0 || tc.extraGen[0] != "--edge-values" {
+				stdout.Reset()
+				stderr.Reset()
+				rc := runCLI([]string{
+					"compare-surface",
+					"--manifest", filepath.Join(compDir, "manifest.json"),
+					"--actual", filepath.Join(vecDir, "expected_rna16.bin"),
+					"--expected", filepath.Join(vecDir, "expected_f64.bin"),
+					"--atol", "1e-2", "--rtol", "1e-2", "--json",
+				}, nil, &stdout, &stderr)
+				if rc != 0 {
+					t.Fatalf("compare-surface failed rc=%d stdout=%s stderr=%s", rc, stdout.String(), stderr.String())
+				}
+			}
+		})
+	}
+}
+
+func TestLutAndFusedConvEndToEndCLI(t *testing.T) {
+	vaneBin := findVaneBin(t)
+
+	// 1. Standalone LUTs: verify Lean-emitted lut.bin matches Go BuildLutTable byte-for-byte!
+	lutCases := []struct {
+		name   string
+		target string
+		act    string
+		extra  []string
+		tol    string
+	}{
+		{"h17_relu", "h17", "relu", nil, "1e-3"},
+		{"h17_copy", "h17", "copy", nil, "1e-3"},
+		{"h17_tanh", "h17", "tanh", nil, "1e-2"},
+		{"h17_gelu", "h17", "gelu", nil, "2e-2"},
+		{"h17_silu", "h17", "silu", nil, "3e-2"},
+		{"h17_exp", "h17", "exp", nil, "2e-1"},
+		{"h17_rsqrt_eps", "h17", "rsqrt", []string{"--eps", "0.0625"}, "2e-2"},
+		{"h16_hard_sigmoid", "h16", "hard_sigmoid", []string{"--alpha", "0.5", "--beta", "0.25"}, "1e-2"},
+		{"h16_scaled_tanh_neg", "h16", "scaled_tanh", []string{"--alpha", "-2.0", "--beta", "0.5"}, "1e-2"},
+	}
+
+	for idx, tc := range lutCases {
+		t.Run("lut_"+tc.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			compDir := filepath.Join(tmp, "comp")
+			vecDir := filepath.Join(tmp, "vec")
+
+			compArgs := append([]string{"compile-lut", "--target", tc.target, "--act", tc.act, "--c", "4", "--h", "8", "--w", "16", "--out-dir", compDir}, tc.extra...)
+			runVane(t, vaneBin, compArgs...)
+
+			valOut := runVane(t, vaneBin, "validate",
+				"--hwx", filepath.Join(compDir, "program.hwx"),
+				"--sections", compDir,
+				"--check-tasks",
+			)
+			if !strings.Contains(valOut, "status: ok") || !strings.Contains(valOut, "ne_act=1") {
+				t.Fatalf("unexpected NE act validate output:\n%s", valOut)
+			}
+
+			genArgs := append([]string{"gen-lut", "--act", tc.act, "--c", "4", "--h", "8", "--w", "16", "--seed", itoa(idx + 400), "--out-dir", vecDir, "--json"}, tc.extra...)
+			if tc.act != "relu" && tc.act != "copy" {
+				genArgs = append(genArgs, "--lut-bin", filepath.Join(compDir, "lut.bin"))
+			}
+			var stdout, stderr bytes.Buffer
+			if rc := runCLI(genArgs, nil, &stdout, &stderr); rc != 0 {
+				t.Fatalf("gen-lut failed rc=%d stderr=%s", rc, stderr.String())
+			}
+
+			if tc.act != "relu" && tc.act != "copy" {
+				stdout.Reset()
+				stderr.Reset()
+				rc := runCLI([]string{
+					"compare-surface",
+					"--manifest", filepath.Join(compDir, "manifest.json"),
+					"--actual", filepath.Join(vecDir, "expected_lut.bin"),
+					"--expected", filepath.Join(vecDir, "expected_f64.bin"),
+					"--atol", tc.tol, "--rtol", tc.tol, "--json",
+				}, nil, &stdout, &stderr)
+				if rc != 0 {
+					t.Fatalf("compare-surface LUT failed rc=%d stdout=%s stderr=%s", rc, stdout.String(), stderr.String())
+				}
+			}
+		})
+	}
+
+	// 2. Fused Conv1x1 + LUT and Conv3x3 (dense s1, dw s1, dense s2 sparse) + LUT
+	t.Run("fused_conv1x1_gelu", func(t *testing.T) {
+		tmp := t.TempDir()
+		vecDir := filepath.Join(tmp, "vec")
+		compDir := filepath.Join(tmp, "comp")
+		var stdout, stderr bytes.Buffer
+		if rc := runCLI([]string{
+			"gen-conv1x1", "--h", "8", "--w", "16", "--cin", "16", "--cout", "16",
+			"--bias", "--act", "gelu", "--seed", "501", "--out-dir", vecDir,
+		}, nil, &stdout, &stderr); rc != 0 {
+			t.Fatalf("gen-conv1x1 --act gelu failed: %s", stderr.String())
+		}
+		runVane(t, vaneBin, "compile-conv1x1", "--target", "h17", "--h", "8", "--w", "16", "--cin", "16", "--cout", "16",
+			"--weights", filepath.Join(vecDir, "weights.bin"),
+			"--bias", filepath.Join(vecDir, "bias.bin"),
+			"--act", "gelu", "--out-dir", compDir)
+		valOut := runVane(t, vaneBin, "validate", "--hwx", filepath.Join(compDir, "program.hwx"), "--sections", compDir, "--check-tasks")
+		if !strings.Contains(valOut, "status: ok") || !strings.Contains(valOut, "conv=1") {
+			t.Fatalf("unexpected validate output:\n%s", valOut)
+		}
+		stdout.Reset()
+		stderr.Reset()
+		if rc := runCLI([]string{
+			"compare-conv", "--manifest", filepath.Join(compDir, "manifest.json"),
+			"--actual", filepath.Join(vecDir, "expected_lut.bin"),
+			"--expected", filepath.Join(vecDir, "expected_f64.bin"),
+			"--atol", "2e-2", "--rtol", "2e-2", "--json",
+		}, nil, &stdout, &stderr); rc != 0 {
+			t.Fatalf("compare-conv fused 1x1 failed: %s %s", stdout.String(), stderr.String())
+		}
+	})
+
+	t.Run("fused_conv3x3_s2_sparse_tanh", func(t *testing.T) {
+		tmp := t.TempDir()
+		vecDir := filepath.Join(tmp, "vec")
+		compDir := filepath.Join(tmp, "comp")
+		var stdout, stderr bytes.Buffer
+		if rc := runCLI([]string{
+			"gen-conv3x3", "--mode", "dense", "--h", "12", "--w", "14", "--cin", "8", "--cout", "16",
+			"--stride", "2", "--pad", "same", "--bias", "--act", "tanh", "--seed", "502", "--out-dir", vecDir,
+		}, nil, &stdout, &stderr); rc != 0 {
+			t.Fatalf("gen-conv3x3 --act tanh failed: %s", stderr.String())
+		}
+		runVane(t, vaneBin, "compile-conv3x3", "--target", "h17", "--mode", "dense",
+			"--h", "12", "--w", "14", "--cin", "8", "--cout", "16", "--stride", "2", "--pad", "same",
+			"--weights", filepath.Join(vecDir, "weights.bin"),
+			"--bias", filepath.Join(vecDir, "bias.bin"),
+			"--act", "tanh", "--out-dir", compDir)
+		valOut := runVane(t, vaneBin, "validate", "--hwx", filepath.Join(compDir, "program.hwx"), "--sections", compDir, "--check-tasks")
+		if !strings.Contains(valOut, "status: ok") || !strings.Contains(valOut, "conv=1") {
+			t.Fatalf("unexpected validate output:\n%s", valOut)
+		}
+		// Verify Go-built LUT table matches Lean-emitted lut.bin byte-for-byte
+		leanLut, err := os.ReadFile(filepath.Join(compDir, "lut.bin"))
+		if err != nil {
+			t.Fatalf("read lut.bin: %v", err)
+		}
+		goLut, _, _, err := ref.BuildLutTable(ref.ActSpec{Name: "tanh"})
+		if err != nil {
+			t.Fatalf("BuildLutTable: %v", err)
+		}
+		if !bytes.Equal(leanLut, goLut) {
+			t.Fatalf("Lean lut.bin and Go BuildLutTable(tanh) differ!")
+		}
+		stdout.Reset()
+		stderr.Reset()
+		if rc := runCLI([]string{
+			"compare-conv", "--manifest", filepath.Join(compDir, "manifest.json"),
+			"--actual", filepath.Join(vecDir, "expected_lut.bin"),
+			"--expected", filepath.Join(vecDir, "expected_f64.bin"),
+			"--atol", "2e-2", "--rtol", "2e-2", "--json",
+		}, nil, &stdout, &stderr); rc != 0 {
+			t.Fatalf("compare-conv fused 3x3 s2 failed: %s %s", stdout.String(), stderr.String())
+		}
+	})
+}

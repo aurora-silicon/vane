@@ -1,5 +1,5 @@
 // Command vane-runner provides Linux accel/ane ABI v3 device probing, HWX execution,
-// deterministic conv test vector generation, and strided surface comparison.
+// deterministic conv/PE/LUT test vector generation, and strided surface comparison.
 package main
 
 import (
@@ -12,6 +12,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/niteria/vane/internal/ane"
@@ -30,16 +31,41 @@ func (s *stringSliceFlag) Set(v string) error {
 	return nil
 }
 
+type optFloatFlag struct {
+	set bool
+	val float64
+}
+
+func (f *optFloatFlag) String() string {
+	if !f.set {
+		return ""
+	}
+	return strconv.FormatFloat(f.val, 'g', -1, 64)
+}
+
+func (f *optFloatFlag) Set(s string) error {
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return err
+	}
+	f.set = true
+	f.val = v
+	return nil
+}
+
 func usage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  vane-runner probe [--device PATH] [--json]")
 	fmt.Fprintln(w, "  vane-runner run --hwx PATH [--sections-dir DIR] [--input PATH]... [--output-out PATH]")
 	fmt.Fprintln(w, "                  [--expected PATH] [--runs N] [--in-place] [--atol F] [--rtol F]")
 	fmt.Fprintln(w, "                  [--max-ulp N] [--device PATH] [--json] [--json-out PATH]")
-	fmt.Fprintln(w, "  vane-runner gen-conv1x1 --h H --w W --cin C --cout O [--bias] [--relu] [--seed N] --out-dir DIR [--json]")
-	fmt.Fprintln(w, "  vane-runner gen-conv3x3 --mode <dense|depthwise> --h H --w W --cin C --cout O --stride <1|2> --pad <same|valid> [--bias] [--relu] [--seed N] --out-dir DIR [--json]")
+	fmt.Fprintln(w, "  vane-runner gen-conv1x1 --h H --w W --cin C --cout O [--bias] [--relu | --act NAME [act flags]] [--lut-bin PATH] [--seed N] --out-dir DIR [--json]")
+	fmt.Fprintln(w, "  vane-runner gen-conv3x3 --mode <dense|depthwise> --h H --w W --cin C --cout O --stride <1|2> --pad <same|valid> [--bias] [--relu | --act NAME [act flags]] [--lut-bin PATH] [--seed N] --out-dir DIR [--json]")
+	fmt.Fprintln(w, "  vane-runner gen-pe --op <abs|square|linear|chain|sadd|ssub|srsub|smul|sdiv|add|sub|rsub|mul|max|min> --h H --w W --c C [--z-h ZH --z-w ZW --z-c ZC] [--alpha F] [--beta F] [--in-scale F] [--bias F] [--scale F] [--scalar F] [--edge-values] [--seed N] --out-dir DIR [--json]")
+	fmt.Fprintln(w, "  vane-runner gen-lut --act NAME --h H --w W --c C [--alpha F] [--beta F] [--lo F] [--hi F] [--eps F] [--scalar F] [--all-fp16] [--lut-bin PATH] [--seed N] --out-dir DIR [--json]")
 	fmt.Fprintln(w, "  vane-runner compare-conv --manifest PATH --actual PATH --expected PATH [--atol F] [--rtol F] [--max-ulp N] [--json]")
 	fmt.Fprintln(w, "  vane-runner compare-conv1x1 --manifest PATH --actual PATH --expected PATH [--atol F] [--rtol F] [--max-ulp N] [--json]")
+	fmt.Fprintln(w, "  vane-runner compare-surface --manifest PATH --actual PATH --expected PATH [--atol F] [--rtol F] [--max-ulp N] [--json]")
 }
 
 func runCLI(args []string, tr ane.Transport, stdout, stderr io.Writer) int {
@@ -56,15 +82,155 @@ func runCLI(args []string, tr ane.Transport, stdout, stderr io.Writer) int {
 		return cmdGenConv1x1(args[1:], stdout, stderr)
 	case "gen-conv3x3":
 		return cmdGenConv3x3(args[1:], stdout, stderr)
+	case "gen-pe":
+		return cmdGenPe(args[1:], stdout, stderr)
+	case "gen-lut":
+		return cmdGenLut(args[1:], stdout, stderr)
 	case "compare-conv":
 		return cmdCompareConv("compare-conv", args[1:], stdout, stderr)
 	case "compare-conv1x1":
 		return cmdCompareConv("compare-conv1x1", args[1:], stdout, stderr)
+	case "compare-surface":
+		return cmdCompareConv("compare-surface", args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "error: unknown subcommand %q\n", args[0])
 		usage(stderr)
 		return 1
 	}
+}
+
+func buildActSpec(name string, alpha, beta, lo, hi, eps, scalar optFloatFlag) (ref.ActSpec, error) {
+	low := strings.ToLower(name)
+	spec := ref.ActSpec{Name: low}
+	switch low {
+	case "", "none", "relu", "copy", "relu6", "abs", "sign", "tanh", "erf", "sigmoid", "gelu", "silu", "exp2", "exp", "sqrt", "inverse", "log2":
+		return spec, nil
+	case "clip":
+		if !lo.set || !hi.set {
+			return spec, fmt.Errorf("clip requires both --lo/--act-lo and --hi/--act-hi")
+		}
+		spec.Lo, spec.Hi = lo.val, hi.val
+		return spec, nil
+	case "leaky_relu":
+		spec.Alpha = 0.01
+		if alpha.set {
+			spec.Alpha = alpha.val
+		}
+		return spec, nil
+	case "threshold":
+		if scalar.set {
+			spec.Scalar = scalar.val
+		} else if alpha.set {
+			spec.Scalar = alpha.val
+		} else if lo.set {
+			spec.Scalar = lo.val
+		}
+		return spec, nil
+	case "thresholded_relu":
+		spec.Alpha = 1.0
+		if alpha.set {
+			spec.Alpha = alpha.val
+		} else if scalar.set {
+			spec.Alpha = scalar.val
+		} else if lo.set {
+			spec.Alpha = lo.val
+		}
+		return spec, nil
+	case "hard_sigmoid":
+		spec.Alpha, spec.Beta = 0.2, 0.5
+		if alpha.set {
+			spec.Alpha = alpha.val
+		}
+		if beta.set {
+			spec.Beta = beta.val
+		}
+		return spec, nil
+	case "clamp_max":
+		if scalar.set {
+			spec.Scalar = scalar.val
+		} else if lo.set {
+			spec.Scalar = lo.val
+		} else if alpha.set {
+			spec.Scalar = alpha.val
+		}
+		return spec, nil
+	case "clamp_min":
+		if scalar.set {
+			spec.Scalar = scalar.val
+		} else if hi.set {
+			spec.Scalar = hi.val
+		} else if alpha.set {
+			spec.Scalar = alpha.val
+		}
+		return spec, nil
+	case "elu":
+		spec.Alpha = 1.0
+		if alpha.set {
+			spec.Alpha = alpha.val
+		}
+		return spec, nil
+	case "scaled_tanh":
+		spec.Alpha, spec.Beta = 1.0, 1.0
+		if alpha.set {
+			spec.Alpha = alpha.val
+		}
+		if beta.set {
+			spec.Beta = beta.val
+		}
+		return spec, nil
+	case "rsqrt":
+		if eps.set {
+			spec.Eps = eps.val
+		}
+		return spec, nil
+	default:
+		return spec, fmt.Errorf("unknown activation %q", name)
+	}
+}
+
+func resolveConvActivation(relu bool, actName string, alpha, beta, lo, hi, eps, scalar optFloatFlag) (ref.ActSpec, bool, error) {
+	low := strings.ToLower(actName)
+	if low == "" {
+		if relu {
+			return ref.ActSpec{Name: "relu"}, false, nil
+		}
+		return ref.ActSpec{Name: "none"}, false, nil
+	}
+	if low == "none" {
+		if relu {
+			return ref.ActSpec{}, false, fmt.Errorf("cannot combine --relu with --act none")
+		}
+		return ref.ActSpec{Name: "none"}, false, nil
+	}
+	if low == "relu" {
+		return ref.ActSpec{Name: "relu"}, false, nil
+	}
+	if relu {
+		return ref.ActSpec{}, false, fmt.Errorf("cannot combine --relu with --act %s", actName)
+	}
+	spec, err := buildActSpec(low, alpha, beta, lo, hi, eps, scalar)
+	if err != nil {
+		return ref.ActSpec{}, false, err
+	}
+	return spec, true, nil
+}
+
+func loadOrBuildLut(spec ref.ActSpec, lutBinPath string) ([]byte, uint16, *uint16, error) {
+	tableBytes, preScale, shift, err := ref.BuildLutTable(spec)
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	if lutBinPath != "" {
+		b, err := os.ReadFile(lutBinPath)
+		if err != nil {
+			return nil, 0, nil, fmt.Errorf("read --lut-bin %q: %w", lutBinPath, err)
+		}
+		if len(b) != 128 {
+			return nil, 0, nil, fmt.Errorf("--lut-bin %q size %d != 128 bytes", lutBinPath, len(b))
+		}
+		tableBytes = b
+	}
+	return tableBytes, preScale, shift, nil
 }
 
 func cmdProbe(args []string, tr ane.Transport, stdout, stderr io.Writer) int {
@@ -274,6 +440,15 @@ func cmdGenConv1x1(args []string, stdout, stderr io.Writer) int {
 	cout := fs.Int("cout", 0, "Output channels Cout")
 	withBias := fs.Bool("bias", false, "Generate bias vector")
 	relu := fs.Bool("relu", false, "Apply ReLU to expected output")
+	actName := fs.String("act", "", "Optional fused activation name (relu or any LUT op)")
+	var actAlpha, actBeta, actLo, actHi, actEps, actScalar optFloatFlag
+	fs.Var(&actAlpha, "act-alpha", "Activation alpha parameter")
+	fs.Var(&actBeta, "act-beta", "Activation beta parameter")
+	fs.Var(&actLo, "act-lo", "Activation lo parameter")
+	fs.Var(&actHi, "act-hi", "Activation hi parameter")
+	fs.Var(&actEps, "act-eps", "Activation eps parameter")
+	fs.Var(&actScalar, "act-scalar", "Activation scalar parameter")
+	lutBin := fs.String("lut-bin", "", "Optional 128-byte LUT binary emitted by vane")
 	seed := fs.Uint64("seed", 1, "Deterministic PRNG seed")
 	outDir := fs.String("out-dir", "", "Output directory for generated test vectors")
 	asJSON := fs.Bool("json", false, "Emit JSON summary")
@@ -290,6 +465,12 @@ func cmdGenConv1x1(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
+	actSpec, isLut, err := resolveConvActivation(*relu, *actName, actAlpha, actBeta, actLo, actHi, actEps, actScalar)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+
 	rng := rand.New(rand.NewPCG(*seed, *seed^0x9e3779b97f4a7c15))
 
 	x, err := ref.NewTensor(1, *cin, *h, *w)
@@ -298,11 +479,9 @@ func cmdGenConv1x1(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	for i := range x.Data {
-		// Uniform in [-1.0, 1.0] quantized to fp16
 		x.Data[i] = fp16.FromFloat64(rng.Float64()*2.0 - 1.0)
 	}
 
-	// Scale weights inversely with sqrt(Cin) so accumulations stay well within Q15.16 & fp16 range
 	wScale := math.Min(0.5, 2.0/math.Sqrt(float64(*cin)))
 	weights := make([]uint16, (*cout)*(*cin))
 	for i := range weights {
@@ -317,15 +496,35 @@ func cmdGenConv1x1(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 
-	yF64, err := ref.Conv2d1x1(x, weights, *cout, bias, *relu)
-	if err != nil {
-		fmt.Fprintf(stderr, "error: float64 reference failed: %v\n", err)
-		return 1
-	}
-	yQ1516, err := ref.Conv2d1x1Q1516(x, weights, *cout, bias, *relu)
-	if err != nil {
-		fmt.Fprintf(stderr, "error: Q15.16 reference failed: %v\n", err)
-		return 1
+	var yF64, yQ1516 ref.Tensor
+	if isLut {
+		tableBytes, preScale, shift, err := loadOrBuildLut(actSpec, *lutBin)
+		if err != nil {
+			fmt.Fprintf(stderr, "error: %v\n", err)
+			return 1
+		}
+		yF64, err = ref.Conv2d1x1Act(x, weights, *cout, bias, actSpec)
+		if err != nil {
+			fmt.Fprintf(stderr, "error: float64 reference failed: %v\n", err)
+			return 1
+		}
+		yQ1516, err = ref.Conv2d1x1Q1516Lut(x, weights, *cout, bias, tableBytes, preScale, shift)
+		if err != nil {
+			fmt.Fprintf(stderr, "error: Q15.16+LUT reference failed: %v\n", err)
+			return 1
+		}
+	} else {
+		effRelu := actSpec.Name == "relu"
+		yF64, err = ref.Conv2d1x1(x, weights, *cout, bias, effRelu)
+		if err != nil {
+			fmt.Fprintf(stderr, "error: float64 reference failed: %v\n", err)
+			return 1
+		}
+		yQ1516, err = ref.Conv2d1x1Q1516(x, weights, *cout, bias, effRelu)
+		if err != nil {
+			fmt.Fprintf(stderr, "error: Q15.16 reference failed: %v\n", err)
+			return 1
+		}
 	}
 
 	rowStride := ref.AlignUp(2*(*w), 64)
@@ -378,29 +577,36 @@ func cmdGenConv1x1(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "error: %v\n", err)
 		return 1
 	}
+	if isLut {
+		if err := writeFile("expected_lut.bin", expQSurface); err != nil {
+			fmt.Fprintf(stderr, "error: %v\n", err)
+			return 1
+		}
+	}
 
 	summary := map[string]any{
-		"h":               *h,
-		"w":               *w,
-		"cin":             *cin,
-		"cout":            *cout,
-		"bias":            *withBias,
-		"relu":            *relu,
-		"seed":            *seed,
-		"row_stride":      rowStride,
-		"plane_stride":    planeStride,
-		"in_bytes":        len(inSurface),
-		"out_bytes":       len(expF64Surface),
-		"weights_bytes":   len(weights) * 2,
-		"bias_bytes":      len(bias) * 2,
-		"out_dir":         *outDir,
+		"h":             *h,
+		"w":             *w,
+		"cin":           *cin,
+		"cout":          *cout,
+		"bias":          *withBias,
+		"relu":          actSpec.Name == "relu",
+		"activation":    actSpec.Name,
+		"seed":          *seed,
+		"row_stride":    rowStride,
+		"plane_stride":  planeStride,
+		"in_bytes":      len(inSurface),
+		"out_bytes":     len(expF64Surface),
+		"weights_bytes": len(weights) * 2,
+		"bias_bytes":    len(bias) * 2,
+		"out_dir":       *outDir,
 	}
 	if *asJSON {
 		raw, _ := json.MarshalIndent(summary, "", "  ")
 		fmt.Fprintln(stdout, string(raw))
 	} else {
-		fmt.Fprintf(stdout, "generated conv1x1 (%dx%d, %d->%d, bias=%t, relu=%t, seed=%d) in %s (in=%dB out=%dB weights=%dB)\n",
-			*h, *w, *cin, *cout, *withBias, *relu, *seed, *outDir, len(inSurface), len(expF64Surface), len(weights)*2)
+		fmt.Fprintf(stdout, "generated conv1x1 (%dx%d, %d->%d, bias=%t, act=%s, seed=%d) in %s (in=%dB out=%dB weights=%dB)\n",
+			*h, *w, *cin, *cout, *withBias, actSpec.Name, *seed, *outDir, len(inSurface), len(expF64Surface), len(weights)*2)
 	}
 	return 0
 }
@@ -417,6 +623,15 @@ func cmdGenConv3x3(args []string, stdout, stderr io.Writer) int {
 	pad := fs.String("pad", "", "Padding mode: same or valid")
 	withBias := fs.Bool("bias", false, "Generate bias vector")
 	relu := fs.Bool("relu", false, "Apply ReLU to expected output")
+	actName := fs.String("act", "", "Optional fused activation name (relu or any LUT op)")
+	var actAlpha, actBeta, actLo, actHi, actEps, actScalar optFloatFlag
+	fs.Var(&actAlpha, "act-alpha", "Activation alpha parameter")
+	fs.Var(&actBeta, "act-beta", "Activation beta parameter")
+	fs.Var(&actLo, "act-lo", "Activation lo parameter")
+	fs.Var(&actHi, "act-hi", "Activation hi parameter")
+	fs.Var(&actEps, "act-eps", "Activation eps parameter")
+	fs.Var(&actScalar, "act-scalar", "Activation scalar parameter")
+	lutBin := fs.String("lut-bin", "", "Optional 128-byte LUT binary emitted by vane")
 	seed := fs.Uint64("seed", 1, "Deterministic PRNG seed")
 	outDir := fs.String("out-dir", "", "Output directory for generated test vectors")
 	asJSON := fs.Bool("json", false, "Emit JSON summary")
@@ -446,6 +661,12 @@ func cmdGenConv3x3(args []string, stdout, stderr io.Writer) int {
 	}
 	if *outDir == "" {
 		fmt.Fprintln(stderr, "error: --out-dir DIR is required")
+		return 1
+	}
+
+	actSpec, isLut, err := resolveConvActivation(*relu, *actName, actAlpha, actBeta, actLo, actHi, actEps, actScalar)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
 		return 1
 	}
 
@@ -487,15 +708,35 @@ func cmdGenConv3x3(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 
-	yF64, err := ref.Conv2d3x3Pad(x, weights, *cout, bias, *stride, *pad, groups, *relu)
-	if err != nil {
-		fmt.Fprintf(stderr, "error: float64 reference failed: %v\n", err)
-		return 1
-	}
-	yQ1516, err := ref.Conv2d3x3Q1516(x, weights, *cout, bias, *stride, *pad, groups, *relu)
-	if err != nil {
-		fmt.Fprintf(stderr, "error: Q15.16 reference failed: %v\n", err)
-		return 1
+	var yF64, yQ1516 ref.Tensor
+	if isLut {
+		tableBytes, preScale, shift, err := loadOrBuildLut(actSpec, *lutBin)
+		if err != nil {
+			fmt.Fprintf(stderr, "error: %v\n", err)
+			return 1
+		}
+		yF64, err = ref.Conv2d3x3PadAct(x, weights, *cout, bias, *stride, *pad, groups, actSpec)
+		if err != nil {
+			fmt.Fprintf(stderr, "error: float64 reference failed: %v\n", err)
+			return 1
+		}
+		yQ1516, err = ref.Conv2d3x3Q1516Lut(x, weights, *cout, bias, *stride, *pad, groups, tableBytes, preScale, shift)
+		if err != nil {
+			fmt.Fprintf(stderr, "error: Q15.16+LUT reference failed: %v\n", err)
+			return 1
+		}
+	} else {
+		effRelu := actSpec.Name == "relu"
+		yF64, err = ref.Conv2d3x3Pad(x, weights, *cout, bias, *stride, *pad, groups, effRelu)
+		if err != nil {
+			fmt.Fprintf(stderr, "error: float64 reference failed: %v\n", err)
+			return 1
+		}
+		yQ1516, err = ref.Conv2d3x3Q1516(x, weights, *cout, bias, *stride, *pad, groups, effRelu)
+		if err != nil {
+			fmt.Fprintf(stderr, "error: Q15.16 reference failed: %v\n", err)
+			return 1
+		}
 	}
 
 	inRowStride := ref.AlignUp(2*(*w), 64)
@@ -551,6 +792,12 @@ func cmdGenConv3x3(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "error: %v\n", err)
 		return 1
 	}
+	if isLut {
+		if err := writeFile("expected_lut.bin", expQSurface); err != nil {
+			fmt.Fprintf(stderr, "error: %v\n", err)
+			return 1
+		}
+	}
 
 	summary := map[string]any{
 		"mode":             *mode,
@@ -565,7 +812,8 @@ func cmdGenConv3x3(args []string, stdout, stderr io.Writer) int {
 		"pt":               padTop,
 		"pl":               padLeft,
 		"bias":             *withBias,
-		"relu":             *relu,
+		"relu":             actSpec.Name == "relu",
+		"activation":       actSpec.Name,
 		"seed":             *seed,
 		"in_row_stride":    inRowStride,
 		"in_plane_stride":  inPlaneStride,
@@ -581,8 +829,418 @@ func cmdGenConv3x3(args []string, stdout, stderr io.Writer) int {
 		raw, _ := json.MarshalIndent(summary, "", "  ")
 		fmt.Fprintln(stdout, string(raw))
 	} else {
-		fmt.Fprintf(stdout, "generated conv3x3 %s (%dx%d->%dx%d, %d->%d, s=%d, pad=%s, bias=%t, relu=%t, seed=%d) in %s (in=%dB out=%dB weights=%dB)\n",
-			*mode, *h, *w, ho, wo, *cin, *cout, *stride, *pad, *withBias, *relu, *seed, *outDir, len(inSurface), len(expF64Surface), len(weights)*2)
+		fmt.Fprintf(stdout, "generated conv3x3 %s (%dx%d->%dx%d, %d->%d, s=%d, pad=%s, bias=%t, act=%s, seed=%d) in %s (in=%dB out=%dB weights=%dB)\n",
+			*mode, *h, *w, ho, wo, *cin, *cout, *stride, *pad, *withBias, actSpec.Name, *seed, *outDir, len(inSurface), len(expF64Surface), len(weights)*2)
+	}
+	return 0
+}
+
+var peEdgeValues = []uint16{
+	0x0000, 0x8000, // +0, -0
+	0x0001, 0x8001, // +-min subnormal
+	0x03ff, 0x83ff, // +-max subnormal
+	0x0400, 0x8400, // +-min normal
+	0x3800, 0xb800, // +-0.5
+	0x3c00, 0xbc00, // +-1.0
+	0x3c01, 0xbc01, // +-(1 + 2^-10)
+	0x3e00, 0xbe00, // +-1.5
+	0x4000, 0xc000, // +-2.0
+	0x4200, 0xc200, // +-3.0
+	0x4900, 0xc900, // +-10.0
+	0x5640, 0xd640, // +-100.0
+	0x7bff, 0xfbff, // +-65504
+	0x7c00, 0xfc00, // +-inf
+	0x7d00, 0xfd00, // +-sNaN
+	0x7e00, 0x7fff, // qNaN, max NaN
+}
+
+func packTensor64B(t ref.Tensor) ([]byte, error) {
+	rs := ref.AlignUp(2*t.W, 64)
+	ps := t.H * rs
+	bs := t.C * ps
+	return ref.PackSurface(t, bs, ps, rs, bs)
+}
+
+func cmdGenPe(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("gen-pe", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	opStr := fs.String("op", "", "PE op: abs|square|linear|chain|sadd|ssub|srsub|smul|sdiv|add|sub|rsub|mul|max|min")
+	h := fs.Int("h", 0, "Primary height H")
+	w := fs.Int("w", 0, "Primary width W")
+	c := fs.Int("c", 0, "Primary channels C")
+	zh := fs.Int("z-h", 0, "Secondary input height ZH (defaults to --h)")
+	zw := fs.Int("z-w", 0, "Secondary input width ZW (defaults to --w)")
+	zc := fs.Int("z-c", 0, "Secondary input channels ZC (defaults to --c)")
+	var alpha, beta, inScale, bias, scale, scalar optFloatFlag
+	fs.Var(&alpha, "alpha", "linear alpha")
+	fs.Var(&beta, "beta", "linear beta")
+	fs.Var(&inScale, "in-scale", "chain in_scale")
+	fs.Var(&bias, "bias", "chain bias")
+	fs.Var(&scale, "scale", "chain scale")
+	fs.Var(&scalar, "scalar", "scalar constant for sadd/ssub/srsub/smul/sdiv")
+	edgeValues := fs.Bool("edge-values", false, "Populate input with special/edge fp16 bit patterns")
+	seed := fs.Uint64("seed", 1, "Deterministic PRNG seed")
+	outDir := fs.String("out-dir", "", "Output directory")
+	asJSON := fs.Bool("json", false, "Emit JSON summary")
+
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	if *opStr == "" || *h <= 0 || *w <= 0 || *c <= 0 || *outDir == "" {
+		fmt.Fprintln(stderr, "error: --op, --h, --w, --c, and --out-dir are required")
+		return 1
+	}
+
+	op := strings.ToLower(*opStr)
+	isTwoSource := op == "add" || op == "sub" || op == "rsub" || op == "mul" || op == "max" || op == "min"
+
+	rng := rand.New(rand.NewPCG(*seed, *seed^0x517cc1b727220a95))
+	x, err := ref.NewTensor(1, *c, *h, *w)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	for i := range x.Data {
+		if *edgeValues {
+			x.Data[i] = peEdgeValues[i%len(peEdgeValues)]
+		} else {
+			x.Data[i] = fp16.FromFloat64(rng.Float64()*4.0 - 2.0)
+		}
+	}
+
+	var z ref.Tensor
+	var yRNA, yF64 ref.Tensor
+	if isTwoSource {
+		zC, zH, zW := *c, *h, *w
+		if *zc > 0 {
+			zC = *zc
+		}
+		if *zh > 0 {
+			zH = *zh
+		}
+		if *zw > 0 {
+			zW = *zw
+		}
+		z, err = ref.NewTensor(1, zC, zH, zW)
+		if err != nil {
+			fmt.Fprintf(stderr, "error: %v\n", err)
+			return 1
+		}
+		for i := range z.Data {
+			if *edgeValues {
+				z.Data[i] = peEdgeValues[(i*7+3)%len(peEdgeValues)]
+			} else {
+				z.Data[i] = fp16.FromFloat64(rng.Float64()*4.0 - 2.0)
+			}
+		}
+		yRNA, err = ref.PeBinary(op, x, z, false)
+		if err != nil {
+			fmt.Fprintf(stderr, "error: %v\n", err)
+			return 1
+		}
+		yF64, err = ref.PeBinaryF64(op, x, z, false)
+		if err != nil {
+			fmt.Fprintf(stderr, "error: %v\n", err)
+			return 1
+		}
+	} else {
+		f16Ptr := func(v float64) *uint16 {
+			h := fp16.FromFloat64(v)
+			if h == fp16.NegZero {
+				h = fp16.PosZero
+			}
+			return &h
+		}
+		switch op {
+		case "abs", "square":
+			yRNA, err = ref.PeUnary(op, x)
+			if err != nil {
+				fmt.Fprintf(stderr, "error: %v\n", err)
+				return 1
+			}
+			yF64, _ = ref.NewTensor(x.N, x.C, x.H, x.W)
+			for i, v := range x.Data {
+				f := fp16.ToFloat64(v)
+				if op == "abs" {
+					yF64.Data[i] = fp16.FromFloat64(math.Abs(f))
+				} else {
+					yF64.Data[i] = fp16.FromFloat64(f * f)
+				}
+			}
+		case "linear":
+			aVal, bVal := 1.0, 0.0
+			if alpha.set {
+				aVal = alpha.val
+			}
+			if beta.set {
+				bVal = beta.val
+			}
+			yRNA, err = ref.PeChain(x, f16Ptr(aVal), f16Ptr(bVal), nil)
+			if err != nil {
+				fmt.Fprintf(stderr, "error: %v\n", err)
+				return 1
+			}
+			yF64, _ = ref.PeChainF64(x, f16Ptr(aVal), f16Ptr(bVal), nil)
+		case "chain":
+			var insP, bP, sP *uint16
+			if inScale.set {
+				insP = f16Ptr(inScale.val)
+			}
+			if bias.set {
+				bP = f16Ptr(bias.val)
+			}
+			if scale.set {
+				sP = f16Ptr(scale.val)
+			}
+			yRNA, err = ref.PeChain(x, insP, bP, sP)
+			if err != nil {
+				fmt.Fprintf(stderr, "error: %v\n", err)
+				return 1
+			}
+			yF64, _ = ref.PeChainF64(x, insP, bP, sP)
+		case "sadd":
+			if !scalar.set {
+				fmt.Fprintln(stderr, "error: sadd requires --scalar F")
+				return 1
+			}
+			yRNA, _ = ref.PeChain(x, nil, f16Ptr(scalar.val), nil)
+			yF64, _ = ref.PeChainF64(x, nil, f16Ptr(scalar.val), nil)
+		case "ssub":
+			if !scalar.set {
+				fmt.Fprintln(stderr, "error: ssub requires --scalar F")
+				return 1
+			}
+			yRNA, _ = ref.PeChain(x, nil, f16Ptr(-scalar.val), nil)
+			yF64, _ = ref.PeChainF64(x, nil, f16Ptr(-scalar.val), nil)
+		case "srsub":
+			if !scalar.set {
+				fmt.Fprintln(stderr, "error: srsub requires --scalar F")
+				return 1
+			}
+			yRNA, _ = ref.PeChain(x, f16Ptr(-1.0), f16Ptr(scalar.val), nil)
+			yF64, _ = ref.PeChainF64(x, f16Ptr(-1.0), f16Ptr(scalar.val), nil)
+		case "smul":
+			if !scalar.set {
+				fmt.Fprintln(stderr, "error: smul requires --scalar F")
+				return 1
+			}
+			yRNA, _ = ref.PeChain(x, nil, nil, f16Ptr(scalar.val))
+			yF64, _ = ref.PeChainF64(x, nil, nil, f16Ptr(scalar.val))
+		case "sdiv":
+			if !scalar.set || scalar.val == 0 || math.IsNaN(scalar.val) {
+				fmt.Fprintln(stderr, "error: sdiv requires non-zero --scalar F")
+				return 1
+			}
+			inv := 1.0 / fp16.ToFloat64(fp16.FromFloat64(scalar.val))
+			yRNA, _ = ref.PeChain(x, nil, nil, f16Ptr(inv))
+			yF64, _ = ref.PeChainF64(x, nil, nil, f16Ptr(inv))
+		default:
+			fmt.Fprintf(stderr, "error: unknown PE op %q\n", *opStr)
+			return 1
+		}
+	}
+
+	in0Buf, err := packTensor64B(x)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: pack input0: %v\n", err)
+		return 1
+	}
+	expRNABuf, err := packTensor64B(yRNA)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: pack expected_rna16: %v\n", err)
+		return 1
+	}
+	expF64Buf, err := packTensor64B(yF64)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: pack expected_f64: %v\n", err)
+		return 1
+	}
+
+	if err := os.MkdirAll(*outDir, 0o755); err != nil {
+		fmt.Fprintf(stderr, "error: create out-dir: %v\n", err)
+		return 1
+	}
+	if err := os.WriteFile(filepath.Join(*outDir, "input0.bin"), in0Buf, 0o644); err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	var in1Bytes int
+	if isTwoSource {
+		in1Buf, err := packTensor64B(z)
+		if err != nil {
+			fmt.Fprintf(stderr, "error: pack input1: %v\n", err)
+			return 1
+		}
+		if err := os.WriteFile(filepath.Join(*outDir, "input1.bin"), in1Buf, 0o644); err != nil {
+			fmt.Fprintf(stderr, "error: %v\n", err)
+			return 1
+		}
+		in1Bytes = len(in1Buf)
+	}
+	if err := os.WriteFile(filepath.Join(*outDir, "expected_rna16.bin"), expRNABuf, 0o644); err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	if err := os.WriteFile(filepath.Join(*outDir, "expected_f64.bin"), expF64Buf, 0o644); err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+
+	summary := map[string]any{
+		"op":          op,
+		"two_source":  isTwoSource,
+		"out_shape":   []int{yRNA.N, yRNA.C, yRNA.H, yRNA.W},
+		"in0_bytes":   len(in0Buf),
+		"in1_bytes":   in1Bytes,
+		"out_bytes":   len(expRNABuf),
+		"edge_values": *edgeValues,
+		"seed":        *seed,
+		"out_dir":     *outDir,
+	}
+	if *asJSON {
+		raw, _ := json.MarshalIndent(summary, "", "  ")
+		fmt.Fprintln(stdout, string(raw))
+	} else {
+		fmt.Fprintf(stdout, "generated pe %s (out=%dx%dx%d, in0=%dB, out=%dB) in %s\n",
+			op, yRNA.C, yRNA.H, yRNA.W, len(in0Buf), len(expRNABuf), *outDir)
+	}
+	return 0
+}
+
+func cmdGenLut(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("gen-lut", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	actName := fs.String("act", "", "Activation name (relu, copy, or any 128B LUT op)")
+	h := fs.Int("h", 0, "Spatial height H")
+	w := fs.Int("w", 0, "Spatial width W")
+	c := fs.Int("c", 0, "Channels C")
+	var alpha, beta, lo, hi, eps, scalar optFloatFlag
+	fs.Var(&alpha, "alpha", "Activation alpha parameter")
+	fs.Var(&beta, "beta", "Activation beta parameter")
+	fs.Var(&lo, "lo", "Activation lo parameter")
+	fs.Var(&hi, "hi", "Activation hi parameter")
+	fs.Var(&eps, "eps", "Activation eps parameter")
+	fs.Var(&scalar, "scalar", "Activation scalar parameter")
+	allFP16 := fs.Bool("all-fp16", false, "Fill input with all 65,536 fp16 bit patterns 0x0000..0xffff")
+	lutBin := fs.String("lut-bin", "", "Optional 128-byte LUT binary emitted by vane")
+	seed := fs.Uint64("seed", 1, "Deterministic PRNG seed")
+	outDir := fs.String("out-dir", "", "Output directory")
+	asJSON := fs.Bool("json", false, "Emit JSON summary")
+
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	if *actName == "" || *h <= 0 || *w <= 0 || *c <= 0 || *outDir == "" {
+		fmt.Fprintln(stderr, "error: --act, --h, --w, --c, and --out-dir are required")
+		return 1
+	}
+
+	spec, err := buildActSpec(*actName, alpha, beta, lo, hi, eps, scalar)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+
+	rng := rand.New(rand.NewPCG(*seed, *seed^0xa0761d6478bd642f))
+	x, err := ref.NewTensor(1, *c, *h, *w)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	for i := range x.Data {
+		if *allFP16 {
+			x.Data[i] = uint16(i & 0xffff)
+		} else {
+			var v float64
+			switch spec.Name {
+			case "sqrt", "rsqrt", "log2":
+				v = 0.05 + rng.Float64()*8.0
+			case "inverse":
+				v = 0.25 + rng.Float64()*4.0
+				if rng.IntN(2) == 0 {
+					v = -v
+				}
+			case "exp", "exp2":
+				v = rng.Float64()*6.0 - 3.0
+			default:
+				v = rng.Float64()*8.0 - 4.0
+			}
+			x.Data[i] = fp16.FromFloat64(v)
+		}
+	}
+
+	yF64, err := ref.ApplyActF64(x, spec)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+
+	var yLut *ref.Tensor
+	if spec.Name != "relu" && spec.Name != "copy" {
+		tableBytes, preScale, shift, err := loadOrBuildLut(spec, *lutBin)
+		if err != nil {
+			fmt.Fprintf(stderr, "error: %v\n", err)
+			return 1
+		}
+		yl, err := ref.ApplyLutTensor(x, tableBytes, preScale, shift)
+		if err != nil {
+			fmt.Fprintf(stderr, "error: %v\n", err)
+			return 1
+		}
+		yLut = &yl
+	}
+
+	inBuf, err := packTensor64B(x)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: pack input: %v\n", err)
+		return 1
+	}
+	expF64Buf, err := packTensor64B(yF64)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: pack expected_f64: %v\n", err)
+		return 1
+	}
+
+	if err := os.MkdirAll(*outDir, 0o755); err != nil {
+		fmt.Fprintf(stderr, "error: create out-dir: %v\n", err)
+		return 1
+	}
+	if err := os.WriteFile(filepath.Join(*outDir, "input.bin"), inBuf, 0o644); err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	if err := os.WriteFile(filepath.Join(*outDir, "expected_f64.bin"), expF64Buf, 0o644); err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	if yLut != nil {
+		expLutBuf, err := packTensor64B(*yLut)
+		if err != nil {
+			fmt.Fprintf(stderr, "error: pack expected_lut: %v\n", err)
+			return 1
+		}
+		if err := os.WriteFile(filepath.Join(*outDir, "expected_lut.bin"), expLutBuf, 0o644); err != nil {
+			fmt.Fprintf(stderr, "error: %v\n", err)
+			return 1
+		}
+	}
+
+	summary := map[string]any{
+		"act":       spec.Name,
+		"shape":     []int{1, *c, *h, *w},
+		"all_fp16":  *allFP16,
+		"has_lut":   yLut != nil,
+		"in_bytes":  len(inBuf),
+		"out_bytes": len(expF64Buf),
+		"seed":      *seed,
+		"out_dir":   *outDir,
+	}
+	if *asJSON {
+		raw, _ := json.MarshalIndent(summary, "", "  ")
+		fmt.Fprintln(stdout, string(raw))
+	} else {
+		fmt.Fprintf(stdout, "generated lut %s (%dx%dx%d, all_fp16=%t, in=%dB) in %s\n",
+			spec.Name, *c, *h, *w, *allFP16, len(inBuf), *outDir)
 	}
 	return 0
 }
@@ -602,7 +1260,7 @@ type manifestDoc struct {
 func cmdCompareConv(cmdName string, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet(cmdName, flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	manifestPath := fs.String("manifest", "", "Path to manifest.json emitted by vane compile-conv1x1 or compile-conv3x3")
+	manifestPath := fs.String("manifest", "", "Path to manifest.json emitted by vane")
 	actualPath := fs.String("actual", "", "Path to actual output surface binary")
 	expectedPath := fs.String("expected", "", "Path to expected output surface binary")
 	atol := fs.Float64("atol", 1e-3, "Absolute tolerance")
