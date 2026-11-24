@@ -169,6 +169,7 @@ structure HwxInfo where
   records : UInt32
   workHint : UInt32
   relocCount : Nat
+  relocPatchOffsets : Array UInt32 := #[]
   ident : Option String
   noteVersion : Option UInt32
 
@@ -489,7 +490,7 @@ def emitHwx (prog : HwxProgram) : Except String ByteArray := do
 
   -- __TEXT layout
   let textVmAddr := vmCursor
-  let constRelOff := alignUp encText.bytes.size 16
+  let constRelOff := alignUp encText.bytes.size 64
   let textFileSize := constRelOff + prog.constants.size
   let textVmSize := alignUp textFileSize pageSize
   if textVmSize > maxSegmentVmSize then
@@ -670,7 +671,7 @@ def emitHwx (prog : HwxProgram) : Except String ByteArray := do
   out := out ++ (← encodeSectionHeader "__text" "__TEXT" textVmAddr encText.bytes.size.toUInt64
     textFileOff.toUInt32 4 reloff.toUInt32 prog.relocations.size.toUInt32 textSectFlags)
   out := out ++ (← encodeSectionHeader "__const" "__TEXT" constVmAddr prog.constants.size.toUInt64
-    (textFileOff + constRelOff).toUInt32 4 0 0 0x26)
+    (textFileOff + constRelOff).toUInt32 6 0 0 0x26)
 
   -- 4. __KERN_0 (optional)
   if let some kb := kernelBytes? then
@@ -1346,6 +1347,7 @@ def validateHwx (bs : ByteArray) : Except String HwxInfo := do
   checkBytesEqual pdActual pdExpected "program descriptor"
 
   -- §9 Validate relocations
+  let mut relocPatches : Array UInt32 := #[]
   if textSec.nreloc > 0 then
     let kSec ← match kernSection? with
       | some k => pure k
@@ -1354,14 +1356,13 @@ def validateHwx (bs : ByteArray) : Except String HwxInfo := do
       throw "__KERN_0,__kern_0 size must be > 0 for relocations"
     if textSec.nreloc.toNat > textSec.size.toNat / 4 then
       throw s!"relocation count {textSec.nreloc} exceeds text.size / 4"
-    let mut seenPatches : Array UInt32 := #[]
     for ri in [:textSec.nreloc.toNat] do
       let rOff := textSec.reloff.toNat + ri * 8
       let patch ← readU32LE bs rOff
       let info ← readU32LE bs (rOff + 4)
       if patch.toNat % 4 != 0 || patch.toNat + 4 > textSec.size.toNat then
         throw s!"relocation {ri}: patch offset {toHex patch.toNat} misaligned or out of bounds"
-      if seenPatches.contains patch then
+      if relocPatches.contains patch then
         throw s!"relocation {ri}: duplicate patch offset {toHex patch.toNat}"
       if !tsInfo.isPayloadSite patch.toNat then
         throw s!"relocation {ri}: patch offset {toHex patch.toNat} does not target a register-record payload word"
@@ -1373,7 +1374,7 @@ def validateHwx (bs : ByteArray) : Except String HwxInfo := do
       if addend.toUInt64 >= kSec.size then
         throw s!"relocation {ri}: addend {toHex addend.toNat} >= kernel size {toHex kSec.size.toNat}"
       let _ ← addU64 kSec.addr addend.toUInt64 s!"relocation {ri} target"
-      seenPatches := seenPatches.push patch
+      relocPatches := relocPatches.push patch
 
   pure {
     target := target
@@ -1392,6 +1393,7 @@ def validateHwx (bs : ByteArray) : Except String HwxInfo := do
     records := records
     workHint := workHint
     relocCount := textSec.nreloc.toNat
+    relocPatchOffsets := relocPatches
     ident := ident?
     noteVersion := noteVer?
   }
