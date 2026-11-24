@@ -54,6 +54,11 @@ theorem resCfgLayout_valid : (validateWordLayout resCfgLayout).isOk = true := by
 theorem neCfgLayout_h16_valid : (validateWordLayout (neCfgLayout .h16)).isOk = true := by decide
 theorem neCfgLayout_h17_valid : (validateWordLayout (neCfgLayout .h17)).isOk = true := by decide
 theorem neOpLayout_valid : (validateWordLayout neOpLayout).isOk = true := by decide
+theorem neActOpLayout_valid : (validateWordLayout neActOpLayout).isOk = true := by decide
+theorem neActShiftEnLayout_valid : (validateWordLayout neActShiftEnLayout).isOk = true := by decide
+theorem peCommonLayout_valid : (validateWordLayout peCommonLayout).isOk = true := by decide
+theorem peTileLayout_valid : (validateWordLayout peTileLayout).isOk = true := by decide
+theorem peBcastLayout_valid : (validateWordLayout peBcastLayout).isOk = true := by decide
 theorem kernelStageLayout_valid : (validateWordLayout kernelStageLayout).isOk = true := by decide
 theorem dim16Layout_valid (name : String) : (validateWordLayout (dim16Layout name)).isOk = true := by
   simp [validateWordLayout, dim16Layout, validateWordLayoutFields, BitField.mask, BitField.maskNat]; rfl
@@ -586,21 +591,95 @@ theorem neTile_roundTrip (ocg fat wu : UInt32)
     encodeWord_decodeFieldChecked _ _ _ "fat" fat henc rfl,
     encodeWord_decodeFieldChecked _ _ _ "WU" wu henc rfl⟩
 
-theorem neOp_roundTrip (bias relu : UInt32)
-    (hbias : bias < 2) (hrelu : relu < 2) :
-    ∃ w, encodeWord neOpLayout #[("biasInKernel", bias), ("relu", relu)] = .ok w ∧
+theorem neOp_roundTrip (bias relu lut : UInt32)
+    (hbias : bias < 2) (hrelu : relu < 2) (hlut : lut < 2) :
+    ∃ w, encodeWord neOpLayout #[("biasInKernel", bias), ("relu", relu), ("lut", lut)] = .ok w ∧
          decodeFieldChecked neOpLayout w "biasInKernel" = .ok bias ∧
-         decodeFieldChecked neOpLayout w "relu" = .ok relu := by
+         decodeFieldChecked neOpLayout w "relu" = .ok relu ∧
+         decodeFieldChecked neOpLayout w "lut" = .ok lut := by
   have h1 : ¬ bias.toNat ≥ 2 := u32_not_ge_of_lt hbias
   have h2 : ¬ relu.toNat ≥ 2 := u32_not_ge_of_lt hrelu
-  have henc : encodeWord neOpLayout #[("biasInKernel", bias), ("relu", relu)] =
-      .ok (((0x00103c00 : UInt32) ||| (bias <<< 4)) ||| (relu <<< 16)) := by
-    change (if bias.toNat ≥ 2 then _ else if relu.toNat ≥ 2 then _ else _) = _
-    simp only [h1, h2, ↓reduceIte]
+  have h3 : ¬ lut.toNat ≥ 2 := u32_not_ge_of_lt hlut
+  have henc : encodeWord neOpLayout #[("biasInKernel", bias), ("relu", relu), ("lut", lut)] =
+      .ok ((((0x00103c00 : UInt32) ||| (bias <<< 4)) ||| (relu <<< 16)) ||| (lut <<< 17)) := by
+    change (if bias.toNat ≥ 2 then _ else if relu.toNat ≥ 2 then _ else if lut.toNat ≥ 2 then _ else _) = _
+    simp only [h1, h2, h3, ↓reduceIte]
     rfl
   exact ⟨_, henc,
     encodeWord_decodeFieldChecked _ _ _ "biasInKernel" bias henc rfl,
-    encodeWord_decodeFieldChecked _ _ _ "relu" relu henc rfl⟩
+    encodeWord_decodeFieldChecked _ _ _ "relu" relu henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "lut" lut henc rfl⟩
+
+theorem neActOp_roundTrip (noShift relu lut : UInt32)
+    (hns : noShift < 2) (hrelu : relu < 2) (hlut : lut < 2) :
+    ∃ w, encodeWord neActOpLayout #[("noShift", noShift), ("relu", relu), ("lut", lut)] = .ok w ∧
+         decodeFieldChecked neActOpLayout w "noShift" = .ok noShift ∧
+         decodeFieldChecked neActOpLayout w "relu" = .ok relu ∧
+         decodeFieldChecked neActOpLayout w "lut" = .ok lut := by
+  have h1 : ¬ noShift.toNat ≥ 2 := u32_not_ge_of_lt hns
+  have h2 : ¬ relu.toNat ≥ 2 := u32_not_ge_of_lt hrelu
+  have h3 : ¬ lut.toNat ≥ 2 := u32_not_ge_of_lt hlut
+  have henc : encodeWord neActOpLayout #[("noShift", noShift), ("relu", relu), ("lut", lut)] =
+      .ok ((((0x00103c08 : UInt32) ||| (noShift <<< 2)) ||| (relu <<< 16)) ||| (lut <<< 17)) := by
+    change (if noShift.toNat ≥ 2 then _ else if relu.toNat ≥ 2 then _ else if lut.toNat ≥ 2 then _ else _) = _
+    simp only [h1, h2, h3, ↓reduceIte]
+    rfl
+  exact ⟨_, henc,
+    encodeWord_decodeFieldChecked _ _ _ "noShift" noShift henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "relu" relu henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "lut" lut henc rfl⟩
+
+theorem peTile_roundTrip (k m : UInt32) (hk : k < 16) (hm : m < 16) :
+    ∃ w, encodeWord peTileLayout #[("k", k), ("m", m)] = .ok w ∧
+         decodeFieldChecked peTileLayout w "k" = .ok k ∧
+         decodeFieldChecked peTileLayout w "m" = .ok m := by
+  have h1 : ¬ k.toNat ≥ 16 := u32_not_ge_of_lt hk
+  have h2 : ¬ m.toNat ≥ 16 := u32_not_ge_of_lt hm
+  have henc : encodeWord peTileLayout #[("k", k), ("m", m)] =
+      .ok (((0 : UInt32) ||| (k <<< 0)) ||| (m <<< 4)) := by
+    change (if k.toNat ≥ 16 then _ else if m.toNat ≥ 16 then _ else _) = _
+    simp only [h1, h2, ↓reduceIte]
+    rfl
+  exact ⟨_, henc,
+    encodeWord_decodeFieldChecked _ _ _ "k" k henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "m" m henc rfl⟩
+
+theorem peBcast_roundTrip (s1w s1h s1c s2w s2h s2c : UInt32)
+    (h1w : s1w < 2) (h1h : s1h < 2) (h1c : s1c < 2)
+    (h2w : s2w < 2) (h2h : s2h < 2) (h2c : s2c < 2) :
+    ∃ w, encodeWord peBcastLayout #[
+            ("src1W", s1w), ("src1H", s1h), ("src1C", s1c),
+            ("src2W", s2w), ("src2H", s2h), ("src2C", s2c)
+          ] = .ok w ∧
+         decodeFieldChecked peBcastLayout w "src1W" = .ok s1w ∧
+         decodeFieldChecked peBcastLayout w "src1H" = .ok s1h ∧
+         decodeFieldChecked peBcastLayout w "src1C" = .ok s1c ∧
+         decodeFieldChecked peBcastLayout w "src2W" = .ok s2w ∧
+         decodeFieldChecked peBcastLayout w "src2H" = .ok s2h ∧
+         decodeFieldChecked peBcastLayout w "src2C" = .ok s2c := by
+  have c1 : ¬ s1w.toNat ≥ 2 := u32_not_ge_of_lt h1w
+  have c2 : ¬ s1h.toNat ≥ 2 := u32_not_ge_of_lt h1h
+  have c3 : ¬ s1c.toNat ≥ 2 := u32_not_ge_of_lt h1c
+  have c4 : ¬ s2w.toNat ≥ 2 := u32_not_ge_of_lt h2w
+  have c5 : ¬ s2h.toNat ≥ 2 := u32_not_ge_of_lt h2h
+  have c6 : ¬ s2c.toNat ≥ 2 := u32_not_ge_of_lt h2c
+  have henc : encodeWord peBcastLayout #[
+      ("src1W", s1w), ("src1H", s1h), ("src1C", s1c),
+      ("src2W", s2w), ("src2H", s2h), ("src2C", s2c)
+    ] = .ok (((((((0 : UInt32) ||| (s1w <<< 0)) ||| (s1h <<< 1)) ||| (s1c <<< 3)) |||
+      (s2w <<< 4)) ||| (s2h <<< 5)) ||| (s2c <<< 7)) := by
+    change (if s1w.toNat ≥ 2 then _ else if s1h.toNat ≥ 2 then _ else
+            if s1c.toNat ≥ 2 then _ else if s2w.toNat ≥ 2 then _ else
+            if s2h.toNat ≥ 2 then _ else if s2c.toNat ≥ 2 then _ else _) = _
+    simp only [c1, c2, c3, c4, c5, c6, ↓reduceIte]
+    rfl
+  exact ⟨_, henc,
+    encodeWord_decodeFieldChecked _ _ _ "src1W" s1w henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "src1H" s1h henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "src1C" s1c henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "src2W" s2w henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "src2H" s2h henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "src2C" s2c henc rfl⟩
 
 theorem resCfg_roundTrip (mode direct p : UInt32)
     (hmode : mode < 4) (hdir : direct < 2) (hp : p < 16) :
@@ -986,5 +1065,32 @@ theorem inRows3x3_eq_max (h s pt ho th : Nat)
       have h0Le := tile_le_maxTileInRowsLinear h s pt ho th n 0 (by omega)
       have h1Le := tile_le_maxTileInRowsLinear h s pt ho th n 1 (by omega)
       omega
+
+-- ============================================================================
+-- 6. Milestone 3 safety invariants (PE anti-hang, 128B LUT alignment, peTile packing)
+-- ============================================================================
+
+/-- PE anti-hang channel stride invariant: rounding width up to 8 never violates the
+    hardware `l2ChanStride >= 2 * min(w, T)` minimum for any `w, T : Nat`. -/
+theorem pe_antihang_chanStride_ge (w T : Nat) :
+    2 * min w T ≤ 2 * min (alignUp w 8) T := by
+  have h : w ≤ alignUp w 8 := alignUp_ge w 8
+  omega
+
+/-- Prepending a 128-byte LUT table preserves 64-byte DMA line alignment for every chunk offset. -/
+theorem fused_lut_align64 (off : Nat) (h : off % 64 = 0) :
+    (off + lutTableBytes) % 64 = 0 := by
+  unfold lutTableBytes
+  omega
+
+/-- `peTile` packing bound: any legal `(k <= 9, m <= 5)` packs cleanly into 8 bits (`< 256`). -/
+theorem peTile_pack_lt_256 (k m : Nat) (hk : k ≤ 9) (hm : m ≤ 5) :
+    (m <<< 4) ||| k < 256 := by
+  have h1 : m <<< 4 < 2 ^ 8 := by
+    rw [Nat.shiftLeft_eq]
+    omega
+  have h2 : k < 2 ^ 8 := by omega
+  have hor := Nat.or_lt_two_pow h1 h2
+  omega
 
 end Vane.Proofs

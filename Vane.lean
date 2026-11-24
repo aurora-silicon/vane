@@ -1,4 +1,5 @@
 import Vane.Binary
+import Vane.Float16
 import Vane.TaskStream
 import Vane.Hwx
 import Vane.Sections
@@ -6,6 +7,8 @@ import Vane.Register
 import Vane.Tiling
 import Vane.Program
 import Vane.Verify
+import Vane.Pe
+import Vane.Lut
 import Vane.Conv
 import Vane.Conv1x1
 import Vane.Conv3x3

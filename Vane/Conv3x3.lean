@@ -10,7 +10,7 @@ open Vane.Tiling
 open Vane.Verify
 open Vane.Conv
 
-export Vane.Conv (stride2TapSlots isNonZeroFp16 maxSparseBodyBytes encodeSparseStream decodeSparseStream)
+export Vane.Conv (ConvActivation stride2TapSlots isNonZeroFp16 maxSparseBodyBytes encodeSparseStream decodeSparseStream)
 export Vane.Verify (verifyConv3x3Task verifyConvTask verifyConvHwxTasks)
 
 /-- Complete compilation artifact for a single-task fp16 3x3 convolution (dense or depthwise). -/
@@ -22,6 +22,8 @@ structure CompiledConv3x3 where
   wide3x3 : Bool
   hasBias : Bool
   relu : Bool
+  activation : ConvActivation := .none
+  lutBytes : Option ByteArray := none
   direct : Bool
   l2UseBytes : Nat
   kernelBytes : Nat
@@ -40,8 +42,9 @@ def packConv3x3KernelChunks
     (sh : Conv3x3Shape)
     (tiling : Tiling)
     (weights : ByteArray)
-    (bias : Option ByteArray) : Except String PackedKernel :=
-  packConvKernelChunks target sh.toConvSpec tiling weights bias
+    (bias : Option ByteArray)
+    (lutPayload? : Option Vane.Lut.LutPayload := none) : Except String PackedKernel :=
+  packConvKernelChunks target sh.toConvSpec tiling weights bias lutPayload?
 
 /-- Compile a single-task fp16 3x3 convolution (dense or depthwise, stride 1 or 2,
     same or valid padding) into a statically verified HWX binary and 4 LOAD sections. -/
@@ -51,8 +54,9 @@ def compileConv3x3
     (weights : ByteArray)
     (bias : Option ByteArray := none)
     (relu : Bool := false)
-    (tilingOverride : Option Tiling := none) : Except String CompiledConv3x3 := do
-  let compiled ← compileConv target shape.toConvSpec weights bias relu tilingOverride
+    (tilingOverride : Option Tiling := none)
+    (act : ConvActivation := .none) : Except String CompiledConv3x3 := do
+  let compiled ← compileConv target shape.toConvSpec weights bias relu tilingOverride act
   pure {
     target := compiled.target
     shape := shape
@@ -61,6 +65,8 @@ def compileConv3x3
     wide3x3 := compiled.wide3x3
     hasBias := compiled.hasBias
     relu := compiled.relu
+    activation := compiled.activation
+    lutBytes := compiled.lutBytes
     direct := compiled.direct
     l2UseBytes := compiled.l2UseBytes
     kernelBytes := compiled.kernelBytes

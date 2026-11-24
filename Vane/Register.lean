@@ -134,7 +134,7 @@ def taskHeader0Layout : WordLayout := {
   ]
 }
 
-/-- Task header word 8: `flags[3:0] = 0x9`, `ene[18:16] = logNE + 1`, other bits 0. -/
+/-- Task header word 8: `flags[3:0] = 0x9`, `ene[18:16] = 0` (PE) or `logNE + 1` (NE), other bits 0. -/
 def taskHeader8Layout : WordLayout := {
   name := "taskHeader[8]"
   fixedMask := 0x0000000f
@@ -147,24 +147,35 @@ def taskHeader8Layout : WordLayout := {
 /-- Fixed 9-word task header constants. -/
 def taskHeaderWord2Const : UInt32 := 0x04000068
 def taskHeaderWord4Const : UInt32 := 0x00fff868
+def taskHeaderWord4CopyConst : UInt32 := 0x00000068
 
-/-- Encode the 9-word NE task header. Checks `taskId < 65536`, `logNE <= 4`, and `9 <= taskWords <= 0x7ff`. -/
-def encodeTaskHeader9 (taskId taskWords logNE : Nat) : Except String (Array UInt32) := do
+/-- Encode the 9-word task header with explicit `ene` (`0` for PE, `1..5` for NE) and
+    optional `header4` override (default `0x00fff868`). -/
+def encodeTaskHeader9Ex
+    (taskId taskWords ene : Nat)
+    (header4 : UInt32 := taskHeaderWord4Const) : Except String (Array UInt32) := do
   if taskId > 0xffff then
     throw s!"task header: taskId {taskId} exceeds 16-bit maximum 65535"
-  if logNE > 4 then
-    throw s!"task header: logNE {logNE} exceeds maximum 4"
+  if ene > 5 then
+    throw s!"task header: ene {ene} exceeds maximum 5"
   if taskWords < 9 || taskWords > 0x7ff then
     throw s!"task header: taskWords {taskWords} out of range 9..{0x7ff}"
   let taskIdU32 ← natToU32Checked taskId "task header taskId"
   let taskWordsU32 ← natToU32Checked taskWords "task header taskWords"
-  let eneU32 ← natToU32Checked (logNE + 1) "task header ene"
+  let eneU32 ← natToU32Checked ene "task header ene"
   let w0 ← encodeWord taskHeader0Layout #[
     ("taskId", taskIdU32),
     ("taskWords", taskWordsU32)
   ]
   let w8 ← encodeWord taskHeader8Layout #[("ene", eneU32)]
-  pure #[w0, 0, taskHeaderWord2Const, 0, taskHeaderWord4Const, 0, 0, 0, w8]
+  pure #[w0, 0, taskHeaderWord2Const, 0, header4, 0, 0, 0, w8]
+
+/-- Encode the 9-word NE task header (`ene = logNE + 1`).
+    Checks `taskId < 65536`, `logNE <= 4`, and `9 <= taskWords <= 0x7ff`. -/
+def encodeTaskHeader9 (taskId taskWords logNE : Nat) : Except String (Array UInt32) := do
+  if logNE > 4 then
+    throw s!"task header: logNE {logNE} exceeds maximum 4"
+  encodeTaskHeader9Ex taskId taskWords (logNE + 1) taskHeaderWord4Const
 
 -- ============================================================================
 -- Machine register addresses (byte offsets in ANE register space)
@@ -177,12 +188,17 @@ def regCin : Nat := 0x000c
 def regWout : Nat := 0x0014
 def regHout : Nat := 0x0018
 def regCout : Nat := 0x001c
+def regBatchN : Nat := 0x0024
 def regConvCfg : Nat := 0x0028
 def regDwGroups : Nat := 0x0030
 def regTH : Nat := 0x0034
 def regNeCommon : Nat := 0x003c
+def regPeCommon : Nat := 0x003c
 def regNeTile : Nat := 0x0040
+def regPeTile : Nat := 0x0044
+def regPeBcast : Nat := 0x0048
 def regTargetCfg : Nat := 0x004c
+def regNeActShiftEn : Nat := 0x0050
 
 -- L2 staging block (0x4100..0x4160)
 def regSrc1Cfg : Nat := 0x4104
@@ -192,12 +208,23 @@ def regSrc1ChanStride : Nat := 0x4114
 def regSrc1RowStride : Nat := 0x4118
 def regSrc1RowBytesA : Nat := 0x411c
 def regSrc1RowBytesB : Nat := 0x4120
+def regSrc2Base : Nat := 0x4124
+def regSrc2ChanStride : Nat := 0x4128
+def regSrc2RowStride : Nat := 0x412c
+def regSrc2RowBytesA : Nat := 0x4130
+def regSrc2RowBytesB : Nat := 0x4134
 def regResCfg : Nat := 0x4148
 def regResBase : Nat := 0x414c
 def regResChanStride : Nat := 0x4150
 def regResRowStride : Nat := 0x4154
 def regResRowBytesA : Nat := 0x4158
 def regResRowBytesB : Nat := 0x415c
+
+-- Planar Engine (PE) arithmetic block (0x4500..0x4510)
+def regPeOp : Nat := 0x4500
+def regPeBias : Nat := 0x4504
+def regPeScale : Nat := 0x4508
+def regPeInScale : Nat := 0x4510
 
 -- Neural Engine block (0x4900..0x4914)
 def regNeCfg : Nat := 0x4900
@@ -207,12 +234,19 @@ def regNeScale : Nat := 0x4910
 
 -- Tile DMA (Source) block (0x4d00..0x4d6c)
 def regSrc1Dep : Nat := 0x4d00
+def regSrc2Dep : Nat := 0x4d04
 def regSrc1DmaCfg : Nat := 0x4d08
+def regSrc2DmaCfg : Nat := 0x4d0c
 def regSrc1BaseLo : Nat := 0x4d10
 def regSrc1BaseHi : Nat := 0x4d14
 def regSrc1DmaRowStride : Nat := 0x4d18
 def regSrc1DmaPlaneStride : Nat := 0x4d1c
+def regSrc2BaseLo : Nat := 0x4d28
+def regSrc2BaseHi : Nat := 0x4d2c
+def regSrc2DmaRowStride : Nat := 0x4d30
+def regSrc2DmaPlaneStride : Nat := 0x4d34
 def regSrc1Fmt : Nat := 0x4d68
+def regSrc2Fmt : Nat := 0x4d6c
 
 -- Result DMA block (0x5100..0x513c)
 def regResDep : Nat := 0x5100
@@ -222,13 +256,17 @@ def regResDmaRowStride : Nat := 0x5110
 def regResDmaPlaneStride : Nat := 0x5114
 def regResFmt : Nat := 0x5138
 
--- Kernel DMA and chunk table block (0x5500..0x55dc)
+-- Kernel DMA, chunk table, and standalone LUT descriptor block (0x5500..0x561c)
 def regKernelStage : Nat := 0x5500
 def regKernelBaseLo : Nat := 0x5510
 def regKernelBaseHi : Nat := 0x5514
 def regChunkSlot (s : Nat) : Nat := 0x5520 + 4 * s
 def regChunkOffset (s : Nat) : Nat := 0x5560 + 4 * s
 def regChunkSize (s : Nat) : Nat := 0x55a0 + 4 * s
+def regLutCfg : Nat := 0x5610
+def regLutSize : Nat := 0x5614
+def regLutBaseLo : Nat := 0x5618
+def regLutBaseHi : Nat := 0x561c
 
 -- Output / cache stage block (0x5900..0x592c)
 def regOut0 : Nat := 0x5900
@@ -302,6 +340,45 @@ def neTileLayout : WordLayout := {
   ]
 }
 
+/-- `0x003c` peCommon: `mode[7:0]` (`0x20` for 1-source, `0x30` for 2-source), bits `[31:8] = 0`. -/
+def peCommonLayout : WordLayout := {
+  name := "peCommon"
+  fields := #[
+    { name := "mode", lo := 0, width := 8 }
+  ]
+}
+
+/-- `0x0044` peTile: `k[3:0]`, `m[7:4]`, bits `[31:8] = 0`. -/
+def peTileLayout : WordLayout := {
+  name := "peTile"
+  fields := #[
+    { name := "k", lo := 0, width := 4 },
+    { name := "m", lo := 4, width := 4 }
+  ]
+}
+
+/-- `0x0048` peBcast: 2-source broadcast flags (`src1` in `[3:0]`, `src2` in `[7:4]`),
+    reserved bits 2, 6, `[31:8]` must be 0. -/
+def peBcastLayout : WordLayout := {
+  name := "peBcast"
+  fields := #[
+    { name := "src1W", lo := 0, width := 1 },
+    { name := "src1H", lo := 1, width := 1 },
+    { name := "src1C", lo := 3, width := 1 },
+    { name := "src2W", lo := 4, width := 1 },
+    { name := "src2H", lo := 5, width := 1 },
+    { name := "src2C", lo := 7, width := 1 }
+  ]
+}
+
+/-- `0x0050` neActShiftEn: `enable[0:0]`, bits `[31:1] = 0`. -/
+def neActShiftEnLayout : WordLayout := {
+  name := "neActShiftEn"
+  fields := #[
+    { name := "enable", lo := 0, width := 1 }
+  ]
+}
+
 /-- `0x4104` src1Cfg: `mode[1:0]`, `P[11:8]`, fixed flags `0x00500070`. -/
 def src1CfgLayout : WordLayout := {
   name := "src1Cfg"
@@ -325,14 +402,28 @@ def resCfgLayout : WordLayout := {
   ]
 }
 
-/-- `0x4904` neOp: base `0x00103c00`, `biasInKernel[4:4]`, `relu[16:16]`. -/
+/-- `0x4904` neOp (NE conv): base `0x00103c00`, `biasInKernel[4:4]`, `relu[16:16]`, `lut[17:17]`. -/
 def neOpLayout : WordLayout := {
   name := "neOp"
-  fixedMask := 0xfffeffef
+  fixedMask := 0xfffcffef
   fixedValue := 0x00103c00
   fields := #[
     { name := "biasInKernel", lo := 4, width := 1 },
-    { name := "relu", lo := 16, width := 1 }
+    { name := "relu", lo := 16, width := 1 },
+    { name := "lut", lo := 17, width := 1 }
+  ]
+}
+
+/-- `0x4904` neActOp (standalone NE activation): base `0x00103c08`,
+    `noShift[2:2]`, `relu[16:16]`, `lut[17:17]`. -/
+def neActOpLayout : WordLayout := {
+  name := "neActOp"
+  fixedMask := 0xfffcfffb
+  fixedValue := 0x00103c08
+  fields := #[
+    { name := "noShift", lo := 2, width := 1 },
+    { name := "relu", lo := 16, width := 1 },
+    { name := "lut", lo := 17, width := 1 }
   ]
 }
 
@@ -425,8 +516,22 @@ def resDepCode : Target → UInt32
 
 -- Fixed register constants
 def src2CfgValue : UInt32 := 0x00500130
+def src2CfgEnabledValue : UInt32 := 0x00500172
 def src1DmaCfgValue : UInt32 := 0x000000ce
 def fp16OneBits : UInt32 := 0x3c00
+def fp16InvLn2Bits : UInt16 := 0x3dc5
+def neActCfgValue : UInt32 := 0x00010082
+def kernelStageNoKernValue : UInt32 := 0x00000080
+def peCommonOneSrcValue : UInt32 := 0x00000020
+def peCommonTwoSrcValue : UInt32 := 0x00000030
+def peOpAbsValue : UInt32 := 0x000001c0
+def peOpSquareValue : UInt32 := 0x00000010
+def peOpAddValue : UInt32 := 0x00080000
+def peOpMulValue : UInt32 := 0x00080004
+def peOpMaxValue : UInt32 := 0x00080008
+def peOpMinValue : UInt32 := 0x0008000c
+def peOpSubValue : UInt32 := 0x000c0000
+def lutTableBytes : Nat := 128
 def out0Value : UInt32 := 0x00000012
 def out1Value : UInt32 := 0x00a000a0
 def out3Value : UInt32 := 0x00000000

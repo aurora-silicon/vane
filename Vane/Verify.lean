@@ -17,9 +17,32 @@ open Vane.Register
 private def vL2CapacityBytes : Nat := 0x200000
 private def vMaxKernelChunkBytes : Nat := 0x10000
 private def vDmaLineBytes : Nat := 64
+private def vLutBytes : Nat := 128
 
 private def vCeilDiv (a b : Nat) : Nat :=
   if b == 0 then 0 else (a + b - 1) / b
+
+private def vCeilLog2 (n : Nat) : Nat :=
+  if n <= 1 then 0 else Nat.log2 (n - 1) + 1
+
+private def vPeIsDirect (target : Target) (outW k : Nat) : Bool :=
+  match target with
+  | .h17 => true
+  | .h16 =>
+    let r := alignUp outW 8
+    let lastStrip := if r == 0 then 0 else r - 32 * ((r - 1) / 32)
+    !(k == 5 && r > 32 && lastStrip == 24)
+
+/-- Independently verify a 128-byte NE LUT table in `__KERN_0`: fits in bounds and
+    reserved words `43..63` (byte offsets `0x56..0x7f`) are all zero. -/
+private def vVerifyLutBytes (kBytes : ByteArray) (lutStart : Nat) (label : String) : Except String Unit := do
+  if lutStart + vLutBytes > kBytes.size then
+    throw s!"{label}: 128-byte LUT range [{lutStart}, {lutStart + vLutBytes}) exceeds __KERN_0 size {kBytes.size}"
+  for wi in [43 : 64] do
+    let w ← readU16LE kBytes (lutStart + 2 * wi)
+    if w != 0 then
+      throw s!"{label}: LUT reserved word {wi} (offset +{toHex (2 * wi)}) is non-zero ({toHex w.toNat})"
+  pure ()
 
 private def vStripW (fat shPref : Nat) : Nat :=
   (128 <<< fat) >>> shPref
@@ -180,11 +203,21 @@ private def vVerifySparseChunkBytes
 -- Task classification & BAR-slot resource binding resolver (extensible for M3/M4)
 -- ============================================================================
 
-/-- High-level task kind recognized by the static safety verifier (extensible for M3 PE ops). -/
+/-- High-level task kind recognized by the static safety verifier. -/
 inductive TaskKind where
   | neConv
+  | neAct
+  | peOp
   | unknown
   deriving Repr, BEq, DecidableEq, Inhabited
+
+/-- Summary counts of verified tasks across all supported HWX task kinds. -/
+structure TaskVerifySummary where
+  total : Nat
+  neConv : Nat
+  neAct : Nat
+  peOp : Nat
+  deriving Repr, BEq, Inhabited
 
 /-- Resolved resource target referenced by a BAR slot in the HWX program descriptor. -/
 inductive BarTarget where
@@ -202,16 +235,26 @@ private def requireDecodedWrite (writes : Array DecodedWrite) (addr : Nat) (labe
   | some w => pure w
   | none => throw s!"missing required register {label} ({toHex addr})"
 
-/-- Classify a decoded task by its emitted machine registers. -/
+/-- Classify a decoded task unambiguously from its emitted machine registers. -/
 def classifyTask (task : DecodedTask) : TaskKind :=
-  if (findDecodedWrite task.writes regConvCfg).isSome ||
-     (findDecodedWrite task.writes regNeCommon).isSome ||
-     (findDecodedWrite task.writes regNeTile).isSome then
+  if (findDecodedWrite task.writes regConvCfg).isSome then
     .neConv
-  else
-    .unknown
+  else if (findDecodedWrite task.writes regDwGroups).isSome ||
+          ((findDecodedWrite task.writes regNeOp).isSome &&
+           ((findDecodedWrite task.writes regNeCommon).isSome ||
+            (findDecodedWrite task.writes regNeTile).isSome)) then
+    .neAct
+  else if (findDecodedWrite task.writes regPeTile).isSome then
+    .peOp
+  else match findDecodedWrite task.writes regPeCommon with
+    | some w =>
+      if w.value == peCommonOneSrcValue || w.value == peCommonTwoSrcValue then
+        .peOp
+      else
+        .unknown
+    | none => .unknown
 
-/-- Return `true` iff a decoded task writes NE convolution configuration registers. -/
+/-- Return `true` iff a decoded task is an NE convolution task. -/
 def isNeConvTask (task : DecodedTask) : Bool :=
   classifyTask task == .neConv
 
@@ -585,7 +628,12 @@ def verifyConvTask (info : HwxInfo) (task : DecodedTask) (kernelBytes? : Option 
 
   let wNeOp ← requireDecodedWrite task.writes regNeOp "neOp"
   let biasInKernelBit ← decodeFieldChecked neOpLayout wNeOp.value "biasInKernel"
+  let reluBit ← decodeFieldChecked neOpLayout wNeOp.value "relu"
+  let lutBit ← decodeFieldChecked neOpLayout wNeOp.value "lut"
+  if reluBit == 1 && lutBit == 1 then
+    throw s!"{prefixMsg}: neOp cannot enable both relu (bit 16) and lut (bit 17)"
   let biasInKernel := biasInKernelBit == 1
+  let hasLut := lutBit == 1
   let scalarBiasMode := !isDepthwise && cout == 1
   if scalarBiasMode then
     let wScalarBias ← requireDecodedWrite task.writes regScalarBias "scalarBias"
@@ -598,7 +646,7 @@ def verifyConvTask (info : HwxInfo) (task : DecodedTask) (kernelBytes? : Option 
 
   let wNeScale ← requireDecodedWrite task.writes regNeScale "neScale"
   let neScaleVal ← decodeFieldChecked neScaleLayout wNeScale.value "val"
-  if neScaleVal != fp16OneBits then
+  if !hasLut && neScaleVal != fp16OneBits then
     throw s!"{prefixMsg}: neScale {toHex neScaleVal.toNat} != expected fp16 1.0 ({toHex fp16OneBits.toNat})"
 
   -- 8. Verify kernel BaseLo/Hi pair, relocation, exact active chunk slot set, control bits,
@@ -678,17 +726,24 @@ def verifyConvTask (info : HwxInfo) (task : DecodedTask) (kernelBytes? : Option 
       if kernBaseOff + cOff + cSz > kSec.size.toNat then
         throw s!"{prefixMsg}: chunk slot {s} range [{kernBaseOff + cOff}, {kernBaseOff + cOff + cSz}) exceeds kernel size {kSec.size}"
 
+      let lutOverhead := if hasLut then vLutBytes else 0
+      if hasLut && cSz < vLutBytes then
+        throw s!"{prefixMsg}: chunk slot {s} size {cSz}B < {vLutBytes}B required for fused LUT"
+      if hasLut then
+        if let some kBytes := kernelBytes? then
+          vVerifyLutBytes kBytes (kernBaseOff + cOff) s!"{prefixMsg} chunk slot {s} fused LUT"
+
       let groupOuts := vGroupOuts blocks
       if !isSparse then
-        let minBytes := alignUp (2 * groupOuts * (cinW * taps + (if biasInKernel then 1 else 0))) vDmaLineBytes
+        let minBytes := alignUp (lutOverhead + 2 * groupOuts * (cinW * taps + (if biasInKernel then 1 else 0))) vDmaLineBytes
         if cSz < minBytes then
           throw s!"{prefixMsg}: chunk slot {s} size {cSz}B < minimum required {minBytes}B for stride-1 kernel"
       else
-        let minBytes := alignUp (2 * (if biasInKernel then groupOuts else 0) + 3 * blocks.size) vDmaLineBytes
+        let minBytes := alignUp (lutOverhead + 2 * (if biasInKernel then groupOuts else 0) + 3 * blocks.size) vDmaLineBytes
         if cSz < minBytes then
           throw s!"{prefixMsg}: chunk slot {s} size {cSz}B < minimum required {minBytes}B for stride-2 sparse kernel"
         if let some kBytes := kernelBytes? then
-          vVerifySparseChunkBytes kBytes (kernBaseOff + cOff) (kernBaseOff + cOff + cSz)
+          vVerifySparseChunkBytes kBytes (kernBaseOff + cOff + lutOverhead) (kernBaseOff + cOff + cSz)
             blocks biasInKernel s!"{prefixMsg} chunk slot {s}"
 
       activeChunks := activeChunks + 1
@@ -824,26 +879,802 @@ def verifyConv3x3Task (info : HwxInfo) (task : DecodedTask) (kernelBytes? : Opti
     throw s!"task {task.taskIndex}: expected 3x3 conv, got {kh}x{kw}"
   verifyConvTask info task kernelBytes?
 
-/-- Verify all recognized tasks decoded from a validated HWX binary via the `TaskKind` dispatcher.
-    When `requireConvTask` is `true`, fails if any task is unknown or if no tasks were verified. -/
-def verifyConvHwxTasks (hwxBytes : ByteArray) (info : HwxInfo) (requireConvTask : Bool := true) :
-    Except String Nat := do
+-- ============================================================================
+-- Independent standalone PE & NE Activation task verifiers (M3)
+-- ============================================================================
+
+/-- Verify a decoded DMA surface stride pair `(rowStride, planeStride)` against a bound surface. -/
+private def vVerifySurfaceDmaBounds
+    (writes : Array DecodedWrite)
+    (surf : ValidatedSurface)
+    (baseOff : Nat)
+    (rowAddr planeAddr : Nat)
+    (rowName planeName prefixMsg : String) : Except String Unit := do
+  let c := surf.channels.toNat
+  let h := surf.height.toNat
+  let w := surf.width.toNat
+  let rowStride ← match findDecodedWrite writes rowAddr with
+    | some wr =>
+      let rs := wr.value.toNat
+      if rs < 2 * w || rs % vDmaLineBytes != 0 then
+        throw s!"{prefixMsg}: {rowName} ({rs}) must be >= {2 * w} and {vDmaLineBytes}-byte aligned"
+      pure rs
+    | none =>
+      if h == 1 then pure (alignUp (2 * w) vDmaLineBytes)
+      else throw s!"{prefixMsg}: missing required register {rowName} ({toHex rowAddr}) for H={h} > 1"
+  let extent ← match findDecodedWrite writes planeAddr with
+    | some wp =>
+      let ps := wp.value.toNat
+      if ps < h * rowStride then
+        throw s!"{prefixMsg}: {planeName} ({ps}) < H * rowStride ({h * rowStride})"
+      pure (c * ps)
+    | none =>
+      if c == 1 then pure (h * rowStride)
+      else throw s!"{prefixMsg}: missing required register {planeName} ({toHex planeAddr}) for C={c} > 1"
+  let cap := min surf.span.toNat surf.sect.size.toNat
+  if baseOff + extent > cap then
+    throw s!"{prefixMsg}: DMA range [{toHex baseOff}, {toHex (baseOff + extent)}) exceeds surface '{surf.shortName}' (span={surf.span}, section={surf.sect.size})"
+  pure ()
+
+/-- Verify the shared output / cache stage block `0x5900..0x592c`. -/
+private def vVerifyOutputStage (writes : Array DecodedWrite) (taskId : Nat) (prefixMsg : String) : Except String Unit := do
+  let wOut0 ← requireDecodedWrite writes regOut0 "out0"
+  if wOut0.value != out0Value then
+    throw s!"{prefixMsg}: out0 {toHex wOut0.value.toNat} != expected {toHex out0Value.toNat}"
+  let wOut1 ← requireDecodedWrite writes regOut1 "out1"
+  if wOut1.value != out1Value then
+    throw s!"{prefixMsg}: out1 {toHex wOut1.value.toNat} != expected {toHex out1Value.toNat}"
+  let wOut2 ← requireDecodedWrite writes regOut2 "out2"
+  let out2Form ← decodeFieldChecked out2Layout wOut2.value "form"
+  let out2Task ← decodeFieldChecked out2Layout wOut2.value "task"
+  if out2Form != 0xe0 then
+    throw s!"{prefixMsg}: out2 form {toHex out2Form.toNat} != expected 0xe0"
+  if out2Task.toNat != taskId then
+    throw s!"{prefixMsg}: out2 task={out2Task} != header taskId={taskId}"
+  let wOut3 ← requireDecodedWrite writes regOut3 "out3"
+  if wOut3.value != out3Value then
+    throw s!"{prefixMsg}: out3 {toHex wOut3.value.toNat} != expected {toHex out3Value.toNat}"
+  let wOut4 ← requireDecodedWrite writes regOut4 "out4"
+  if wOut4.value != out4Value then
+    throw s!"{prefixMsg}: out4 {toHex wOut4.value.toNat} != expected {toHex out4Value.toNat}"
+  let wOut5 ← requireDecodedWrite writes regOut5 "out5"
+  if wOut5.value != out5Value then
+    throw s!"{prefixMsg}: out5 {toHex wOut5.value.toNat} != expected {toHex out5Value.toNat}"
+  pure ()
+
+/-- Standalone static safety verifier for decoded Planar Engine (PE) tasks (1-source and 2-source).
+    Operates purely on decoded HWX bytes with zero dependency on `Vane.Pe`. -/
+def verifyPeTask (info : HwxInfo) (task : DecodedTask) : Except String Unit := do
+  let target := info.target
+  let prefixMsg := s!"task {task.taskIndex} (PE)"
+
+  -- 1. Verify 9-word header with ene == 0
+  let (h0, h1, h2, h3, h4, h5, h6, h7, h8) ← match task.header.toList with
+    | [w0, w1, w2, w3, w4, w5, w6, w7, w8] => pure (w0, w1, w2, w3, w4, w5, w6, w7, w8)
+    | _ => throw s!"{prefixMsg}: expected 9-word header, got {task.header.size}"
+
+  let taskId := (← decodeFieldChecked taskHeader0Layout h0 "taskId").toNat
+  let taskWords := (← decodeFieldChecked taskHeader0Layout h0 "taskWords").toNat
+  if taskWords < 9 || taskWords > 0x7ff then
+    throw s!"{prefixMsg}: header[0] taskWords={taskWords} out of range 9..{0x7ff}"
+  if h1 != 0 then
+    throw s!"{prefixMsg}: header[1] must be 0, got {toHex h1.toNat}"
+  if h2 != taskHeaderWord2Const then
+    throw s!"{prefixMsg}: header[2] {toHex h2.toNat} != expected {toHex taskHeaderWord2Const.toNat}"
+  if h3 != 0 then
+    throw s!"{prefixMsg}: header[3] must be 0, got {toHex h3.toNat}"
+  if h4 != taskHeaderWord4Const then
+    throw s!"{prefixMsg}: header[4] {toHex h4.toNat} != expected {toHex taskHeaderWord4Const.toNat}"
+  if h5 != 0 || h6 != 0 || h7 != 0 then
+    throw s!"{prefixMsg}: header[5..7] must all be 0"
+  let ene ← decodeFieldChecked taskHeader8Layout h8 "ene"
+  if ene != 0 then
+    throw s!"{prefixMsg}: PE task requires header[8] ene=0, got ene={ene}"
+
+  -- 2. Reject duplicate register writes
+  let mut seenAddrs : Array Nat := #[]
+  for w in task.writes do
+    if seenAddrs.contains w.byteAddr then
+      throw s!"{prefixMsg}: duplicate write to register {toHex w.byteAddr}"
+    seenAddrs := seenAddrs.push w.byteAddr
+
+  -- 3. Common block & PE control registers
+  if (findDecodedWrite task.writes regConvCfg).isSome then
+    throw s!"{prefixMsg}: PE task must not write convCfg (0x0028)"
+  if (findDecodedWrite task.writes regDwGroups).isSome then
+    throw s!"{prefixMsg}: PE task must not write dwGroups (0x0030)"
+  if (findDecodedWrite task.writes regNeTile).isSome then
+    throw s!"{prefixMsg}: PE task must not write neTile (0x0040)"
+
+  let wWin ← requireDecodedWrite task.writes regWin "Win"
+  let wHin ← requireDecodedWrite task.writes regHin "Hin"
+  let wCin ← requireDecodedWrite task.writes regCin "Cin"
+  let wWout ← requireDecodedWrite task.writes regWout "Wout"
+  let wHout ← requireDecodedWrite task.writes regHout "Hout"
+  let wCout ← requireDecodedWrite task.writes regCout "Cout"
+  let wTH ← requireDecodedWrite task.writes regTH "TH"
+  let wPeCommon ← requireDecodedWrite task.writes regPeCommon "peCommon"
+  let wPeTile ← requireDecodedWrite task.writes regPeTile "peTile"
+  let wTargetCfg ← requireDecodedWrite task.writes regTargetCfg "targetCfg"
+
+  if let some wN := findDecodedWrite task.writes regBatchN then
+    if wN.value != 1 then
+      throw s!"{prefixMsg}: batch N (0x0024) must be 1, got {wN.value}"
+
+  let outW := (← decodeFieldChecked (dim16Layout "Win") wWin.value "val").toNat
+  let outH := (← decodeFieldChecked (dim16Layout "Hin") wHin.value "val").toNat
+  let outC := wCin.value.toNat
+  let wout := (← decodeFieldChecked (dim16Layout "Wout") wWout.value "val").toNat
+  let hout := (← decodeFieldChecked (dim16Layout "Hout") wHout.value "val").toNat
+  let cout := wCout.value.toNat
+  let th := (← decodeFieldChecked (dim16Layout "TH") wTH.value "val").toNat
+
+  if outW == 0 || outH == 0 || outC == 0 || outC > 65535 then
+    throw s!"{prefixMsg}: invalid PE dims (C={outC}, H={outH}, W={outW})"
+  if wout != outW || hout != outH || cout != outC then
+    throw s!"{prefixMsg}: Win/Hin/Cin ({outC}x{outH}x{outW}) != Wout/Hout/Cout ({cout}x{hout}x{wout})"
+  if wTargetCfg.value != 0 then
+    throw s!"{prefixMsg}: PE targetCfg (0x004c) must be 0, got {toHex wTargetCfg.value.toNat}"
+
+  let peMode ← decodeFieldChecked peCommonLayout wPeCommon.value "mode"
+  if peMode != peCommonOneSrcValue && peMode != peCommonTwoSrcValue then
+    throw s!"{prefixMsg}: peCommon mode {toHex peMode.toNat} must be 0x20 (1-src) or 0x30 (2-src)"
+  let twoSource := peMode == peCommonTwoSrcValue
+
+  let k := (← decodeFieldChecked peTileLayout wPeTile.value "k").toNat
+  let m := (← decodeFieldChecked peTileLayout wPeTile.value "m").toNat
+  let maxK := if twoSource then 8 else 9
+  if k < 4 || k > maxK then
+    throw s!"{prefixMsg}: peTile k={k} out of range 4..{maxK}"
+  if th == 0 || th > outH then
+    throw s!"{prefixMsg}: tileHeight={th} out of range 1..{outH}"
+  let expM := min (maxK - k) (vCeilLog2 th)
+  if m != expM then
+    throw s!"{prefixMsg}: peTile m={m} != expected min({maxK - k}, ceilLog2({th}))={expM}"
+  let stripW := (1 : Nat) <<< k
+
+  -- 4. Resolve input and output surfaces via BAR pairs & validate shapes / broadcast flags
+  let (src1Slot, src1Target, src1BaseOff, _) ←
+    resolveBasePair info task.writes regSrc1BaseLo regSrc1BaseHi "src1BaseLo" "src1BaseHi" prefixMsg
+  let src1Surf ← match src1Target with
+    | .surface s =>
+      if s.direction != .input then
+        throw s!"{prefixMsg}: src1Base BAR slot {src1Slot} bound to non-input surface '{s.shortName}'"
+      pure s
+    | _ => throw s!"{prefixMsg}: src1Base BAR slot {src1Slot} does not reference an input surface"
+  if src1Surf.n != 1 then
+    throw s!"{prefixMsg}: src1 surface must be single-batch (n=1), got {src1Surf.n}"
+  if src1BaseOff % vDmaLineBytes != 0 then
+    throw s!"{prefixMsg}: src1Base offset {toHex src1BaseOff} is not {vDmaLineBytes}-byte aligned"
+
+  let (resSlot, resTarget, resBaseOff, _) ←
+    resolveBasePair info task.writes regResBaseLo regResBaseHi "resBaseLo" "resBaseHi" prefixMsg
+  let outSurf ← match resTarget with
+    | .surface s =>
+      if s.direction != .output then
+        throw s!"{prefixMsg}: resBase BAR slot {resSlot} bound to non-output surface '{s.shortName}'"
+      pure s
+    | _ => throw s!"{prefixMsg}: resBase BAR slot {resSlot} does not reference an output surface"
+  if outSurf.n != 1 then
+    throw s!"{prefixMsg}: output surface must be single-batch (n=1), got {outSurf.n}"
+  if resBaseOff % vDmaLineBytes != 0 then
+    throw s!"{prefixMsg}: resBase offset {toHex resBaseOff} is not {vDmaLineBytes}-byte aligned"
+  if outSurf.channels.toNat != outC || outSurf.height.toNat != outH || outSurf.width.toNat != outW then
+    throw s!"{prefixMsg}: output surface ({outSurf.channels}x{outSurf.height}x{outSurf.width}) != PE dims ({outC}x{outH}x{outW})"
+  if resSlot == src1Slot then
+    throw s!"{prefixMsg}: output BAR slot {resSlot} aliases src1 BAR slot"
+
+  let s1C := src1Surf.channels.toNat
+  let s1H := src1Surf.height.toNat
+  let s1W := src1Surf.width.toNat
+
+  let src2Surf? : Option (ValidatedSurface × Nat) ←
+    if twoSource then
+      let (src2Slot, src2Target, src2BaseOff, _) ←
+        resolveBasePair info task.writes regSrc2BaseLo regSrc2BaseHi "src2BaseLo" "src2BaseHi" prefixMsg
+      let s2 ← match src2Target with
+        | .surface s =>
+          if s.direction != .input then
+            throw s!"{prefixMsg}: src2Base BAR slot {src2Slot} bound to non-input surface '{s.shortName}'"
+          pure s
+        | _ => throw s!"{prefixMsg}: src2Base BAR slot {src2Slot} does not reference an input surface"
+      if s2.n != 1 then
+        throw s!"{prefixMsg}: src2 surface must be single-batch (n=1), got {s2.n}"
+      if src2BaseOff % vDmaLineBytes != 0 then
+        throw s!"{prefixMsg}: src2Base offset {toHex src2BaseOff} is not {vDmaLineBytes}-byte aligned"
+      if resSlot == src2Slot then
+        throw s!"{prefixMsg}: output BAR slot {resSlot} aliases src2 BAR slot"
+
+      let s2C := s2.channels.toNat
+      let s2H := s2.height.toNat
+      let s2W := s2.width.toNat
+      if (s1C != 1 && s1C != outC) || (s2C != 1 && s2C != outC) || max s1C s2C != outC then
+        throw s!"{prefixMsg}: invalid C broadcast src1.C={s1C}, src2.C={s2C}, out.C={outC}"
+      if (s1H != 1 && s1H != outH) || (s2H != 1 && s2H != outH) || max s1H s2H != outH then
+        throw s!"{prefixMsg}: invalid H broadcast src1.H={s1H}, src2.H={s2H}, out.H={outH}"
+      if (s1W != 1 && s1W != outW) || (s2W != 1 && s2W != outW) || max s1W s2W != outW then
+        throw s!"{prefixMsg}: invalid W broadcast src1.W={s1W}, src2.W={s2W}, out.W={outW}"
+
+      let bcastWord : UInt32 := match findDecodedWrite task.writes regPeBcast with
+        | some wb => wb.value
+        | none => 0
+      let b1W ← decodeFieldChecked peBcastLayout bcastWord "src1W"
+      let b1H ← decodeFieldChecked peBcastLayout bcastWord "src1H"
+      let b1C ← decodeFieldChecked peBcastLayout bcastWord "src1C"
+      let b2W ← decodeFieldChecked peBcastLayout bcastWord "src2W"
+      let b2H ← decodeFieldChecked peBcastLayout bcastWord "src2H"
+      let b2C ← decodeFieldChecked peBcastLayout bcastWord "src2C"
+      let exp1W : UInt32 := if s1W != outW then 1 else 0
+      let exp1H : UInt32 := if s1H != outH then 1 else 0
+      let exp1C : UInt32 := if s1C != outC then 1 else 0
+      let exp2W : UInt32 := if s2W != outW then 1 else 0
+      let exp2H : UInt32 := if s2H != outH then 1 else 0
+      let exp2C : UInt32 := if s2C != outC then 1 else 0
+      if b1W != exp1W || b1H != exp1H || b1C != exp1C || b2W != exp2W || b2H != exp2H || b2C != exp2C then
+        throw s!"{prefixMsg}: peBcast {toHex bcastWord.toNat} mismatches resolved broadcast flags"
+      pure (some (s2, src2BaseOff))
+    else
+      if s1C != outC || s1H != outH || s1W != outW then
+        throw s!"{prefixMsg}: 1-source src1 ({s1C}x{s1H}x{s1W}) != out ({outC}x{outH}x{outW})"
+      if let some wb := findDecodedWrite task.writes regPeBcast then
+        if wb.value != 0 then
+          throw s!"{prefixMsg}: 1-source PE task must not set peBcast ({toHex wb.value.toNat})"
+      for (addr, nm) in #[
+        (regSrc2Base, "src2Base"), (regSrc2ChanStride, "src2ChanStride"),
+        (regSrc2RowStride, "src2RowStride"), (regSrc2RowBytesA, "src2RowBytesA"),
+        (regSrc2RowBytesB, "src2RowBytesB"), (regSrc2Dep, "src2Dep"),
+        (regSrc2DmaCfg, "src2DmaCfg"), (regSrc2BaseLo, "src2BaseLo"),
+        (regSrc2BaseHi, "src2BaseHi"), (regSrc2DmaRowStride, "src2DmaRowStride"),
+        (regSrc2DmaPlaneStride, "src2DmaPlaneStride"), (regSrc2Fmt, "src2Fmt")
+      ] do
+        if (findDecodedWrite task.writes addr).isSome then
+          throw s!"{prefixMsg}: 1-source PE task must omit {nm} ({toHex addr})"
+      pure none
+
+  -- 5. Verify PE arithmetic block (0x4500..0x4510)
+  let peOpW? := findDecodedWrite task.writes regPeOp
+  let peBiasW? := findDecodedWrite task.writes regPeBias
+  let peScaleW? := findDecodedWrite task.writes regPeScale
+  let peInScaleW? := findDecodedWrite task.writes regPeInScale
+  if twoSource then
+    let some wOp := peOpW?
+      | throw s!"{prefixMsg}: 2-source PE task requires peOp (0x4500)"
+    let v := wOp.value
+    if v != peOpAddValue && v != peOpMulValue && v != peOpMaxValue && v != peOpMinValue && v != peOpSubValue then
+      throw s!"{prefixMsg}: illegal 2-source peOp opcode {toHex v.toNat}"
+    if peBiasW?.isSome || peScaleW?.isSome || peInScaleW?.isSome then
+      throw s!"{prefixMsg}: 2-source PE task must not write chain constant registers (0x4504/0x4508/0x4510)"
+  else
+    match peOpW? with
+    | some wOp =>
+      if wOp.value != peOpAbsValue && wOp.value != peOpSquareValue then
+        throw s!"{prefixMsg}: illegal 1-source peOp opcode {toHex wOp.value.toNat}"
+      if peBiasW?.isSome || peScaleW?.isSome || peInScaleW?.isSome then
+        throw s!"{prefixMsg}: 1-source unary peOp must not write chain constant registers (0x4504/0x4508/0x4510)"
+    | none =>
+      if peBiasW?.isNone && peScaleW?.isNone && peInScaleW?.isNone then
+        throw s!"{prefixMsg}: 1-source PE chain without peOp (0x4500) must write at least one of 0x4504/0x4508/0x4510"
+
+  -- 6. L2 SRAM staging, anti-hang invariant, whole2, direct/staged result, and [0, 2 MiB) disjointness
+  let wSrc1Cfg ← requireDecodedWrite task.writes regSrc1Cfg "src1Cfg"
+  let src1Mode ← decodeFieldChecked src1CfgLayout wSrc1Cfg.value "mode"
+  let src1P ← decodeFieldChecked src1CfgLayout wSrc1Cfg.value "P"
+  if src1Mode != 2 || src1P != 1 then
+    throw s!"{prefixMsg}: src1Cfg mode={src1Mode}, P={src1P} invalid"
+  let wSrc2Cfg ← requireDecodedWrite task.writes regSrc2Cfg "src2Cfg"
+  let expSrc2Cfg := if twoSource then src2CfgEnabledValue else src2CfgValue
+  if wSrc2Cfg.value != expSrc2Cfg then
+    throw s!"{prefixMsg}: src2Cfg {toHex wSrc2Cfg.value.toNat} != expected {toHex expSrc2Cfg.toNat}"
+
+  let wSrc1Base ← requireDecodedWrite task.writes regSrc1Base "src1Base"
+  let wSrc1Chs ← requireDecodedWrite task.writes regSrc1ChanStride "src1ChanStride"
+  let wSrc1Row ← requireDecodedWrite task.writes regSrc1RowStride "src1RowStride"
+  let wSrc1RowA ← requireDecodedWrite task.writes regSrc1RowBytesA "src1RowBytesA"
+  let wSrc1RowB ← requireDecodedWrite task.writes regSrc1RowBytesB "src1RowBytesB"
+  let src1L2Base := wSrc1Base.value.toNat
+  let src1Chs := wSrc1Chs.value.toNat
+  let src1Row := wSrc1Row.value.toNat
+  if src1L2Base % vDmaLineBytes != 0 then
+    throw s!"{prefixMsg}: L2 src1Base {toHex src1L2Base} is not {vDmaLineBytes}-byte aligned"
+  let minAntiHang1 := 2 * min s1W stripW
+  if s1C > 1 && src1Chs < minAntiHang1 then
+    throw s!"{prefixMsg}: anti-hang violation: src1ChanStride ({src1Chs}) < 2 * min(W1={s1W}, T={stripW}) = {minAntiHang1}"
+  let expRow1 := 2 * min (alignUp s1W 8) stripW
+  if src1Chs < expRow1 || src1Chs % 16 != 0 then
+    throw s!"{prefixMsg}: src1ChanStride ({src1Chs}) invalid (must be >= {expRow1} and 16B-aligned)"
+  let minU1 := s1C * src1Chs
+  if src1Row < minU1 || (src1Row - minU1) % 16 != 0 then
+    throw s!"{prefixMsg}: src1RowStride ({src1Row}) incompatible with C1*chs={minU1}"
+  if wSrc1RowA.value.toNat != minU1 || wSrc1RowB.value.toNat != minU1 then
+    throw s!"{prefixMsg}: src1RowBytesA/B ({wSrc1RowA.value}, {wSrc1RowB.value}) != C1*chs ({minU1})"
+  let size1 := (if s1H > 1 then th else 1) * src1Row
+
+  let mut l2Ranges : Array ByteRange := #[
+    { label := "pe_src1", start := src1L2Base, size := size1 }
+  ]
+
+  if let some (s2, _) := src2Surf? then
+    let s2C := s2.channels.toNat
+    let s2H := s2.height.toNat
+    let s2W := s2.width.toNat
+    let wSrc2Base ← requireDecodedWrite task.writes regSrc2Base "src2Base"
+    let wSrc2Chs ← requireDecodedWrite task.writes regSrc2ChanStride "src2ChanStride"
+    let wSrc2Row ← requireDecodedWrite task.writes regSrc2RowStride "src2RowStride"
+    let wSrc2RowA ← requireDecodedWrite task.writes regSrc2RowBytesA "src2RowBytesA"
+    let wSrc2RowB ← requireDecodedWrite task.writes regSrc2RowBytesB "src2RowBytesB"
+    let src2L2Base := wSrc2Base.value.toNat
+    let src2Chs := wSrc2Chs.value.toNat
+    let src2Row := wSrc2Row.value.toNat
+    if src2L2Base % vDmaLineBytes != 0 then
+      throw s!"{prefixMsg}: L2 src2Base {toHex src2L2Base} is not {vDmaLineBytes}-byte aligned"
+    let minAntiHang2 := 2 * min s2W stripW
+    if s2C > 1 && src2Chs < minAntiHang2 then
+      throw s!"{prefixMsg}: anti-hang violation: src2ChanStride ({src2Chs}) < 2 * min(W2={s2W}, T={stripW}) = {minAntiHang2}"
+    let whole2 := s2C == 1 && s2H == 1 && s2W > 1 && outH > 1 && th < outH
+    let expRow2 := 2 * (if whole2 then alignUp s2W 8 else min (alignUp s2W 8) stripW)
+    if src2Chs < expRow2 || src2Chs % 16 != 0 then
+      throw s!"{prefixMsg}: src2ChanStride ({src2Chs}) invalid (must be >= {expRow2} and 16B-aligned, whole2={whole2})"
+    let minU2 := s2C * src2Chs
+    if src2Row < minU2 || (src2Row - minU2) % 16 != 0 then
+      throw s!"{prefixMsg}: src2RowStride ({src2Row}) incompatible with C2*chs={minU2}"
+    if wSrc2RowA.value.toNat != minU2 || wSrc2RowB.value.toNat != minU2 then
+      throw s!"{prefixMsg}: src2RowBytesA/B ({wSrc2RowA.value}, {wSrc2RowB.value}) != C2*chs ({minU2})"
+    let size2 := (if s2H > 1 then th else 1) * src2Row
+    l2Ranges := l2Ranges.push { label := "pe_src2", start := src2L2Base, size := size2 }
+
+  let wResCfg ← requireDecodedWrite task.writes regResCfg "resCfg"
+  let wResBase ← requireDecodedWrite task.writes regResBase "resBase"
+  let resMode ← decodeFieldChecked resCfgLayout wResCfg.value "mode"
+  let resP ← decodeFieldChecked resCfgLayout wResCfg.value "P"
+  let directBit ← decodeFieldChecked resCfgLayout wResCfg.value "direct"
+  if resMode != 2 || resP != 1 then
+    throw s!"{prefixMsg}: resCfg mode={resMode}, P={resP} invalid"
+  let direct := directBit == 1
+  let expDirect := vPeIsDirect target outW k
+  if direct != expDirect then
+    throw s!"{prefixMsg}: resCfg direct={direct} disagrees with {target.name} PE direct={expDirect} (W={outW}, k={k})"
+  let resL2Base := wResBase.value.toNat
+  if resL2Base % vDmaLineBytes != 0 then
+    throw s!"{prefixMsg}: L2 resBase {toHex resL2Base} is not {vDmaLineBytes}-byte aligned"
+
+  if direct then
+    for (addr, nm) in #[
+      (regResChanStride, "resChanStride"), (regResRowStride, "resRowStride"),
+      (regResRowBytesA, "resRowBytesA"), (regResRowBytesB, "resRowBytesB")
+    ] do
+      if (findDecodedWrite task.writes addr).isSome then
+        throw s!"{prefixMsg}: direct mode must omit staged register {nm} ({toHex addr})"
+    if resL2Base > vL2CapacityBytes then
+      throw s!"{prefixMsg}: L2 resBase {toHex resL2Base} exceeds 2 MiB ({toHex vL2CapacityBytes})"
+  else
+    let wResChs ← requireDecodedWrite task.writes regResChanStride "resChanStride"
+    let wResRow ← requireDecodedWrite task.writes regResRowStride "resRowStride"
+    let wResRowA ← requireDecodedWrite task.writes regResRowBytesA "resRowBytesA"
+    let wResRowB ← requireDecodedWrite task.writes regResRowBytesB "resRowBytesB"
+    let expDrow := 2 * min (alignUp outW 8) stripW
+    if wResChs.value.toNat != expDrow then
+      throw s!"{prefixMsg}: staged resChanStride {wResChs.value} != expected {expDrow}"
+    let minDu := outC * expDrow
+    let resRow := wResRow.value.toNat
+    if resRow < minDu || (resRow - minDu) % 16 != 0 then
+      throw s!"{prefixMsg}: staged resRowStride {resRow} incompatible with C*drow={minDu}"
+    if wResRowA.value.toNat != minDu || wResRowB.value.toNat != minDu then
+      throw s!"{prefixMsg}: staged resRowBytesA/B ({wResRowA.value}, {wResRowB.value}) != {minDu}"
+    l2Ranges := l2Ranges.push { label := "pe_res", start := resL2Base, size := th * resRow }
+
+  checkRangesDisjoint l2Ranges s!"{prefixMsg} L2 SRAM" 0 (some vL2CapacityBytes)
+
+  -- 7. DMA deps, configs, formats, and surface bounds
+  match ← resolveBarTarget info 4 with
+  | .configZero => pure ()
+  | _ => throw s!"{prefixMsg}: BAR slot 4 must have VM base 0"
+
+  let wSrc1Dep ← requireDecodedWrite task.writes regSrc1Dep "src1Dep"
+  if wSrc1Dep.barSlot != some 4 then
+    throw s!"{prefixMsg}: src1Dep (0x4d00) must use BAR slot 4"
+  if (← decodeFieldChecked src1DepLayout wSrc1Dep.value "code") != 0x21 then
+    throw s!"{prefixMsg}: src1Dep code must be 0x21"
+  if (← decodeFieldChecked src1DepLayout wSrc1Dep.value "task").toNat != taskId then
+    throw s!"{prefixMsg}: src1Dep task != header taskId={taskId}"
+  let wSrc1DmaCfg ← requireDecodedWrite task.writes regSrc1DmaCfg "src1DmaCfg"
+  if wSrc1DmaCfg.value != src1DmaCfgValue then
+    throw s!"{prefixMsg}: src1DmaCfg {toHex wSrc1DmaCfg.value.toNat} != {toHex src1DmaCfgValue.toNat}"
+  let wSrc1Fmt ← requireDecodedWrite task.writes regSrc1Fmt "src1Fmt"
+  if wSrc1Fmt.value != 0x01002031 then
+    throw s!"{prefixMsg}: src1Fmt {toHex wSrc1Fmt.value.toNat} != 0x1002031"
+  vVerifySurfaceDmaBounds task.writes src1Surf src1BaseOff
+    regSrc1DmaRowStride regSrc1DmaPlaneStride "src1DmaRowStride" "src1DmaPlaneStride" prefixMsg
+
+  if let some (s2, s2Off) := src2Surf? then
+    let wSrc2Dep ← requireDecodedWrite task.writes regSrc2Dep "src2Dep"
+    if wSrc2Dep.barSlot != some 4 then
+      throw s!"{prefixMsg}: src2Dep (0x4d04) must use BAR slot 4"
+    if (← decodeFieldChecked src1DepLayout wSrc2Dep.value "code") != 0x21 then
+      throw s!"{prefixMsg}: src2Dep code must be 0x21"
+    if (← decodeFieldChecked src1DepLayout wSrc2Dep.value "task").toNat != taskId then
+      throw s!"{prefixMsg}: src2Dep task != header taskId={taskId}"
+    let wSrc2DmaCfg ← requireDecodedWrite task.writes regSrc2DmaCfg "src2DmaCfg"
+    if wSrc2DmaCfg.value != src1DmaCfgValue then
+      throw s!"{prefixMsg}: src2DmaCfg {toHex wSrc2DmaCfg.value.toNat} != {toHex src1DmaCfgValue.toNat}"
+    let wSrc2Fmt ← requireDecodedWrite task.writes regSrc2Fmt "src2Fmt"
+    if wSrc2Fmt.value != 0x01002031 then
+      throw s!"{prefixMsg}: src2Fmt {toHex wSrc2Fmt.value.toNat} != 0x1002031"
+    vVerifySurfaceDmaBounds task.writes s2 s2Off
+      regSrc2DmaRowStride regSrc2DmaPlaneStride "src2DmaRowStride" "src2DmaPlaneStride" prefixMsg
+
+  let wResDep ← requireDecodedWrite task.writes regResDep "resDep"
+  if wResDep.barSlot != some 4 then
+    throw s!"{prefixMsg}: resDep (0x5100) must use BAR slot 4"
+  if (← decodeFieldChecked resDepLayout wResDep.value "code") != resDepCode target then
+    throw s!"{prefixMsg}: resDep code mismatch"
+  if (← decodeFieldChecked resDepLayout wResDep.value "task").toNat != taskId then
+    throw s!"{prefixMsg}: resDep task != header taskId={taskId}"
+  if ((← decodeFieldChecked resDepLayout wResDep.value "direct") == 1) != direct then
+    throw s!"{prefixMsg}: resDep direct bit != resCfg direct={direct}"
+  let wResFmt ← requireDecodedWrite task.writes regResFmt "resFmt"
+  if wResFmt.value != 0x01302031 then
+    throw s!"{prefixMsg}: resFmt {toHex wResFmt.value.toNat} != 0x1302031"
+  vVerifySurfaceDmaBounds task.writes outSurf resBaseOff
+    regResDmaRowStride regResDmaPlaneStride "resDmaRowStride" "resDmaPlaneStride" prefixMsg
+
+  -- 8. Kernel stage (no kernel) & Output stage
+  let wKernStage ← requireDecodedWrite task.writes regKernelStage "kernelStage"
+  if wKernStage.value != kernelStageNoKernValue then
+    throw s!"{prefixMsg}: PE kernelStage (0x5500) must be {toHex kernelStageNoKernValue.toNat}, got {toHex wKernStage.value.toNat}"
+  vVerifyOutputStage task.writes taskId prefixMsg
+
+/-- Standalone static safety verifier for decoded NE activation / 128-byte LUT tasks.
+    Operates purely on decoded HWX bytes with zero dependency on `Vane.Lut`. -/
+def verifyNeActTask (info : HwxInfo) (task : DecodedTask) (kernelBytes? : Option ByteArray := none) :
+    Except String Unit := do
+  let target := info.target
+  let prefixMsg := s!"task {task.taskIndex} (NE act)"
+
+  -- 1. Verify 9-word header
+  let (h0, h1, h2, h3, h4, h5, h6, h7, h8) ← match task.header.toList with
+    | [w0, w1, w2, w3, w4, w5, w6, w7, w8] => pure (w0, w1, w2, w3, w4, w5, w6, w7, w8)
+    | _ => throw s!"{prefixMsg}: expected 9-word header, got {task.header.size}"
+
+  let taskId := (← decodeFieldChecked taskHeader0Layout h0 "taskId").toNat
+  let taskWords := (← decodeFieldChecked taskHeader0Layout h0 "taskWords").toNat
+  if taskWords < 9 || taskWords > 0x7ff then
+    throw s!"{prefixMsg}: header[0] taskWords={taskWords} out of range 9..{0x7ff}"
+  if h1 != 0 then
+    throw s!"{prefixMsg}: header[1] must be 0, got {toHex h1.toNat}"
+  if h2 != taskHeaderWord2Const then
+    throw s!"{prefixMsg}: header[2] {toHex h2.toNat} != expected {toHex taskHeaderWord2Const.toNat}"
+  if h3 != 0 then
+    throw s!"{prefixMsg}: header[3] must be 0, got {toHex h3.toNat}"
+  if h4 != taskHeaderWord4Const && h4 != taskHeaderWord4CopyConst then
+    throw s!"{prefixMsg}: header[4] {toHex h4.toNat} not in [0x00fff868, 0x00000068]"
+  if h5 != 0 || h6 != 0 || h7 != 0 then
+    throw s!"{prefixMsg}: header[5..7] must all be 0"
+  let ene ← decodeFieldChecked taskHeader8Layout h8 "ene"
+  if ene < 1 || ene > 5 then
+    throw s!"{prefixMsg}: header[8] ene={ene} out of range 1..5"
+  let logNE := ene.toNat - 1
+
+  -- 2. Reject duplicate writes
+  let mut seenAddrs : Array Nat := #[]
+  for w in task.writes do
+    if seenAddrs.contains w.byteAddr then
+      throw s!"{prefixMsg}: duplicate write to register {toHex w.byteAddr}"
+    seenAddrs := seenAddrs.push w.byteAddr
+
+  -- 3. Common block
+  if (findDecodedWrite task.writes regConvCfg).isSome then
+    throw s!"{prefixMsg}: standalone NE act must omit convCfg (0x0028)"
+  let wDw ← requireDecodedWrite task.writes regDwGroups "dwGroups"
+  let perGroupIn ← decodeFieldChecked dwGroupsLayout wDw.value "perGroupIn"
+  if perGroupIn != 1 then
+    throw s!"{prefixMsg}: dwGroups (0x0030) must be 0x00014000 (perGroupIn=1)"
+
+  let wWin ← requireDecodedWrite task.writes regWin "Win"
+  let wHin ← requireDecodedWrite task.writes regHin "Hin"
+  let wCin ← requireDecodedWrite task.writes regCin "Cin"
+  let wWout ← requireDecodedWrite task.writes regWout "Wout"
+  let wHout ← requireDecodedWrite task.writes regHout "Hout"
+  let wCout ← requireDecodedWrite task.writes regCout "Cout"
+  let wTH ← requireDecodedWrite task.writes regTH "TH"
+  let wNeCommon ← requireDecodedWrite task.writes regNeCommon "neCommon"
+  let wNeTile ← requireDecodedWrite task.writes regNeTile "neTile"
+  let wTargetCfg ← requireDecodedWrite task.writes regTargetCfg "targetCfg"
+
+  if let some wN := findDecodedWrite task.writes regBatchN then
+    if wN.value != 1 then
+      throw s!"{prefixMsg}: batch N (0x0024) must be 1, got {wN.value}"
+
+  let w := (← decodeFieldChecked (dim16Layout "Win") wWin.value "val").toNat
+  let h := (← decodeFieldChecked (dim16Layout "Hin") wHin.value "val").toNat
+  let c := wCin.value.toNat
+  let wout := (← decodeFieldChecked (dim16Layout "Wout") wWout.value "val").toNat
+  let hout := (← decodeFieldChecked (dim16Layout "Hout") wHout.value "val").toNat
+  let cout := wCout.value.toNat
+  let th := (← decodeFieldChecked (dim16Layout "TH") wTH.value "val").toNat
+
+  if w == 0 || h == 0 || c == 0 then
+    throw s!"{prefixMsg}: invalid dims (C={c}, H={h}, W={w})"
+  if wout != w || hout != h || cout != c then
+    throw s!"{prefixMsg}: input dims ({c}x{h}x{w}) != output dims ({cout}x{hout}x{wout})"
+  if th == 0 || th > h then
+    throw s!"{prefixMsg}: tileHeight={th} out of range 1..{h}"
+  if wTargetCfg.value != targetCfgValue target then
+    throw s!"{prefixMsg}: targetCfg {toHex wTargetCfg.value.toNat} != expected {toHex (targetCfgValue target).toNat}"
+
+  let kind := (← decodeFieldChecked neCommonLayout wNeCommon.value "kind").toNat
+  let shPref := (← decodeFieldChecked neCommonLayout wNeCommon.value "shPref").toNat
+  let shMin := (← decodeFieldChecked neCommonLayout wNeCommon.value "shMin").toNat
+  let shMax := (← decodeFieldChecked neCommonLayout wNeCommon.value "shMax").toNat
+  let f := (← decodeFieldChecked neCommonLayout wNeCommon.value "F").toNat
+  let wide3x3Bit := (← decodeFieldChecked neCommonLayout wNeCommon.value "wide3x3").toNat
+  if kind != 0 || wide3x3Bit != 0 then
+    throw s!"{prefixMsg}: neCommon kind={kind}, wide3x3={wide3x3Bit} must both be 0"
+  if shMin != shPref || shPref > shMax || shMax > 4 then
+    throw s!"{prefixMsg}: invalid shifts shPref={shPref}, shMin={shMin}, shMax={shMax}"
+
+  let ocg := (← decodeFieldChecked neTileLayout wNeTile.value "ocg").toNat
+  let fat := (← decodeFieldChecked neTileLayout wNeTile.value "fat").toNat
+  let wu := (← decodeFieldChecked neTileLayout wNeTile.value "WU").toNat
+  if ocg != 0 then
+    throw s!"{prefixMsg}: standalone NE act requires ocg=0, got {ocg}"
+  if fat > 1 || wu > 3 || wu + f + fat != logNE then
+    throw s!"{prefixMsg}: invalid neTile (WU={wu}, F={f}, fat={fat}, logNE={logNE})"
+  let stripW := vStripW fat shPref
+  if stripW < 8 || stripW > 256 then
+    throw s!"{prefixMsg}: strip width T={stripW} outside [8, 256]"
+
+  -- 4. Resolve input and output surfaces
+  let (inSlot, inTarget, srcBaseOff, _) ←
+    resolveBasePair info task.writes regSrc1BaseLo regSrc1BaseHi "src1BaseLo" "src1BaseHi" prefixMsg
+  let inSurf ← match inTarget with
+    | .surface s =>
+      if s.direction != .input then
+        throw s!"{prefixMsg}: src1Base BAR slot {inSlot} bound to non-input surface '{s.shortName}'"
+      pure s
+    | _ => throw s!"{prefixMsg}: src1Base BAR slot {inSlot} does not reference an input surface"
+  let (outSlot, outTarget, resBaseOff, _) ←
+    resolveBasePair info task.writes regResBaseLo regResBaseHi "resBaseLo" "resBaseHi" prefixMsg
+  let outSurf ← match outTarget with
+    | .surface s =>
+      if s.direction != .output then
+        throw s!"{prefixMsg}: resBase BAR slot {outSlot} bound to non-output surface '{s.shortName}'"
+      pure s
+    | _ => throw s!"{prefixMsg}: resBase BAR slot {outSlot} does not reference an output surface"
+  if inSurf.n != 1 || outSurf.n != 1 then
+    throw s!"{prefixMsg}: single-batch surfaces required"
+  if srcBaseOff % vDmaLineBytes != 0 || resBaseOff % vDmaLineBytes != 0 then
+    throw s!"{prefixMsg}: surface base offsets must be {vDmaLineBytes}-byte aligned"
+  if inSurf.channels.toNat != c || inSurf.height.toNat != h || inSurf.width.toNat != w then
+    throw s!"{prefixMsg}: input surface dims mismatch"
+  if outSurf.channels.toNat != c || outSurf.height.toNat != h || outSurf.width.toNat != w then
+    throw s!"{prefixMsg}: output surface dims mismatch"
+
+  -- 5. Verify NE act & LUT registers (0x4900..0x4910, 0x0050, 0x5500, 0x5610..0x561c)
+  let wNeOp ← requireDecodedWrite task.writes regNeOp "neOp"
+  let noShiftBit ← decodeFieldChecked neActOpLayout wNeOp.value "noShift"
+  let reluBit ← decodeFieldChecked neActOpLayout wNeOp.value "relu"
+  let lutBit ← decodeFieldChecked neActOpLayout wNeOp.value "lut"
+  if reluBit == 1 && lutBit == 1 then
+    throw s!"{prefixMsg}: neActOp cannot enable both relu (bit 16) and lut (bit 17)"
+  let hasLut := lutBit == 1
+  if h4 == taskHeaderWord4CopyConst && (reluBit == 1 || hasLut) then
+    throw s!"{prefixMsg}: header[4]=0x00000068 is only allowed for copy (relu=0, lut=0)"
+
+  if noShiftBit == 0 then
+    if !hasLut then
+      throw s!"{prefixMsg}: input shift (noShift=0) requires lut=1"
+    let wShiftEn ← requireDecodedWrite task.writes regNeActShiftEn "neActShiftEn"
+    let shiftEn ← decodeFieldChecked neActShiftEnLayout wShiftEn.value "enable"
+    if shiftEn != 1 then
+      throw s!"{prefixMsg}: neActShiftEn (0x0050) must be 1 when noShift=0"
+    let wShift ← requireDecodedWrite task.writes regScalarBias "scalarBias"
+    validateWordBits scalarBiasLayout wShift.value
+  else
+    if let some wShiftEn := findDecodedWrite task.writes regNeActShiftEn then
+      if wShiftEn.value != 0 then
+        throw s!"{prefixMsg}: neActShiftEn (0x0050) must be omitted or 0 when noShift=1"
+    if (findDecodedWrite task.writes regScalarBias).isSome then
+      throw s!"{prefixMsg}: scalarBias (0x490c) must be omitted when noShift=1"
+
+  let wNeScale ← requireDecodedWrite task.writes regNeScale "neScale"
+  let neScaleVal ← decodeFieldChecked neScaleLayout wNeScale.value "val"
+  if !hasLut && neScaleVal != fp16OneBits then
+    throw s!"{prefixMsg}: non-LUT neScale {toHex neScaleVal.toNat} != fp16 1.0 ({toHex fp16OneBits.toNat})"
+
+  let wKernStage ← requireDecodedWrite task.writes regKernelStage "kernelStage"
+  if hasLut then
+    let wNeCfg ← requireDecodedWrite task.writes regNeCfg "neCfg"
+    if wNeCfg.value != neActCfgValue then
+      throw s!"{prefixMsg}: LUT neCfg (0x4900) {toHex wNeCfg.value.toNat} != expected {toHex neActCfgValue.toNat}"
+    let ksSparse ← decodeFieldChecked kernelStageLayout wKernStage.value "sparse"
+    let ksStage ← decodeFieldChecked kernelStageLayout wKernStage.value "stage"
+    if ksSparse != 0 || ksStage != 1 then
+      throw s!"{prefixMsg}: LUT kernelStage (0x5500) must be 0x000102c0 (sparse=0, stage=1)"
+    let wLutCfg ← requireDecodedWrite task.writes regLutCfg "lutCfg"
+    let lutEn ← decodeFieldChecked chunkSlotLayout wLutCfg.value "enable"
+    let lutOn20 ← decodeFieldChecked chunkSlotLayout wLutCfg.value "on20"
+    let lutTask ← decodeFieldChecked chunkSlotLayout wLutCfg.value "task"
+    if lutEn != 1 || lutOn20 != 1 || lutTask.toNat != taskId then
+      throw s!"{prefixMsg}: lutCfg (0x5610) invalid (enable={lutEn}, on20={lutOn20}, task={lutTask}, expected taskId={taskId})"
+    let wLutSize ← requireDecodedWrite task.writes regLutSize "lutSize"
+    if wLutSize.value.toNat != vLutBytes then
+      throw s!"{prefixMsg}: lutSize (0x5614) {wLutSize.value} != {vLutBytes}"
+    let (lutSlot, lutTarget, lutOff, lutLoPayloadOff) ←
+      resolveBasePair info task.writes regLutBaseLo regLutBaseHi "lutBaseLo" "lutBaseHi" prefixMsg
+    let kSec ← match lutTarget with
+      | .kernel s => pure s
+      | _ => throw s!"{prefixMsg}: lutBase BAR slot {lutSlot} does not reference __KERN_0"
+    if !info.relocPatchOffsets.contains lutLoPayloadOff.toUInt32 then
+      throw s!"{prefixMsg}: missing Mach-O relocation targeting lutBaseLo payload offset {toHex lutLoPayloadOff}"
+    if lutOff % vDmaLineBytes != 0 then
+      throw s!"{prefixMsg}: lutBase offset {toHex lutOff} is not {vDmaLineBytes}-byte aligned"
+    if lutOff + vLutBytes > kSec.size.toNat then
+      throw s!"{prefixMsg}: LUT range [{lutOff}, {lutOff + vLutBytes}) exceeds __KERN_0 size {kSec.size}"
+    if let some kBytes := kernelBytes? then
+      vVerifyLutBytes kBytes lutOff s!"{prefixMsg} LUT"
+  else
+    if wKernStage.value != kernelStageNoKernValue then
+      throw s!"{prefixMsg}: non-LUT kernelStage (0x5500) must be {toHex kernelStageNoKernValue.toNat}"
+    for (addr, nm) in #[
+      (regLutCfg, "lutCfg"), (regLutSize, "lutSize"),
+      (regLutBaseLo, "lutBaseLo"), (regLutBaseHi, "lutBaseHi")
+    ] do
+      if (findDecodedWrite task.writes addr).isSome then
+        throw s!"{prefixMsg}: non-LUT NE act must omit {nm} ({toHex addr})"
+
+  -- 6. L2 staging & [0, 2 MiB) bounds
+  let wSrc1Cfg ← requireDecodedWrite task.writes regSrc1Cfg "src1Cfg"
+  let src1Mode ← decodeFieldChecked src1CfgLayout wSrc1Cfg.value "mode"
+  let src1P ← decodeFieldChecked src1CfgLayout wSrc1Cfg.value "P"
+  if src1Mode != 2 || src1P != 1 then
+    throw s!"{prefixMsg}: src1Cfg invalid"
+  let wSrc2Cfg ← requireDecodedWrite task.writes regSrc2Cfg "src2Cfg"
+  if wSrc2Cfg.value != src2CfgValue then
+    throw s!"{prefixMsg}: src2Cfg {toHex wSrc2Cfg.value.toNat} != {toHex src2CfgValue.toNat}"
+
+  let wSrc1Base ← requireDecodedWrite task.writes regSrc1Base "src1Base"
+  let wSrc1Chs ← requireDecodedWrite task.writes regSrc1ChanStride "src1ChanStride"
+  let wSrc1Row ← requireDecodedWrite task.writes regSrc1RowStride "src1RowStride"
+  let wSrc1RowA ← requireDecodedWrite task.writes regSrc1RowBytesA "src1RowBytesA"
+  let wSrc1RowB ← requireDecodedWrite task.writes regSrc1RowBytesB "src1RowBytesB"
+  let wResCfg ← requireDecodedWrite task.writes regResCfg "resCfg"
+  let wResBase ← requireDecodedWrite task.writes regResBase "resBase"
+
+  let expRow := 2 * min (alignUp w 8) stripW
+  if wSrc1Chs.value.toNat != expRow then
+    throw s!"{prefixMsg}: src1ChanStride {wSrc1Chs.value} != expected {expRow}"
+  let minU := c * expRow
+  let src1Row := wSrc1Row.value.toNat
+  if src1Row < minU || (src1Row - minU) % 16 != 0 then
+    throw s!"{prefixMsg}: src1RowStride {src1Row} incompatible with C*row={minU}"
+  if wSrc1RowA.value.toNat != minU || wSrc1RowB.value.toNat != minU then
+    throw s!"{prefixMsg}: src1RowBytesA/B mismatch"
+  let srcL2Base := wSrc1Base.value.toNat
+  if srcL2Base % vDmaLineBytes != 0 then
+    throw s!"{prefixMsg}: L2 src1Base {toHex srcL2Base} is not {vDmaLineBytes}-byte aligned"
+  let srcBytes := th * src1Row
+
+  let resMode ← decodeFieldChecked resCfgLayout wResCfg.value "mode"
+  let resP ← decodeFieldChecked resCfgLayout wResCfg.value "P"
+  let directBit ← decodeFieldChecked resCfgLayout wResCfg.value "direct"
+  if resMode != 2 || resP != 1 then
+    throw s!"{prefixMsg}: resCfg invalid"
+  let direct := directBit == 1
+  let expDirect := vIsDirect target fat shMax w
+  if direct != expDirect then
+    throw s!"{prefixMsg}: resCfg direct={direct} disagrees with target/tiling direct={expDirect}"
+  let resL2Base := wResBase.value.toNat
+  if resL2Base % vDmaLineBytes != 0 then
+    throw s!"{prefixMsg}: L2 resBase {toHex resL2Base} is not {vDmaLineBytes}-byte aligned"
+
+  let mut l2Ranges : Array ByteRange := #[
+    { label := "ne_act_src", start := srcL2Base, size := srcBytes }
+  ]
+  if direct then
+    for (addr, nm) in #[
+      (regResChanStride, "resChanStride"), (regResRowStride, "resRowStride"),
+      (regResRowBytesA, "resRowBytesA"), (regResRowBytesB, "resRowBytesB")
+    ] do
+      if (findDecodedWrite task.writes addr).isSome then
+        throw s!"{prefixMsg}: direct mode must omit staged register {nm} ({toHex addr})"
+    if resL2Base > vL2CapacityBytes then
+      throw s!"{prefixMsg}: L2 resBase {toHex resL2Base} exceeds 2 MiB ({toHex vL2CapacityBytes})"
+  else
+    let wResChs ← requireDecodedWrite task.writes regResChanStride "resChanStride"
+    let wResRow ← requireDecodedWrite task.writes regResRowStride "resRowStride"
+    let wResRowA ← requireDecodedWrite task.writes regResRowBytesA "resRowBytesA"
+    let wResRowB ← requireDecodedWrite task.writes regResRowBytesB "resRowBytesB"
+    let expDrow := vDchs w stripW
+    if wResChs.value.toNat != expDrow then
+      throw s!"{prefixMsg}: resChanStride {wResChs.value} != expected {expDrow}"
+    let minDu := c * expDrow
+    let resRow := wResRow.value.toNat
+    if resRow < minDu || (resRow - minDu) % 16 != 0 then
+      throw s!"{prefixMsg}: resRowStride {resRow} incompatible with C*drow={minDu}"
+    if wResRowA.value.toNat != minDu || wResRowB.value.toNat != minDu then
+      throw s!"{prefixMsg}: resRowBytesA/B mismatch"
+    l2Ranges := l2Ranges.push { label := "ne_act_res", start := resL2Base, size := th * resRow }
+
+  checkRangesDisjoint l2Ranges s!"{prefixMsg} L2 SRAM" 0 (some vL2CapacityBytes)
+
+  -- 7. DMA deps, formats, surface bounds, and output stage
+  match ← resolveBarTarget info 4 with
+  | .configZero => pure ()
+  | _ => throw s!"{prefixMsg}: BAR slot 4 must have VM base 0"
+  let wSrcDep ← requireDecodedWrite task.writes regSrc1Dep "src1Dep"
+  if wSrcDep.barSlot != some 4 then
+    throw s!"{prefixMsg}: src1Dep must use BAR slot 4"
+  if (← decodeFieldChecked src1DepLayout wSrcDep.value "code") != 0x21 then
+    throw s!"{prefixMsg}: src1Dep code must be 0x21"
+  if (← decodeFieldChecked src1DepLayout wSrcDep.value "task").toNat != taskId then
+    throw s!"{prefixMsg}: src1Dep task != header taskId={taskId}"
+  let wResDep ← requireDecodedWrite task.writes regResDep "resDep"
+  if wResDep.barSlot != some 4 then
+    throw s!"{prefixMsg}: resDep must use BAR slot 4"
+  if (← decodeFieldChecked resDepLayout wResDep.value "code") != resDepCode target then
+    throw s!"{prefixMsg}: resDep code mismatch"
+  if (← decodeFieldChecked resDepLayout wResDep.value "task").toNat != taskId then
+    throw s!"{prefixMsg}: resDep task != header taskId={taskId}"
+  if ((← decodeFieldChecked resDepLayout wResDep.value "direct") == 1) != direct then
+    throw s!"{prefixMsg}: resDep direct bit != resCfg direct={direct}"
+
+  let wSrc1DmaCfg ← requireDecodedWrite task.writes regSrc1DmaCfg "src1DmaCfg"
+  if wSrc1DmaCfg.value != src1DmaCfgValue then
+    throw s!"{prefixMsg}: src1DmaCfg mismatch"
+  let wSrc1Fmt ← requireDecodedWrite task.writes regSrc1Fmt "src1Fmt"
+  if wSrc1Fmt.value != 0x01002031 then
+    throw s!"{prefixMsg}: src1Fmt mismatch"
+  let wResFmt ← requireDecodedWrite task.writes regResFmt "resFmt"
+  if wResFmt.value != 0x01302031 then
+    throw s!"{prefixMsg}: resFmt mismatch"
+
+  vVerifySurfaceDmaBounds task.writes inSurf srcBaseOff
+    regSrc1DmaRowStride regSrc1DmaPlaneStride "src1DmaRowStride" "src1DmaPlaneStride" prefixMsg
+  vVerifySurfaceDmaBounds task.writes outSurf resBaseOff
+    regResDmaRowStride regResDmaPlaneStride "resDmaRowStride" "resDmaPlaneStride" prefixMsg
+  vVerifyOutputStage task.writes taskId prefixMsg
+
+/-- Verify all recognized tasks decoded from a validated HWX binary (`neConv`, `neAct`, `peOp`)
+    and return per-kind counts. When `requireKnownTask` is `true`, rejects any `.unknown` task
+    or empty verified count. -/
+def verifyHwxTasksSummary (hwxBytes : ByteArray) (info : HwxInfo) (requireKnownTask : Bool := true) :
+    Except String TaskVerifySummary := do
   let textBytes ← readSlice hwxBytes info.textSection.offset.toNat info.textSection.size.toNat
   let tasks ← decodeTaskStream info.target textBytes
   let kernelBytes? ← match info.kernelSection with
     | some kSec => some <$> readSlice hwxBytes kSec.offset.toNat kSec.size.toNat
     | none => pure none
-  let mut checked := 0
+  let mut nConv := 0
+  let mut nAct := 0
+  let mut nPe := 0
   for task in tasks do
     match classifyTask task with
     | .neConv =>
       verifyConvTask info task kernelBytes?
-      checked := checked + 1
+      nConv := nConv + 1
+    | .neAct =>
+      verifyNeActTask info task kernelBytes?
+      nAct := nAct + 1
+    | .peOp =>
+      verifyPeTask info task
+      nPe := nPe + 1
     | .unknown =>
-      if requireConvTask then
-        throw s!"task {task.taskIndex}: missing NE conv configuration registers"
-  if requireConvTask && checked == 0 then
-    throw "HWX contains no NE conv tasks"
-  pure checked
+      if requireKnownTask then
+        throw s!"task {task.taskIndex}: unrecognized task kind (missing conv, NE activation, and PE configuration registers)"
+  let total := nConv + nAct + nPe
+  if requireKnownTask && total == 0 then
+    throw "HWX contains no recognized tasks"
+  pure { total := total, neConv := nConv, neAct := nAct, peOp := nPe }
+
+/-- Verify all recognized tasks (`neConv`, `neAct`, `peOp`) decoded from a validated HWX binary. -/
+def verifyHwxTasks (hwxBytes : ByteArray) (info : HwxInfo) (requireKnownTask : Bool := true) :
+    Except String Nat := do
+  let s ← verifyHwxTasksSummary hwxBytes info (requireKnownTask := requireKnownTask)
+  pure s.total
+
+/-- Compatibility wrapper verifying all recognized tasks decoded from a validated HWX binary. -/
+def verifyConvHwxTasks (hwxBytes : ByteArray) (info : HwxInfo) (requireConvTask : Bool := true) :
+    Except String Nat :=
+  verifyHwxTasks hwxBytes info (requireKnownTask := requireConvTask)
 
 end Vane.Verify

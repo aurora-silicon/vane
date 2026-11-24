@@ -1,6 +1,7 @@
 import Vane
 
 open Vane.Binary
+open Vane.Float16
 open Vane.TaskStream
 open Vane.Hwx
 open Vane.Sections
@@ -8,6 +9,8 @@ open Vane.Register
 open Vane.Tiling
 open Vane.Program
 open Vane.Verify
+open Vane.Pe
+open Vane.Lut
 open Vane.Conv
 open Vane.Conv1x1
 open Vane.Conv3x3
@@ -555,7 +558,7 @@ private def runAllTests : IO (Array TestResult) := do
     let wResStg ← encodeWord resCfgLayout #[("mode", 2), ("direct", 0), ("P", 1)]
     if wResStg != 0x00500172 then throw s!"resCfg(staged)={toHex wResStg.toNat}"
 
-    let wOp ← encodeWord neOpLayout #[("biasInKernel", 1), ("relu", 1)]
+    let wOp ← encodeWord neOpLayout #[("biasInKernel", 1), ("relu", 1), ("lut", 0)]
     if wOp != 0x00113c10 then throw s!"neOp={toHex wOp.toNat}"
 
     let hdr ← encodeTaskHeader9 0 64 4
@@ -1998,7 +2001,7 @@ private def runAllTests : IO (Array TestResult) := do
   ) "scalarBias")
 
   results := results.push (checkErr "m2 neg verifier: dense Cout=1 with biasInKernel=1 rejected" (do
-    let wOpBad ← encodeWord neOpLayout #[("biasInKernel", 1), ("relu", 0)]
+    let wOpBad ← encodeWord neOpLayout #[("biasInKernel", 1), ("relu", 0), ("lut", 0)]
     let plain := baseTd1C1.plainWrites.map fun w =>
       if w.byteAddr == regNeOp then { w with value := wOpBad } else w
     emitTaskAndVerify .h17 baseIn1C1 baseOut1C1 basePk1C1.bytes { baseTd1C1 with plainWrites := plain }
@@ -2190,6 +2193,499 @@ private def runAllTests : IO (Array TestResult) := do
     let cur ← readU32LE baseConv.hwx fOff
     tamperRegAndVerify baseConv regResBase (cur + 32)
   ) "64-byte aligned")
+
+  -- =========================================================================
+  -- Milestone 3 Tests: Float16, PE, 128B LUTs, Fused Conv+LUT, & M3 Verifier
+  -- =========================================================================
+
+  -- 1. Float16 / Float32 / math helpers
+  results := results.push (checkOk "m3: Float16 exhaustive 65536 bit-pattern round-trip & f16ToF32Bits" (do
+    for i in [:65536] do
+      let h := i.toUInt16
+      let f := f16ToFloat h
+      let f32 := f16ToF32Bits h
+      if f16IsNaN h then
+        if !f.isNaN then throw s!"NaN 0x{Nat.toDigits 16 h.toNat} did not convert to NaN"
+        let rt := floatToF16 f
+        if rt != f16QNaN then throw s!"NaN round-trip gave {toHex rt.toNat}"
+        if (f32 &&& 0x7f800000) != 0x7f800000 || (f32 &&& 0x007fffff) == 0 then
+          throw s!"f16ToF32Bits NaN failed for {toHex h.toNat}: {toHex f32.toNat}"
+      else
+        let rt := floatToF16 f
+        if rt != h then
+          throw s!"round-trip mismatch for {toHex h.toNat}: got {toHex rt.toNat}"
+        let cz := floatToF16CanonicalZero f
+        if h == f16NegZero then
+          if cz != f16PosZero then throw "canonicalZero failed on -0.0"
+        else if cz != h then
+          throw s!"canonicalZero mismatch for {toHex h.toNat}"
+    -- Spot check f16ToF32Bits exact IEEE-754 binary32 values
+    if f16ToF32Bits 0x3c00 != 0x3f800000 then throw "f16ToF32Bits(1.0) mismatch"
+    if f16ToF32Bits 0xbc00 != 0xbf800000 then throw "f16ToF32Bits(-1.0) mismatch"
+    if f16ToF32Bits 0x3e00 != 0x3fc00000 then throw "f16ToF32Bits(1.5) mismatch"
+    if f16ToF32Bits 0x0001 != 0x33800000 then throw "f16ToF32Bits(2^-24) mismatch"
+    if f16ToF32Bits 0x8000 != 0x80000000 then throw "f16ToF32Bits(-0.0) mismatch"
+    if f16ToF32Bits 0x7c00 != 0x7f800000 then throw "f16ToF32Bits(+inf) mismatch"
+    if f16ToF32Bits 0xfc00 != 0xff800000 then throw "f16ToF32Bits(-inf) mismatch"
+    -- prevF16 checks
+    if prevF16 0x0000 != 0x8001 then throw "prevF16(+0) != -2^-24"
+    if prevF16 0x8000 != 0x8001 then throw "prevF16(-0) != -2^-24"
+    if prevF16 0x0001 != 0x0000 then throw "prevF16(+2^-24) != +0"
+    if prevF16 0x3c00 != 0x3bff then throw "prevF16(1.0) != 0x3bff"
+    if prevF16 0x8001 != 0x8002 then throw "prevF16(-2^-24) != -2*2^-24"
+    if prevF16 0xfbff != 0xfc00 then throw "prevF16(-65504) != -inf"
+    if prevF16 0xfc00 != 0xfc00 then throw "prevF16(-inf) != -inf"
+    -- erfApprox & expm1 accuracy checks
+    if Float.abs (erfApprox 0.0) > 1e-12 then throw "erfApprox(0) != 0"
+    if Float.abs (erfApprox 1.0 - 0.8427007929) > 2e-6 then throw s!"erfApprox(1.0)={erfApprox 1.0}"
+    if Float.abs (erfApprox (-1.0) + 0.8427007929) > 2e-6 then throw "erfApprox(-1.0) oddness"
+    if Float.abs (erfApprox 2.0 - 0.9953222650) > 2e-6 then throw s!"erfApprox(2.0)={erfApprox 2.0}"
+    if Float.abs (expm1 1e-6 - 1.0000005e-6) > 1e-12 then throw "expm1(1e-6) inaccurate"
+    if Float.abs (expm1 (-1.0) - (Float.exp (-1.0) - 1.0)) > 1e-12 then throw "expm1(-1) inaccurate"
+    -- rna16 rounding checks (ties away, -0 -> +0, NaN -> +0, overflow at 65520)
+    if rna16 (1.0 + ldexp 1.0 (-11)) != 0x3c01 then throw "rna16 ties-away failed"
+    if rna16 (-0.0) != 0x0000 then throw "rna16(-0.0) != +0.0"
+    if rna16 (0.0 / 0.0) != 0x0000 then throw "rna16(NaN) != +0.0"
+    if rna16 65520.0 != 0x7c00 then throw "rna16(65520) != +inf"
+    if rna16 (-65520.0) != 0xfc00 then throw "rna16(-65520) != -inf"
+    if rna16 65519.0 != 0x7bff then throw "rna16(65519) != 65504"
+    -- parseFloat?
+    match parseFloat? "-1.25e-2" with
+    | some v => if Float.abs (v + 0.0125) > 1e-12 then throw "parseFloat? -1.25e-2 mismatch"
+    | none => throw "parseFloat? failed on -1.25e-2"
+    pure ()
+  ))
+
+  -- 2. PE bitfields, tiling, 1-source & 2-source & broadcasts & H16 staged
+  results := results.push (checkOk "m3: PE 1-source ops (abs, square, linear, 3-step chain, scalars) on H16 & H17" (do
+    let d : TensorDims := { c := 8, h := 16, w := 24 }
+    let divOp ← PeOp.scalarDiv (floatToF16 4.0)
+    let ops : Array PeOp := #[
+      .abs,
+      .square,
+      PeOp.linearActivation (floatToF16 1.5) (floatToF16 (-0.25)),
+      .chain (some (floatToF16 1.5)) (some (floatToF16 (-0.25))) (some (floatToF16 0.5)),
+      PeOp.scalarAdd (floatToF16 2.0),
+      PeOp.scalarSub (floatToF16 3.0),
+      PeOp.scalarRSub (floatToF16 5.0),
+      PeOp.scalarMul (floatToF16 (-0.5)),
+      divOp
+    ]
+    for tgt in #[Target.h16, Target.h17] do
+      for op in ops do
+        let c ← compilePe tgt op d
+        let s ← verifyHwxTasksSummary c.hwx c.info (requireKnownTask := true)
+        if s.peOp != 1 || s.total != 1 then
+          throw s!"expected 1 verified PE task for {tgt.name}/{op.opName}, got {repr s}"
+    pure ()
+  ))
+
+  results := results.push (checkErr "m3 neg: PE scalarDiv rejects zero divisor" (do
+    PeOp.scalarDiv 0x0000
+  ) "non-zero")
+
+  results := results.push (checkErr "m3 neg: PE empty chain rejected" (do
+    compilePe .h17 (.chain none none none) { c := 4, h := 4, w := 4 }
+  ) "at least one")
+
+  results := results.push (checkOk "m3: PE 2-source binary ops + broadcasts + whole2 + large multi-tile on H16 & H17" (do
+    let dFull : TensorDims := { c := 4, h := 8, w := 16 }
+    let binOps : Array (PeBinOp × Bool) := #[
+      (.add, false), (.sub, false), (.sub, true), (.mul, false), (.max, false), (.min, false)
+    ]
+    for tgt in #[Target.h16, Target.h17] do
+      for (bop, rev) in binOps do
+        let c ← compilePe tgt (.binary bop dFull dFull rev) dFull
+        let s ← verifyHwxTasksSummary c.hwx c.info (requireKnownTask := true)
+        if s.peOp != 1 then throw s!"expected 1 PE task for {bop.name}"
+    -- Broadcast shapes: [C,1,1], [1,H,W], [1,1,W] with th < H (whole2!), [C,H,1], [1,1,1]
+    let bcastPairs : Array (TensorDims × TensorDims × Bool) := #[
+      ({ c := 8, h := 8, w := 16 }, { c := 8, h := 1, w := 1 }, false),
+      ({ c := 8, h := 8, w := 16 }, { c := 1, h := 8, w := 16 }, false),
+      ({ c := 8, h := 8, w := 16 }, { c := 8, h := 8, w := 1 }, false),
+      ({ c := 8, h := 8, w := 16 }, { c := 1, h := 1, w := 1 }, false),
+      ({ c := 1, h := 8, w := 16 }, { c := 8, h := 1, w := 1 }, true),
+      -- Large multi-tile triggering th < H with [1,1,W] row broadcast (whole2 = true)
+      ({ c := 256, h := 64, w := 128 }, { c := 1, h := 1, w := 128 }, false)
+    ]
+    for (s1, s2, rev) in bcastPairs do
+      for tgt in #[Target.h16, Target.h17] do
+        let c ← compilePe tgt (.binary .add s1 s2 rev) s1
+        let s ← verifyHwxTasksSummary c.hwx c.info (requireKnownTask := true)
+        if s.peOp != 1 then throw "expected 1 PE task for broadcast"
+    -- Also explicit whole2 forced tiling check: [1,4,8,16] + [1,1,1,16] with th=4 < H=8
+    let cWhole2 ← compilePe .h17 (.binary .add { c := 4, h := 8, w := 16 } { c := 1, h := 1, w := 16 } false)
+      { c := 4, h := 8, w := 16 } (tilingOverride := some { k := 4, tileHeight := 4 })
+    let sW2 ← verifyHwxTasksSummary cWhole2.hwx cWhole2.info (requireKnownTask := true)
+    if sW2.peOp != 1 then throw "whole2 explicit tiling failed"
+    pure ()
+  ))
+
+  results := results.push (checkOk "m3: PE H16 staged-result edge case (k=5, W=56)" (do
+    let d : TensorDims := { c := 4, h := 8, w := 56 }
+    if peIsDirect .h16 56 5 then throw "expected peIsDirect(.h16, 56, 5) == false"
+    if !peIsDirect .h17 56 5 then throw "expected peIsDirect(.h17, 56, 5) == true"
+    let cH16 ← compilePe .h16 .abs d (tilingOverride := some { k := 5, tileHeight := 8 })
+    if cH16.direct then throw "expected H16 k=5 W=56 to use staged result mode"
+    let s ← verifyHwxTasksSummary cH16.hwx cH16.info (requireKnownTask := true)
+    if s.peOp != 1 then throw "H16 staged PE verification failed"
+    -- Auto chooser on H16 should prefer direct mode (e.g. k=6)
+    let cAuto ← compilePe .h16 .abs d
+    if !cAuto.direct then throw "expected H16 auto PE chooser to prefer direct mode"
+    pure ()
+  ))
+
+  -- 3. LUT table generation, invariants, parameter validation, & mathematical accuracy
+  results := results.push (checkOk "m3: all 23 LUT specs generate valid 128B tables (zero reserved, +0 canon, accurate eval)" (do
+    let allSpecs : Array LutSpec := #[
+      .relu6,
+      .clip (-1.5) 2.5,
+      .leakyRelu 0.25,
+      .abs,
+      .sign,
+      .threshold 0.5,
+      .thresholdedRelu 1.0,
+      .hardSigmoid 0.2 0.5,
+      .hardSigmoid 0.5 0.25,
+      .clampMax (-0.5),
+      .clampMin 2.0,
+      .elu 1.0,
+      .elu 0.5,
+      .tanh,
+      .scaledTanh 2.0 0.5,
+      .scaledTanh (-2.0) 0.5,
+      .erf,
+      .sigmoid,
+      .gelu,
+      .silu,
+      .exp2,
+      .exp,
+      .sqrt,
+      .rsqrt 0.0,
+      .rsqrt 0.0625,
+      .inverse,
+      .log2
+    ]
+    for spec in allSpecs do
+      let lp ← buildLutTable spec
+      if lp.words.size != 64 || lp.bytes.size != 128 then
+        throw s!"{spec.name}: expected 64 words / 128 bytes"
+      for wi in [43 : 64] do
+        if lp.words[wi]! != 0 then
+          throw s!"{spec.name}: reserved word {wi} non-zero"
+      for wi in [:41] do
+        if lp.words[wi]! == f16NegZero then
+          throw s!"{spec.name}: table word {wi} contains -0.0 (0x8000)"
+
+    -- Verify mathematical accuracy of evalLutTable against analytical formulas
+    let checkEval (label : String) (spec : LutSpec) (xs : Array Float) (exactFn : Float → Float) (tol : Float) : Except String Unit := do
+      let lp ← buildLutTable spec
+      for x in xs do
+        let xh := floatToF16 x
+        let xf := f16ToFloat xh
+        let gotBits := evalLutTable lp.words lp.preScaleBits lp.inputShiftBits xh
+        let got := f16ToFloat gotBits
+        let want := exactFn xf
+        let err := Float.abs (got - want)
+        if err > tol then
+          throw s!"{label} at x={xf}: got={got}, want={want}, err={err} > tol={tol}"
+
+    let grid : Array Float := #[-6.0, -3.5, -2.0, -1.25, -0.5, -0.125, 0.0, 0.125, 0.5, 1.25, 2.0, 3.5, 7.0]
+    let posGrid : Array Float := #[0.125, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 4.0, 9.0, 16.0]
+    let invSqrt2 := 0.707106781186547524400844362104849039
+
+    checkEval "relu6" .relu6 grid (fun x => max 0.0 (min 6.0 x)) 0.0
+    checkEval "clip" (.clip (-1.5) 2.5) grid (fun x => max (-1.5) (min 2.5 x)) 0.0
+    checkEval "leaky_relu" (.leakyRelu 0.25) grid (fun x => if x < 0.0 then 0.25 * x else x) 1e-3
+    checkEval "abs" .abs grid Float.abs 0.0
+    checkEval "sign" .sign grid (fun x => if x < 0.0 then -1.0 else if x > 0.0 then 1.0 else 0.0) 0.0
+    checkEval "threshold" (.threshold 0.5) grid (fun x => max x 0.5) 0.0
+    checkEval "thresholded_relu" (.thresholdedRelu 1.0) #[-2.0, 0.0, 0.5, 0.9, 1.25, 3.0] (fun x => if x > 1.0 then x else 0.0) 0.0
+    checkEval "hard_sigmoid_std" (.hardSigmoid 0.2 0.5) grid (fun x => max 0.0 (min 1.0 (0.2 * x + 0.5))) 2e-3
+    checkEval "hard_sigmoid_shift" (.hardSigmoid 0.5 0.25) grid (fun x => max 0.0 (min 1.0 (0.5 * x + 0.25))) 2e-3
+    checkEval "clamp_max" (.clampMax (-0.5)) grid (fun x => max x (-0.5)) 0.0
+    checkEval "clamp_min" (.clampMin 2.0) grid (fun x => min x 2.0) 0.0
+    checkEval "elu" (.elu 1.0) grid (fun x => if x >= 0.0 then x else expm1 x) 1e-2
+    checkEval "tanh" .tanh grid Float.tanh 3e-3
+    checkEval "scaled_tanh_pos" (.scaledTanh 2.0 0.5) grid (fun x => 2.0 * Float.tanh (0.5 * x)) 5e-3
+    checkEval "scaled_tanh_neg" (.scaledTanh (-2.0) 0.5) grid (fun x => (-2.0) * Float.tanh (0.5 * x)) 5e-3
+    checkEval "erf" .erf grid erfApprox 4e-3
+    checkEval "sigmoid" .sigmoid grid (fun x => 1.0 / (1.0 + Float.exp (-x))) 5e-3
+    checkEval "gelu" .gelu grid (fun x => 0.5 * x * (1.0 + erfApprox (x * invSqrt2))) 1e-2
+    checkEval "silu" .silu grid (fun x => x / (1.0 + Float.exp (-x))) 2e-2
+    checkEval "exp2" .exp2 #[-4.0, -2.5, -1.0, -0.25, 0.0, 0.5, 1.25, 3.0] exp2Float 2e-2
+    checkEval "exp" .exp #[-4.0, -2.0, -0.5, 0.0, 0.5, 1.5, 2.5] Float.exp 0.1
+    checkEval "sqrt" .sqrt posGrid Float.sqrt 1e-2
+    checkEval "rsqrt0" (.rsqrt 0.0) posGrid (fun x => 1.0 / Float.sqrt x) 1e-2
+    checkEval "rsqrt_eps" (.rsqrt 0.25) #[0.0, 0.25, 1.0, 3.75] (fun x => 1.0 / Float.sqrt (x + 0.25)) 1e-2
+    checkEval "inverse" .inverse #[-4.0, -2.0, -0.5, 0.5, 2.0, 4.0] (fun x => 1.0 / x) 1e-2
+    checkEval "log2" .log2 posGrid log2Float 1e-2
+    pure ()
+  ))
+
+  results := results.push (checkErr "m3 neg: LUT clip rejects lo > hi" (do
+    buildLutTable (.clip 2.0 1.0)
+  ) "lo")
+
+  results := results.push (checkErr "m3 neg: LUT hard_sigmoid rejects alpha <= 0" (do
+    buildLutTable (.hardSigmoid 0.0 0.5)
+  ) "alpha")
+
+  results := results.push (checkErr "m3 neg: LUT rsqrt rejects eps < 0" (do
+    buildLutTable (.rsqrt (-0.1))
+  ) "eps")
+
+  -- 4. Standalone compileNeAct across H16 & H17
+  results := results.push (checkOk "m3: standalone compileNeAct (relu, copy, LUTs, rsqrt+eps, exp, hard_sigmoid) on H16 & H17" (do
+    let acts : Array NeActSpec := #[
+      .relu,
+      .copy,
+      .lut .relu6,
+      .lut .tanh,
+      .lut .sigmoid,
+      .lut .gelu,
+      .lut .silu,
+      .lut .exp,
+      .lut (.rsqrt 0.0625),
+      .lut (.hardSigmoid 0.5 0.25),
+      .lut .sqrt,
+      .lut .inverse,
+      .lut .log2
+    ]
+    for tgt in #[Target.h16, Target.h17] do
+      for act in acts do
+        let c ← compileNeAct tgt act 8 16 24
+        let s ← verifyHwxTasksSummary c.hwx c.info (requireKnownTask := true)
+        if s.neAct != 1 || s.total != 1 then
+          throw s!"expected 1 verified NE act task for {tgt.name}/{act.name}"
+    -- Large C test forcing shPref > 0 (C = 16384 -> T = 64 -> u = 2 MiB)
+    let cBig ← compileNeAct .h17 (.lut .tanh) 16384 4 128
+    let sBig ← verifyHwxTasksSummary cBig.hwx cBig.info (requireKnownTask := true)
+    if sBig.neAct != 1 then throw "large C standalone NE act failed"
+    pure ()
+  ))
+
+  -- 5. Fused conv + LUT activation (1x1 dense, 3x3 dense s1/s2, 3x3 dw s1/s2, Cout=1 & Cout>1, 64KiB boundary)
+  results := results.push (checkOk "m3: fused 1x1 & 3x3 (dense, depthwise, stride-2 sparse) conv + LUT on H16 & H17" (do
+    let lutSpecs : Array LutSpec := #[
+      .tanh, .sigmoid, .gelu, .silu, .exp, .elu 1.0, .relu6,
+      .hardSigmoid 0.5 0.25, .rsqrt 0.0625
+    ]
+    -- 1x1 dense + LUTs (with and without bias)
+    for spec in lutSpecs do
+      let sh1 : Conv1x1Shape := { h := 8, w := 16, cin := 16, cout := 16 }
+      let c1 ← compileConv1x1 .h17 sh1 (mkTaggedWeights 16 16) (some (mkTaggedBias 16)) false none (.lut spec)
+      let s1 ← verifyHwxTasksSummary c1.hwx c1.info (requireKnownTask := true)
+      if s1.neConv != 1 then throw s!"fused 1x1 {spec.name} failed"
+      -- No user bias with shifted LUT (rsqrt/hard_sigmoid) synthesizes kernel bias cleanly
+      let c1NoB ← compileConv1x1 .h16 sh1 (mkTaggedWeights 16 16) none false none (.lut spec)
+      let s1NoB ← verifyHwxTasksSummary c1NoB.hwx c1NoB.info (requireKnownTask := true)
+      if s1NoB.neConv != 1 then throw s!"fused 1x1 h16 no-bias {spec.name} failed"
+
+    -- 3x3 dense stride-1 + LUT
+    let sh3D1 : Conv3x3Shape := { mode := .dense, h := 8, w := 16, cin := 8, cout := 16, stride := 1, pad := .same }
+    let c3D1 ← compileConv3x3 .h17 sh3D1 (mkTaggedWeights3x3 16 8) (some (mkTaggedBias 16)) false none (.lut .gelu)
+    if (← verifyHwxTasksSummary c3D1.hwx c3D1.info).neConv != 1 then throw "fused 3x3 dense s1 failed"
+
+    -- 3x3 depthwise stride-1 + LUT
+    let sh3Dw1 : Conv3x3Shape := { mode := .depthwise, h := 8, w := 16, cin := 16, cout := 16, stride := 1, pad := .same }
+    let c3Dw1 ← compileConv3x3 .h17 sh3Dw1 (mkTaggedWeights3x3 16 1) (some (mkTaggedBias 16)) false none (.lut .silu)
+    if (← verifyHwxTasksSummary c3Dw1.hwx c3Dw1.info).neConv != 1 then throw "fused 3x3 dw s1 failed"
+
+    -- 3x3 stride-2 sparse + LUT (Cout > 1 with kernel bias, Cout == 1 with scalar bias, and shift without bias)
+    for tgt in #[Target.h16, Target.h17] do
+      let sh3S2 : Conv3x3Shape := { mode := .dense, h := 12, w := 14, cin := 8, cout := 16, stride := 2, pad := .same }
+      let c3S2 ← compileConv3x3 tgt sh3S2 (mkTaggedWeights3x3 16 8) (some (mkTaggedBias 16)) false none (.lut .tanh)
+      if (← verifyHwxTasksSummary c3S2.hwx c3S2.info).neConv != 1 then throw "fused 3x3 s2 Cout=16 failed"
+
+      let sh3S2C1 : Conv3x3Shape := { mode := .dense, h := 12, w := 14, cin := 8, cout := 1, stride := 2, pad := .valid }
+      let c3S2C1 ← compileConv3x3 tgt sh3S2C1 (mkTaggedWeights3x3 1 8) none false none (.lut (.rsqrt 0.0625))
+      if (← verifyHwxTasksSummary c3S2C1.hwx c3S2C1.info).neConv != 1 then throw "fused 3x3 s2 Cout=1 rsqrt failed"
+
+      let sh3DwS2 : Conv3x3Shape := { mode := .depthwise, h := 12, w := 14, cin := 16, cout := 16, stride := 2, pad := .same }
+      let c3DwS2 ← compileConv3x3 tgt sh3DwS2 (mkTaggedWeights3x3 16 1) none false none (.lut (.hardSigmoid 0.5 0.25))
+      if (← verifyHwxTasksSummary c3DwS2.hwx c3DwS2.info).neConv != 1 then throw "fused 3x3 dw s2 hard_sigmoid failed"
+    pure ()
+  ))
+
+  results := results.push (checkOk "m3: 64 KiB chunk boundary with +128B fused LUT forces re-tiling cleanly" (do
+    -- 1x1 dense Cin=2048, Cout=16:
+    -- Without LUT: F=0 puts all 16 outs in 1 chunk = 2 * 16 * 2048 = 65536B (fits 64 KiB).
+    -- With LUT: F=0 chunk would be 65536 + 128 = 65664B > 65536B -> must reject F=0 and pick F >= 1!
+    let sh : ConvSpec := { kernelSize := 1, h := 4, w := 8, cin := 2048, cout := 16 }
+    let tF0 : Tiling := { logNE := 0, f := 0, fat := 0, ocg := 4, shPref := 0, shMax := 4, tileHeight := 4 }
+    validateConvSafety .h17 sh tF0 0 false
+    match validateConvSafety .h17 sh tF0 128 false with
+    | .ok () => throw "expected F=0 65536B + 128B LUT to exceed 64 KiB"
+    | .error _ => pure ()
+    let tChosen ← chooseConvTiling .h17 sh 128 false
+    if tChosen.f == 0 then throw "expected chooseConvTiling with +128B LUT to choose F >= 1"
+    let c ← compileConv .h17 sh (zeroBytes (2 * 16 * 2048)) none false none (.lut .tanh)
+    if (← verifyHwxTasksSummary c.hwx c.info).neConv != 1 then throw "re-tiled fused conv verification failed"
+    pure ()
+  ))
+
+  results := results.push (checkErr "m3 neg: 64 KiB chunk cap rejects impossible Cout=1 Cin=32768 + fused LUT" (do
+    let sh : ConvSpec := { kernelSize := 1, h := 2, w := 8, cin := 32768, cout := 1 }
+    chooseConvTiling .h17 sh 128 false
+  ) "no legal")
+
+  results := results.push (checkErr "m3 neg: compileConv rejects relu=true combined with LUT activation" (do
+    let sh : ConvSpec := { kernelSize := 1, h := 4, w := 8, cin := 8, cout := 8 }
+    compileConv .h17 sh (mkTaggedWeights 8 8) none true none (.lut .tanh)
+  ) "cannot pass both")
+
+  -- 6. Tampered-task negative verifier tests for M3 (PE, NE Act, Fused Conv)
+  let basePe1 ← unwrap "basePe1" (compilePe .h17 .abs { c := 8, h := 8, w := 16 })
+  let basePe2 ← unwrap "basePe2" (compilePe .h17 (.binary .add { c := 4, h := 8, w := 16 } { c := 4, h := 1, w := 1 } false) { c := 4, h := 8, w := 16 })
+  let baseNeLut ← unwrap "baseNeLut" (compileNeAct .h17 (.lut .tanh) 8 8 16)
+  let baseFusedS1 ← unwrap "baseFusedS1" (compileConv1x1 .h17 { h := 8, w := 16, cin := 16, cout := 16 } (mkTaggedWeights 16 16) (some (mkTaggedBias 16)) false none (.lut .tanh))
+  let baseFusedS2 ← unwrap "baseFusedS2" (compileConv3x3 .h17 { mode := .dense, h := 12, w := 14, cin := 8, cout := 16, stride := 2, pad := .same } (mkTaggedWeights3x3 16 8) (some (mkTaggedBias 16)) false none (.lut .tanh))
+
+  let tamperGenericAndVerify (hwx : ByteArray) (info : HwxInfo) (regAddr : Nat) (newVal : UInt32) : Except String Unit := do
+    let fOff ← findRegFileOffset hwx info regAddr
+    let badHwx ← putU32LE hwx fOff newVal
+    let badInfo ← validateHwx badHwx
+    let _ ← verifyHwxTasks badHwx badInfo (requireKnownTask := true)
+    pure ()
+
+  -- PE negative tests
+  results := results.push (checkErr "m3 neg verifier (PE): ene != 0 rejected" (do
+    let textBytes ← readSlice basePe1.hwx basePe1.info.textSection.offset.toNat basePe1.info.textSection.size.toNat
+    let tasks ← decodeTaskStream basePe1.info.target textBytes
+    let some t0 := tasks[0]? | throw "no task 0"
+    let h8FileOff := basePe1.info.textSection.offset.toNat + t0.startOffset + 32
+    let badW8 ← encodeWord taskHeader8Layout #[("ene", 1)]
+    let badHwx ← putU32LE basePe1.hwx h8FileOff badW8
+    let badInfo ← validateHwx badHwx
+    let _ ← verifyHwxTasks badHwx badInfo (requireKnownTask := true)
+    pure ()
+  ) "ene=0")
+
+  results := results.push (checkErr "m3 neg verifier (PE): anti-hang src1ChanStride < 2*min(W,T) rejected" (do
+    -- basePe1 has C=8 > 1, W=16, T >= 16 -> min anti-hang is 32; tamper to 16
+    tamperGenericAndVerify basePe1.hwx basePe1.info regSrc1ChanStride 16
+  ) "anti-hang")
+
+  results := results.push (checkErr "m3 neg verifier (PE): wrong peBcast bits rejected" (do
+    tamperGenericAndVerify basePe2.hwx basePe2.info regPeBcast 0
+  ) "peBcast")
+
+  results := results.push (checkErr "m3 neg verifier (PE): peTile m mismatch rejected" (do
+    let curM := peTileM false basePe1.tiling.k basePe1.tiling.tileHeight
+    let badM : UInt32 := if curM == 0 then 1 else 0
+    let wBad ← encodeWord peTileLayout #[("k", basePe1.tiling.k.toUInt32), ("m", badM)]
+    tamperGenericAndVerify basePe1.hwx basePe1.info regPeTile wBad
+  ) "peTile m=")
+
+  results := results.push (checkErr "m3 neg verifier (PE): targetCfg != 0 rejected" (do
+    tamperGenericAndVerify basePe1.hwx basePe1.info regTargetCfg 0x00200000
+  ) "targetCfg")
+
+  results := results.push (checkErr "m3 neg verifier (PE): 2-source writing 0x4504 (peBias) rejected" (do
+    let d1 : TensorDims := { c := 4, h := 8, w := 16 }
+    let d2 : TensorDims := { c := 4, h := 1, w := 1 }
+    let t ← choosePeTiling .h17 d1 d1 (some d2)
+    let td ← lowerPeTask .h17 (.binary .add d1 d2 false) d1 d1 (some d2) 6 (some 7) t
+    let tdBad : TaskDesc := { td with plainWrites := td.plainWrites.push { byteAddr := regPeBias, value := 0x3f800000 } }
+    let sX ← makeFp16Surface .h17 "x" "input_x" .input 4 8 16
+    let sZ ← makeFp16Surface .h17 "z" "input_z" .input 4 1 1
+    let sY ← makeFp16Surface .h17 "y" "output_y" .output 4 8 16
+    let em ← emitProgram { target := .h17, surfaces := #[sX, sZ, sY], tasks := #[tdBad] }
+    let _ ← verifyHwxTasks em.hwx em.info (requireKnownTask := true)
+    pure ()
+  ) "chain constant")
+
+  results := results.push (checkErr "m3 neg verifier (PE): 2-source missing 0x4d28 (src2BaseLo) rejected" (do
+    let d1 : TensorDims := { c := 4, h := 8, w := 16 }
+    let d2 : TensorDims := { c := 4, h := 1, w := 1 }
+    let t ← choosePeTiling .h17 d1 d1 (some d2)
+    let td ← lowerPeTask .h17 (.binary .add d1 d2 false) d1 d1 (some d2) 6 (some 7) t
+    let tdBad : TaskDesc := { td with barWrites := td.barWrites.filter (fun b => b.baseByteAddr != regSrc2BaseLo) }
+    let sX ← makeFp16Surface .h17 "x" "input_x" .input 4 8 16
+    let sZ ← makeFp16Surface .h17 "z" "input_z" .input 4 1 1
+    let sY ← makeFp16Surface .h17 "y" "output_y" .output 4 8 16
+    let em ← emitProgram { target := .h17, surfaces := #[sX, sZ, sY], tasks := #[tdBad] }
+    let _ ← verifyHwxTasks em.hwx em.info (requireKnownTask := true)
+    pure ()
+  ) "src2BaseLo")
+
+  results := results.push (checkErr "m3 neg verifier (PE): L2 overlap between src1 and src2 rejected" (do
+    tamperGenericAndVerify basePe2.hwx basePe2.info regSrc2Base 0
+  ) "overlapping")
+
+  results := results.push (checkErr "m3 neg verifier (PE): L2 overflow > 2 MiB rejected" (do
+    tamperGenericAndVerify basePe1.hwx basePe1.info regSrc1Base 0x200000
+  ) "exceeds limit")
+
+  -- NE Act negative tests
+  results := results.push (checkErr "m3 neg verifier (NE act): relu == 1 && lut == 1 rejected" (do
+    let wBad ← encodeWord neActOpLayout #[("noShift", 1), ("relu", 1), ("lut", 1)]
+    tamperGenericAndVerify baseNeLut.hwx baseNeLut.info regNeOp wBad
+  ) "both relu")
+
+  results := results.push (checkErr "m3 neg verifier (NE act): lut == 1 with lutSize != 128 rejected" (do
+    tamperGenericAndVerify baseNeLut.hwx baseNeLut.info regLutSize 64
+  ) "lutSize")
+
+  results := results.push (checkErr "m3 neg verifier (NE act): non-zero reserved LUT word rejected" (do
+    let some kSec := baseNeLut.info.kernelSection | throw "missing __KERN_0"
+    let badHwx ← putU16LE baseNeLut.hwx (kSec.offset.toNat + 2 * 50) 0x0001
+    let badInfo ← validateHwx badHwx
+    let _ ← verifyHwxTasks badHwx badInfo (requireKnownTask := true)
+    pure ()
+  ) "reserved word")
+
+  results := results.push (checkErr "m3 neg verifier (NE act): dwGroups != 0x14000 rejected" (do
+    let wBad ← encodeWord dwGroupsLayout #[("perGroupIn", 2)]
+    tamperGenericAndVerify baseNeLut.hwx baseNeLut.info regDwGroups wBad
+  ) "dwGroups")
+
+  results := results.push (checkErr "m3 neg verifier (NE act): missing LUT relocation rejected" (do
+    let lp ← buildLutTable .tanh
+    let t ← chooseNeActTiling .h17 8 8 16
+    let td ← lowerNeActTask .h17 (.lut .tanh) (some lp) 8 8 16 t
+    let tdNoReloc : TaskDesc := { td with kernelRelocs := #[] }
+    let sX ← makeFp16Surface .h17 "x" "input_x" .input 8 8 16
+    let sY ← makeFp16Surface .h17 "y" "output_y" .output 8 8 16
+    let em ← emitProgram { target := .h17, surfaces := #[sX, sY], tasks := #[tdNoReloc], kernel := some lp.bytes }
+    let _ ← verifyHwxTasks em.hwx em.info (requireKnownTask := true)
+    pure ()
+  ) "relocation")
+
+  results := results.push (checkErr "m3 neg verifier (NE act): L2 overflow > 2 MiB rejected" (do
+    tamperGenericAndVerify baseNeLut.hwx baseNeLut.info regSrc1Base 0x200000
+  ) "exceeds limit")
+
+  -- Fused Conv + LUT negative tests
+  results := results.push (checkErr "m3 neg verifier (fused conv): relu == 1 && lut == 1 rejected" (do
+    let wBad ← encodeWord neOpLayout #[("biasInKernel", 1), ("relu", 1), ("lut", 1)]
+    tamperGenericAndVerify baseFusedS1.hwx baseFusedS1.info regNeOp wBad
+  ) "both relu")
+
+  results := results.push (checkErr "m3 neg verifier (fused conv): chunkSize < 128 with lut == 1 rejected" (do
+    tamperGenericAndVerify baseFusedS1.hwx baseFusedS1.info (regChunkSize 0) 64
+  ) "128B required")
+
+  results := results.push (checkErr "m3 neg verifier (fused conv): non-zero reserved LUT word in fused chunk rejected" (do
+    let some kSec := baseFusedS1.info.kernelSection | throw "missing __KERN_0"
+    let badHwx ← putU16LE baseFusedS1.hwx (kSec.offset.toNat + 2 * 60) 0x1234
+    let badInfo ← validateHwx badHwx
+    let _ ← verifyHwxTasks badHwx badInfo (requireKnownTask := true)
+    pure ()
+  ) "reserved word")
+
+  results := results.push (checkErr "m3 neg verifier (fused sparse conv): corrupted sparse stream after 128B LUT rejected" (do
+    let some kSec := baseFusedS2.info.kernelSection | throw "missing __KERN_0"
+    -- Chunk 0 starts with 128B LUT, then 2B bias, then u24 sparse length header at +130
+    let u24Off := kSec.offset.toNat + 128 + 2
+    let h1 ← putU8 baseFusedS2.hwx u24Off 0x00
+    let h2 ← putU8 h1 (u24Off + 1) 0x80
+    let h3 ← putU8 h2 (u24Off + 2) 0x00
+    let badInfo ← validateHwx h3
+    let _ ← verifyHwxTasks h3 badInfo (requireKnownTask := true)
+    pure ()
+  ) "exceeds chunk end")
 
   pure results
 

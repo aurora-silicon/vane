@@ -1,4 +1,5 @@
 import Vane.Binary
+import Vane.Float16
 import Vane.TaskStream
 import Vane.Hwx
 import Vane.Sections
@@ -6,10 +7,12 @@ import Vane.Register
 import Vane.Tiling
 import Vane.Program
 import Vane.Verify
+import Vane.Lut
 
 namespace Vane.Conv
 
 open Vane.Binary
+open Vane.Float16
 open Vane.TaskStream
 open Vane.Hwx
 open Vane.Sections
@@ -17,6 +20,31 @@ open Vane.Register
 open Vane.Tiling
 open Vane.Program
 open Vane.Verify
+open Vane.Lut
+
+/-- Fused post-convolution activation (`none`, hardware `relu`, or any 128-byte NE LUT). -/
+inductive ConvActivation where
+  | none
+  | relu
+  | lut (spec : LutSpec)
+  deriving Repr, BEq, Inhabited
+
+namespace ConvActivation
+
+def name : ConvActivation → String
+  | .none => "none"
+  | .relu => "relu"
+  | .lut spec => spec.name
+
+def isRelu : ConvActivation → Bool
+  | .relu => true
+  | _ => false
+
+def isLut : ConvActivation → Bool
+  | .lut _ => true
+  | _ => false
+
+end ConvActivation
 
 /-- Packed chunk slot metadata in `__KERN_0`. -/
 structure KernelChunkSlot where
@@ -25,12 +53,13 @@ structure KernelChunkSlot where
   size : Nat
   deriving Repr, BEq, Inhabited
 
-/-- Result of packing fp16 weights and optional bias into `__KERN_0`. -/
+/-- Result of packing fp16 weights, optional bias, and optional fused 128-byte LUT into `__KERN_0`. -/
 structure PackedKernel where
   bytes : ByteArray
   slots : Array KernelChunkSlot
   biasInKernel : Bool
   scalarBiasBits : UInt16
+  lutPayload : Option LutPayload := none
   deriving BEq
 
 /-- Complete compilation artifact for a single-task fp16 NE convolution (`1x1` or `3x3`). -/
@@ -42,6 +71,8 @@ structure CompiledConv where
   wide3x3 : Bool
   hasBias : Bool
   relu : Bool
+  activation : ConvActivation := .none
+  lutBytes : Option ByteArray := none
   direct : Bool
   l2UseBytes : Nat
   kernelBytes : Nat
@@ -158,38 +189,73 @@ def computeWide3x3Conv (target : Target) (sh : ConvSpec) (t : Tiling) : Bool :=
     let rep := ((1 : Nat) <<< t.logNE) >>> t.f
     maxBlockSlotsConv sh t <= 32768 * rep
 
-/-- Unified fp16 kernel weight & optional bias packer for 1x1 dense, 3x3 dense stride-1,
-    3x3 depthwise stride-1, and 3x3 stride-2 zero-skipping sparse convolutions.
+/-- Apply an optional LUT input shift (`rsqrt(eps)` / `hard_sigmoid(alpha, beta != 0.5)`)
+    to convolution bias bytes, returning `(effectiveBias?, biasInKernel, scalarBiasBits)`. -/
+private def resolveConvBias
+    (sh : ConvSpec)
+    (bias : Option ByteArray)
+    (lutPayload? : Option LutPayload) : Except String (Option ByteArray × Bool × UInt16) := do
+  if let some b := bias then
+    let expectedBiasBytes := 2 * sh.cout
+    if b.size != expectedBiasBytes then
+      throw s!"bias byte size {b.size} != expected {expectedBiasBytes} (2 * Cout={sh.cout})"
+
+  let scalarBiasMode := sh.effMode == .dense && sh.cout == 1
+  let shiftBits? := lutPayload?.bind (fun lp => lp.inputShiftBits)
+
+  let effBias? ← match shiftBits? with
+    | none => pure bias
+    | some shiftBits =>
+      let shiftF := f16ToFloat shiftBits
+      match bias with
+      | some b =>
+        let mut shifted := ByteArray.emptyWithCapacity b.size
+        for o in [:sh.cout] do
+          let orig ← readU16LE b (2 * o)
+          let updated := floatToF16CanonicalZero (f16ToFloat orig + shiftF)
+          shifted := pushU16LE shifted updated
+        pure (some shifted)
+      | none =>
+        -- Synthesize constant shift across all channels (scalarBias if dense Cout=1, kernel bias otherwise)
+        let mut synth := ByteArray.emptyWithCapacity (2 * sh.cout)
+        for _ in [:sh.cout] do
+          synth := pushU16LE synth shiftBits
+        pure (some synth)
+
+  let hasEffBias := effBias?.isSome
+  let biasInKernel := hasEffBias && !scalarBiasMode
+  let scalarBiasBits ←
+    if scalarBiasMode then
+      match effBias? with
+      | some b => readU16LE b 0
+      | none => pure (0 : UInt16)
+    else
+      pure (0 : UInt16)
+  pure (effBias?, biasInKernel, scalarBiasBits)
+
+/-- Unified fp16 kernel weight, optional bias, and optional fused 128-byte LUT packer
+    for 1x1 dense, 3x3 dense stride-1, 3x3 depthwise stride-1, and 3x3 stride-2 sparse convolutions.
     Enforces the hardware 64 KiB per-chunk size cap on every active chunk. -/
 def packConvKernelChunks
     (target : Target)
     (sh : ConvSpec)
     (tiling : Tiling)
     (weights : ByteArray)
-    (bias : Option ByteArray) : Except String PackedKernel := do
-  validateConvSafety target sh tiling
+    (bias : Option ByteArray)
+    (lutPayload? : Option LutPayload := none) : Except String PackedKernel := do
+  if let some lp := lutPayload? then
+    if lp.bytes.size != lutTableBytes then
+      throw s!"fused LUT table byte size {lp.bytes.size} != expected {lutTableBytes}"
+
+  let (effBias?, biasInKernel, scalarBiasBits) ← resolveConvBias sh bias lutPayload?
+  let extraLutBytes := if lutPayload?.isSome then lutTableBytes else 0
+  validateConvSafety target sh tiling extraLutBytes biasInKernel
 
   let cinW := sh.cinW
   let taps := sh.taps
   let expectedWeightBytes := 2 * sh.cout * cinW * taps
   if weights.size != expectedWeightBytes then
     throw s!"weights byte size {weights.size} != expected {expectedWeightBytes} (2 * Cout={sh.cout} * cinW={cinW} * taps={taps})"
-
-  if let some b := bias then
-    let expectedBiasBytes := 2 * sh.cout
-    if b.size != expectedBiasBytes then
-      throw s!"bias byte size {b.size} != expected {expectedBiasBytes} (2 * Cout={sh.cout})"
-
-  let hasBias := bias.isSome
-  let scalarBiasMode := sh.effMode == .dense && sh.cout == 1
-  let biasInKernel := hasBias && !scalarBiasMode
-  let scalarBiasBits ←
-    if scalarBiasMode then
-      match bias with
-      | some b => readU16LE b 0
-      | none => pure (0 : UInt16)
-    else
-      pure (0 : UInt16)
 
   let groups := (1 : Nat) <<< tiling.f
   let rep := ((1 : Nat) <<< tiling.logNE) >>> tiling.f
@@ -203,12 +269,15 @@ def packConvKernelChunks
   for g in [:groups] do
     let blocks := groupOutputBlocksConv sh tiling g
     if !blocks.isEmpty then
-      let mut chunk := ByteArray.empty
+      -- Prepend the exact 128-byte LUT table in front of every active kernel chunk when fused
+      let mut chunk := match lutPayload? with
+        | some lp => lp.bytes
+        | none => ByteArray.empty
       if !sparse then
         -- Dense uncompressed kernel encoding (1x1 or 3x3 stride-1)
         for (o0, n) in blocks do
           if biasInKernel then
-            match bias with
+            match effBias? with
             | some b =>
               for k in [:n] do
                 let bOff := 2 * (o0 + k)
@@ -227,7 +296,7 @@ def packConvKernelChunks
         -- Stride-2 zero-skipping sparse kernel encoding (3x3)
         for (o0, n) in blocks do
           if biasInKernel then
-            match bias with
+            match effBias? with
             | some b =>
               for k in [:n] do
                 let bOff := 2 * (o0 + k)
@@ -288,6 +357,7 @@ def packConvKernelChunks
     slots := slots
     biasInKernel := biasInKernel
     scalarBiasBits := scalarBiasBits
+    lutPayload := lutPayload?
   }
 
 /-- Lower a single-task fp16 NE convolution (`1x1` or `3x3`) into a generic `TaskDesc`
@@ -372,12 +442,20 @@ def lowerConvTask
     ("direct", if direct then 1 else 0),
     ("P", 1)
   ]
+  let hasLut := packed.lutPayload.isSome
+  if hasLut && relu then
+    throw "lowerConvTask: cannot enable both relu and fused LUT activation"
+  let neScaleVal : UInt32 := match packed.lutPayload with
+    | some lp => lp.preScaleBits.toUInt32
+    | none => fp16OneBits
+
   let wNeCfg ← encodeWord (neCfgLayout target) #[("sparse", if sparse then 1 else 0)]
   let wNeOp ← encodeWord neOpLayout #[
     ("biasInKernel", if packed.biasInKernel then 1 else 0),
-    ("relu", if relu then 1 else 0)
+    ("relu", if relu && !hasLut then 1 else 0),
+    ("lut", if hasLut then 1 else 0)
   ]
-  let wNeScale ← encodeWord neScaleLayout #[("val", fp16OneBits)]
+  let wNeScale ← encodeWord neScaleLayout #[("val", neScaleVal)]
   let wSrc1Fmt ← encodeWord (dmaFmtLayout "src1Fmt") #[("format", 0x002031), ("P", 1)]
   let wResFmt ← encodeWord (dmaFmtLayout "resFmt") #[("format", 0x302031), ("P", 1)]
   let wKernStage ← encodeWord kernelStageLayout #[
@@ -489,23 +567,41 @@ def lowerConvTask
     kernelRelocs := #[{ barRecIndex := 0, payloadWordIndex := 0 }]
   }
 
-/-- Unified compiler for single-task fp16 NE convolutions (`1x1` and `3x3`, dense and depthwise).
+/-- Unified compiler for single-task fp16 NE convolutions (`1x1` and `3x3`, dense and depthwise),
+    with optional fused ReLU or 128-byte NE LUT activation.
     Lowers registers via `lowerConvTask`, assembles the HWX and 4 LOAD sections via `emitProgram`,
-    and runs the standalone decoded static safety verifier `Vane.Verify.verifyConvHwxTasks`. -/
+    and runs the standalone decoded static safety verifier `Vane.Verify.verifyHwxTasks`. -/
 def compileConv
     (target : Target)
     (shape : ConvSpec)
     (weights : ByteArray)
     (bias : Option ByteArray := none)
     (relu : Bool := false)
-    (tilingOverride : Option Tiling := none) : Except String CompiledConv := do
+    (tilingOverride : Option Tiling := none)
+    (act : ConvActivation := .none) : Except String CompiledConv := do
   validateConvShape shape
-  let tiling ← match tilingOverride with
-    | some t => validateConvTiling target shape t; pure t
-    | none => chooseConvTiling target shape
 
-  let packed ← packConvKernelChunks target shape tiling weights bias
-  let taskDesc ← lowerConvTask target shape tiling packed relu
+  let effectiveAct ← match act with
+    | .none => pure (if relu then ConvActivation.relu else ConvActivation.none)
+    | .relu => pure ConvActivation.relu
+    | .lut spec =>
+      if relu then
+        throw s!"compileConv: cannot pass both relu=true and fused LUT activation '{spec.name}'"
+      pure (ConvActivation.lut spec)
+
+  let lutPayload? ← match effectiveAct with
+    | .lut spec => some <$> buildLutTable spec
+    | _ => pure none
+
+  let (_, willHaveBiasInKernel, _) ← resolveConvBias shape bias lutPayload?
+  let extraLutBytes := if lutPayload?.isSome then lutTableBytes else 0
+
+  let tiling ← match tilingOverride with
+    | some t => validateConvTiling target shape t extraLutBytes willHaveBiasInKernel; pure t
+    | none => chooseConvTiling target shape extraLutBytes willHaveBiasInKernel
+
+  let packed ← packConvKernelChunks target shape tiling weights bias lutPayload?
+  let taskDesc ← lowerConvTask target shape tiling packed effectiveAct.isRelu
 
   let inSurf ← makeFp16Surface target "x" "input_x" .input shape.cin shape.h shape.w
   let outSurf ← makeFp16Surface target "y" "output_y" .output shape.cout shape.outH shape.outW
@@ -520,7 +616,7 @@ def compileConv
     ident := some "vane"
   }
 
-  let _ ← verifyConvHwxTasks emitted.hwx emitted.info (requireConvTask := true)
+  let _ ← verifyHwxTasks emitted.hwx emitted.info (requireKnownTask := true)
 
   pure {
     target := target
@@ -529,7 +625,9 @@ def compileConv
     sparse := shape.isSparse
     wide3x3 := computeWide3x3Conv target shape tiling
     hasBias := bias.isSome
-    relu := relu
+    relu := effectiveAct.isRelu
+    activation := effectiveAct
+    lutBytes := lutPayload?.map (fun lp => lp.bytes)
     direct := isDirectConv target shape tiling
     l2UseBytes := l2UseBytesConv target shape tiling
     kernelBytes := packed.bytes.size

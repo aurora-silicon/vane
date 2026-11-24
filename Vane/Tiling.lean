@@ -428,17 +428,23 @@ def validateConvShape (sh : ConvSpec) : Except String Unit := do
       throw s!"invalid 3x3 output shape ({sh.outH}x{sh.outW}): Ho and Wo must be >= 1"
   pure ()
 
-/-- Check stride-1 dense per-group kernel chunk size cap (`<= 64 KiB`). -/
-def checkConvDenseChunks64K (sh : ConvSpec) (t : Tiling) : Except String Unit := do
+/-- Check stride-1 dense per-group kernel chunk size cap (`<= 64 KiB`), accounting for
+    optional prepended LUT overhead (`extraChunkBytes`) and kernel bias words. -/
+def checkConvDenseChunks64K
+    (sh : ConvSpec)
+    (t : Tiling)
+    (extraChunkBytes : Nat := 0)
+    (hasBiasInKernel : Bool := false) : Except String Unit := do
   if sh.stride == 1 then
     let cinW := sh.cinW
     let taps := sh.taps
+    let wordsPerOut := cinW * taps + (if hasBiasInKernel then 1 else 0)
     let groups := (1 : Nat) <<< t.f
     for g in [:groups] do
       let blocks := groupOutputBlocksConv sh t g
       let groupOuts := blocks.foldl (fun acc (_, n) => acc + n) 0
       if groupOuts > 0 then
-        let chunkBytes := alignUp (2 * groupOuts * cinW * taps) 64
+        let chunkBytes := alignUp (extraChunkBytes + 2 * groupOuts * wordsPerOut) 64
         if chunkBytes > maxKernelChunkBytes then
           throw s!"illegal tiling: group {g} weight chunk {chunkBytes}B exceeds {maxKernelChunkBytes}B (64 KiB)"
   pure ()
@@ -493,7 +499,9 @@ def validateConvCoverageSafety (target : Target) (sh : ConvSpec) (t : Tiling) : 
     Enforces only hardware-required invariants (register field limits, WU <= 3, ocg bounds,
     channel coverage, strip width, shPref <= shMax, tileHeight >= 1, L2 <= 2 MiB, and
     stride-1 per-group chunk size <= 64 KiB), omitting chooser-only policy rules. -/
-def validateConvSafety (target : Target) (sh : ConvSpec) (t : Tiling) : Except String Unit :=
+def validateConvSafety
+    (target : Target) (sh : ConvSpec) (t : Tiling)
+    (extraChunkBytes : Nat := 0) (hasBiasInKernel : Bool := false) : Except String Unit :=
   validateConvShape sh >>= fun () =>
   if t.logNE > 4 then
     .error s!"illegal tiling: logNE={t.logNE} exceeds 4"
@@ -518,7 +526,7 @@ def validateConvSafety (target : Target) (sh : ConvSpec) (t : Tiling) : Except S
     else if l2UseBytesConv target sh t > l2CapacityBytes then
       .error s!"illegal tiling: L2 footprint {l2UseBytesConv target sh t} bytes exceeds {l2CapacityBytes} bytes (2 MiB)"
     else
-      checkConvDenseChunks64K sh t
+      checkConvDenseChunks64K sh t extraChunkBytes hasBiasInKernel
 
 /-- Conservative chooser policy constraints layered on top of `validateConvSafety`. -/
 def validateConvChooserPolicy (sh : ConvSpec) (t : Tiling) : Except String Unit := do
@@ -547,8 +555,10 @@ def validateConvChooserPolicy (sh : ConvSpec) (t : Tiling) : Except String Unit 
 
 /-- Full tiling legality check combining silicon safety (`validateConvSafety`) and
     conservative chooser policy (`validateConvChooserPolicy`). -/
-def validateConvTiling (target : Target) (sh : ConvSpec) (t : Tiling) : Except String Unit := do
-  validateConvSafety target sh t
+def validateConvTiling
+    (target : Target) (sh : ConvSpec) (t : Tiling)
+    (extraChunkBytes : Nat := 0) (hasBiasInKernel : Bool := false) : Except String Unit := do
+  validateConvSafety target sh t extraChunkBytes hasBiasInKernel
   validateConvChooserPolicy sh t
 
 -- ============================================================================
@@ -646,8 +656,11 @@ def maxTileHeightConv (target : Target) (sh : ConvSpec) (probe : Tiling) : Nat :
   return 0
 
 /-- Deterministic independent tile chooser for single-task fp16 NE convolutions (1x1 and 3x3).
-    Computes maximal legal `tileHeight` in O(1) per candidate and validates through `validateConvTiling`. -/
-def chooseConvTiling (target : Target) (sh : ConvSpec) : Except String Tiling := do
+    Computes maximal legal `tileHeight` in O(1) per candidate and validates through `validateConvTiling`.
+    Pass `extraChunkBytes := 128` when fusing a 128-byte LUT into every kernel chunk. -/
+def chooseConvTiling
+    (target : Target) (sh : ConvSpec)
+    (extraChunkBytes : Nat := 0) (hasBiasInKernel : Bool := false) : Except String Tiling := do
   validateConvShape sh
 
   let eff := sh.effMode
@@ -692,7 +705,7 @@ def chooseConvTiling (target : Target) (sh : ConvSpec) : Except String Tiling :=
                     let maxTh := maxTileHeightConv target sh probe
                     if maxTh >= 1 then
                       let cand : Tiling := { probe with tileHeight := maxTh }
-                      match validateConvTiling target sh cand with
+                      match validateConvTiling target sh cand extraChunkBytes hasBiasInKernel with
                       | .ok () => return cand
                       | .error _ => pure ()
 

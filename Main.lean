@@ -1,10 +1,15 @@
 import Vane
 
 open Vane.Binary
+open Vane.Float16
 open Vane.TaskStream
 open Vane.Hwx
 open Vane.Sections
 open Vane.Tiling
+open Vane.Verify
+open Vane.Pe
+open Vane.Lut
+open Vane.Conv
 open Vane.Conv1x1
 open Vane.Conv3x3
 
@@ -14,11 +19,19 @@ private def usage : String :=
   "  vane sections --hwx <path> --out-dir <dir>\n" ++
   "  vane emit-demo --target <h16|h17> --out-dir <dir> [--with-kernel] [--with-scratch]\n" ++
   "  vane compile-conv1x1 --target <h16|h17> --h <H> --w <W> --cin <Cin> --cout <Cout>\n" ++
-  "                       --weights <path> [--bias <path>] [--relu] --out-dir <dir>\n" ++
+  "                       --weights <path> [--bias <path>] [--relu | --act <name> [act params]] --out-dir <dir>\n" ++
   "  vane compile-conv3x3 --target <h16|h17> --mode <dense|depthwise>\n" ++
   "                       --h <H> --w <W> --cin <Cin> --cout <Cout>\n" ++
   "                       --stride <1|2> --pad <same|valid>\n" ++
-  "                       --weights <path> [--bias <path>] [--relu] --out-dir <dir>\n"
+  "                       --weights <path> [--bias <path>] [--relu | --act <name> [act params]] --out-dir <dir>\n" ++
+  "  vane compile-pe --target <h16|h17> --op <abs|square|linear|chain|sadd|ssub|srsub|smul|sdiv|add|sub|rsub|mul|max|min>\n" ++
+  "                  --h <H> --w <W> --c <C> [--z-h <ZH> --z-w <ZW> --z-c <ZC>]\n" ++
+  "                  [--alpha F] [--beta F] [--in-scale F] [--bias F] [--scale F] [--scalar F]\n" ++
+  "                  --out-dir <dir>\n" ++
+  "  vane compile-lut --target <h16|h17> --act <relu|copy|relu6|clip|leaky_relu|abs|sign|threshold|thresholded_relu|hard_sigmoid|clamp_max|clamp_min|elu|tanh|scaled_tanh|erf|sigmoid|gelu|silu|exp2|exp|sqrt|rsqrt|inverse|log2>\n" ++
+  "                   --h <H> --w <W> --c <C>\n" ++
+  "                   [--alpha F] [--beta F] [--lo F] [--hi F] [--eps F] [--scalar F]\n" ++
+  "                   --out-dir <dir>\n"
 
 private def requireArgValue (flag : String) (rest : List String) : Except String (String × List String) :=
   match rest with
@@ -30,6 +43,82 @@ private def parsePosNat (flag s : String) : Except String Nat :=
   | some n =>
     if n == 0 then throw s!"{flag} must be >= 1, got 0" else pure n
   | none => throw s!"invalid positive integer '{s}' for {flag}"
+
+private def parseFloatArg (flag s : String) : Except String Float :=
+  match parseFloat? s with
+  | some f => pure f
+  | none => throw s!"invalid floating-point value '{s}' for {flag}"
+
+private def parseF16Arg (flag s : String) : Except String UInt16 := do
+  let f ← parseFloatArg flag s
+  pure (floatToF16CanonicalZero f)
+
+private structure ActParamFlags where
+  alpha : Option Float := none
+  beta : Option Float := none
+  lo : Option Float := none
+  hi : Option Float := none
+  eps : Option Float := none
+  scalar : Option Float := none
+
+private def parseLutSpec (actName : String) (p : ActParamFlags) : Except String LutSpec :=
+  match actName.toLower with
+  | "relu6" => pure .relu6
+  | "clip" =>
+    match p.lo, p.hi with
+    | some lo, some hi => pure (.clip lo hi)
+    | _, _ => throw "clip activation requires both --lo/--act-lo and --hi/--act-hi"
+  | "leaky_relu" => pure (.leakyRelu (p.alpha.getD 0.01))
+  | "abs" => pure .abs
+  | "sign" => pure .sign
+  | "threshold" =>
+    let a := p.scalar.orElse (fun () => p.alpha) |>.orElse (fun () => p.lo) |>.getD 0.0
+    pure (.threshold a)
+  | "thresholded_relu" =>
+    let a := p.alpha.orElse (fun () => p.scalar) |>.orElse (fun () => p.lo) |>.getD 1.0
+    pure (.thresholdedRelu a)
+  | "hard_sigmoid" => pure (.hardSigmoid (p.alpha.getD 0.2) (p.beta.getD 0.5))
+  | "clamp_max" =>
+    let v := p.scalar.orElse (fun () => p.lo) |>.orElse (fun () => p.alpha) |>.getD 0.0
+    pure (.clampMax v)
+  | "clamp_min" =>
+    let v := p.scalar.orElse (fun () => p.hi) |>.orElse (fun () => p.alpha) |>.getD 0.0
+    pure (.clampMin v)
+  | "elu" => pure (.elu (p.alpha.getD 1.0))
+  | "tanh" => pure .tanh
+  | "scaled_tanh" => pure (.scaledTanh (p.alpha.getD 1.0) (p.beta.getD 1.0))
+  | "erf" => pure .erf
+  | "sigmoid" => pure .sigmoid
+  | "gelu" => pure .gelu
+  | "silu" => pure .silu
+  | "exp2" => pure .exp2
+  | "exp" => pure .exp
+  | "sqrt" => pure .sqrt
+  | "rsqrt" => pure (.rsqrt (p.eps.getD 0.0))
+  | "inverse" => pure .inverse
+  | "log2" => pure .log2
+  | other => throw s!"unknown LUT activation '{other}'"
+
+private def parseNeActSpec (actName : String) (p : ActParamFlags) : Except String NeActSpec :=
+  match actName.toLower with
+  | "relu" => pure .relu
+  | "copy" => pure .copy
+  | other => NeActSpec.lut <$> parseLutSpec other p
+
+private def parseConvAct (reluFlag : Bool) (actName? : Option String) (p : ActParamFlags) : Except String ConvActivation :=
+  match actName? with
+  | none => pure (if reluFlag then .relu else .none)
+  | some raw =>
+    let low := raw.toLower
+    if low == "none" then
+      if reluFlag then throw "cannot combine --relu with --act none"
+      else pure .none
+    else if low == "relu" then
+      pure .relu
+    else if reluFlag then
+      throw s!"cannot combine --relu with --act {raw}"
+    else
+      ConvActivation.lut <$> parseLutSpec low p
 
 private def formatBarSlots (slots : Array UInt8) : String :=
   let parts := slots.toList.map fun s => toString s.toNat
@@ -47,17 +136,12 @@ private def escapeJsonString (s : String) : String :=
   ) ""
 
 private def buildDemoProgram (target : Target) (withKernel withScratch : Bool) : Except String HwxProgram := do
-  -- Two surfaces: input x0 (slot 6), output y0 (slot 7).
-  -- If withKernel, __KERN_0 lands at slot 8. If withScratch, __DATA lands at slot 3.
   let sIn := SurfaceSpec.packed "in0" "input_0" .input 1 16 8 8
   let sOut := SurfaceSpec.packed "out0" "output_0" .output 1 16 8 8
 
   let mut recs : Array RegRecord := #[
-    -- Sequential record referencing input surface BAR slot 6 (block 0: word 0x0000..0x0003)
     .sequential 0x0000 (some 6) #[0x00000001, 0x00000002],
-    -- Sequential record referencing output surface BAR slot 7 (block 1: word 0x1040..0x1041)
     .sequential 0x1040 (some 7) #[0x00000010, 0x00000020],
-    -- Bitmask record (block 3: word 0x1140 + mask 0b101 => 0x1140, 0x1141, 0x1143)
     .bitmask 0x1140 0x0005 #[0x00000100, 0x00000200, 0x00000300]
   ]
 
@@ -69,13 +153,11 @@ private def buildDemoProgram (target : Target) (withKernel withScratch : Bool) :
     kb ← putU32LE kb 64 0x9abcdef0
     kernelPayload := some kb
     kernelRecIdx := some recs.size
-    -- Sequential record referencing kernel BAR slot 8 (block 5: word 0x1340), payload word 0 = addend 0x40
     recs := recs.push (.sequential 0x1340 (some 8) #[0x00000040, 0x00000000])
 
   let mut scratchSpec : Option ScratchSpec := none
   if withScratch then
     scratchSpec := some { size := 0x4000, usable := 0x2000 }
-    -- Sequential record referencing scratch BAR slot 3 (block 4: word 0x1240)
     recs := recs.push (.sequential 0x1240 (some 3) #[0x00000000])
 
   let task := Task.mk9 recs
@@ -138,6 +220,7 @@ private def renderConv1x1ManifestJson (compiled : CompiledConv1x1) : String :=
   let secs := compiled.sections
   let sh := compiled.shape
   let t := compiled.tiling
+  let lutLine := if compiled.lutBytes.isSome then "  \"lut_file\": \"lut.bin\",\n" else ""
   "{\n" ++
   "  \"op\": \"conv1x1\",\n" ++
   s!"  \"target\": \"{compiled.target.name}\",\n" ++
@@ -156,6 +239,8 @@ private def renderConv1x1ManifestJson (compiled : CompiledConv1x1) : String :=
   "  },\n" ++
   s!"  \"has_bias\": {if compiled.hasBias then "true" else "false"},\n" ++
   s!"  \"relu\": {if compiled.relu then "true" else "false"},\n" ++
+  s!"  \"activation\": \"{escapeJsonString compiled.activation.name}\",\n" ++
+  lutLine ++
   "  \"tiling\": {\n" ++
   s!"    \"log_ne\": {t.logNE},\n" ++
   s!"    \"f\": {t.f},\n" ++
@@ -186,6 +271,7 @@ private def renderConv3x3ManifestJson (compiled : CompiledConv3x3) : String :=
   let secs := compiled.sections
   let sh := compiled.shape
   let t := compiled.tiling
+  let lutLine := if compiled.lutBytes.isSome then "  \"lut_file\": \"lut.bin\",\n" else ""
   "{\n" ++
   "  \"op\": \"conv3x3\",\n" ++
   s!"  \"mode\": \"{sh.mode.name}\",\n" ++
@@ -216,6 +302,8 @@ private def renderConv3x3ManifestJson (compiled : CompiledConv3x3) : String :=
   s!"  \"wide3x3\": {if compiled.wide3x3 then "true" else "false"},\n" ++
   s!"  \"has_bias\": {if compiled.hasBias then "true" else "false"},\n" ++
   s!"  \"relu\": {if compiled.relu then "true" else "false"},\n" ++
+  s!"  \"activation\": \"{escapeJsonString compiled.activation.name}\",\n" ++
+  lutLine ++
   "  \"tiling\": {\n" ++
   s!"    \"log_ne\": {t.logNE},\n" ++
   s!"    \"f\": {t.f},\n" ++
@@ -231,6 +319,86 @@ private def renderConv3x3ManifestJson (compiled : CompiledConv3x3) : String :=
   s!"  \"direct\": {if compiled.direct then "true" else "false"},\n" ++
   s!"  \"l2_use_bytes\": {compiled.l2UseBytes},\n" ++
   s!"  \"kernel_bytes\": {compiled.kernelBytes},\n" ++
+  s!"  \"task_count\": {info.taskStream.taskCount},\n" ++
+  s!"  \"record_count\": {info.records},\n" ++
+  s!"  \"relocation_count\": {info.relocCount},\n" ++
+  s!"  \"has_kernel\": {if info.kernelSection.isSome then "true" else "false"},\n" ++
+  s!"  \"has_scratch\": {if info.scratchSection.isSome then "true" else "false"},\n" ++
+  "  \"surfaces\": [\n" ++
+  renderSurfacesJson info.surfaces ++ "\n" ++
+  "  ]\n" ++
+  "}\n"
+
+private def renderPeManifestJson (compiled : CompiledPe) (peOpLabel : String) : String :=
+  let info := compiled.info
+  let secs := compiled.sections
+  let t := compiled.tiling
+  let m := peTileM compiled.op.isTwoSource t.k t.tileHeight
+  "{\n" ++
+  "  \"op\": \"pe\",\n" ++
+  s!"  \"pe_op\": \"{escapeJsonString peOpLabel}\",\n" ++
+  s!"  \"target\": \"{compiled.target.name}\",\n" ++
+  "  \"hwx\": \"program.hwx\",\n" ++
+  "  \"sections\": {\n" ++
+  "    \"generic\": {\"file\": \"generic.bin\", \"size\": " ++ toString secs.generic.size ++ "},\n" ++
+  "    \"operation\": {\"file\": \"operation.bin\", \"size\": " ++ toString secs.operation.size ++ "},\n" ++
+  "    \"procedure\": {\"file\": \"procedure.bin\", \"size\": " ++ toString secs.procedure.size ++ "},\n" ++
+  "    \"text_properties\": {\"file\": \"text-properties.bin\", \"size\": " ++ toString secs.textProperties.size ++ "}\n" ++
+  "  },\n" ++
+  "  \"tiling\": {\n" ++
+  s!"    \"k\": {t.k},\n" ++
+  s!"    \"m\": {m},\n" ++
+  s!"    \"strip_width\": {peStripWidth t.k},\n" ++
+  s!"    \"tile_height\": {t.tileHeight}\n" ++
+  "  },\n" ++
+  s!"  \"direct\": {if compiled.direct then "true" else "false"},\n" ++
+  s!"  \"l2_use_bytes\": {compiled.l2UseBytes},\n" ++
+  s!"  \"task_count\": {info.taskStream.taskCount},\n" ++
+  s!"  \"record_count\": {info.records},\n" ++
+  s!"  \"relocation_count\": {info.relocCount},\n" ++
+  s!"  \"has_kernel\": {if info.kernelSection.isSome then "true" else "false"},\n" ++
+  s!"  \"has_scratch\": {if info.scratchSection.isSome then "true" else "false"},\n" ++
+  "  \"surfaces\": [\n" ++
+  renderSurfacesJson info.surfaces ++ "\n" ++
+  "  ]\n" ++
+  "}\n"
+
+private def renderNeActManifestJson (compiled : CompiledNeAct) : String :=
+  let info := compiled.info
+  let secs := compiled.sections
+  let t := compiled.tiling
+  let lutExtra := match compiled.lutPayload with
+    | none => ""
+    | some lp =>
+      let shiftLine := match lp.inputShiftBits with
+        | some s => s!"  \"input_shift_f16\": {s.toNat},\n"
+        | none => ""
+      "  \"lut_file\": \"lut.bin\",\n" ++
+      s!"  \"pre_scale_f16\": {lp.preScaleBits.toNat},\n" ++
+      shiftLine
+  "{\n" ++
+  "  \"op\": \"ne_act\",\n" ++
+  s!"  \"act\": \"{escapeJsonString compiled.act.name}\",\n" ++
+  s!"  \"target\": \"{compiled.target.name}\",\n" ++
+  "  \"hwx\": \"program.hwx\",\n" ++
+  "  \"sections\": {\n" ++
+  "    \"generic\": {\"file\": \"generic.bin\", \"size\": " ++ toString secs.generic.size ++ "},\n" ++
+  "    \"operation\": {\"file\": \"operation.bin\", \"size\": " ++ toString secs.operation.size ++ "},\n" ++
+  "    \"procedure\": {\"file\": \"procedure.bin\", \"size\": " ++ toString secs.procedure.size ++ "},\n" ++
+  "    \"text_properties\": {\"file\": \"text-properties.bin\", \"size\": " ++ toString secs.textProperties.size ++ "}\n" ++
+  "  },\n" ++
+  lutExtra ++
+  "  \"tiling\": {\n" ++
+  s!"    \"log_ne\": {t.logNE},\n" ++
+  s!"    \"f\": {t.f},\n" ++
+  s!"    \"fat\": {t.fat},\n" ++
+  s!"    \"wu\": {t.wu},\n" ++
+  s!"    \"sh_pref\": {t.shPref},\n" ++
+  s!"    \"sh_max\": {t.shMax},\n" ++
+  s!"    \"tile_height\": {t.tileHeight}\n" ++
+  "  },\n" ++
+  s!"  \"direct\": {if compiled.direct then "true" else "false"},\n" ++
+  s!"  \"l2_use_bytes\": {compiled.l2UseBytes},\n" ++
   s!"  \"task_count\": {info.taskStream.taskCount},\n" ++
   s!"  \"record_count\": {info.records},\n" ++
   s!"  \"relocation_count\": {info.relocCount},\n" ++
@@ -279,8 +447,8 @@ private def cmdValidate (args : List String) : IO UInt32 := do
       IO.eprintln s!"HWX validation failed: {e}"
       return 1
 
-  let checkedTasks ← match verifyConvHwxTasks hwxBytes info (requireConvTask := checkTasks) with
-    | .ok n => pure n
+  let summary ← match verifyHwxTasksSummary hwxBytes info (requireKnownTask := checkTasks) with
+    | .ok s => pure s
     | .error e =>
       IO.eprintln s!"task-legality validation failed: {e}"
       return 1
@@ -313,12 +481,14 @@ private def cmdValidate (args : List String) : IO UInt32 := do
   IO.println s!"target: {info.target.name}"
   IO.println s!"surfaces ({info.surfaces.size}): {String.intercalate ", " surfDesc}"
   IO.println s!"tasks: {info.taskStream.taskCount} (records={info.records}, text={info.textSection.size}B, relocs={info.relocCount})"
-  if checkedTasks > 0 then
-    IO.println s!"verified_conv_tasks: {checkedTasks}"
+  if summary.total > 0 then
+    IO.println s!"verified_tasks: {summary.total} (conv={summary.neConv}, ne_act={summary.neAct}, pe={summary.peOp})"
+    if summary.neConv > 0 then
+      IO.println s!"verified_conv_tasks: {summary.neConv}"
   IO.println s!"bar_refs: {formatBarSlots info.taskStream.barSlots}"
   IO.println s!"kernel: {match info.kernelSection with | some k => s!"{k.size}B" | none => "none"}, scratch: {match info.scratchSection with | some sc => s!"{sc.size}B" | none => "none"}"
-  if let some summary := sectionSummary then
-    IO.println summary
+  if let some s := sectionSummary then
+    IO.println s
   return 0
 
 private def cmdSections (args : List String) : IO UInt32 := do
@@ -451,6 +621,8 @@ private def cmdCompileConv1x1 (args : List String) : IO UInt32 := do
   let mut weightsPath : Option String := none
   let mut biasPath : Option String := none
   let mut relu := false
+  let mut actStr : Option String := none
+  let mut actParams : ActParamFlags := {}
   let mut outDir : Option String := none
   let mut rest := args
 
@@ -486,6 +658,52 @@ private def cmdCompileConv1x1 (args : List String) : IO UInt32 := do
       | .error e => IO.eprintln s!"error: {e}"; return 1
     | "--relu" :: tl =>
       relu := true; rest := tl
+    | "--act" :: tl =>
+      match requireArgValue "--act" tl with
+      | .ok (v, tl') => actStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--act-alpha" :: tl =>
+      match requireArgValue "--act-alpha" tl with
+      | .ok (v, tl') =>
+        match parseFloatArg "--act-alpha" v with
+        | .ok f => actParams := { actParams with alpha := some f }; rest := tl'
+        | .error e => IO.eprintln s!"error: {e}"; return 1
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--act-beta" :: tl =>
+      match requireArgValue "--act-beta" tl with
+      | .ok (v, tl') =>
+        match parseFloatArg "--act-beta" v with
+        | .ok f => actParams := { actParams with beta := some f }; rest := tl'
+        | .error e => IO.eprintln s!"error: {e}"; return 1
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--act-lo" :: tl =>
+      match requireArgValue "--act-lo" tl with
+      | .ok (v, tl') =>
+        match parseFloatArg "--act-lo" v with
+        | .ok f => actParams := { actParams with lo := some f }; rest := tl'
+        | .error e => IO.eprintln s!"error: {e}"; return 1
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--act-hi" :: tl =>
+      match requireArgValue "--act-hi" tl with
+      | .ok (v, tl') =>
+        match parseFloatArg "--act-hi" v with
+        | .ok f => actParams := { actParams with hi := some f }; rest := tl'
+        | .error e => IO.eprintln s!"error: {e}"; return 1
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--act-eps" :: tl =>
+      match requireArgValue "--act-eps" tl with
+      | .ok (v, tl') =>
+        match parseFloatArg "--act-eps" v with
+        | .ok f => actParams := { actParams with eps := some f }; rest := tl'
+        | .error e => IO.eprintln s!"error: {e}"; return 1
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--act-scalar" :: tl =>
+      match requireArgValue "--act-scalar" tl with
+      | .ok (v, tl') =>
+        match parseFloatArg "--act-scalar" v with
+        | .ok f => actParams := { actParams with scalar := some f }; rest := tl'
+        | .error e => IO.eprintln s!"error: {e}"; return 1
+      | .error e => IO.eprintln s!"error: {e}"; return 1
     | "--out-dir" :: tl =>
       match requireArgValue "--out-dir" tl with
       | .ok (v, tl') => outDir := some v; rest := tl'
@@ -513,6 +731,10 @@ private def cmdCompileConv1x1 (args : List String) : IO UInt32 := do
   let some dirStr := outDir
     | do IO.eprintln "error: --out-dir <dir> is required"; return 1
 
+  let act ← match parseConvAct relu actStr actParams with
+    | .ok a => pure a
+    | .error e => IO.eprintln s!"error: {e}"; return 1
+
   let shape ← match (do
       let h ← parsePosNat "--h" hRaw
       let w ← parsePosNat "--w" wRaw
@@ -538,7 +760,7 @@ private def cmdCompileConv1x1 (args : List String) : IO UInt32 := do
         IO.eprintln s!"error: failed to read bias '{bPath}': {e}"
         return 1
 
-  let compiled ← match compileConv1x1 target shape weightsBytes biasBytes? relu with
+  let compiled ← match compileConv1x1 target shape weightsBytes biasBytes? false none act with
     | .ok c => pure c
     | .error e =>
       IO.eprintln s!"error: compile-conv1x1 failed: {e}"
@@ -553,6 +775,8 @@ private def cmdCompileConv1x1 (args : List String) : IO UInt32 := do
     IO.FS.writeBinFile (dir / "operation.bin") compiled.sections.operation
     IO.FS.writeBinFile (dir / "procedure.bin") compiled.sections.procedure
     IO.FS.writeBinFile (dir / "text-properties.bin") compiled.sections.textProperties
+    if let some lutBs := compiled.lutBytes then
+      IO.FS.writeBinFile (dir / "lut.bin") lutBs
     IO.FS.writeFile (dir / "manifest.json") manifest
   catch e =>
     IO.eprintln s!"error: failed to write compiled outputs to '{dirStr}': {e}"
@@ -561,7 +785,7 @@ private def cmdCompileConv1x1 (args : List String) : IO UInt32 := do
   let t := compiled.tiling
   IO.println (
     s!"compiled {target.name} conv1x1 ({shape.h}x{shape.w}, {shape.cin}->{shape.cout}, " ++
-    s!"bias={compiled.hasBias}, relu={compiled.relu}) to {dirStr}: " ++
+    s!"bias={compiled.hasBias}, act={compiled.activation.name}) to {dirStr}: " ++
     s!"hwx={compiled.hwx.size}B kernel={compiled.kernelBytes}B l2={compiled.l2UseBytes}B " ++
     s!"direct={compiled.direct} tiling=(logNE={t.logNE},F={t.f},fat={t.fat},ocg={t.ocg},WU={t.wu},sh={t.shPref}..{t.shMax},TH={t.tileHeight})"
   )
@@ -579,6 +803,8 @@ private def cmdCompileConv3x3 (args : List String) : IO UInt32 := do
   let mut weightsPath : Option String := none
   let mut biasPath : Option String := none
   let mut relu := false
+  let mut actStr : Option String := none
+  let mut actParams : ActParamFlags := {}
   let mut outDir : Option String := none
   let mut rest := args
 
@@ -626,6 +852,52 @@ private def cmdCompileConv3x3 (args : List String) : IO UInt32 := do
       | .error e => IO.eprintln s!"error: {e}"; return 1
     | "--relu" :: tl =>
       relu := true; rest := tl
+    | "--act" :: tl =>
+      match requireArgValue "--act" tl with
+      | .ok (v, tl') => actStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--act-alpha" :: tl =>
+      match requireArgValue "--act-alpha" tl with
+      | .ok (v, tl') =>
+        match parseFloatArg "--act-alpha" v with
+        | .ok f => actParams := { actParams with alpha := some f }; rest := tl'
+        | .error e => IO.eprintln s!"error: {e}"; return 1
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--act-beta" :: tl =>
+      match requireArgValue "--act-beta" tl with
+      | .ok (v, tl') =>
+        match parseFloatArg "--act-beta" v with
+        | .ok f => actParams := { actParams with beta := some f }; rest := tl'
+        | .error e => IO.eprintln s!"error: {e}"; return 1
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--act-lo" :: tl =>
+      match requireArgValue "--act-lo" tl with
+      | .ok (v, tl') =>
+        match parseFloatArg "--act-lo" v with
+        | .ok f => actParams := { actParams with lo := some f }; rest := tl'
+        | .error e => IO.eprintln s!"error: {e}"; return 1
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--act-hi" :: tl =>
+      match requireArgValue "--act-hi" tl with
+      | .ok (v, tl') =>
+        match parseFloatArg "--act-hi" v with
+        | .ok f => actParams := { actParams with hi := some f }; rest := tl'
+        | .error e => IO.eprintln s!"error: {e}"; return 1
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--act-eps" :: tl =>
+      match requireArgValue "--act-eps" tl with
+      | .ok (v, tl') =>
+        match parseFloatArg "--act-eps" v with
+        | .ok f => actParams := { actParams with eps := some f }; rest := tl'
+        | .error e => IO.eprintln s!"error: {e}"; return 1
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--act-scalar" :: tl =>
+      match requireArgValue "--act-scalar" tl with
+      | .ok (v, tl') =>
+        match parseFloatArg "--act-scalar" v with
+        | .ok f => actParams := { actParams with scalar := some f }; rest := tl'
+        | .error e => IO.eprintln s!"error: {e}"; return 1
+      | .error e => IO.eprintln s!"error: {e}"; return 1
     | "--out-dir" :: tl =>
       match requireArgValue "--out-dir" tl with
       | .ok (v, tl') => outDir := some v; rest := tl'
@@ -663,6 +935,10 @@ private def cmdCompileConv3x3 (args : List String) : IO UInt32 := do
   let some dirStr := outDir
     | do IO.eprintln "error: --out-dir <dir> is required"; return 1
 
+  let act ← match parseConvAct relu actStr actParams with
+    | .ok a => pure a
+    | .error e => IO.eprintln s!"error: {e}"; return 1
+
   let shape ← match (do
       let h ← parsePosNat "--h" hRaw
       let w ← parsePosNat "--w" wRaw
@@ -697,7 +973,7 @@ private def cmdCompileConv3x3 (args : List String) : IO UInt32 := do
         IO.eprintln s!"error: failed to read bias '{bPath}': {e}"
         return 1
 
-  let compiled ← match compileConv3x3 target shape weightsBytes biasBytes? relu with
+  let compiled ← match compileConv3x3 target shape weightsBytes biasBytes? false none act with
     | .ok c => pure c
     | .error e =>
       IO.eprintln s!"error: compile-conv3x3 failed: {e}"
@@ -712,6 +988,8 @@ private def cmdCompileConv3x3 (args : List String) : IO UInt32 := do
     IO.FS.writeBinFile (dir / "operation.bin") compiled.sections.operation
     IO.FS.writeBinFile (dir / "procedure.bin") compiled.sections.procedure
     IO.FS.writeBinFile (dir / "text-properties.bin") compiled.sections.textProperties
+    if let some lutBs := compiled.lutBytes then
+      IO.FS.writeBinFile (dir / "lut.bin") lutBs
     IO.FS.writeFile (dir / "manifest.json") manifest
   catch e =>
     IO.eprintln s!"error: failed to write compiled outputs to '{dirStr}': {e}"
@@ -721,9 +999,330 @@ private def cmdCompileConv3x3 (args : List String) : IO UInt32 := do
   IO.println (
     s!"compiled {target.name} conv3x3 {shape.mode.name} ({shape.h}x{shape.w}->{shape.outH}x{shape.outW}, " ++
     s!"{shape.cin}->{shape.cout}, s={shape.stride}, pad={shape.pad.name}, sparse={compiled.sparse}, " ++
-    s!"wide3x3={compiled.wide3x3}, bias={compiled.hasBias}, relu={compiled.relu}) to {dirStr}: " ++
+    s!"wide3x3={compiled.wide3x3}, bias={compiled.hasBias}, act={compiled.activation.name}) to {dirStr}: " ++
     s!"hwx={compiled.hwx.size}B kernel={compiled.kernelBytes}B l2={compiled.l2UseBytes}B " ++
     s!"direct={compiled.direct} tiling=(logNE={t.logNE},F={t.f},fat={t.fat},ocg={effOcg shape t},WU={t.wu},sh={t.shPref}..{t.shMax},TH={t.tileHeight})"
+  )
+  return 0
+
+private def cmdCompilePe (args : List String) : IO UInt32 := do
+  let mut targetStr : Option String := none
+  let mut opStr : Option String := none
+  let mut hStr : Option String := none
+  let mut wStr : Option String := none
+  let mut cStr : Option String := none
+  let mut zhStr : Option String := none
+  let mut zwStr : Option String := none
+  let mut zcStr : Option String := none
+  let mut alphaStr : Option String := none
+  let mut betaStr : Option String := none
+  let mut inScaleStr : Option String := none
+  let mut biasStr : Option String := none
+  let mut scaleStr : Option String := none
+  let mut scalarStr : Option String := none
+  let mut outDir : Option String := none
+  let mut rest := args
+
+  while !rest.isEmpty do
+    match rest with
+    | "--target" :: tl =>
+      match requireArgValue "--target" tl with
+      | .ok (v, tl') => targetStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--op" :: tl =>
+      match requireArgValue "--op" tl with
+      | .ok (v, tl') => opStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--h" :: tl =>
+      match requireArgValue "--h" tl with
+      | .ok (v, tl') => hStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--w" :: tl =>
+      match requireArgValue "--w" tl with
+      | .ok (v, tl') => wStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--c" :: tl =>
+      match requireArgValue "--c" tl with
+      | .ok (v, tl') => cStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--z-h" :: tl =>
+      match requireArgValue "--z-h" tl with
+      | .ok (v, tl') => zhStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--z-w" :: tl =>
+      match requireArgValue "--z-w" tl with
+      | .ok (v, tl') => zwStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--z-c" :: tl =>
+      match requireArgValue "--z-c" tl with
+      | .ok (v, tl') => zcStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--alpha" :: tl =>
+      match requireArgValue "--alpha" tl with
+      | .ok (v, tl') => alphaStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--beta" :: tl =>
+      match requireArgValue "--beta" tl with
+      | .ok (v, tl') => betaStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--in-scale" :: tl =>
+      match requireArgValue "--in-scale" tl with
+      | .ok (v, tl') => inScaleStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--bias" :: tl =>
+      match requireArgValue "--bias" tl with
+      | .ok (v, tl') => biasStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--scale" :: tl =>
+      match requireArgValue "--scale" tl with
+      | .ok (v, tl') => scaleStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--scalar" :: tl =>
+      match requireArgValue "--scalar" tl with
+      | .ok (v, tl') => scalarStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--out-dir" :: tl =>
+      match requireArgValue "--out-dir" tl with
+      | .ok (v, tl') => outDir := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | flag :: _ =>
+      IO.eprintln s!"error: unknown argument '{flag}' for compile-pe"
+      IO.eprintln usage
+      return 1
+    | [] => break
+
+  let some tStr := targetStr
+    | do IO.eprintln "error: --target <h16|h17> is required"; return 1
+  let some target := Target.parse? tStr
+    | do IO.eprintln s!"error: unknown target '{tStr}' (expected h16 or h17)"; return 1
+  let some opRaw := opStr
+    | do IO.eprintln "error: --op <name> is required"; return 1
+  let some hRaw := hStr
+    | do IO.eprintln "error: --h <H> is required"; return 1
+  let some wRaw := wStr
+    | do IO.eprintln "error: --w <W> is required"; return 1
+  let some cRaw := cStr
+    | do IO.eprintln "error: --c <C> is required"; return 1
+  let some dirStr := outDir
+    | do IO.eprintln "error: --out-dir <dir> is required"; return 1
+
+  let dims ← match (do
+      let h ← parsePosNat "--h" hRaw
+      let w ← parsePosNat "--w" wRaw
+      let c ← parsePosNat "--c" cRaw
+      pure ({ c := c, h := h, w := w } : TensorDims)) with
+    | .ok d => pure d
+    | .error e => IO.eprintln s!"error: {e}"; return 1
+
+  let zDims ← match (do
+      let zh ← match zhStr with | some s => parsePosNat "--z-h" s | none => pure dims.h
+      let zw ← match zwStr with | some s => parsePosNat "--z-w" s | none => pure dims.w
+      let zc ← match zcStr with | some s => parsePosNat "--z-c" s | none => pure dims.c
+      pure ({ c := zc, h := zh, w := zw } : TensorDims)) with
+    | .ok d => pure d
+    | .error e => IO.eprintln s!"error: {e}"; return 1
+
+  let opLow := opRaw.toLower
+  let peOp ← match (do
+      match opLow with
+      | "abs" => pure PeOp.abs
+      | "square" => pure PeOp.square
+      | "linear" =>
+        let a ← match alphaStr with | some s => parseF16Arg "--alpha" s | none => pure f16PosOne
+        let b ← match betaStr with | some s => parseF16Arg "--beta" s | none => pure f16PosZero
+        pure (PeOp.linearActivation a b)
+      | "chain" =>
+        let ins ← match inScaleStr with | some s => some <$> parseF16Arg "--in-scale" s | none => pure none
+        let b ← match biasStr with | some s => some <$> parseF16Arg "--bias" s | none => pure none
+        let sc ← match scaleStr with | some s => some <$> parseF16Arg "--scale" s | none => pure none
+        pure (PeOp.chain ins b sc)
+      | "sadd" =>
+        let some s := scalarStr | throw "sadd requires --scalar F"
+        pure (PeOp.scalarAdd (← parseF16Arg "--scalar" s))
+      | "ssub" =>
+        let some s := scalarStr | throw "ssub requires --scalar F"
+        pure (PeOp.scalarSub (← parseF16Arg "--scalar" s))
+      | "srsub" =>
+        let some s := scalarStr | throw "srsub requires --scalar F"
+        pure (PeOp.scalarRSub (← parseF16Arg "--scalar" s))
+      | "smul" =>
+        let some s := scalarStr | throw "smul requires --scalar F"
+        pure (PeOp.scalarMul (← parseF16Arg "--scalar" s))
+      | "sdiv" =>
+        let some s := scalarStr | throw "sdiv requires --scalar F"
+        PeOp.scalarDiv (← parseF16Arg "--scalar" s)
+      | "add" => pure (.binary .add dims zDims false)
+      | "sub" => pure (.binary .sub dims zDims false)
+      | "rsub" => pure (.binary .sub dims zDims true)
+      | "mul" => pure (.binary .mul dims zDims false)
+      | "max" => pure (.binary .max dims zDims false)
+      | "min" => pure (.binary .min dims zDims false)
+      | other => throw s!"unknown PE op '{other}'") with
+    | .ok o => pure o
+    | .error e => IO.eprintln s!"error: {e}"; return 1
+
+  let compiled ← match compilePe target peOp dims with
+    | .ok c => pure c
+    | .error e => IO.eprintln s!"error: compile-pe failed: {e}"; return 1
+
+  let manifest := renderPeManifestJson compiled opLow
+  let dir := System.FilePath.mk dirStr
+  try
+    IO.FS.createDirAll dir
+    IO.FS.writeBinFile (dir / "program.hwx") compiled.hwx
+    IO.FS.writeBinFile (dir / "generic.bin") compiled.sections.generic
+    IO.FS.writeBinFile (dir / "operation.bin") compiled.sections.operation
+    IO.FS.writeBinFile (dir / "procedure.bin") compiled.sections.procedure
+    IO.FS.writeBinFile (dir / "text-properties.bin") compiled.sections.textProperties
+    IO.FS.writeFile (dir / "manifest.json") manifest
+  catch e =>
+    IO.eprintln s!"error: failed to write PE outputs to '{dirStr}': {e}"
+    return 1
+
+  let t := compiled.tiling
+  IO.println (
+    s!"compiled {target.name} pe {opLow} (out={compiled.outDims.c}x{compiled.outDims.h}x{compiled.outDims.w}) " ++
+    s!"to {dirStr}: hwx={compiled.hwx.size}B l2={compiled.l2UseBytes}B direct={compiled.direct} " ++
+    s!"tiling=(k={t.k},T={peStripWidth t.k},TH={t.tileHeight})"
+  )
+  return 0
+
+private def cmdCompileLut (args : List String) : IO UInt32 := do
+  let mut targetStr : Option String := none
+  let mut actStr : Option String := none
+  let mut hStr : Option String := none
+  let mut wStr : Option String := none
+  let mut cStr : Option String := none
+  let mut params : ActParamFlags := {}
+  let mut outDir : Option String := none
+  let mut rest := args
+
+  while !rest.isEmpty do
+    match rest with
+    | "--target" :: tl =>
+      match requireArgValue "--target" tl with
+      | .ok (v, tl') => targetStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--act" :: tl =>
+      match requireArgValue "--act" tl with
+      | .ok (v, tl') => actStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--h" :: tl =>
+      match requireArgValue "--h" tl with
+      | .ok (v, tl') => hStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--w" :: tl =>
+      match requireArgValue "--w" tl with
+      | .ok (v, tl') => wStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--c" :: tl =>
+      match requireArgValue "--c" tl with
+      | .ok (v, tl') => cStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--alpha" :: tl =>
+      match requireArgValue "--alpha" tl with
+      | .ok (v, tl') =>
+        match parseFloatArg "--alpha" v with
+        | .ok f => params := { params with alpha := some f }; rest := tl'
+        | .error e => IO.eprintln s!"error: {e}"; return 1
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--beta" :: tl =>
+      match requireArgValue "--beta" tl with
+      | .ok (v, tl') =>
+        match parseFloatArg "--beta" v with
+        | .ok f => params := { params with beta := some f }; rest := tl'
+        | .error e => IO.eprintln s!"error: {e}"; return 1
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--lo" :: tl =>
+      match requireArgValue "--lo" tl with
+      | .ok (v, tl') =>
+        match parseFloatArg "--lo" v with
+        | .ok f => params := { params with lo := some f }; rest := tl'
+        | .error e => IO.eprintln s!"error: {e}"; return 1
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--hi" :: tl =>
+      match requireArgValue "--hi" tl with
+      | .ok (v, tl') =>
+        match parseFloatArg "--hi" v with
+        | .ok f => params := { params with hi := some f }; rest := tl'
+        | .error e => IO.eprintln s!"error: {e}"; return 1
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--eps" :: tl =>
+      match requireArgValue "--eps" tl with
+      | .ok (v, tl') =>
+        match parseFloatArg "--eps" v with
+        | .ok f => params := { params with eps := some f }; rest := tl'
+        | .error e => IO.eprintln s!"error: {e}"; return 1
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--scalar" :: tl =>
+      match requireArgValue "--scalar" tl with
+      | .ok (v, tl') =>
+        match parseFloatArg "--scalar" v with
+        | .ok f => params := { params with scalar := some f }; rest := tl'
+        | .error e => IO.eprintln s!"error: {e}"; return 1
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--out-dir" :: tl =>
+      match requireArgValue "--out-dir" tl with
+      | .ok (v, tl') => outDir := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | flag :: _ =>
+      IO.eprintln s!"error: unknown argument '{flag}' for compile-lut"
+      IO.eprintln usage
+      return 1
+    | [] => break
+
+  let some tStr := targetStr
+    | do IO.eprintln "error: --target <h16|h17> is required"; return 1
+  let some target := Target.parse? tStr
+    | do IO.eprintln s!"error: unknown target '{tStr}' (expected h16 or h17)"; return 1
+  let some aStr := actStr
+    | do IO.eprintln "error: --act <name> is required"; return 1
+  let some hRaw := hStr
+    | do IO.eprintln "error: --h <H> is required"; return 1
+  let some wRaw := wStr
+    | do IO.eprintln "error: --w <W> is required"; return 1
+  let some cRaw := cStr
+    | do IO.eprintln "error: --c <C> is required"; return 1
+  let some dirStr := outDir
+    | do IO.eprintln "error: --out-dir <dir> is required"; return 1
+
+  let act ← match parseNeActSpec aStr params with
+    | .ok a => pure a
+    | .error e => IO.eprintln s!"error: {e}"; return 1
+
+  let (c, h, w) ← match (do
+      let h ← parsePosNat "--h" hRaw
+      let w ← parsePosNat "--w" wRaw
+      let c ← parsePosNat "--c" cRaw
+      pure (c, h, w)) with
+    | .ok dims => pure dims
+    | .error e => IO.eprintln s!"error: {e}"; return 1
+
+  let compiled ← match compileNeAct target act c h w with
+    | .ok c => pure c
+    | .error e => IO.eprintln s!"error: compile-lut failed: {e}"; return 1
+
+  let manifest := renderNeActManifestJson compiled
+  let dir := System.FilePath.mk dirStr
+  try
+    IO.FS.createDirAll dir
+    IO.FS.writeBinFile (dir / "program.hwx") compiled.hwx
+    IO.FS.writeBinFile (dir / "generic.bin") compiled.sections.generic
+    IO.FS.writeBinFile (dir / "operation.bin") compiled.sections.operation
+    IO.FS.writeBinFile (dir / "procedure.bin") compiled.sections.procedure
+    IO.FS.writeBinFile (dir / "text-properties.bin") compiled.sections.textProperties
+    if let some lp := compiled.lutPayload then
+      IO.FS.writeBinFile (dir / "lut.bin") lp.bytes
+    IO.FS.writeFile (dir / "manifest.json") manifest
+  catch e =>
+    IO.eprintln s!"error: failed to write LUT outputs to '{dirStr}': {e}"
+    return 1
+
+  let t := compiled.tiling
+  IO.println (
+    s!"compiled {target.name} ne_act {compiled.act.name} ({c}x{h}x{w}) " ++
+    s!"to {dirStr}: hwx={compiled.hwx.size}B l2={compiled.l2UseBytes}B direct={compiled.direct} " ++
+    s!"tiling=(logNE={t.logNE},F={t.f},fat={t.fat},WU={t.wu},sh={t.shPref}..{t.shMax},TH={t.tileHeight})"
   )
   return 0
 
@@ -734,6 +1333,8 @@ def main (args : List String) : IO UInt32 := do
   | "emit-demo" :: rest => cmdEmitDemo rest
   | "compile-conv1x1" :: rest => cmdCompileConv1x1 rest
   | "compile-conv3x3" :: rest => cmdCompileConv3x3 rest
+  | "compile-pe" :: rest => cmdCompilePe rest
+  | "compile-lut" :: rest => cmdCompileLut rest
   | "--help" :: _ | "-h" :: _ | [] =>
     IO.println usage
     return 0

@@ -25,10 +25,12 @@ structure TaskReloc where
   payloadWordIndex : Nat := 0
   deriving Repr, BEq, Inhabited
 
-/-- High-level single-task descriptor reusable across NE conv, PE ops, and multi-task graphs. -/
+/-- High-level single-task descriptor reusable across NE conv, NE act, PE ops, and multi-task graphs. -/
 structure TaskDesc where
   taskId : Nat := 0
-  logNE : Nat
+  logNE : Nat := 0
+  eneOverride : Option Nat := none
+  header4 : UInt32 := taskHeaderWord4Const
   plainWrites : Array RegWrite
   barWrites : Array BarRegWrite
   kernelRelocs : Array TaskReloc := #[]
@@ -103,7 +105,12 @@ def emitProgram (spec : ProgramSpec) : Except String EmittedProgram := do
     let (plainRecs, barRecs) ← packTaskRecordsSplit td.plainWrites td.barWrites
     let allRecs := plainRecs ++ barRecs
     let totalTaskWords := 9 + recordWordsCount allRecs
-    let header ← encodeTaskHeader9 td.taskId totalTaskWords td.logNE
+    let header ← match td.eneOverride with
+      | some ene => encodeTaskHeader9Ex td.taskId totalTaskWords ene td.header4
+      | none =>
+        if td.logNE > 4 then
+          throw s!"task header: logNE {td.logNE} exceeds maximum 4"
+        encodeTaskHeader9Ex td.taskId totalTaskWords (td.logNE + 1) td.header4
     tasks := tasks.push { header := header, records := allRecs }
     for rel in td.kernelRelocs do
       if rel.barRecIndex >= td.barWrites.size then
