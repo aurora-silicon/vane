@@ -72,22 +72,20 @@ def isNonZeroFp16 (w : UInt16) : Bool :=
 /-- Maximum byte length representable in the 3-byte little-endian `u24` sparse stream prefix. -/
 def maxSparseBodyBytes : Nat := 0xffffff
 
-/-- Encode a slot stream (`Array (Option UInt16)`) into the zero-skipping sparse binary format:
-    pads to a multiple of 16 slots, encodes each 16-slot vector as `(mask : u16, kept weights...)`,
-    and prefixes with the 3-byte little-endian `u24` body byte length. -/
-def encodeSparseStream (slots : Array (Option UInt16)) : Except String ByteArray := do
+/-- Append a zero-skipping sparse encoded stream directly onto `dst` (O(N), avoiding quadratic `++`). -/
+def appendSparseStream (dst : ByteArray) (slots : Array (Option UInt16)) : Except String ByteArray := do
   let paddedLen := alignUp slots.size 16
   let numVecs := paddedLen / 16
-  let mut bodyHalfwords : Array UInt16 := #[]
+  let mut bodyHalfwords : Array UInt16 := Array.mkEmpty (numVecs * 2)
 
   for v in [:numVecs] do
     let base := v * 16
     let mut mask : UInt16 := 0
-    let mut kept : Array UInt16 := #[]
+    let mut kept : Array UInt16 := Array.mkEmpty 16
     for i in [:16] do
       let idx := base + i
-      if idx < slots.size then
-        match slots[idx]! with
+      if h : idx < slots.size then
+        match slots[idx] with
         | some w =>
           if isNonZeroFp16 w then
             mask := mask ||| ((1 : UInt16) <<< i.toUInt16)
@@ -101,7 +99,7 @@ def encodeSparseStream (slots : Array (Option UInt16)) : Except String ByteArray
   if bodyBytes > maxSparseBodyBytes then
     throw s!"sparse kernel body length {bodyBytes} exceeds 24-bit limit {maxSparseBodyBytes}"
 
-  let mut out := ByteArray.empty
+  let mut out := dst
   out := out.push (bodyBytes &&& 0xff).toUInt8
   out := out.push ((bodyBytes >>> 8) &&& 0xff).toUInt8
   out := out.push ((bodyBytes >>> 16) &&& 0xff).toUInt8
@@ -109,15 +107,21 @@ def encodeSparseStream (slots : Array (Option UInt16)) : Except String ByteArray
     out := pushU16LE out hw
   pure out
 
+/-- Encode a slot stream (`Array (Option UInt16)`) into the zero-skipping sparse binary format:
+    pads to a multiple of 16 slots, encodes each 16-slot vector as `(mask : u16, kept weights...)`,
+    and prefixes with the 3-byte little-endian `u24` body byte length. -/
+def encodeSparseStream (slots : Array (Option UInt16)) : Except String ByteArray :=
+  appendSparseStream ByteArray.empty slots
+
 /-- Decode a zero-skipping sparse stream starting at `offset` in `bs`.
     Returns `(decodedSlots, totalBytesConsumed)` where `decodedSlots.size` is a multiple of 16
     and skipped/padding slots decode to `0x0000`. -/
 def decodeSparseStream (bs : ByteArray) (offset : Nat := 0) : Except String (Array UInt16 × Nat) := do
   if offset + 3 > bs.size then
     throw s!"sparse stream truncated at u24 length header (offset={offset}, size={bs.size})"
-  let b0 := (bs.get! offset).toNat
-  let b1 := (bs.get! (offset + 1)).toNat
-  let b2 := (bs.get! (offset + 2)).toNat
+  let b0 := (← readU8 bs offset).toNat
+  let b1 := (← readU8 bs (offset + 1)).toNat
+  let b2 := (← readU8 bs (offset + 2)).toNat
   let bodyBytes := b0 ||| (b1 <<< 8) ||| (b2 <<< 16)
   if bodyBytes % 2 != 0 then
     throw s!"sparse stream body length {bodyBytes} is not a multiple of 2"
@@ -193,8 +197,8 @@ def packConvKernelChunks
     throw s!"invalid chunk replication geometry: groups={groups}, rep={rep}"
 
   let sparse := sh.isSparse
-  let mut kernelBuf := ByteArray.empty
-  let mut slots : Array KernelChunkSlot := #[]
+  let mut slotChunks : Array (Nat × ByteArray) := Array.mkEmpty 16
+  let mut totalKernelBytes : Nat := 0
 
   for g in [:groups] do
     let blocks := groupOutputBlocksConv sh tiling g
@@ -204,27 +208,33 @@ def packConvKernelChunks
         -- Dense uncompressed kernel encoding (1x1 or 3x3 stride-1)
         for (o0, n) in blocks do
           if biasInKernel then
-            let b := bias.get!
-            for k in [:n] do
-              let bOff := 2 * (o0 + k)
-              chunk := chunk.push (b.get! bOff)
-              chunk := chunk.push (b.get! (bOff + 1))
+            match bias with
+            | some b =>
+              for k in [:n] do
+                let bOff := 2 * (o0 + k)
+                chunk := chunk.push (← readU8 b bOff)
+                chunk := chunk.push (← readU8 b (bOff + 1))
+            | none =>
+              throw "internal error: biasInKernel set without bias bytes"
           for ci in [:cinW] do
             for tp in [:taps] do
               for k in [:n] do
                 let o := o0 + k
                 let wOff := 2 * ((o * cinW + ci) * taps + tp)
-                chunk := chunk.push (weights.get! wOff)
-                chunk := chunk.push (weights.get! (wOff + 1))
+                chunk := chunk.push (← readU8 weights wOff)
+                chunk := chunk.push (← readU8 weights (wOff + 1))
       else
         -- Stride-2 zero-skipping sparse kernel encoding (3x3)
         for (o0, n) in blocks do
           if biasInKernel then
-            let b := bias.get!
-            for k in [:n] do
-              let bOff := 2 * (o0 + k)
-              chunk := chunk.push (b.get! bOff)
-              chunk := chunk.push (b.get! (bOff + 1))
+            match bias with
+            | some b =>
+              for k in [:n] do
+                let bOff := 2 * (o0 + k)
+                chunk := chunk.push (← readU8 b bOff)
+                chunk := chunk.push (← readU8 b (bOff + 1))
+            | none =>
+              throw "internal error: biasInKernel set without bias bytes"
           let ev := alignUp n 2
           let mut slotStream : Array (Option UInt16) := Array.mkEmpty (cinW * 16 * ev)
           for ci in [:cinW] do
@@ -242,8 +252,7 @@ def packConvKernelChunks
               | none =>
                 for _ in [:ev] do
                   slotStream := slotStream.push none
-          let encoded ← encodeSparseStream slotStream
-          chunk := chunk ++ encoded
+          chunk ← appendSparseStream chunk slotStream
 
       chunk := padToAlign chunk dmaLineBytes
       if chunk.size > maxKernelChunkBytes then
@@ -254,20 +263,25 @@ def packConvKernelChunks
         let s := g * rep
         if s >= 16 then
           throw s!"chunk slot index {s} exceeds 0..15"
-        let off := kernelBuf.size
-        kernelBuf := kernelBuf ++ chunk
-        slots := slots.push { slot := s, offset := off, size := chunk.size }
+        slotChunks := slotChunks.push (s, chunk)
+        totalKernelBytes := totalKernelBytes + chunk.size
       | .h16 =>
         for j in [:rep] do
           let s := g * rep + j
           if s >= 16 then
             throw s!"chunk slot index {s} exceeds 0..15"
-          let off := kernelBuf.size
-          kernelBuf := kernelBuf ++ chunk
-          slots := slots.push { slot := s, offset := off, size := chunk.size }
+          slotChunks := slotChunks.push (s, chunk)
+          totalKernelBytes := totalKernelBytes + chunk.size
 
-  if slots.isEmpty || kernelBuf.isEmpty then
+  if slotChunks.isEmpty || totalKernelBytes == 0 then
     throw "kernel packer produced 0 active chunk slots"
+
+  let mut kernelBuf := ByteArray.emptyWithCapacity totalKernelBytes
+  let mut slots : Array KernelChunkSlot := Array.mkEmpty slotChunks.size
+  for (s, chunk) in slotChunks do
+    let off := kernelBuf.size
+    kernelBuf := kernelBuf ++ chunk
+    slots := slots.push { slot := s, offset := off, size := chunk.size }
 
   pure {
     bytes := kernelBuf
@@ -292,7 +306,7 @@ def lowerConvTask
   let dchs := dchsBytesConv shape tiling
   let srcRow := srcRowStrideConv shape tiling
   let resRow := resRowStrideConv shape tiling
-  let srcL2 := srcL2BytesConv shape tiling
+  let resBase := resBaseBytesConv shape tiling
 
   let ho := shape.outH
   let wo := shape.outW
@@ -301,29 +315,56 @@ def lowerConvTask
   let outRowStride := alignUp (2 * wo) dmaLineBytes
   let outPlaneStride := ho * outRowStride
 
-  let wWin ← encodeWord (dim16Layout "Win") #[("val", shape.winReg.toUInt32)]
-  let wHin ← encodeWord (dim16Layout "Hin") #[("val", shape.hinReg.toUInt32)]
-  let wWout ← encodeWord (dim16Layout "Wout") #[("val", wo.toUInt32)]
-  let wHout ← encodeWord (dim16Layout "Hout") #[("val", ho.toUInt32)]
+  let winU32 ← natToU32Checked shape.winReg "Win"
+  let hinU32 ← natToU32Checked shape.hinReg "Hin"
+  let cinU32 ← natToU32Checked shape.cin "Cin"
+  let woU32 ← natToU32Checked wo "Wout"
+  let hoU32 ← natToU32Checked ho "Hout"
+  let coutU32 ← natToU32Checked shape.cout "Cout"
+  let kU32 ← natToU32Checked shape.kernelSize "kernelSize"
+  let sU32 ← natToU32Checked shape.stride "stride"
+  let plU32 ← natToU32Checked shape.padLeft "padLeft"
+  let ptU32 ← natToU32Checked shape.padTop "padTop"
+  let thU32 ← natToU32Checked tiling.tileHeight "TH"
+  let shPrefU32 ← natToU32Checked tiling.shPref "shPref"
+  let shMaxU32 ← natToU32Checked tiling.shMax "shMax"
+  let fU32 ← natToU32Checked tiling.f "F"
+  let effOcgU32 ← natToU32Checked (effOcgConv shape tiling) "ocg"
+  let fatU32 ← natToU32Checked tiling.fat "fat"
+  let wuU32 ← natToU32Checked tiling.wu "WU"
+  let taskIdU32 ← natToU32Checked taskId "taskId"
+  let chsU32 ← natToU32Checked chs "src1ChanStride"
+  let srcRowU32 ← natToU32Checked srcRow "src1RowStride"
+  let srcRowBytesU32 ← natToU32Checked (shape.cin * chs) "src1RowBytes"
+  let resBaseU32 ← natToU32Checked resBase "resBase"
+  let inRowStrideU32 ← natToU32Checked inRowStride "src1DmaRowStride"
+  let inPlaneStrideU32 ← natToU32Checked inPlaneStride "src1DmaPlaneStride"
+  let outRowStrideU32 ← natToU32Checked outRowStride "resDmaRowStride"
+  let outPlaneStrideU32 ← natToU32Checked outPlaneStride "resDmaPlaneStride"
+
+  let wWin ← encodeWord (dim16Layout "Win") #[("val", winU32)]
+  let wHin ← encodeWord (dim16Layout "Hin") #[("val", hinU32)]
+  let wWout ← encodeWord (dim16Layout "Wout") #[("val", woU32)]
+  let wHout ← encodeWord (dim16Layout "Hout") #[("val", hoU32)]
   let wConvCfg ← encodeWord convCfgLayout #[
-    ("kw", shape.kernelSize.toUInt32), ("kh", shape.kernelSize.toUInt32),
-    ("sx", shape.stride.toUInt32), ("sy", shape.stride.toUInt32),
-    ("pl", shape.padLeft.toUInt32), ("pt", shape.padTop.toUInt32),
+    ("kw", kU32), ("kh", kU32),
+    ("sx", sU32), ("sy", sU32),
+    ("pl", plU32), ("pt", ptU32),
     ("hx", 1), ("vy", 1)
   ]
-  let wTH ← encodeWord (dim16Layout "TH") #[("val", tiling.tileHeight.toUInt32)]
+  let wTH ← encodeWord (dim16Layout "TH") #[("val", thU32)]
   let wNeCommon ← encodeWord neCommonLayout #[
     ("kind", 0),
-    ("shPref", tiling.shPref.toUInt32),
-    ("shMin", tiling.shPref.toUInt32),
-    ("shMax", tiling.shMax.toUInt32),
-    ("F", tiling.f.toUInt32),
+    ("shPref", shPrefU32),
+    ("shMin", shPrefU32),
+    ("shMax", shMaxU32),
+    ("F", fU32),
     ("wide3x3", if wide3x3 then 1 else 0)
   ]
   let wNeTile ← encodeWord neTileLayout #[
-    ("ocg", (effOcgConv shape tiling).toUInt32),
-    ("fat", tiling.fat.toUInt32),
-    ("WU", tiling.wu.toUInt32)
+    ("ocg", effOcgU32),
+    ("fat", fatU32),
+    ("WU", wuU32)
   ]
   let wSrc1Cfg ← encodeWord src1CfgLayout #[("mode", 2), ("P", 1)]
   let wResCfg ← encodeWord resCfgLayout #[
@@ -343,17 +384,17 @@ def lowerConvTask
     ("sparse", if sparse then 1 else 0),
     ("stage", 1)
   ]
-  let wChunkSlotVal ← encodeWord chunkSlotLayout #[("enable", 1), ("on20", 1), ("task", 0)]
-  let wOut2 ← encodeWord out2Layout #[("form", 0xe0), ("task", 0)]
+  let wChunkSlotVal ← encodeWord chunkSlotLayout #[("enable", 1), ("on20", 1), ("task", taskIdU32)]
+  let wOut2 ← encodeWord out2Layout #[("form", 0xe0), ("task", taskIdU32)]
 
   let mut plain : Array RegWrite := #[
     -- Common block
     { byteAddr := regWin, value := wWin },
     { byteAddr := regHin, value := wHin },
-    { byteAddr := regCin, value := shape.cin.toUInt32 },
+    { byteAddr := regCin, value := cinU32 },
     { byteAddr := regWout, value := wWout },
     { byteAddr := regHout, value := wHout },
-    { byteAddr := regCout, value := shape.cout.toUInt32 },
+    { byteAddr := regCout, value := coutU32 },
     { byteAddr := regConvCfg, value := wConvCfg },
     { byteAddr := regTH, value := wTH },
     { byteAddr := regNeCommon, value := wNeCommon },
@@ -363,24 +404,24 @@ def lowerConvTask
     { byteAddr := regSrc1Cfg, value := wSrc1Cfg },
     { byteAddr := regSrc2Cfg, value := src2CfgValue },
     { byteAddr := regSrc1Base, value := 0 },
-    { byteAddr := regSrc1ChanStride, value := chs.toUInt32 },
-    { byteAddr := regSrc1RowStride, value := srcRow.toUInt32 },
-    { byteAddr := regSrc1RowBytesA, value := (shape.cin * chs).toUInt32 },
-    { byteAddr := regSrc1RowBytesB, value := (shape.cin * chs).toUInt32 },
+    { byteAddr := regSrc1ChanStride, value := chsU32 },
+    { byteAddr := regSrc1RowStride, value := srcRowU32 },
+    { byteAddr := regSrc1RowBytesA, value := srcRowBytesU32 },
+    { byteAddr := regSrc1RowBytesB, value := srcRowBytesU32 },
     { byteAddr := regResCfg, value := wResCfg },
-    { byteAddr := regResBase, value := srcL2.toUInt32 },
+    { byteAddr := regResBase, value := resBaseU32 },
     -- Neural Engine block
     { byteAddr := regNeCfg, value := wNeCfg },
     { byteAddr := regNeOp, value := wNeOp },
     { byteAddr := regNeScale, value := wNeScale },
     -- Tile DMA (Source) block
     { byteAddr := regSrc1DmaCfg, value := src1DmaCfgValue },
-    { byteAddr := regSrc1DmaRowStride, value := inRowStride.toUInt32 },
-    { byteAddr := regSrc1DmaPlaneStride, value := inPlaneStride.toUInt32 },
+    { byteAddr := regSrc1DmaRowStride, value := inRowStrideU32 },
+    { byteAddr := regSrc1DmaPlaneStride, value := inPlaneStrideU32 },
     { byteAddr := regSrc1Fmt, value := wSrc1Fmt },
     -- Result DMA block
-    { byteAddr := regResDmaRowStride, value := outRowStride.toUInt32 },
-    { byteAddr := regResDmaPlaneStride, value := outPlaneStride.toUInt32 },
+    { byteAddr := regResDmaRowStride, value := outRowStrideU32 },
+    { byteAddr := regResDmaPlaneStride, value := outPlaneStrideU32 },
     { byteAddr := regResFmt, value := wResFmt },
     -- Kernel DMA stage
     { byteAddr := regKernelStage, value := wKernStage },
@@ -400,11 +441,14 @@ def lowerConvTask
 
   -- Staged mode result L2 registers (omitted in direct mode)
   if !direct then
+    let dchsU32 ← natToU32Checked dchs "resChanStride"
+    let resRowU32 ← natToU32Checked resRow "resRowStride"
+    let resRowBytesU32 ← natToU32Checked (shape.cout * dchs) "resRowBytes"
     plain := plain ++ #[
-      { byteAddr := regResChanStride, value := dchs.toUInt32 },
-      { byteAddr := regResRowStride, value := resRow.toUInt32 },
-      { byteAddr := regResRowBytesA, value := (shape.cout * dchs).toUInt32 },
-      { byteAddr := regResRowBytesB, value := (shape.cout * dchs).toUInt32 }
+      { byteAddr := regResChanStride, value := dchsU32 },
+      { byteAddr := regResRowStride, value := resRowU32 },
+      { byteAddr := regResRowBytesA, value := resRowBytesU32 },
+      { byteAddr := regResRowBytesB, value := resRowBytesU32 }
     ]
 
   -- Scalar bias register (written only when effMode == dense && Cout == 1)
@@ -414,17 +458,19 @@ def lowerConvTask
 
   -- Active kernel chunk table slots (inactive slots omitted)
   for cs in packed.slots do
+    let cOffU32 ← natToU32Checked cs.offset s!"chunkOffset[{cs.slot}]"
+    let cSzU32 ← natToU32Checked cs.size s!"chunkSize[{cs.slot}]"
     plain := plain ++ #[
       { byteAddr := regChunkSlot cs.slot, value := wChunkSlotVal },
-      { byteAddr := regChunkOffset cs.slot, value := cs.offset.toUInt32 },
-      { byteAddr := regChunkSize cs.slot, value := cs.size.toUInt32 }
+      { byteAddr := regChunkOffset cs.slot, value := cOffU32 },
+      { byteAddr := regChunkSize cs.slot, value := cSzU32 }
     ]
 
   -- BAR-tagged sequential records in canonical order
-  let wSrc1Dep ← encodeWord src1DepLayout #[("code", 0x21), ("task", 0)]
+  let wSrc1Dep ← encodeWord src1DepLayout #[("code", 0x21), ("task", taskIdU32)]
   let wResDep ← encodeWord resDepLayout #[
     ("code", resDepCode target),
-    ("task", 0),
+    ("task", taskIdU32),
     ("direct", if direct then 1 else 0)
   ]
   let barRecs : Array BarRegWrite := #[
@@ -461,8 +507,8 @@ def compileConv
   let packed ← packConvKernelChunks target shape tiling weights bias
   let taskDesc ← lowerConvTask target shape tiling packed relu
 
-  let inSurf := makeFp16Surface target "x" "input_x" .input shape.cin shape.h shape.w
-  let outSurf := makeFp16Surface target "y" "output_y" .output shape.cout shape.outH shape.outW
+  let inSurf ← makeFp16Surface target "x" "input_x" .input shape.cin shape.h shape.w
+  let outSurf ← makeFp16Surface target "y" "output_y" .output shape.cout shape.outH shape.outW
 
   let emitted ← emitProgram {
     target := target

@@ -30,7 +30,7 @@ def BitField.mask (f : BitField) : UInt32 :=
   f.maskNat.toUInt32
 
 /-- Recursive field-list validator for `WordLayout` (kernel-reducible for formal layout proofs). -/
-private def validateWordLayoutFields
+def validateWordLayoutFields
     (layoutName : String) (fixedMask : UInt32) :
     List BitField → UInt32 → List String → Except String UInt32
   | [], usedMask, _ => .ok usedMask
@@ -58,49 +58,68 @@ def validateWordLayout (layout : WordLayout) : Except String UInt32 :=
   else
     validateWordLayoutFields layout.name layout.fixedMask layout.fields.toList layout.fixedMask []
 
+/-- Validate that all supplied `(fieldName, value)` pairs have unique, known field names. -/
+def validateEncodeValues
+    (layoutName : String) (fields : List BitField) :
+    List (String × UInt32) → List String → Except String Unit
+  | [], _ => .ok ()
+  | (fname, _) :: rest, seenVals =>
+    if seenVals.any (fun nm => decide (nm = fname)) then
+      .error s!"layout '{layoutName}': duplicate value for field '{fname}'"
+    else if !fields.any (fun f => decide (f.name = fname)) then
+      .error s!"layout '{layoutName}': unknown field '{fname}'"
+    else
+      validateEncodeValues layoutName fields rest (fname :: seenVals)
+
+/-- Recursively width-check and OR all fields of a `WordLayout` into `word`. -/
+def encodeWordFields
+    (layoutName : String) (values : List (String × UInt32)) :
+    List BitField → UInt32 → Except String UInt32
+  | [], word => .ok word
+  | f :: rest, word =>
+    match values.find? (fun p => decide (p.1 = f.name)) with
+    | none => .error s!"layout '{layoutName}': missing required field '{f.name}'"
+    | some (_, val) =>
+      let limit : Nat := (1 : Nat) <<< f.width
+      if val.toNat >= limit then
+        .error s!"layout '{layoutName}.{f.name}': value {val} ({toHex val.toNat}) exceeds {f.width}-bit field max {limit - 1}"
+      else
+        encodeWordFields layoutName values rest (word ||| (val <<< f.lo.toUInt32))
+
 /-- Width-checked bitfield encoder: validates layout disjointness, checks that every field
     is supplied exactly once and fits strictly in `< 2^width`, and combines with fixed bits. -/
-def encodeWord (layout : WordLayout) (values : Array (String × UInt32)) : Except String UInt32 := do
-  let _ ← validateWordLayout layout
-  let mut seenVals : Array String := #[]
-  for (fname, _) in values do
-    if seenVals.contains fname then
-      throw s!"layout '{layout.name}': duplicate value for field '{fname}'"
-    if !layout.fields.any (fun f => f.name == fname) then
-      throw s!"layout '{layout.name}': unknown field '{fname}'"
-    seenVals := seenVals.push fname
-
-  let mut word : UInt32 := layout.fixedValue
-  for f in layout.fields do
-    let some (_, val) := values.find? (fun (nm, _) => nm == f.name)
-      | throw s!"layout '{layout.name}': missing required field '{f.name}'"
-    let limit : Nat := (1 : Nat) <<< f.width
-    if val.toNat >= limit then
-      throw s!"layout '{layout.name}.{f.name}': value {val} ({toHex val.toNat}) exceeds {f.width}-bit field max {limit - 1}"
-    word := word ||| (val <<< f.lo.toUInt32)
-  pure word
+def encodeWord (layout : WordLayout) (values : Array (String × UInt32)) : Except String UInt32 :=
+  validateWordLayout layout >>= fun _ =>
+  validateEncodeValues layout.name layout.fields.toList values.toList [] >>= fun () =>
+  encodeWordFields layout.name values.toList layout.fields.toList layout.fixedValue
 
 /-- Extract a bitfield value from a 32-bit word without bounds checking the layout. -/
 def decodeField (word : UInt32) (f : BitField) : UInt32 :=
   let rawMask : UInt32 := (((1 : Nat) <<< f.width) - 1).toUInt32
   (word >>> f.lo.toUInt32) &&& rawMask
 
+/-- Look up a named bitfield in a `WordLayout` field list. -/
+def findBitField? (fields : List BitField) (fieldName : String) : Option BitField :=
+  fields.find? (fun f => decide (f.name = fieldName))
+
 /-- Check that `word` matches `layout`'s fixed bits and has zero in all unused bits. -/
-def validateWordBits (layout : WordLayout) (word : UInt32) : Except String Unit := do
-  let usedMask ← validateWordLayout layout
+def validateWordBits (layout : WordLayout) (word : UInt32) : Except String Unit :=
+  validateWordLayout layout >>= fun usedMask =>
   if (word &&& layout.fixedMask) != layout.fixedValue then
-    throw s!"layout '{layout.name}': word {toHex word.toNat} violates fixed bits (got {toHex (word &&& layout.fixedMask).toNat}, expected {toHex layout.fixedValue.toNat})"
-  let unused := word &&& (~~~usedMask)
-  if unused != 0 then
-    throw s!"layout '{layout.name}': word {toHex word.toNat} has non-zero reserved/unused bits {toHex unused.toNat}"
-  pure ()
+    .error s!"layout '{layout.name}': word {toHex word.toNat} violates fixed bits (got {toHex (word &&& layout.fixedMask).toNat}, expected {toHex layout.fixedValue.toNat})"
+  else
+    let unused := word &&& (~~~usedMask)
+    if unused != 0 then
+      .error s!"layout '{layout.name}': word {toHex word.toNat} has non-zero reserved/unused bits {toHex unused.toNat}"
+    else
+      .ok ()
 
 /-- Validate fixed/unused bits of `word` against `layout` and extract the named field. -/
-def decodeFieldChecked (layout : WordLayout) (word : UInt32) (fieldName : String) : Except String UInt32 := do
-  validateWordBits layout word
-  match layout.fields.find? (fun f => f.name == fieldName) with
-  | some f => pure (decodeField word f)
-  | none => throw s!"layout '{layout.name}': unknown field '{fieldName}'"
+def decodeFieldChecked (layout : WordLayout) (word : UInt32) (fieldName : String) : Except String UInt32 :=
+  validateWordBits layout word >>= fun () =>
+  match findBitField? layout.fields.toList fieldName with
+  | some f => .ok (decodeField word f)
+  | none => .error s!"layout '{layout.name}': unknown field '{fieldName}'"
 
 -- ============================================================================
 -- Task header layouts (9-word header for NE 1x1 conv)
@@ -129,18 +148,22 @@ def taskHeader8Layout : WordLayout := {
 def taskHeaderWord2Const : UInt32 := 0x04000068
 def taskHeaderWord4Const : UInt32 := 0x00fff868
 
-/-- Encode the 9-word NE task header. Checks `logNE <= 4` and `9 <= taskWords <= 0x7ff`. -/
+/-- Encode the 9-word NE task header. Checks `taskId < 65536`, `logNE <= 4`, and `9 <= taskWords <= 0x7ff`. -/
 def encodeTaskHeader9 (taskId taskWords logNE : Nat) : Except String (Array UInt32) := do
+  if taskId > 0xffff then
+    throw s!"task header: taskId {taskId} exceeds 16-bit maximum 65535"
   if logNE > 4 then
     throw s!"task header: logNE {logNE} exceeds maximum 4"
   if taskWords < 9 || taskWords > 0x7ff then
     throw s!"task header: taskWords {taskWords} out of range 9..{0x7ff}"
+  let taskIdU32 ← natToU32Checked taskId "task header taskId"
+  let taskWordsU32 ← natToU32Checked taskWords "task header taskWords"
+  let eneU32 ← natToU32Checked (logNE + 1) "task header ene"
   let w0 ← encodeWord taskHeader0Layout #[
-    ("taskId", taskId.toUInt32),
-    ("taskWords", taskWords.toUInt32)
+    ("taskId", taskIdU32),
+    ("taskWords", taskWordsU32)
   ]
-  let ene := logNE + 1
-  let w8 ← encodeWord taskHeader8Layout #[("ene", ene.toUInt32)]
+  let w8 ← encodeWord taskHeader8Layout #[("ene", eneU32)]
   pure #[w0, 0, taskHeaderWord2Const, 0, taskHeaderWord4Const, 0, 0, 0, w8]
 
 -- ============================================================================
@@ -492,9 +515,10 @@ def packPlainWrites (writes : Array RegWrite) : Except String (Array RegRecord) 
 
   pure out
 
-/-- Pack plain writes followed by explicit BAR-tagged sequential records in caller order,
+/-- Pack plain writes and explicit BAR-tagged sequential records separately in a single pass,
     ensuring no byte address is written by both plain and BAR records. -/
-def packTaskRecords (plain : Array RegWrite) (barRecs : Array BarRegWrite) : Except String (Array RegRecord) := do
+def packTaskRecordsSplit (plain : Array RegWrite) (barRecs : Array BarRegWrite) :
+    Except String (Array RegRecord × Array RegRecord) := do
   let mut barAddrs : Array Nat := #[]
   let mut barEncoded : Array RegRecord := #[]
   for br in barRecs do
@@ -519,6 +543,12 @@ def packTaskRecords (plain : Array RegWrite) (barRecs : Array BarRegWrite) : Exc
       throw s!"register address {toHex pw.byteAddr} written by both plain and BAR records"
 
   let plainRecs ← packPlainWrites plain
+  pure (plainRecs, barEncoded)
+
+/-- Pack plain writes followed by explicit BAR-tagged sequential records in caller order,
+    ensuring no byte address is written by both plain and BAR records. -/
+def packTaskRecords (plain : Array RegWrite) (barRecs : Array BarRegWrite) : Except String (Array RegRecord) := do
+  let (plainRecs, barEncoded) ← packTaskRecordsSplit plain barRecs
   pure (plainRecs ++ barEncoded)
 
 /-- Count total 32-bit words consumed by an array of register records (header + payload). -/

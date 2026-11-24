@@ -52,32 +52,41 @@ structure EmittedProgram where
   sections : LoadSections
 
 /-- Build a 64-byte row-strided fp16 `SurfaceSpec` with target-appropriate section sizing
-    (16 KiB rounded on H16, exact span on H17). -/
+    (16 KiB rounded on H16, exact span on H17), checking all `Nat -> UInt32/UInt64` conversions. -/
 def makeFp16Surface
     (target : Target)
     (shortName symbolName : String)
     (direction : SurfaceDirection)
-    (channels height width : Nat) : SurfaceSpec :=
+    (channels height width : Nat) : Except String SurfaceSpec := do
+  if channels == 0 || height == 0 || width == 0 then
+    throw s!"surface '{shortName}': dimensions (C={channels}, H={height}, W={width}) must all be >= 1"
+  let cU32 ← natToU32Checked channels s!"surface '{shortName}' channels"
+  let hU32 ← natToU32Checked height s!"surface '{shortName}' height"
+  let wU32 ← natToU32Checked width s!"surface '{shortName}' width"
   let rowStride := alignUp (2 * width) dmaLineBytes
   let planeStride := height * rowStride
   let span := channels * planeStride
   let alloc := alignUp span pageSize
+  let rowStrideU64 ← natToU64Checked rowStride s!"surface '{shortName}' rowStride"
+  let planeStrideU64 ← natToU64Checked planeStride s!"surface '{shortName}' planeStride"
+  let spanU64 ← natToU64Checked span s!"surface '{shortName}' span"
+  let allocU64 ← natToU64Checked alloc s!"surface '{shortName}' allocSize"
   let sectSize : UInt64 := match target with
-    | .h16 => alloc.toUInt64
-    | .h17 => span.toUInt64
-  {
+    | .h16 => allocU64
+    | .h17 => spanU64
+  pure {
     shortName := shortName
     symbolName := symbolName
     direction := direction
     n := 1
-    channels := channels.toUInt32
-    height := height.toUInt32
-    width := width.toUInt32
-    rowStride := rowStride.toUInt64
-    planeStride := planeStride.toUInt64
-    batchStride := span.toUInt64
+    channels := cU32
+    height := hU32
+    width := wU32
+    rowStride := rowStrideU64
+    planeStride := planeStrideU64
+    batchStride := spanU64
     sectionSize := some sectSize
-    allocSize := some alloc.toUInt64
+    allocSize := some allocU64
   }
 
 /-- Emit a complete HWX Mach-O binary and its 4 Linux LOAD sections from a generic `ProgramSpec`,
@@ -91,8 +100,8 @@ def emitProgram (spec : ProgramSpec) : Except String EmittedProgram := do
 
   for ti in [:spec.tasks.size] do
     let td := spec.tasks[ti]!
-    let plainRecs ← packPlainWrites td.plainWrites
-    let allRecs ← packTaskRecords td.plainWrites td.barWrites
+    let (plainRecs, barRecs) ← packTaskRecordsSplit td.plainWrites td.barWrites
+    let allRecs := plainRecs ++ barRecs
     let totalTaskWords := 9 + recordWordsCount allRecs
     let header ← encodeTaskHeader9 td.taskId totalTaskWords td.logNE
     tasks := tasks.push { header := header, records := allRecs }
@@ -116,7 +125,8 @@ def emitProgram (spec : ProgramSpec) : Except String EmittedProgram := do
     let some (_, _, _, patchOff) :=
       encStream.payloadSites.find? (fun (tIdx, rIdx, pIdx, _) => tIdx == ti && rIdx == ri && pIdx == pi)
       | throw s!"emitProgram: failed to locate relocation payload offset for task {ti}, record {ri}, word {pi}"
-    relocs := relocs.push { patchOffset := patchOff.toUInt32 }
+    let patchOffU32 ← natToU32Checked patchOff s!"emitProgram task {ti} relocation patchOffset"
+    relocs := relocs.push { patchOffset := patchOffU32 }
 
   let prog : HwxProgram := {
     target := spec.target

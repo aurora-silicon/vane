@@ -353,6 +353,10 @@ def resRowStrideConv (sh : ConvSpec) (t : Tiling) : Nat :=
 def srcL2BytesConv (sh : ConvSpec) (t : Tiling) : Nat :=
   inRowsConv sh t.tileHeight * srcRowStrideConv sh t
 
+/-- 64-byte aligned L2 SRAM byte offset of result staging (`alignUp srcL2Bytes 64`). -/
+def resBaseBytesConv (sh : ConvSpec) (t : Tiling) : Nat :=
+  alignUp (srcL2BytesConv sh t) 64
+
 /-- Bytes of L2 SRAM occupied by result staging. -/
 def resL2BytesConv (target : Target) (sh : ConvSpec) (t : Tiling) : Nat :=
   if isDirectConv target sh t then
@@ -360,9 +364,9 @@ def resL2BytesConv (target : Target) (sh : ConvSpec) (t : Tiling) : Nat :=
   else
     min t.tileHeight sh.outH * resRowStrideConv sh t
 
-/-- Total L2 SRAM footprint (`srcL2Bytes + resL2Bytes`). -/
+/-- Total L2 SRAM footprint (`alignUp srcL2Bytes 64 + resL2Bytes`). -/
 def l2UseBytesConv (target : Target) (sh : ConvSpec) (t : Tiling) : Nat :=
-  srcL2BytesConv sh t + resL2BytesConv target sh t
+  resBaseBytesConv sh t + resL2BytesConv target sh t
 
 /-- Smallest `i in 0..5` such that `wd % (base >> i) == 0`, or `6` if none. -/
 def firstDiv (wd base : Nat) : Nat := Id.run do
@@ -507,6 +511,8 @@ def validateConvSafety (target : Target) (sh : ConvSpec) (t : Tiling) : Except S
       .error s!"illegal tiling: strip width T={stripW} outside [8, 256]"
     else if t.shPref > t.shMax then
       .error s!"illegal tiling: shifts shPref={t.shPref} > shMax={t.shMax}"
+    else if t.shMax > 4 then
+      .error s!"illegal tiling: shMax={t.shMax} exceeds maximum 4"
     else if t.tileHeight == 0 then
       .error s!"illegal tiling: tileHeight=0 must be >= 1"
     else if l2UseBytesConv target sh t > l2CapacityBytes then
@@ -526,10 +532,6 @@ def validateConvChooserPolicy (sh : ConvSpec) (t : Tiling) : Except String Unit 
     throw s!"chooser policy: F={t.f} exceeds min(4, ceil_log2(Cout={sh.cout}))={maxF}"
   if eff == .depthwise && sh.cout >= 16 && t.f != 4 then
     throw s!"chooser policy: depthwise with C={sh.cout} >= 16 requires F=4, got F={t.f}"
-
-  -- Work-unit shift upper bound
-  if t.shMax > 4 then
-    throw s!"chooser policy: shMax={t.shMax} exceeds 4"
 
   -- Width cover rule on output width Wo
   let stripW := stripWidth t
@@ -587,14 +589,23 @@ def maxTileHeightConv (target : Target) (sh : ConvSpec) (probe : Tiling) : Nat :
   let direct := isDirectConv target sh probe
 
   if sh.kernelSize == 1 then
-    if direct then
-      let resBytes := ((1 : Nat) <<< (probe.f + effOcgConv sh probe + probe.fat)) * 512
-      if resBytes >= l2CapacityBytes || srcRow == 0 then return 0
-      else return min ho ((l2CapacityBytes - resBytes) / srcRow)
-    else
-      let perRow := srcRow + resRowStrideConv sh probe
-      if perRow == 0 then return 0
-      else return min ho (l2CapacityBytes / perRow)
+    let thBound1 : Nat :=
+      if direct then
+        let resBytes := ((1 : Nat) <<< (probe.f + effOcgConv sh probe + probe.fat)) * 512
+        if resBytes >= l2CapacityBytes || srcRow == 0 then 0
+        else min ho ((l2CapacityBytes - resBytes) / srcRow)
+      else
+        let perRow := srcRow + resRowStrideConv sh probe
+        if perRow == 0 then 0
+        else min ho (l2CapacityBytes / perRow)
+    for dec in [:4] do
+      if thBound1 > dec then
+        let th := thBound1 - dec
+        if th >= 1 then
+          let cand : Tiling := { probe with tileHeight := th }
+          if l2UseBytesConv target sh cand <= l2CapacityBytes then
+            return th
+    return 0
 
   -- 3x3 O(1) maximal tile height:
   -- Step 1: test th = Ho directly
@@ -624,8 +635,8 @@ def maxTileHeightConv (target : Target) (sh : ConvSpec) (probe : Tiling) : Nat :
   if thBound == 0 then
     return 0
 
-  -- Step 3: refine over at most {thBound, thBound - 1, thBound - 2}
-  for dec in [:3] do
+  -- Step 3: refine over at most {thBound, thBound - 1, thBound - 2, thBound - 3}
+  for dec in [:4] do
     if thBound > dec then
       let th := thBound - dec
       if th >= 1 then

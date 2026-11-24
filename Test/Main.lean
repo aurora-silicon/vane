@@ -1665,8 +1665,8 @@ private def runAllTests : IO (Array TestResult) := do
     let bs := mkTaggedBias 4
     let packed ← packConvKernelChunks .h17 sh3 tRelaxed ws (some bs)
     let td ← lowerConvTask .h17 sh3 tRelaxed packed true
-    let inSurf := makeFp16Surface .h17 "x" "input_x" .input sh3.cin sh3.h sh3.w
-    let outSurf := makeFp16Surface .h17 "y" "output_y" .output sh3.cout sh3.outH sh3.outW
+    let inSurf ← makeFp16Surface .h17 "x" "input_x" .input sh3.cin sh3.h sh3.w
+    let outSurf ← makeFp16Surface .h17 "y" "output_y" .output sh3.cout sh3.outH sh3.outW
     let emitted ← emitProgram {
       target := .h17
       surfaces := #[inSurf, outSurf]
@@ -1708,8 +1708,8 @@ private def runAllTests : IO (Array TestResult) := do
     -- Share one __KERN_0 buffer large enough for both tasks (task 0 uses [0, pk1.size), task 1 uses [0, pk3.size))
     let td0 ← lowerConvTask .h17 sh1 t1 pk1 false (taskId := 0)
     let td1 ← lowerConvTask .h17 sh3 t3 pk3 true (taskId := 1)
-    let inSurf := makeFp16Surface .h17 "x" "input_x" .input 16 8 16
-    let outSurf := makeFp16Surface .h17 "y" "output_y" .output 16 8 16
+    let inSurf ← makeFp16Surface .h17 "x" "input_x" .input 16 8 16
+    let outSurf ← makeFp16Surface .h17 "y" "output_y" .output 16 8 16
     let emitted ← emitProgram {
       target := .h17
       surfaces := #[inSurf, outSurf]
@@ -1722,6 +1722,474 @@ private def runAllTests : IO (Array TestResult) := do
     if nChecked != 2 then throw s!"expected 2 verified conv tasks, got {nChecked}"
     pure ()
   ))
+
+  -- =========================================================================
+  -- M3 Checked Nat -> UInt32/UInt64 Overflow Tests
+  -- =========================================================================
+
+  results := results.push (checkErr "m3 neg: natToU32Checked rejects 1 <<< 32" (do
+    natToU32Checked ((1 : Nat) <<< 32) "test"
+  ) "overflows UInt32")
+
+  results := results.push (checkErr "m3 neg: natToU64Checked rejects 1 <<< 64" (do
+    natToU64Checked ((1 : Nat) <<< 64) "test"
+  ) "overflows UInt64")
+
+  results := results.push (checkErr "m3 neg: encodeTaskHeader9 rejects taskId = 1 <<< 32 (no silent wrap to 0)" (do
+    encodeTaskHeader9 ((1 : Nat) <<< 32) 64 4
+  ) "taskId")
+
+  results := results.push (checkErr "m3 neg: encodeTaskHeader9 rejects taskId = 65536" (do
+    encodeTaskHeader9 65536 64 4
+  ) "taskId")
+
+  results := results.push (checkErr "m3 neg: makeFp16Surface rejects huge H = 1 <<< 32" (do
+    makeFp16Surface .h17 "x" "input_x" .input 1 ((1 : Nat) <<< 32) 8
+  ) "overflows UInt32")
+
+  results := results.push (checkErr "m3 neg: makeFp16Surface rejects huge W = 1 <<< 32" (do
+    makeFp16Surface .h17 "x" "input_x" .input 1 8 ((1 : Nat) <<< 32)
+  ) "overflows UInt32")
+
+  results := results.push (checkErr "m3 neg: makeFp16Surface rejects UInt64 span overflow" (do
+    makeFp16Surface .h17 "x" "input_x" .input 0xffffffff 0xffffffff 0x80000000
+  ) "overflows UInt64")
+
+  results := results.push (checkErr "m3 neg: lowerConvTask rejects taskId = 1 <<< 32" (do
+    let sh : ConvSpec := { kernelSize := 1, h := 8, w := 16, cin := 16, cout := 16 }
+    let t ← chooseConvTiling .h17 sh
+    let pk ← packConvKernelChunks .h17 sh t (mkTaggedWeights 16 16) none
+    lowerConvTask .h17 sh t pk false (taskId := (1 : Nat) <<< 32)
+  ) "overflows UInt32")
+
+  -- =========================================================================
+  -- B1-B4 / M1 / M2 / N5 Comprehensive Negative Verifier & Safety Tests
+  -- =========================================================================
+
+  -- B2: shMax > 4 and (fat=1, shPref=5) rejected by validateConvSafety directly
+  results := results.push (checkErr "b2 neg: validateConvSafety rejects shMax=5" (do
+    let sh : ConvSpec := { kernelSize := 1, h := 8, w := 16, cin := 16, cout := 16 }
+    let t : Tiling := { logNE := 4, f := 4, fat := 0, ocg := 0, shPref := 0, shMax := 5, tileHeight := 8 }
+    validateConvSafety .h17 sh t
+  ) "shMax=5")
+
+  results := results.push (checkErr "b2 neg: validateConvSafety rejects (fat=1, shPref=5, shMax=5)" (do
+    let sh : ConvSpec := { kernelSize := 1, h := 8, w := 16, cin := 16, cout := 16 }
+    let t : Tiling := { logNE := 4, f := 3, fat := 1, ocg := 1, shPref := 5, shMax := 5, tileHeight := 8 }
+    validateConvSafety .h17 sh t
+  ) "shMax=5")
+
+  -- Helper: emit a custom single-task HWX from a modified TaskDesc/surfaces/reloc flag and run verifyConvHwxTasks
+  let emitTaskAndVerify
+      (target : Target) (inSurf outSurf : SurfaceSpec) (kernel : ByteArray)
+      (td : TaskDesc) (emitReloc : Bool := true)
+      (extraRecs : Array RegRecord := #[])
+      (headerPatch? : Option (Nat × UInt32) := none) : Except String Unit := do
+    let (plainRecs, barRecs) ← packTaskRecordsSplit td.plainWrites td.barWrites
+    let allRecs := plainRecs ++ barRecs ++ extraRecs
+    let totalTaskWords := 9 + recordWordsCount allRecs
+    let mut hdr ← encodeTaskHeader9 td.taskId totalTaskWords td.logNE
+    if let some (idx, val) := headerPatch? then
+      hdr := hdr.set! idx val
+    let prologue : UInt32 := match target with | .h16 => 1 | .h17 => 0
+    let stream : TaskStream := { prologue := prologue, tasks := #[{ header := hdr, records := allRecs }] }
+    let encStream ← encodeTaskStream target stream
+    let mut relocs : Array RelocationSpec := #[]
+    if emitReloc then
+      for rel in td.kernelRelocs do
+        let some (_, _, _, patchOff) :=
+          encStream.payloadSites.find? (fun (tIdx, rIdx, pIdx, _) =>
+            tIdx == 0 && rIdx == plainRecs.size + rel.barRecIndex && pIdx == rel.payloadWordIndex)
+          | throw "missing reloc site"
+        relocs := relocs.push { patchOffset := patchOff.toUInt32 }
+    let hwx ← emitHwx {
+      target := target
+      surfaces := #[inSurf, outSurf]
+      constants := zeroBytes textConstBytes
+      kernel := some kernel
+      taskStream := stream
+      relocations := relocs
+      ident := some "vane"
+    }
+    let info ← validateHwx hwx
+    let _ ← verifyConvHwxTasks hwx info (requireConvTask := true)
+    pure ()
+
+  -- Baseline components for structural negative tests
+  let baseSh1 : ConvSpec := { kernelSize := 1, h := 8, w := 16, cin := 16, cout := 16 }
+  let baseT1 ← unwrap "baseT1" (chooseConvTiling .h17 baseSh1)
+  let basePk1 ← unwrap "basePk1" (packConvKernelChunks .h17 baseSh1 baseT1 (mkTaggedWeights 16 16) (some (mkTaggedBias 16)))
+  let baseTd1 ← unwrap "baseTd1" (lowerConvTask .h17 baseSh1 baseT1 basePk1 true)
+  let baseIn1 ← unwrap "baseIn1" (makeFp16Surface .h17 "x" "input_x" .input 16 8 16)
+  let baseOut1 ← unwrap "baseOut1" (makeFp16Surface .h17 "y" "output_y" .output 16 8 16)
+
+  let baseSh1Cout1 : ConvSpec := { kernelSize := 1, h := 4, w := 8, cin := 16, cout := 1 }
+  let baseT1C1 ← unwrap "baseT1C1" (chooseConvTiling .h17 baseSh1Cout1)
+  let basePk1C1 ← unwrap "basePk1C1" (packConvKernelChunks .h17 baseSh1Cout1 baseT1C1 (mkTaggedWeights 1 16) (some (mkTaggedBias 1)))
+  let baseTd1C1 ← unwrap "baseTd1C1" (lowerConvTask .h17 baseSh1Cout1 baseT1C1 basePk1C1 false)
+  let baseIn1C1 ← unwrap "baseIn1C1" (makeFp16Surface .h17 "x" "input_x" .input 16 4 8)
+  let baseOut1C1 ← unwrap "baseOut1C1" (makeFp16Surface .h17 "y" "output_y" .output 1 4 8)
+
+  let baseSh3Dw1 : ConvSpec := { kernelSize := 3, mode := .depthwise, h := 8, w := 8, cin := 1, cout := 1, stride := 1, pad := .same }
+  let baseT3Dw1 ← unwrap "baseT3Dw1" (chooseConvTiling .h17 baseSh3Dw1)
+  let basePk3Dw1 ← unwrap "basePk3Dw1" (packConvKernelChunks .h17 baseSh3Dw1 baseT3Dw1 (mkTaggedWeights3x3 1 1) none)
+  let baseTd3Dw1 ← unwrap "baseTd3Dw1" (lowerConvTask .h17 baseSh3Dw1 baseT3Dw1 basePk3Dw1 false)
+  let baseIn3Dw1 ← unwrap "baseIn3Dw1" (makeFp16Surface .h17 "x" "input_x" .input 1 8 8)
+  let baseOut3Dw1 ← unwrap "baseOut3Dw1" (makeFp16Surface .h17 "y" "output_y" .output 1 8 8)
+
+  -- B1: non-zero src1BaseLo / resBaseLo, missing/mismatched/nonzero *BaseHi, kernelBaseLo overflow
+  results := results.push (checkErr "m2 neg verifier: non-zero misaligned src1BaseLo rejected" (do
+    tamperRegAndVerify baseConv regSrc1BaseLo 32
+  ) "64-byte aligned")
+
+  results := results.push (checkErr "m2 neg verifier: non-zero aligned src1BaseLo overflowing surface rejected" (do
+    tamperRegAndVerify baseConv regSrc1BaseLo 64
+  ) "input DMA range")
+
+  results := results.push (checkErr "m2 neg verifier: non-zero aligned resBaseLo overflowing surface rejected" (do
+    tamperRegAndVerify baseConv regResBaseLo 64
+  ) "output DMA range")
+
+  results := results.push (checkErr "m2 neg verifier: non-zero src1BaseHi rejected" (do
+    tamperRegAndVerify baseConv regSrc1BaseHi 1
+  ) "input DMA range")
+
+  results := results.push (checkErr "m2 neg verifier: non-zero resBaseHi rejected" (do
+    tamperRegAndVerify baseConv regResBaseHi 1
+  ) "output DMA range")
+
+  results := results.push (checkErr "m2 neg verifier: non-zero kernelBaseHi rejected" (do
+    tamperRegAndVerify baseConv regKernelBaseHi 1
+  ) "exceeds kernel size")
+
+  results := results.push (checkErr "m2 neg verifier: kernelBaseLo relocation addend overflowing __KERN_0 rejected" (do
+    tamperRegAndVerify baseConv regKernelBaseLo 64
+  ) "exceeds kernel size")
+
+  results := results.push (checkErr "m2 neg verifier: missing src1BaseHi rejected" (do
+    let barWrites := baseTd1.barWrites.map fun br =>
+      if br.baseByteAddr == regSrc1BaseLo then { br with values := #[0] } else br
+    emitTaskAndVerify .h17 baseIn1 baseOut1 basePk1.bytes { baseTd1 with barWrites := barWrites }
+  ) "src1BaseHi")
+
+  results := results.push (checkErr "m2 neg verifier: missing resBaseHi rejected" (do
+    let barWrites := baseTd1.barWrites.map fun br =>
+      if br.baseByteAddr == regResBaseLo then { br with values := #[0] } else br
+    emitTaskAndVerify .h17 baseIn1 baseOut1 basePk1.bytes { baseTd1 with barWrites := barWrites }
+  ) "resBaseHi")
+
+  results := results.push (checkErr "m2 neg verifier: missing kernelBaseHi rejected" (do
+    let barWrites := baseTd1.barWrites.map fun br =>
+      if br.baseByteAddr == regKernelBaseLo then { br with values := #[0] } else br
+    emitTaskAndVerify .h17 baseIn1 baseOut1 basePk1.bytes { baseTd1 with barWrites := barWrites }
+  ) "kernelBaseHi")
+
+  results := results.push (checkErr "m2 neg verifier: mismatched BAR slot between src1BaseLo and src1BaseHi rejected" (do
+    let mut barWrites : Array BarRegWrite := #[]
+    for br in baseTd1.barWrites do
+      if br.baseByteAddr == regSrc1BaseLo then
+        barWrites := barWrites.push { baseByteAddr := regSrc1BaseLo, barSlot := 6, values := #[0] }
+        barWrites := barWrites.push { baseByteAddr := regSrc1BaseHi, barSlot := 7, values := #[0] }
+      else
+        barWrites := barWrites.push br
+    emitTaskAndVerify .h17 baseIn1 baseOut1 basePk1.bytes { baseTd1 with barWrites := barWrites }
+  ) "BAR slot mismatch")
+
+  -- B2: shMax=5, (fat=1, shPref=5, shMax=5), shMin!=shPref, WU+F+fat!=logNE
+  results := results.push (checkErr "m2 neg verifier: shMax=5 rejected" (do
+    let wBad ← encodeWord neCommonLayout #[
+      ("kind", 0), ("shPref", 0), ("shMin", 0), ("shMax", 5), ("F", 4), ("wide3x3", 0)
+    ]
+    tamperRegAndVerify baseConv regNeCommon wBad
+  ) "shMax=5")
+
+  results := results.push (checkErr "m2 neg verifier: (fat=1, shPref=5, shMax=5) rejected" (do
+    let fOffCom ← findRegFileOffset baseConv.hwx baseConv.info regNeCommon
+    let fOffTile ← findRegFileOffset baseConv.hwx baseConv.info regNeTile
+    let wCom ← encodeWord neCommonLayout #[
+      ("kind", 0), ("shPref", 5), ("shMin", 5), ("shMax", 5), ("F", 3), ("wide3x3", 0)
+    ]
+    let wTile ← encodeWord neTileLayout #[("ocg", 1), ("fat", 1), ("WU", 0)]
+    let hwx1 ← putU32LE baseConv.hwx fOffCom wCom
+    let hwx2 ← putU32LE hwx1 fOffTile wTile
+    let info ← validateHwx hwx2
+    let _ ← verifyConvHwxTasks hwx2 info (requireConvTask := true)
+    pure ()
+  ) "shMax=5")
+
+  results := results.push (checkErr "m2 neg verifier: shMin != shPref rejected" (do
+    let wBad ← encodeWord neCommonLayout #[
+      ("kind", 0), ("shPref", 0), ("shMin", 1), ("shMax", 4), ("F", 4), ("wide3x3", 0)
+    ]
+    tamperRegAndVerify baseConv regNeCommon wBad
+  ) "shMin")
+
+  results := results.push (checkErr "m2 neg verifier: WU + F + fat != logNE rejected" (do
+    let wBad ← encodeWord neTileLayout #[("ocg", 0), ("fat", 0), ("WU", 1)]
+    tamperRegAndVerify baseConv regNeTile wBad
+  ) "WU(1) + F(4) + fat(0) != logNE(4)")
+
+  -- 1x1 with wide3x3=1 or dwGroups
+  results := results.push (checkErr "m2 neg verifier: 1x1 with wide3x3=1 rejected" (do
+    let fOff ← findRegFileOffset baseConv.hwx baseConv.info regNeCommon
+    let cur ← readU32LE baseConv.hwx fOff
+    tamperRegAndVerify baseConv regNeCommon (cur ||| ((1 : UInt32) <<< 27))
+  ) "wide3x3")
+
+  results := results.push (checkErr "m2 neg verifier: 1x1 with dwGroups (0x0030) rejected" (do
+    let wDw ← encodeWord dwGroupsLayout #[("perGroupIn", 1)]
+    let plain := baseTd1.plainWrites.push { byteAddr := regDwGroups, value := wDw }
+    emitTaskAndVerify .h17 baseIn1 baseOut1 basePk1.bytes { baseTd1 with plainWrites := plain }
+  ) "dwGroups")
+
+  -- Invalid dwGroups (perGroupIn != 1, Cin != Cout, Cin == 1)
+  results := results.push (checkErr "m2 neg verifier: dwGroups perGroupIn != 1 rejected" (do
+    let wDwBad ← encodeWord dwGroupsLayout #[("perGroupIn", 2)]
+    tamperReg3x3AndVerify base3Dw regDwGroups wDwBad
+  ) "perGroupIn")
+
+  results := results.push (checkErr "m2 neg verifier: dwGroups with Cin != Cout rejected" (do
+    let shUnequal : ConvSpec := { kernelSize := 3, mode := .dense, h := 8, w := 16, cin := 8, cout := 16, stride := 1, pad := .same }
+    let tU ← chooseConvTiling .h17 shUnequal
+    let pkU ← packConvKernelChunks .h17 shUnequal tU (mkTaggedWeights3x3 16 8) none
+    let tdU ← lowerConvTask .h17 shUnequal tU pkU false
+    let inU ← makeFp16Surface .h17 "x" "input_x" .input 8 8 16
+    let outU ← makeFp16Surface .h17 "y" "output_y" .output 16 8 16
+    let wDw ← encodeWord dwGroupsLayout #[("perGroupIn", 1)]
+    let plain := tdU.plainWrites.push { byteAddr := regDwGroups, value := wDw }
+    emitTaskAndVerify .h17 inU outU pkU.bytes { tdU with plainWrites := plain }
+  ) "Cin == Cout")
+
+  results := results.push (checkErr "m2 neg verifier: dwGroups with Cin == Cout == 1 rejected" (do
+    let wDw ← encodeWord dwGroupsLayout #[("perGroupIn", 1)]
+    let plain := baseTd3Dw1.plainWrites.push { byteAddr := regDwGroups, value := wDw }
+    emitTaskAndVerify .h17 baseIn3Dw1 baseOut3Dw1 basePk3Dw1.bytes { baseTd3Dw1 with plainWrites := plain }
+  ) "Cin == Cout > 1")
+
+  -- Stride-2 Win/Hin mismatch
+  results := results.push (checkErr "m2 neg verifier: stride-2 Win mismatch rejected" (do
+    tamperReg3x3AndVerify base3DenseS2 regWin 15
+  ) "Win=")
+
+  results := results.push (checkErr "m2 neg verifier: stride-2 Hin mismatch rejected" (do
+    tamperReg3x3AndVerify base3DenseS2 regHin 15
+  ) "Hin=")
+
+  -- resCfg.direct mismatch vs isDirect, and resDep.direct mismatch vs resCfg.direct
+  results := results.push (checkErr "m2 neg verifier: resCfg.direct mismatch vs target/tiling rejected" (do
+    let wBad ← encodeWord resCfgLayout #[("mode", 2), ("direct", 0), ("P", 1)]
+    tamperRegAndVerify baseConv regResCfg wBad
+  ) "resCfg direct")
+
+  results := results.push (checkErr "m2 neg verifier: resDep.direct mismatch vs resCfg.direct rejected" (do
+    let wBad ← encodeWord resDepLayout #[("code", resDepCode .h17), ("task", 0), ("direct", 0)]
+    tamperRegAndVerify baseConv regResDep wBad
+  ) "resDep direct")
+
+  -- scalarBias missing / spurious / combined with biasInKernel=1
+  results := results.push (checkErr "m2 neg verifier: missing scalarBias for dense Cout=1 rejected" (do
+    let plain := baseTd1C1.plainWrites.filter (fun w => w.byteAddr != regScalarBias)
+    emitTaskAndVerify .h17 baseIn1C1 baseOut1C1 basePk1C1.bytes { baseTd1C1 with plainWrites := plain }
+  ) "scalarBias")
+
+  results := results.push (checkErr "m2 neg verifier: spurious scalarBias for Cout > 1 rejected" (do
+    let plain := baseTd1.plainWrites.push { byteAddr := regScalarBias, value := 0x3c00 }
+    emitTaskAndVerify .h17 baseIn1 baseOut1 basePk1.bytes { baseTd1 with plainWrites := plain }
+  ) "scalarBias")
+
+  results := results.push (checkErr "m2 neg verifier: dense Cout=1 with biasInKernel=1 rejected" (do
+    let wOpBad ← encodeWord neOpLayout #[("biasInKernel", 1), ("relu", 0)]
+    let plain := baseTd1C1.plainWrites.map fun w =>
+      if w.byteAddr == regNeOp then { w with value := wOpBad } else w
+    emitTaskAndVerify .h17 baseIn1C1 baseOut1C1 basePk1C1.bytes { baseTd1C1 with plainWrites := plain }
+  ) "biasInKernel=0")
+
+  -- Missing Mach-O kernel relocation
+  results := results.push (checkErr "m2 neg verifier: missing Mach-O kernel relocation rejected" (do
+    emitTaskAndVerify .h17 baseIn1 baseOut1 basePk1.bytes baseTd1 (emitReloc := false)
+  ) "relocation")
+
+  -- DMA stride / alignment / span violations
+  results := results.push (checkErr "m2 neg verifier: unaligned input DMA row stride rejected" (do
+    tamperRegAndVerify baseConv regSrc1DmaRowStride 32
+  ) "64-byte aligned")
+
+  results := results.push (checkErr "m2 neg verifier: input DMA plane stride < H*rowStride rejected" (do
+    tamperRegAndVerify baseConv regSrc1DmaPlaneStride 64
+  ) "plane stride")
+
+  results := results.push (checkErr "m2 neg verifier: output DMA plane stride exceeding surface rejected" (do
+    tamperRegAndVerify baseConv regResDmaPlaneStride 0x10000
+  ) "output DMA range")
+
+  -- Duplicate register write
+  results := results.push (checkErr "m2 neg verifier: duplicate register write rejected" (do
+    let dupRec := RegRecord.sequential (regWin / 4).toUInt16 none #[16]
+    emitTaskAndVerify .h17 baseIn1 baseOut1 basePk1.bytes baseTd1 (extraRecs := #[dupRec])
+  ) "duplicate write")
+
+  -- B3: chunkSlot on20==0, task!=0, missing active chunk slot, spurious extra chunk slot,
+  --     chunkOffset % 64 != 0, under-sized stride-1 chunkSize, truncated sparse chunk
+  results := results.push (checkErr "m2 neg verifier: chunkSlot on20==0 rejected" (do
+    let wBad ← encodeWord chunkSlotLayout #[("enable", 1), ("on20", 0), ("task", 0)]
+    tamperRegAndVerify baseConv (regChunkSlot 0) wBad
+  ) "on20=1")
+
+  results := results.push (checkErr "m2 neg verifier: chunkSlot task != taskId rejected" (do
+    let wBad ← encodeWord chunkSlotLayout #[("enable", 1), ("on20", 1), ("task", 1)]
+    tamperRegAndVerify baseConv (regChunkSlot 0) wBad
+  ) "taskId")
+
+  results := results.push (checkErr "m2 neg verifier: missing required active chunk slot rejected" (do
+    let plain := baseTd1.plainWrites.filter fun w =>
+      w.byteAddr != regChunkSlot 15 && w.byteAddr != regChunkOffset 15 && w.byteAddr != regChunkSize 15
+    emitTaskAndVerify .h17 baseIn1 baseOut1 basePk1.bytes { baseTd1 with plainWrites := plain }
+  ) "missing required active chunk slot")
+
+  results := results.push (checkErr "m2 neg verifier: spurious extra chunk slot rejected" (do
+    let wSlot ← encodeWord chunkSlotLayout #[("enable", 1), ("on20", 1), ("task", 0)]
+    let plain := baseTd1C1.plainWrites ++ #[
+      { byteAddr := regChunkSlot 1, value := wSlot },
+      { byteAddr := regChunkOffset 1, value := 0 },
+      { byteAddr := regChunkSize 1, value := 64 }
+    ]
+    emitTaskAndVerify .h17 baseIn1C1 baseOut1C1 basePk1C1.bytes { baseTd1C1 with plainWrites := plain }
+  ) "spurious chunk slot")
+
+  results := results.push (checkErr "m2 neg verifier: misaligned chunkOffset % 64 != 0 rejected" (do
+    tamperRegAndVerify baseConv (regChunkOffset 0) 32
+  ) "64-byte aligned")
+
+  results := results.push (checkErr "m2 neg verifier: under-sized stride-1 chunkSize rejected" (do
+    -- base3DenseS1 has Cin=16, 1 output/group, 9 taps + 1 bias = 290B -> min 320B; 64B is too small
+    tamperReg3x3AndVerify base3DenseS1 (regChunkSize 0) 64
+  ) "minimum required")
+
+  results := results.push (checkErr "m2 neg verifier: truncated stride-2 sparse chunk u24 length rejected" (do
+    -- Overwrite first block's u24 length in __KERN_0 (immediately after 2B bias of chunk 0) to exceed chunkSize
+    let some kSec := base3DenseS2.info.kernelSection
+      | throw "missing __KERN_0"
+    let u24FileOff := kSec.offset.toNat + 2
+    let hwx1 ← putU8 base3DenseS2.hwx u24FileOff 0x00
+    let hwx2 ← putU8 hwx1 (u24FileOff + 1) 0x80
+    let hwx3 ← putU8 hwx2 (u24FileOff + 2) 0x00
+    let info ← validateHwx hwx3
+    let _ ← verifyConvHwxTasks hwx3 info (requireConvTask := true)
+    pure ()
+  ) "exceeds chunk end")
+
+  -- B4: tampered task header words 0..7
+  results := results.push (checkErr "m2 neg verifier: header[0] reserved bits [31:27] != 0 rejected" (do
+    let textBytes ← readSlice baseConv.hwx baseConv.info.textSection.offset.toNat baseConv.info.textSection.size.toNat
+    let tasks ← decodeTaskStream baseConv.info.target textBytes
+    let some t0 := tasks[0]? | throw "no task 0"
+    let h0FileOff := baseConv.info.textSection.offset.toNat + t0.startOffset
+    let h0 ← readU32LE baseConv.hwx h0FileOff
+    let badHwx ← putU32LE baseConv.hwx h0FileOff (h0 ||| ((1 : UInt32) <<< 27))
+    let info ← validateHwx badHwx
+    let _ ← verifyConvHwxTasks badHwx info (requireConvTask := true)
+    pure ()
+  ) "reserved")
+
+  results := results.push (checkErr "m2 neg verifier: header[1] != 0 rejected" (do
+    emitTaskAndVerify .h17 baseIn1 baseOut1 basePk1.bytes baseTd1 (headerPatch? := some (1, 1))
+  ) "header[1]")
+
+  results := results.push (checkErr "m2 neg verifier: header[2] tampered rejected" (do
+    emitTaskAndVerify .h17 baseIn1 baseOut1 basePk1.bytes baseTd1 (headerPatch? := some (2, 0x04000069))
+  ) "header[2]")
+
+  results := results.push (checkErr "m2 neg verifier: header[4] tampered rejected" (do
+    emitTaskAndVerify .h17 baseIn1 baseOut1 basePk1.bytes baseTd1 (headerPatch? := some (4, 0x00fff869))
+  ) "header[4]")
+
+  results := results.push (checkErr "m2 neg verifier: header[5] != 0 rejected" (do
+    emitTaskAndVerify .h17 baseIn1 baseOut1 basePk1.bytes baseTd1 (headerPatch? := some (5, 1))
+  ) "header[5..7]")
+
+  -- B4: tampered src1Fmt / resFmt / src1DmaCfg / neScale / out0..out5
+  results := results.push (checkErr "m2 neg verifier: tampered src1DmaCfg rejected" (do
+    tamperRegAndVerify baseConv regSrc1DmaCfg 0x000000cf
+  ) "src1DmaCfg")
+
+  results := results.push (checkErr "m2 neg verifier: tampered src1Fmt rejected" (do
+    tamperRegAndVerify baseConv regSrc1Fmt 0x01002030
+  ) "src1Fmt")
+
+  results := results.push (checkErr "m2 neg verifier: tampered resFmt rejected" (do
+    tamperRegAndVerify baseConv regResFmt 0x01302030
+  ) "resFmt")
+
+  results := results.push (checkErr "m2 neg verifier: tampered neScale rejected" (do
+    tamperRegAndVerify baseConv regNeScale 0x00004000
+  ) "neScale")
+
+  results := results.push (checkErr "m2 neg verifier: tampered out0 rejected" (do
+    tamperRegAndVerify baseConv regOut0 0x00000013
+  ) "out0")
+
+  results := results.push (checkErr "m2 neg verifier: tampered out2 form rejected" (do
+    tamperRegAndVerify baseConv regOut2 0x000000e1
+  ) "out2")
+
+  results := results.push (checkErr "m2 neg verifier: tampered out5 rejected" (do
+    tamperRegAndVerify baseConv regOut5 0x20010700
+  ) "out5")
+
+  -- B4: missing BAR-4 on src1Dep / resDep & bad code/task
+  results := results.push (checkErr "m2 neg verifier: src1Dep without BAR-4 rejected" (do
+    let barWrites := baseTd1.barWrites.filter (fun br => br.baseByteAddr != regSrc1Dep)
+    let wSrcDep ← encodeWord src1DepLayout #[("code", 0x21), ("task", 0)]
+    let plain := baseTd1.plainWrites.push { byteAddr := regSrc1Dep, value := wSrcDep }
+    emitTaskAndVerify .h17 baseIn1 baseOut1 basePk1.bytes { baseTd1 with plainWrites := plain, barWrites := barWrites }
+  ) "BAR slot 4")
+
+  results := results.push (checkErr "m2 neg verifier: resDep without BAR-4 rejected" (do
+    let barWrites := baseTd1.barWrites.filter (fun br => br.baseByteAddr != regResDep)
+    let wResDep ← encodeWord resDepLayout #[("code", resDepCode .h17), ("task", 0), ("direct", 1)]
+    let plain := baseTd1.plainWrites.push { byteAddr := regResDep, value := wResDep }
+    emitTaskAndVerify .h17 baseIn1 baseOut1 basePk1.bytes { baseTd1 with plainWrites := plain, barWrites := barWrites }
+  ) "BAR slot 4")
+
+  results := results.push (checkErr "m2 neg verifier: src1Dep bad code rejected" (do
+    tamperRegAndVerify baseConv regSrc1Dep 0x00000022
+  ) "src1Dep code")
+
+  -- B4: direct-mode staged register 0x4150 present
+  results := results.push (checkErr "m2 neg verifier: direct-mode 0x4150 (resChanStride) present rejected" (do
+    let plain := baseTd1.plainWrites.push { byteAddr := regResChanStride, value := 32 }
+    emitTaskAndVerify .h17 baseIn1 baseOut1 basePk1.bytes { baseTd1 with plainWrites := plain }
+  ) "direct mode must omit")
+
+  -- N5: inSurf.n != 1 and unaligned L2 bases
+  results := results.push (checkErr "m2 neg verifier: inSurf.n != 1 rejected" (do
+    let badSpan := 2 * baseIn1.batchStride
+    let badAlloc := (alignUp badSpan.toNat pageSize).toUInt64
+    let badIn : SurfaceSpec := {
+      baseIn1 with
+      n := 2
+      sectionSize := some badSpan
+      allocSize := some badAlloc
+    }
+    emitTaskAndVerify .h17 badIn baseOut1 basePk1.bytes baseTd1
+  ) "single-batch")
+
+  results := results.push (checkErr "m2 neg verifier: unaligned L2 src1Base % 64 != 0 rejected" (do
+    let fOffSrc ← findRegFileOffset baseConv.hwx baseConv.info regSrc1Base
+    let fOffRes ← findRegFileOffset baseConv.hwx baseConv.info regResBase
+    let curRes ← readU32LE baseConv.hwx fOffRes
+    let hwx1 ← putU32LE baseConv.hwx fOffSrc 32
+    let hwx2 ← putU32LE hwx1 fOffRes (curRes + 64)
+    let info ← validateHwx hwx2
+    let _ ← verifyConvHwxTasks hwx2 info (requireConvTask := true)
+    pure ()
+  ) "L2 src1Base")
+
+  results := results.push (checkErr "m2 neg verifier: unaligned L2 resBase % 64 != 0 rejected" (do
+    let fOff ← findRegFileOffset baseConv.hwx baseConv.info regResBase
+    let cur ← readU32LE baseConv.hwx fOff
+    tamperRegAndVerify baseConv regResBase (cur + 32)
+  ) "64-byte aligned")
 
   pure results
 

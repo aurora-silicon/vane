@@ -6,6 +6,20 @@ def maxU64Nat : Nat := 0xffffffffffffffff
 /-- Maximum representable 32-bit unsigned integer as a `Nat`. -/
 def maxU32Nat : Nat := 0xffffffff
 
+/-- Checked narrowing conversion from `Nat` to `UInt32`. -/
+def natToU32Checked (n : Nat) (label : String) : Except String UInt32 :=
+  if n > maxU32Nat then
+    .error s!"{label}: value {n} overflows UInt32 (max {maxU32Nat})"
+  else
+    .ok n.toUInt32
+
+/-- Checked narrowing conversion from `Nat` to `UInt64`. -/
+def natToU64Checked (n : Nat) (label : String) : Except String UInt64 :=
+  if n > maxU64Nat then
+    .error s!"{label}: value {n} overflows UInt64 (max {maxU64Nat})"
+  else
+    .ok n.toUInt64
+
 /-- Round `n` up to a multiple of `align` (when `align > 0`). -/
 def alignUp (n align : Nat) : Nat :=
   if align == 0 then n
