@@ -111,11 +111,11 @@ def cover (wAligned stripW base : Nat) : Nat :=
 
 /-- Minimum cover exponent across alignment multiples `{8, 16, 32, 64}`. -/
 def coverMin (w stripW fat : Nat) : Nat :=
-  let base := 128 <<< fat
-  let c8 := cover (alignUp w 8) stripW base
-  let c16 := cover (alignUp w 16) stripW base
-  let c32 := cover (alignUp w 32) stripW base
-  let c64 := cover (alignUp w 64) stripW base
+  let wuBase : Nat := (128 : Nat) <<< fat
+  let c8 := cover (alignUp w 8) stripW wuBase
+  let c16 := cover (alignUp w 16) stripW wuBase
+  let c32 := cover (alignUp w 32) stripW wuBase
+  let c64 := cover (alignUp w 64) stripW wuBase
   min (min c8 c16) (min c32 c64)
 
 /-- Validate basic 1x1 conv shape bounds (`H, W in 1..65535`, `Cin, Cout >= 1`). -/
@@ -149,10 +149,9 @@ def validateTiling (target : Target) (shape : Conv1x1Shape) (t : Tiling) : Excep
   if wu > 3 then
     throw s!"illegal tiling: WU={wu} exceeds 2-bit limit 3 (logNE={t.logNE}, F={t.f}, fat={t.fat})"
 
-  -- Rule 4: Output channels per NE (ocg)
-  let ocgOk := t.ocg <= 4 || (target == .h17 && t.ocg == 5 && t.f == 4 && t.fat == 0)
-  if !ocgOk then
-    throw s!"illegal tiling: ocg={t.ocg} not allowed on {target.name} with F={t.f}, fat={t.fat}"
+  -- Rule 4: Output channels per NE (0 <= ocg <= 4)
+  if t.ocg > 4 then
+    throw s!"illegal tiling: ocg={t.ocg} exceeds maximum 4"
 
   -- Rule 5: Output channel coverage
   let maxCout := match target with
@@ -191,8 +190,8 @@ def validateTiling (target : Target) (shape : Conv1x1Shape) (t : Tiling) : Excep
 
   pure ()
 
-/-- Compute the smallest legal `ocg` for `(target, cout, f, fat)` under rules 4 and 5. -/
-def chooseOcg? (target : Target) (cout f fat : Nat) : Option Nat :=
+/-- Compute the smallest legal `ocg` (`0 <= ocg <= 4`) for `(target, cout, f)` under rules 4 and 5. -/
+def chooseOcg? (target : Target) (cout f : Nat) : Option Nat :=
   let need := ceilDiv cout ((1 : Nat) <<< f)
   let ocg1 := ceilLog2 need
   if ocg1 <= 4 then
@@ -203,8 +202,6 @@ def chooseOcg? (target : Target) (cout f fat : Nat) : Option Nat :=
     | .h17 =>
       if cout <= ((1 : Nat) <<< (f + 4 + 1)) then
         some 4
-      else if f == 4 && fat == 0 && cout <= ((1 : Nat) <<< (4 + 5 + 1)) then
-        some 5
       else
         none
 
@@ -223,7 +220,7 @@ def chooseTiling (target : Target) (shape : Conv1x1Shape) : Except String Tiling
       for fStep in [:maxF + 1] do
         let f := maxF - fStep
         if f + fat <= logNE && (logNE - f - fat) <= 3 then
-          if let some ocg := chooseOcg? target shape.cout f fat then
+          if let some ocg := chooseOcg? target shape.cout f then
             for shPref in [:5] do
               let stripW := (128 <<< fat) >>> shPref
               if stripW >= 8 && stripW <= 256 then

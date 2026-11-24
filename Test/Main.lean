@@ -569,10 +569,10 @@ private def runAllTests : IO (Array TestResult) := do
     let t16 : Tiling := { logNE := 4, f := 4, fat := 0, ocg := 1, shPref := 0, shMax := 2, tileHeight := 16 }
     validateTiling .h16 sh t16
     validateTiling .h17 sh t16
-    -- H17 ocg=5 at F=4, fat=0 covering Cout=1024
-    let sh1024 : Conv1x1Shape := { h := 8, w := 16, cin := 16, cout := 1024 }
-    let t1024 : Tiling := { logNE := 4, f := 4, fat := 0, ocg := 5, shPref := 0, shMax := 3, tileHeight := 8 }
-    validateTiling .h17 sh1024 t1024
+    -- H17 2-round covering Cout=512 at F=4, ocg=4, fat=0
+    let sh512 : Conv1x1Shape := { h := 8, w := 16, cin := 16, cout := 512 }
+    let t512 : Tiling := { logNE := 4, f := 4, fat := 0, ocg := 4, shPref := 0, shMax := 3, tileHeight := 8 }
+    validateTiling .h17 sh512 t512
     pure ()
   ))
 
@@ -585,6 +585,12 @@ private def runAllTests : IO (Array TestResult) := do
   results := results.push (checkErr "m1 neg: tiling rejects ocg=5 at F=0, fat=1 on H17" (do
     let sh : Conv1x1Shape := { h := 8, w := 16, cin := 8, cout := 32 }
     let t : Tiling := { logNE := 4, f := 0, fat := 1, ocg := 5, shPref := 0, shMax := 4, tileHeight := 8 }
+    validateTiling .h17 sh t
+  ) "ocg=5")
+
+  results := results.push (checkErr "m1 neg: tiling rejects ocg=5 at F=4, fat=0 on H17" (do
+    let sh : Conv1x1Shape := { h := 8, w := 8, cin := 64, cout := 600 }
+    let t : Tiling := { logNE := 4, f := 4, fat := 0, ocg := 5, shPref := 0, shMax := 4, tileHeight := 8 }
     validateTiling .h17 sh t
   ) "ocg=5")
 
@@ -633,10 +639,14 @@ private def runAllTests : IO (Array TestResult) := do
   ) "coverage")
 
   results := results.push (checkErr "m1 neg: tiling rejects Cout exceeding H17 coverage" (do
-    let sh : Conv1x1Shape := { h := 8, w := 16, cin := 8, cout := 1025 }
-    let t : Tiling := { logNE := 4, f := 4, fat := 0, ocg := 5, shPref := 0, shMax := 3, tileHeight := 8 }
+    let sh : Conv1x1Shape := { h := 8, w := 16, cin := 8, cout := 513 }
+    let t : Tiling := { logNE := 4, f := 4, fat := 0, ocg := 4, shPref := 0, shMax := 3, tileHeight := 8 }
     validateTiling .h17 sh t
   ) "coverage")
+
+  results := results.push (checkErr "m1 neg: chooseTiling rejects H17 Cout=600 (> 512)" (do
+    chooseTiling .h17 { h := 8, w := 8, cin := 64, cout := 600 }
+  ) "no legal")
 
   -- Tile chooser across diverse shapes on H16 and H17
   results := results.push (checkOk "m1: chooseTiling across diverse shapes on H16 and H17" (do
@@ -659,18 +669,24 @@ private def runAllTests : IO (Array TestResult) := do
       let t17 ← chooseTiling .h17 sh
       validateTiling .h17 sh t17
 
-    -- H17 2-round shapes (Cout > 256)
+    -- H17 2-round shapes (256 < Cout <= 512)
     let h17OnlyShapes : Array Conv1x1Shape := #[
       { h := 8, w := 16, cin := 64, cout := 300 },
-      { h := 16, w := 32, cin := 256, cout := 512 },
-      { h := 8, w := 16, cin := 32, cout := 1024 }
+      { h := 16, w := 32, cin := 256, cout := 512 }
     ]
     for sh in h17OnlyShapes do
       let t17 ← chooseTiling .h17 sh
       validateTiling .h17 sh t17
+      if t17.ocg > 4 then throw s!"chosen ocg={t17.ocg} exceeds 4"
       -- Verify H16 properly rejects Cout > 256
       match chooseTiling .h16 sh with
       | .ok _ => throw s!"expected H16 to reject Cout={sh.cout}"
+      | .error _ => pure ()
+
+    -- Verify H17 rejects Cout > 512 in single-task chooser
+    for badCout in #[513, 600, 1024] do
+      match chooseTiling .h17 { h := 8, w := 8, cin := 64, cout := badCout } with
+      | .ok _ => throw s!"expected H17 to reject single-task Cout={badCout}"
       | .error _ => pure ()
 
     -- Verify a shape that forces staged mode (shMax=4, fat=0, W=40 => (128>>4)=8 < min(32,40)=32)
@@ -837,6 +853,11 @@ private def runAllTests : IO (Array TestResult) := do
     -- Set bit 6 on 0x40 (neTile)
     tamperRegAndVerify baseConv regNeTile 0x00000040
   ) "reserved")
+
+  results := results.push (checkErr "m1 neg verifier: tampered neTile ocg=5 (F=4, fat=0)" (do
+    -- Set ocg=5, fat=0, WU=0 on 0x40 (neTile)
+    tamperRegAndVerify baseConv regNeTile 0x00000005
+  ) "ocg=5")
 
   results := results.push (checkErr "m1 neg verifier: tampered chunk slot disabled while size written" (do
     -- Clear enable bit 0 on chunk slot 0 (0x5520 = 0x20 instead of 0x21)

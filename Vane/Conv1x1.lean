@@ -249,6 +249,8 @@ def verifyConv1x1Task (info : HwxInfo) (task : DecodedTask) : Except String Unit
   let ocg := (← decodeFieldChecked neTileLayout wNeTile.value "ocg").toNat
   let fat := (← decodeFieldChecked neTileLayout wNeTile.value "fat").toNat
   let wu := (← decodeFieldChecked neTileLayout wNeTile.value "WU").toNat
+  if ocg > 4 then
+    throw s!"{prefixMsg}: ocg={ocg} exceeds maximum 4"
   if wu > 3 then
     throw s!"{prefixMsg}: WU={wu} exceeds 3"
   if f + fat > logNE || wu + f + fat != logNE then
