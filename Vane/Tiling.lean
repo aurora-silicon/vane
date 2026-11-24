@@ -41,6 +41,26 @@ def ceilLog2 (n : Nat) : Nat :=
 def ceilDiv (a b : Nat) : Nat :=
   if b == 0 then 0 else (a + b - 1) / b
 
+/-- Compute the output channel blocks `(o0, count)` assigned to group `g` (`0 <= g < 2^F`)
+    under standard round blocking. -/
+def groupOutputBlocks (cout f ocg g : Nat) : Array (Nat × Nat) := Id.run do
+  let groups := (1 : Nat) <<< f
+  let blk := (1 : Nat) <<< ocg
+  let round := groups * blk
+  let full := cout / round
+  let rem := cout % round
+  let mut blocks : Array (Nat × Nat) := #[]
+  for r in [:full] do
+    blocks := blocks.push (r * round + g * blk, blk)
+  if rem > 0 then
+    let base := rem / groups
+    let extra := rem % groups
+    let lastSize := base + (if g < extra then 1 else 0)
+    let lastStart := g * base + min g extra
+    if lastSize > 0 then
+      blocks := blocks.push (full * round + lastStart, lastSize)
+  return blocks
+
 /-- Work-unit split exponent `WU = logNE - F - fat` (valid when `F + fat <= logNE`). -/
 def Tiling.wu (t : Tiling) : Nat :=
   t.logNE - t.f - t.fat
@@ -190,6 +210,16 @@ def validateTiling (target : Target) (shape : Conv1x1Shape) (t : Tiling) : Excep
   let l2Use := l2UseBytes target shape t
   if l2Use > l2CapacityBytes then
     throw s!"illegal tiling: L2 footprint {l2Use} bytes exceeds {l2CapacityBytes} bytes (2 MiB)"
+
+  -- Rule 12: Per-chunk kernel size cap (<= 64 KiB)
+  let groups := (1 : Nat) <<< t.f
+  for g in [:groups] do
+    let blocks := groupOutputBlocks shape.cout t.f t.ocg g
+    let groupOuts := blocks.foldl (fun acc (_, n) => acc + n) 0
+    if groupOuts > 0 then
+      let chunkBytes := alignUp (2 * shape.cin * groupOuts) 64
+      if chunkBytes > maxKernelChunkBytes then
+        throw s!"illegal tiling: group {g} 1x1 weight chunk {chunkBytes}B exceeds {maxKernelChunkBytes}B (64 KiB)"
 
   pure ()
 
@@ -384,26 +414,6 @@ end Conv3x3Shape
 def effOcg (sh : Conv3x3Shape) (t : Tiling) : Nat :=
   if sh.effMode == .depthwise then 0 else t.ocg
 
-/-- Compute the output channel blocks `(o0, count)` assigned to group `g` (`0 <= g < 2^F`)
-    under standard round blocking. -/
-def groupOutputBlocks (cout f ocg g : Nat) : Array (Nat × Nat) := Id.run do
-  let groups := (1 : Nat) <<< f
-  let blk := (1 : Nat) <<< ocg
-  let round := groups * blk
-  let full := cout / round
-  let rem := cout % round
-  let mut blocks : Array (Nat × Nat) := #[]
-  for r in [:full] do
-    blocks := blocks.push (r * round + g * blk, blk)
-  if rem > 0 then
-    let base := rem / groups
-    let extra := rem % groups
-    let lastSize := base + (if g < extra then 1 else 0)
-    let lastStart := g * base + min g extra
-    if lastSize > 0 then
-      blocks := blocks.push (full * round + lastStart, lastSize)
-  return blocks
-
 /-- Compute the output channel blocks `(o0, n)` assigned to group `g` (`0 <= g < 2^F`) for 3x3 conv.
     True depthwise with `F == 4` assigns `o % 16 == g` as `(o, 1)` blocks in ascending order;
     all other cases use the standard round-blocking formula with `(Cout, F, effOcg)`. -/
@@ -529,7 +539,7 @@ def validateConv3x3Shape (sh : Conv3x3Shape) : Except String Unit := do
     throw s!"invalid 3x3 output shape ({sh.outH}x{sh.outW}): Ho and Wo must be >= 1"
   pure ()
 
-/-- Decidable legality validator enforcing all 14 hardware tiling rules for single-task fp16 3x3 conv. -/
+/-- Decidable legality validator enforcing all 13 hardware tiling rules for single-task fp16 3x3 conv. -/
 def validateConv3x3Tiling (target : Target) (sh : Conv3x3Shape) (t : Tiling) : Except String Unit := do
   -- Rule 1: Valid shape
   validateConv3x3Shape sh
@@ -624,13 +634,6 @@ def validateConv3x3Tiling (target : Target) (sh : Conv3x3Shape) (t : Tiling) : E
         let denseChunkBytes := alignUp (2 * groupOuts * cinW * 9) 64
         if denseChunkBytes > maxKernelChunkBytes then
           throw s!"illegal 3x3 tiling: group {g} dense weight chunk {denseChunkBytes}B exceeds {maxKernelChunkBytes}B (64 KiB)"
-
-  -- Rule 14: H17 dense 3x3 stride-1 wide3x3 slot limit (maxBlockSlots <= 32768 * rep)
-  if target == .h17 && eff == .dense && sh.stride == 1 then
-    let rep := ((1 : Nat) <<< t.logNE) >>> t.f
-    let mbs := maxBlockSlots3x3 sh t
-    if mbs > 32768 * rep then
-      throw s!"illegal 3x3 tiling: h17 stride-1 dense maxBlockSlots={mbs} exceeds wide3x3 limit {32768 * rep} (rep={rep})"
 
   pure ()
 

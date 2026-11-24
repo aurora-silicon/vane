@@ -108,6 +108,8 @@ def packKernelChunks
       chunk := padToAlign chunk dmaLineBytes
       if chunk.size != expectedPadded then
         throw s!"internal error: group {g} chunk size {chunk.size} != expected {expectedPadded}"
+      if chunk.size > maxKernelChunkBytes then
+        throw s!"1x1 kernel group {g} chunk size {chunk.size}B exceeds maximum {maxKernelChunkBytes}B (64 KiB)"
 
       match target with
       | .h17 =>
@@ -370,6 +372,8 @@ def verifyConv1x1Task (info : HwxInfo) (task : DecodedTask) : Except String Unit
       let cSz := szw.value.toNat
       if cSz == 0 || cSz % dmaLineBytes != 0 then
         throw s!"{prefixMsg}: chunk slot {s} size {cSz} must be a positive multiple of {dmaLineBytes}"
+      if cSz > maxKernelChunkBytes then
+        throw s!"{prefixMsg}: chunk slot {s} size {cSz}B exceeds maximum {maxKernelChunkBytes}B (64 KiB)"
       if cOff + cSz > kSec.size.toNat then
         throw s!"{prefixMsg}: chunk slot {s} range [{cOff}, {cOff + cSz}) exceeds kernel size {kSec.size}"
       activeChunks := activeChunks + 1

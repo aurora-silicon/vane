@@ -1474,13 +1474,34 @@ private def runAllTests : IO (Array TestResult) := do
     if cStgDw.l2UseBytes > l2CapacityBytes then
       throw s!"expected l2 <= 2 MiB for depthwise (3x128, C=5500), got {cStgDw.l2UseBytes}"
     if cStgDw.wide3x3 then throw "expected wide3x3=false for depthwise (3x128, C=5500)"
+
+    -- Multi-round boundary: (16x16, Cin=227, Cout=256, s=1, same, bias+relu) => 65,408 B/chunk <= 64 KiB
+    let sh227 : Conv3x3Shape := { mode := .dense, h := 16, w := 16, cin := 227, cout := 256, stride := 1, pad := .same }
+    let c227 ← compileConv3x3 .h17 sh227 (mkTaggedWeights3x3 256 227) (some (mkTaggedBias 256)) true
+    if !c227.wide3x3 then throw "expected wide3x3=true for (16x16, 227->256)"
+    if c227.tiling.f != 4 || c227.tiling.ocg != 3 then
+      throw s!"expected F=4, ocg=3 for (16x16, 227->256), got F={c227.tiling.f}, ocg={c227.tiling.ocg}"
+    if c227.kernelBytes != 16 * 65408 then
+      throw s!"expected 16*65408B kernel for (16x16, 227->256), got {c227.kernelBytes}"
+
+    -- Legal H17 dense 3x3 stride-1 with wide3x3=false: (4x8, Cin=2000, Cout=16, s=1, same, bias) => 36,032 B/chunk
+    let sh2000 : Conv3x3Shape := { mode := .dense, h := 4, w := 8, cin := 2000, cout := 16, stride := 1, pad := .same }
+    let c2000 ← compileConv3x3 .h17 sh2000 (mkTaggedWeights3x3 16 2000) (some (mkTaggedBias 16)) false
+    if c2000.wide3x3 then throw "expected wide3x3=false for (4x8, 2000->16) (maxBlockSlots=36000 > 32768)"
+    if c2000.kernelBytes != 16 * 36032 then
+      throw s!"expected 16*36032B kernel for (4x8, 2000->16), got {c2000.kernelBytes}"
     pure ()
   ))
 
-  -- Rule 13 & Rule 14 negative tests (64 KiB chunk cap and H17 wide3x3 slot limit)
-  results := results.push (checkErr "m2 neg: H17 rejects (4x8, Cin=460, Cout=128, s=1, same) (> 64 KiB chunk / > 32768*rep slots)" (do
+  -- Per-chunk 64 KiB cap negative tests (3x3 and 1x1)
+  results := results.push (checkErr "m2 neg: H17 rejects (4x8, Cin=460, Cout=128, s=1, same) (> 64 KiB chunk)" (do
     let sh460 : Conv3x3Shape := { mode := .dense, h := 4, w := 8, cin := 460, cout := 128, stride := 1, pad := .same }
     compileConv3x3 .h17 sh460 (mkTaggedWeights3x3 128 460) none false
+  ) "no legal")
+
+  results := results.push (checkErr "m2 neg: H17 rejects (16x16, Cin=256, Cout=256, s=1, same) (73,792 B > 64 KiB chunk)" (do
+    let sh256x256 : Conv3x3Shape := { mode := .dense, h := 16, w := 16, cin := 256, cout := 256, stride := 1, pad := .same }
+    compileConv3x3 .h17 sh256x256 (mkTaggedWeights3x3 256 256) (some (mkTaggedBias 256)) false
   ) "no legal")
 
   results := results.push (checkErr "m2 neg: H17 rejects (4x8, Cin=4900, Cout=1, s=1, same) (> 64 KiB chunk)" (do
@@ -1492,6 +1513,19 @@ private def runAllTests : IO (Array TestResult) := do
     let sh4900 : Conv3x3Shape := { mode := .dense, h := 4, w := 8, cin := 4900, cout := 1, stride := 1, pad := .same }
     let t : Tiling := { logNE := 4, f := 0, fat := 1, ocg := 0, shPref := 0, shMax := 4, tileHeight := 4 }
     validateConv3x3Tiling .h17 sh4900 t
+  ) "64 KiB")
+
+  results := results.push (checkErr "m2 neg: 1x1 validator rejects chunk > 64 KiB" (do
+    let sh1x1Big : Conv1x1Shape := { h := 4, w := 8, cin := 4096, cout := 256 }
+    let t : Tiling := { logNE := 4, f := 4, fat := 0, ocg := 4, shPref := 0, shMax := 4, tileHeight := 4 }
+    validateTiling .h17 sh1x1Big t
+  ) "64 KiB")
+
+  results := results.push (checkErr "m2 neg: 1x1 packer rejects bias pushing chunk > 64 KiB" (do
+    -- 2 * 2048 * 16 = 65536 (weights alone fit), + 16*2 = 32B bias -> 65568 -> padded 65600 > 65536
+    let sh1x1Bias : Conv1x1Shape := { h := 4, w := 8, cin := 2048, cout := 256 }
+    let t : Tiling := { logNE := 4, f := 4, fat := 0, ocg := 4, shPref := 0, shMax := 4, tileHeight := 4 }
+    packKernelChunks .h17 sh1x1Bias t (mkTaggedWeights 256 2048) (some (mkTaggedBias 256))
   ) "64 KiB")
 
   -- =========================================================================
@@ -1517,6 +1551,18 @@ private def runAllTests : IO (Array TestResult) := do
   let base3Boundary455 ← unwrap "base3Boundary455" (compileConv3x3 .h17
     { mode := .dense, h := 4, w := 8, cin := 455, cout := 128, stride := 1, pad := .same }
     (mkTaggedWeights3x3 128 455) (some (mkTaggedBias 128)) true)
+
+  let base3Wide0 ← unwrap "base3Wide0" (compileConv3x3 .h17
+    { mode := .dense, h := 4, w := 8, cin := 2000, cout := 16, stride := 1, pad := .same }
+    (mkTaggedWeights3x3 16 2000) (some (mkTaggedBias 16)) false)
+
+  let base1x1Boundary ← unwrap "base1x1Boundary" (compileConv1x1 .h17
+    { h := 4, w := 8, cin := 2048, cout := 256 }
+    (mkTaggedWeights 256 2048) none false)
+
+  results := results.push (checkErr "m2 neg verifier: 1x1 chunkSize > 65536 rejected (even within __KERN_0 bounds)" (do
+    tamperRegAndVerify base1x1Boundary (regChunkSize 0) (maxKernelChunkBytes + 64).toUInt32
+  ) "64 KiB")
 
   results := results.push (checkErr "m2 neg verifier: sparse mismatch (neCfg=1 vs kernelStage=0 on s=1)" (do
     tamperReg3x3AndVerify base3DenseS1 regNeCfg 0x10000182
@@ -1544,11 +1590,17 @@ private def runAllTests : IO (Array TestResult) := do
     tamperReg3x3AndVerify base3Dw regNeCommon (cur ||| ((1 : UInt32) <<< 27))
   ) "wide3x3")
 
-  results := results.push (checkErr "m2 neg verifier: wide3x3=0 on H17 dense stride-1 rejected" (do
+  results := results.push (checkErr "m2 neg verifier: wide3x3=1 exceeding maxBlockSlots rejected" (do
+    let fOff ← findRegFileOffset base3Wide0.hwx base3Wide0.info regNeCommon
+    let cur ← readU32LE base3Wide0.hwx fOff
+    tamperReg3x3AndVerify base3Wide0 regNeCommon (cur ||| ((1 : UInt32) <<< 27))
+  ) "maxBlockSlots")
+
+  results := results.push (checkOk "m2 pos verifier: wide3x3=0 accepted on H17 dense stride-1 (4x8, 2000->16)" (do
     let fOff ← findRegFileOffset base3DenseS1.hwx base3DenseS1.info regNeCommon
     let cur ← readU32LE base3DenseS1.hwx fOff
     tamperReg3x3AndVerify base3DenseS1 regNeCommon (cur &&& (~~~((1 : UInt32) <<< 27)))
-  ) "wide3x3")
+  ))
 
   results := results.push (checkErr "m2 neg verifier: chunkSize > 65536 rejected (even within __KERN_0 bounds)" (do
     -- base3Boundary455 has kernelBytes = 16 * 65536, so chunk 0 at offset 0 with size 65600 fits in __KERN_0

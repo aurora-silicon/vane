@@ -445,22 +445,18 @@ def verifyConv3x3Task (info : HwxInfo) (task : DecodedTask) : Except String Unit
     resSkew := 0
   }
 
-  -- Verify wide3x3 bit 27 consistency (Rule 14: 1 iff H17 dense stride-1, 0 otherwise)
-  let expectWide3x3 := target == .h17 && shape.effMode == .dense && stride == 1
-  if expectWide3x3 then
-    if wide3x3Bit != 1 then
-      throw s!"{prefixMsg}: neCommon wide3x3 must be 1 for h17 dense stride-1 3x3 conv (got {wide3x3Bit})"
+  -- Verify wide3x3 bit 27 safety precondition (wide3x3=0 is legal; wide3x3=1 requires H17 dense s=1 and maxBlockSlots <= 32768*rep)
+  if wide3x3Bit == 1 then
+    if target != .h17 then
+      throw s!"{prefixMsg}: neCommon wide3x3=1 is illegal on {target.name}"
+    if shape.effMode != .dense then
+      throw s!"{prefixMsg}: neCommon wide3x3=1 is illegal for depthwise 3x3 conv"
+    if stride != 1 then
+      throw s!"{prefixMsg}: neCommon wide3x3=1 is illegal for stride-{stride} 3x3 conv"
     let rep := ((1 : Nat) <<< logNE) >>> f
     let mbs := maxBlockSlots3x3 shape probeTiling
     if mbs > 32768 * rep then
       throw s!"{prefixMsg}: neCommon wide3x3=1 illegal because maxBlockSlots={mbs} > 32768*rep={32768 * rep}"
-  else if wide3x3Bit != 0 then
-    if target != .h17 then
-      throw s!"{prefixMsg}: neCommon wide3x3=1 is illegal on {target.name}"
-    else if shape.effMode != .dense then
-      throw s!"{prefixMsg}: neCommon wide3x3=1 is illegal for depthwise 3x3 conv"
-    else
-      throw s!"{prefixMsg}: neCommon wide3x3=1 is illegal for stride-{stride} 3x3 conv"
 
   -- 6. Decode L2 staging registers & verify exact srcPx and non-overlapping [0, 2 MiB) ranges
   let wSrc1Cfg ← requireDecodedWrite task.writes regSrc1Cfg "src1Cfg"
