@@ -613,7 +613,7 @@ private def TaskPlanKind.direct : TaskPlanKind → Bool
   | .pe p => p.direct
   | .lut p => p.direct
   | .pePool p => p.direct
-  | .peReduce _ => true
+  | .peReduce p => p.direct
   | .nePool p => p.direct
   | .neChannelReduce p => p.direct
 

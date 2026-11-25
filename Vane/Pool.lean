@@ -469,6 +469,7 @@ structure PePoolPlan where
 structure PeReducePlan where
   k : Nat
   tileHeight : Nat
+  direct : Bool
   srcStageBase : Nat
   resStageBase : Nat
   l2TaskPeak : Nat
@@ -598,7 +599,7 @@ def choosePeReduceTilingForL2
     let k := min 9 (max 5 (ceilLog2 wAligned))
     match placeTwoTemps occupied 0 resSz true resIsL2 with
     | some (_, rb, pk) =>
-      return { k := k, tileHeight := ax.sH, srcStageBase := 0, resStageBase := rb, l2TaskPeak := pk }
+      return { k := k, tileHeight := ax.sH, direct := !resIsL2, srcStageBase := 0, resStageBase := rb, l2TaskPeak := pk }
     | none =>
       throw s!"no legal {target.name} PE reduce L2 result staging fits available L2 budget"
 
@@ -636,7 +637,7 @@ def choosePeReduceTilingForL2
       let strips := ceilDiv wAligned stripW * ceilDiv ax.sH th
       let area := stripW * th
       let plan : PeReducePlan := {
-        k := k, tileHeight := th, srcStageBase := sb, resStageBase := rb, l2TaskPeak := pk
+        k := k, tileHeight := th, direct := !resIsL2, srcStageBase := sb, resStageBase := rb, l2TaskPeak := pk
       }
       let isBetter := match best? with
         | none => true

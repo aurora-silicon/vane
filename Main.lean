@@ -1653,7 +1653,16 @@ private def cmdCompileReduce (args : List String) : IO UInt32 := do
       let h ← parsePosNat "--h" hRaw
       let w ← parsePosNat "--w" wRaw
       let c ← parsePosNat "--c" cRaw
-      let eps ← match epsStr with | some s => parseF16Arg "--eps" s | none => pure 0
+      let eps ← match epsStr with
+        | some s =>
+          let f ← parseFloatArg "--eps" s
+          if f < 0.0 then
+            throw s!"--eps must be >= 0, got '{s}'"
+          let bits := floatToF16CanonicalZero f
+          if !f16IsFinite bits then
+            throw s!"--eps value {f} overflows finite fp16 range"
+          pure bits
+        | none => pure 0
       pure ({
         target := target, op := redOp, dims := { c := c, h := h, w := w },
         axes := axes, eps := eps
@@ -2157,6 +2166,8 @@ private def cmdCompileGraph (args : List String) : IO UInt32 := do
             let eps : UInt16 ← match ← jsonOptFloat nj "eps" ctx with
               | none => pure 0
               | some f =>
+                if f < 0.0 then
+                  throw s!"{ctx} (reduce): eps must be >= 0, got {f}"
                 let bits := floatToF16CanonicalZero f
                 if !f16IsFinite bits then
                   throw s!"{ctx} (reduce): eps value {f} overflows finite fp16 range"

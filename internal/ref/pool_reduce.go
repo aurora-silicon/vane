@@ -27,7 +27,7 @@ func PoolAxisGeometry(inp, k, s int, pad string, pBefore, pAfter int, axis strin
 	if k <= 0 {
 		return 0, 0, 0, fmt.Errorf("pool %s: kernel size %d must be > 0", axis, k)
 	}
-	if s <= 0 {
+	if s == 0 {
 		s = 1
 	}
 	if s != 1 && s != 2 {

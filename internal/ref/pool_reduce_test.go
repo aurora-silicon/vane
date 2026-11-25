@@ -62,6 +62,17 @@ func TestEvalPoolMaxAndAvgModes(t *testing.T) {
 	if got := fp16.ToFloat64(yCust.Data[0]); got != 1.0 {
 		t.Fatalf("custom corner = %v, want 1.0", got)
 	}
+
+	// Negative strides must be rejected rather than coerced to 1
+	if _, _, _, err := PoolAxisGeometry(4, 2, -1, "valid", 0, 0, "H"); err == nil {
+		t.Fatal("expected PoolAxisGeometry to reject negative stride -1")
+	}
+	if _, err := EvalPool(x, PoolSpec{Op: "max", KH: 2, KW: 2, SH: -1, SW: 1, Pad: "valid"}); err == nil {
+		t.Fatal("expected EvalPool to reject negative SH=-1")
+	}
+	if _, err := EvalPool(x, PoolSpec{Op: "avg", KH: 2, KW: 2, SH: 1, SW: -2, Pad: "valid"}); err == nil {
+		t.Fatal("expected EvalPool to reject negative SW=-2")
+	}
 }
 
 func TestEvalReduceAllTenOpsAndAxes(t *testing.T) {

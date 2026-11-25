@@ -4671,6 +4671,58 @@ private def runM5bTests : IO (Array TestResult) := do
     tamperM5aTaskReg baseRedToPe1Dram.hwx baseRedToPe1Dram.info 1 regSrc1Dep badDep
   ) "[multiBatchRaw]")
 
+  -- 10. [M2] Additional negative verifier tamper tests (H16 staged PE pool direct=1, peReduce 4D DMA OOB, L2 PE2 broadcast handoff)
+  let baseStagedPePoolH16 ← match compilePool {
+      target := .h16, op := .max, dims := { c := 5120, h := 2, w := 112 },
+      kh := 2, kw := 2, sh := 2, sw := 2, pad := .valid
+    } with
+    | .ok c => pure c
+    | .error e => throw (IO.userError s!"baseStagedPePoolH16 setup failed: {e}")
+
+  results := results.push (checkErr "m5b [M2] neg tamper: H16 multi-strip k=5 pePool resCfg/resDep direct=1 rejected by verifier" (do
+    let fCfg ← findM5aTaskRegOffset baseStagedPePoolH16.hwx baseStagedPePoolH16.info 0 regResCfg
+    let fDep ← findM5aTaskRegOffset baseStagedPePoolH16.hwx baseStagedPePoolH16.info 0 regResDep
+    let origCfg ← readU32LE baseStagedPePoolH16.hwx fCfg
+    let origDep ← readU32LE baseStagedPePoolH16.hwx fDep
+    let h1 ← putU32LE baseStagedPePoolH16.hwx fCfg (origCfg ||| ((1 : UInt32) <<< 3))
+    let h2 ← putU32LE h1 fDep (origDep ||| ((1 : UInt32) <<< 24))
+    let badInfo ← validateHwx h2
+    let _ ← verifyHwxTasks h2 badInfo (requireKnownTask := true)
+    pure ()
+  ) "PE pool direct")
+
+  let basePeRed4dChw ← match compileReduce {
+      target := .h17, op := .sum, dims := { c := 8, h := 4, w := 32 },
+      axes := { reduceC := true, reduceH := true, reduceW := true }
+    } with
+    | .ok c => pure c
+    | .error e => throw (IO.userError s!"basePeRed4dChw setup failed: {e}")
+
+  let basePeRed4dW ← match compileReduce {
+      target := .h17, op := .mean, dims := { c := 8, h := 6, w := 32 },
+      axes := { reduceW := true }
+    } with
+    | .ok c => pure c
+    | .error e => throw (IO.userError s!"basePeRed4dW setup failed: {e}")
+
+  results := results.push (checkErr "m5b [M2] neg tamper: peReduce input 4D DMA stride (sD>1 0x4d20) inflated past input surface capacity rejected" (do
+    let fD ← findM5aTaskRegOffset basePeRed4dChw.hwx basePeRed4dChw.info 0 regSrc1DmaDStride
+    let origD ← readU32LE basePeRed4dChw.hwx fD
+    tamperM5aTaskReg basePeRed4dChw.hwx basePeRed4dChw.info 0 regSrc1DmaDStride (origD + 0x10000)
+  ) "exceeds")
+
+  results := results.push (checkErr "m5b [M2] neg tamper: peReduce output 4D DMA stride (sN>1 0x511c) inflated past output surface capacity rejected" (do
+    let fN ← findM5aTaskRegOffset basePeRed4dW.hwx basePeRed4dW.info 0 regResDmaNStride
+    let origN ← readU32LE basePeRed4dW.hwx fN
+    tamperM5aTaskReg basePeRed4dW.hwx basePeRed4dW.info 0 regResDmaNStride (origN + 0x10000)
+  ) "exceeds")
+
+  results := results.push (checkErr "m5b [M2] neg tamper: L2-resident PE2 broadcast src2Cfg setting L2 handoff bit rejected by verifier" (do
+    let fCfg2 ← findM5aTaskRegOffset baseL2Bcast.hwx baseL2Bcast.info 1 regSrc2Cfg
+    let origCfg2 ← readU32LE baseL2Bcast.hwx fCfg2
+    tamperM5aTaskReg baseL2Bcast.hwx baseL2Bcast.info 1 regSrc2Cfg (origCfg2 ||| cfgBitHandoffPe)
+  ) "must use whole-task wait, not L2 handoff")
+
   pure results
 
 def main : IO UInt32 := do
