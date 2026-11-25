@@ -421,6 +421,7 @@ structure VerifiedTaskFootprint where
   kind : TaskKind
   engine : Engine
   isNeCompute : Bool
+  isMultiBatch : Bool := false
   liveL2Mask : UInt32 := 0
   l2Accesses : Array VerifiedL2Access
   dramAccesses : Array VerifiedDramAccess
@@ -3098,6 +3099,7 @@ def verifyPeReduceTaskMulti
     kind := .peReduce
     engine := .pe
     isNeCompute := false
+    isMultiBatch := sN > 1
     liveL2Mask := h7
     l2Accesses := l2Accs
     dramAccesses := dramAccs
@@ -4033,8 +4035,8 @@ def verifyProgramHazards (fps : Array VerifiedTaskFootprint) : Except String Uni
                 -- src2AheadPE: plain HB/HBL does NOT order PE src2 staging fill or L2 read
                 src2Wait22 || src2Wait5 || src2Kind ||
                   (b.role == .src2L2 && handoff2)
-              else if ti.engine == .ne && b.role == .src1Stage && a.role == .resStage then
-                -- neSrcStageAhead: plain HBL/HB does NOT order NE DMA src1Stage fill over draining resStage
+              else if b.role == .src1Stage && a.role == .resStage then
+                -- srcStageAhead: plain HBL/HB does NOT order NE or PE DMA src1Stage fill over draining resStage
                 src2Wait5 || src2Wait22
               else
                 hbl k i || handoff2 || handoff3
@@ -4042,8 +4044,8 @@ def verifyProgramHazards (fps : Array VerifiedTaskFootprint) : Except String Uni
             if !ordered then
               let xeTag := if tk.engine != ti.engine then " [XE cross-engine]" else ""
               let src2Tag := if ti.engine == .pe && (b.role == .src2Stage || b.role == .src2L2) then " [src2AheadPE]" else ""
-              let neStageTag := if ti.engine == .ne && b.role == .src1Stage && a.role == .resStage then " [neSrcStageAhead]" else ""
-              throw s!"S5 L2 hazard{xeTag}{src2Tag}{neStageTag}: unordered conflict between task {k} ({a.role.name} [{toHex a.lo}, {toHex a.hi})) and task {i} ({b.role.name} [{toHex b.lo}, {toHex b.hi}))"
+              let stageAheadTag := if b.role == .src1Stage && a.role == .resStage then " [srcStageAhead]" else ""
+              throw s!"S5 L2 hazard{xeTag}{src2Tag}{stageAheadTag}: unordered conflict between task {k} ({a.role.name} [{toHex a.lo}, {toHex a.hi})) and task {i} ({b.role.name} [{toHex b.lo}, {toHex b.hi}))"
 
       -- B. Check all conflicting DRAM pairs
       for a in tk.dramAccesses do
@@ -4103,6 +4105,11 @@ def verifyProgramHazards (fps : Array VerifiedTaskFootprint) : Except String Uni
         | some (p, a) =>
           if !(a.lo <= b.lo && b.hi <= a.hi) then
             throw s!"S5 DRAM scratch integrity: task {i} {b.port.name} scratch read [{toHex b.lo}, {toHex b.hi}) is only partially covered by latest writer task {p} resDma [{toHex a.lo}, {toHex a.hi})"
+          if fps[p]!.isMultiBatch then
+            if b.port == .src1Dma && ti.sync.src1DepKind != 1 then
+              throw s!"S5 DRAM scratch coherence [multiBatchRaw]: task {i} src1Dma reading multi-batch (BatchN > 1) scratch [{toHex b.lo}, {toHex b.hi}) written by task {p} must set 0x4d00 depKind to 1 (got {ti.sync.src1DepKind})"
+            if b.port == .src2Dma && ti.sync.src2DepKind != 1 then
+              throw s!"S5 DRAM scratch coherence [multiBatchRaw]: task {i} src2Dma reading multi-batch (BatchN > 1) scratch [{toHex b.lo}, {toHex b.hi}) written by task {p} must set 0x4d04 depKind to 1 (got {ti.sync.src2DepKind})"
 
   pure ()
 

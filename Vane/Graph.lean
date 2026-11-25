@@ -1386,6 +1386,19 @@ private def latestEngineBefore (pre : Array PreLoweredTask) (eng : Engine) (i : 
       best := some j
   return best
 
+private def isMultiBatchOp (op : PlannedOp) : Bool :=
+  match op with
+  | .peReduce _ axes _ dims => (peReduceAxes dims.c dims.h axes.reduceC axes.reduceH).sN > 1
+  | _ => false
+
+private def latestScratchWriterBefore (pre : Array PreLoweredTask) (i lo hi : Nat) : Option Nat := Id.run do
+  let mut latestW? : Option Nat := none
+  for j in [:i] do
+    for a in pre[j]!.dramAccesses do
+      if a.resource == .scratch && a.isWrite && intervalsOverlap a.lo a.hi lo hi then
+        latestW? := some j
+  return latestW?
+
 private def computeSynchronization (pre : Array PreLoweredTask) : Array TaskSyncInfo := Id.run do
   let n := pre.size
   let mut syncs : Array TaskSyncInfo := Array.ofFn (n := n) fun i => {
@@ -1412,24 +1425,20 @@ private def computeSynchronization (pre : Array PreLoweredTask) : Array TaskSync
         else if prodEng == .pe && latestEngineBefore pre .pe i == some prod then
           syncs := syncs.set! i { syncs[i]! with src1HandoffPe := true }
 
-  -- Seed BAR 3 DRAM-scratch read coherence (depKind = 2, depDist = min 15 (i - j - 1)) on every PE src1/src2
-  -- reading a scratch buffer written by an earlier task j < i (latest writer j).
+  -- Seed BAR 3 DRAM-scratch read coherence (depKind = 1 if latest writer has BatchN > 1 else 2,
+  -- depDist = min 15 (i - j - 1)) on every PE src1/src2 reading a scratch buffer written by an earlier task j < i.
   -- Never credit depDist > 0 as ordering: the fixpoint loop below adds HB / src2Wait5 / src2Wait22 whenever j < i - 1.
   for i in [1 : n] do
     if pre[i]!.node.engine == .pe then
       for b in pre[i]!.dramAccesses do
         if b.resource == .scratch && !b.isWrite then
-          let mut latestW? : Option Nat := none
-          for j in [:i] do
-            for a in pre[j]!.dramAccesses do
-              if a.resource == .scratch && a.isWrite && intervalsOverlap a.lo a.hi b.lo b.hi then
-                latestW? := some j
-          if let some j := latestW? then
+          if let some j := latestScratchWriterBefore pre i b.lo b.hi then
+            let depKind := if isMultiBatchOp pre[j]!.node.op then 1 else 2
             let dist := min 15 (i - j - 1)
             if b.port == .src1Dma then
-              syncs := syncs.set! i { syncs[i]! with src1DepKind := 2, src1DepDist := dist }
+              syncs := syncs.set! i { syncs[i]! with src1DepKind := depKind, src1DepDist := dist }
             else if b.port == .src2Dma then
-              syncs := syncs.set! i { syncs[i]! with src2DepKind := 2, src2DepDist := dist }
+              syncs := syncs.set! i { syncs[i]! with src2DepKind := depKind, src2DepDist := dist }
 
   let mut latestNeArr : Array (Option Nat) := Array.mkEmpty n
   let mut latestPeArr : Array (Option Nat) := Array.mkEmpty n
@@ -1457,6 +1466,7 @@ private def computeSynchronization (pre : Array PreLoweredTask) : Array TaskSync
         | _ => .peOp
       engine := pre[i.val]!.node.engine
       isNeCompute := pre[i.val]!.node.isNeCompute
+      isMultiBatch := isMultiBatchOp pre[i.val]!.node.op
       l2Accesses := pre[i.val]!.l2Accesses
       dramAccesses := pre[i.val]!.dramAccesses
       sync := syncs[i.val]!
@@ -1510,9 +1520,15 @@ private def computeSynchronization (pre : Array PreLoweredTask) : Array TaskSync
           for b in ti.dramAccesses do
             if a.resource == b.resource && (a.isWrite || b.isWrite) && intervalsOverlap a.lo a.hi b.lo b.hi then
               if ti.engine == .ne && b.port == .src1Dma then
-                -- srcReadNE: set 0x4d00 depKind=2, depDist=0 and ensure HB(k, i - 1)
-                if syncs[i]!.src1DepKind != 2 || syncs[i]!.src1DepDist != 0 then
-                  syncs := syncs.set! i { syncs[i]! with src1DepKind := 2, src1DepDist := 0 }
+                -- srcReadNE: set 0x4d00 depKind (1 if latest scratch writer has BatchN > 1, else 2), depDist=0 and ensure HB(k, i - 1)
+                let wantDepKind :=
+                  if b.resource == .scratch then
+                    match latestScratchWriterBefore pre i b.lo b.hi with
+                    | some lw => if isMultiBatchOp pre[lw]!.node.op then 1 else 2
+                    | none => 2
+                  else 2
+                if syncs[i]!.src1DepKind != wantDepKind || syncs[i]!.src1DepDist != 0 then
+                  syncs := syncs.set! i { syncs[i]! with src1DepKind := wantDepKind, src1DepDist := 0 }
                   changed := true
                 if !hbEq k (i - 1) then
                   let prev := i - 1
@@ -1579,8 +1595,8 @@ private def computeSynchronization (pre : Array PreLoweredTask) : Array TaskSync
                     if !syncs[i]!.src2WaitPe22 then
                       syncs := syncs.set! i { syncs[i]! with src2WaitPe22 := true }
                       changed := true
-              else if ti.engine == .ne && b.role == .src1Stage && a.role == .resStage then
-                -- neSrcStageAhead: plain HBL/HB does NOT order NE DMA src1Stage fill over draining resStage
+              else if b.role == .src1Stage && a.role == .resStage then
+                -- srcStageAhead: plain HBL/HB does NOT order NE or PE DMA src1Stage fill over draining resStage
                 if !(src2Wait5 || src2Wait22) then
                   if tk.engine == .ne then
                     if !syncs[i]!.src1WaitNe5 then

@@ -3786,7 +3786,7 @@ private def runM4Tests : IO (Array TestResult) := do
     let orig ← readU32LE baseNeSrcStageAhead.hwx fCfg1
     let stripped := orig &&& (~~~cfgBitWaitNe5)
     tamperTaskRegAndVerify baseNeSrcStageAhead.hwx baseNeSrcStageAhead.info 1 regSrc1Cfg stripped
-  ) "neSrcStageAhead")
+  ) "srcStageAhead")
 
   pure results
 
@@ -4550,6 +4550,126 @@ private def runM5bTests : IO (Array TestResult) := do
     let _ ← verifyHwxTasks h2 badInfo (requireKnownTask := true)
     pure ()
   ) "L2-resident PE2 broadcast")
+
+  -- 9. Silicon-discovered DRAM-scratch sync rules: general PE/NE srcStageAhead & multi-batch (BatchN > 1) depKind=1
+  let baseLnDram ← match Vane.Graph.compileGraph {
+      target := .h16, defaultPlacement := .dram
+      inputs := #[{ name := "x", shape := { c := 8, h := 6, w := 32 } }]
+      nodes := #[
+        { id := "mu", inputs := #["x"], op := .reduce .mean { reduceW := true } },
+        { id := "xc", inputs := #["x", "mu"], op := .pe2 .sub false },
+        { id := "inv_std", inputs := #["xc"], op := .reduce .rsqrtMeanSquare { reduceW := true } (floatToF16CanonicalZero 0.001) },
+        { id := "out", inputs := #["xc", "inv_std"], op := .pe2 .mul false }
+      ]
+    } with
+    | .ok g => pure g
+    | .error e => throw (IO.userError s!"baseLnDram setup failed: {e}")
+
+  let baseRedToNeDram ← match Vane.Graph.compileGraph {
+      target := .h16, defaultPlacement := .dram
+      inputs := #[{ name := "x", shape := { c := 8, h := 6, w := 32 } }]
+      nodes := #[
+        { id := "mu", inputs := #["x"], op := .reduce .mean { reduceW := true } },
+        { id := "proj", inputs := #["mu"], op := .conv1x1 8 8 (mkM5aW1x1 8 8 1) none .none }
+      ]
+    } with
+    | .ok g => pure g
+    | .error e => throw (IO.userError s!"baseRedToNeDram setup failed: {e}")
+
+  let baseRedToPe1Dram ← match Vane.Graph.compileGraph {
+      target := .h16, defaultPlacement := .dram
+      inputs := #[{ name := "x", shape := { c := 8, h := 6, w := 32 } }]
+      nodes := #[
+        { id := "mu", inputs := #["x"], op := .reduce .mean { reduceW := true } },
+        { id := "scaled", inputs := #["mu"], op := .pe1 (PeOp.scalarMul 0x3800) }
+      ]
+    } with
+    | .ok g => pure g
+    | .error e => throw (IO.userError s!"baseRedToPe1Dram setup failed: {e}")
+
+  results := results.push (checkOk "m5b: LayerNorm(axis=W) DRAM + peReduce(w)->PE/NE emit depKind=1 (BatchN>1) & waitPe22 (srcStageAhead)" (do
+    for tgt in #[Target.h16, Target.h17] do
+      let lnDram ← Vane.Graph.compileGraph {
+        target := tgt, defaultPlacement := .dram
+        inputs := #[{ name := "x", shape := { c := 8, h := 6, w := 32 } }]
+        nodes := #[
+          { id := "mu", inputs := #["x"], op := .reduce .mean { reduceW := true } },
+          { id := "xc", inputs := #["x", "mu"], op := .pe2 .sub false },
+          { id := "inv_std", inputs := #["xc"], op := .reduce .rsqrtMeanSquare { reduceW := true } (floatToF16CanonicalZero 0.001) },
+          { id := "out", inputs := #["xc", "inv_std"], op := .pe2 .mul false }
+        ]
+      }
+      let s ← verifyM5aGraph lnDram 4
+      if s.peReduce != 2 || s.peOp != 2 || lnDram.scratchBytes == 0 then
+        throw s!"{tgt.name} lnDram unexpected summary={repr s} scratch={lnDram.scratchBytes}"
+      -- Task 1 (xc): src2Dep reads task 0 (BatchN=6 > 1) -> depKind=1; src1Cfg sets bit 22 (srcStageAhead)
+      let w1s2 ← readU32LE lnDram.hwx (← findM5aTaskRegOffset lnDram.hwx lnDram.info 1 regSrc2Dep)
+      let dk1s2 ← decodeFieldChecked (srcDepMultiLayout "src2Dep") w1s2 "depKind"
+      if dk1s2 != 1 then
+        throw s!"{tgt.name} lnDram task 1 src2Dep depKind={dk1s2} != 1"
+      let w1c1 ← readU32LE lnDram.hwx (← findM5aTaskRegOffset lnDram.hwx lnDram.info 1 regSrc1Cfg)
+      if (w1c1 &&& cfgBitWaitPe22) == 0 then
+        throw s!"{tgt.name} lnDram task 1 src1Cfg {toHex w1c1.toNat} missing bit 22 (waitPe22 for srcStageAhead)"
+      -- Task 2 (inv_std): src1Dep reads task 1 (BatchN=1) -> depKind=2
+      let w2s1 ← readU32LE lnDram.hwx (← findM5aTaskRegOffset lnDram.hwx lnDram.info 2 regSrc1Dep)
+      let dk2s1 ← decodeFieldChecked (srcDepMultiLayout "src1Dep") w2s1 "depKind"
+      if dk2s1 != 2 then
+        throw s!"{tgt.name} lnDram task 2 src1Dep depKind={dk2s1} != 2"
+      -- Task 3 (out): src1Dep reads task 1 (BatchN=1) -> depKind=2; src2Dep reads task 2 (BatchN=6 > 1) -> depKind=1; src1Cfg sets bit 22
+      let w3s1 ← readU32LE lnDram.hwx (← findM5aTaskRegOffset lnDram.hwx lnDram.info 3 regSrc1Dep)
+      let dk3s1 ← decodeFieldChecked (srcDepMultiLayout "src1Dep") w3s1 "depKind"
+      if dk3s1 != 2 then
+        throw s!"{tgt.name} lnDram task 3 src1Dep depKind={dk3s1} != 2"
+      let w3s2 ← readU32LE lnDram.hwx (← findM5aTaskRegOffset lnDram.hwx lnDram.info 3 regSrc2Dep)
+      let dk3s2 ← decodeFieldChecked (srcDepMultiLayout "src2Dep") w3s2 "depKind"
+      if dk3s2 != 1 then
+        throw s!"{tgt.name} lnDram task 3 src2Dep depKind={dk3s2} != 1"
+      let w3c1 ← readU32LE lnDram.hwx (← findM5aTaskRegOffset lnDram.hwx lnDram.info 3 regSrc1Cfg)
+      if (w3c1 &&& cfgBitWaitPe22) == 0 then
+        throw s!"{tgt.name} lnDram task 3 src1Cfg {toHex w3c1.toNat} missing bit 22 (waitPe22 for srcStageAhead)"
+    -- Also verify NE consumer (peReduce(w) -> DRAM -> neConv1x1) emits depKind=1, depDist=0
+    let _ ← verifyM5aGraph baseRedToNeDram 2
+    let wNe ← readU32LE baseRedToNeDram.hwx (← findM5aTaskRegOffset baseRedToNeDram.hwx baseRedToNeDram.info 1 regSrc1Dep)
+    let dkNe ← decodeFieldChecked (srcDepMultiLayout "src1Dep") wNe "depKind"
+    let ddNe ← decodeFieldChecked (srcDepMultiLayout "src1Dep") wNe "depDist"
+    if dkNe != 1 || ddNe != 0 then
+      throw s!"peReduce(w)->neConv1x1 DRAM task 1 src1Dep expected (depKind=1, depDist=0), got ({dkNe}, {ddNe})"
+    -- Also verify PE src1 consumer (peReduce(w) -> DRAM -> pe1) emits depKind=1
+    let _ ← verifyM5aGraph baseRedToPe1Dram 2
+    let wPe1 ← readU32LE baseRedToPe1Dram.hwx (← findM5aTaskRegOffset baseRedToPe1Dram.hwx baseRedToPe1Dram.info 1 regSrc1Dep)
+    let dkPe1 ← decodeFieldChecked (srcDepMultiLayout "src1Dep") wPe1 "depKind"
+    if dkPe1 != 1 then
+      throw s!"peReduce(w)->pe1 DRAM task 1 src1Dep expected depKind=1, got {dkPe1}"
+    pure ()
+  ))
+
+  results := results.push (checkErr "m5b neg tamper: clearing PE src1Cfg bit 22 when src1Stage overlaps prior PE resStage rejected ([srcStageAhead])" (do
+    let fCfg1 ← findM5aTaskRegOffset baseLnDram.hwx baseLnDram.info 1 regSrc1Cfg
+    let origCfg1 ← readU32LE baseLnDram.hwx fCfg1
+    let stripped := origCfg1 &&& (~~~cfgBitWaitPe22)
+    tamperM5aTaskReg baseLnDram.hwx baseLnDram.info 1 regSrc1Cfg stripped
+  ) "[srcStageAhead]")
+
+  results := results.push (checkErr "m5b neg tamper: PE src2Dep reading BatchN>1 peReduce scratch with depKind=2 rejected ([multiBatchRaw])" (do
+    let fDep ← findM5aTaskRegOffset baseLnDram.hwx baseLnDram.info 1 regSrc2Dep
+    let origDep ← readU32LE baseLnDram.hwx fDep
+    let badDep := (origDep &&& (~~~((0x3 : UInt32) <<< 28))) ||| ((2 : UInt32) <<< 28)
+    tamperM5aTaskReg baseLnDram.hwx baseLnDram.info 1 regSrc2Dep badDep
+  ) "[multiBatchRaw]")
+
+  results := results.push (checkErr "m5b neg tamper: NE src1Dep reading BatchN>1 peReduce scratch with depKind=2 rejected ([multiBatchRaw])" (do
+    let fDep ← findM5aTaskRegOffset baseRedToNeDram.hwx baseRedToNeDram.info 1 regSrc1Dep
+    let origDep ← readU32LE baseRedToNeDram.hwx fDep
+    let badDep := (origDep &&& (~~~((0x3 : UInt32) <<< 28))) ||| ((2 : UInt32) <<< 28)
+    tamperM5aTaskReg baseRedToNeDram.hwx baseRedToNeDram.info 1 regSrc1Dep badDep
+  ) "[multiBatchRaw]")
+
+  results := results.push (checkErr "m5b neg tamper: PE src1Dep reading BatchN>1 peReduce scratch with depKind=2 rejected ([multiBatchRaw])" (do
+    let fDep ← findM5aTaskRegOffset baseRedToPe1Dram.hwx baseRedToPe1Dram.info 1 regSrc1Dep
+    let origDep ← readU32LE baseRedToPe1Dram.hwx fDep
+    let badDep := (origDep &&& (~~~((0x3 : UInt32) <<< 28))) ||| ((2 : UInt32) <<< 28)
+    tamperM5aTaskReg baseRedToPe1Dram.hwx baseRedToPe1Dram.info 1 regSrc1Dep badDep
+  ) "[multiBatchRaw]")
 
   pure results
 
