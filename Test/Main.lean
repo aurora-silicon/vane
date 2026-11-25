@@ -3789,8 +3789,334 @@ private def runM4Tests : IO (Array TestResult) := do
 
   pure results
 
+private def mkM5aW1x1 (cin cout seed : Nat) : ByteArray :=
+  Vane.Graph.u16ArrayToBytes (Array.ofFn (n := cout * cin) fun i =>
+    if (i.val + seed) % 3 == 0 then 0x3400 else 0x3800)
+
+private def mkM5aW3x3 (cin cout : Nat) (isDw : Bool) : ByteArray :=
+  let cinW := if isDw then 1 else cin
+  Vane.Graph.u16ArrayToBytes (Array.ofFn (n := cout * cinW * 9) fun i =>
+    if i.val % 5 == 0 then 0x3800 else 0x3000)
+
+private def mkM5aBias (cout : Nat) : ByteArray :=
+  Vane.Graph.u16ArrayToBytes (Array.replicate cout (0x3400 : UInt16))
+
+private def verifyM5aGraph (g : Vane.Graph.CompiledGraph) (expTasks : Nat) : Except String TaskVerifySummary := do
+  let info ← validateHwx g.hwx
+  validateSectionsWithInfo info g.sections
+  let s ← verifyHwxTasksSummary g.hwx info (requireKnownTask := true)
+  if s.total != expTasks then
+    throw s!"expected {expTasks} verified tasks, got {s.total}"
+  pure s
+
+private def findM5aTaskRegOffset (hwx : ByteArray) (info : HwxInfo) (taskIdx regAddr : Nat) : Except String Nat := do
+  let textBytes ← readSlice hwx info.textSection.offset.toNat info.textSection.size.toNat
+  let tasks ← decodeTaskStream info.target textBytes
+  let some task := tasks[taskIdx]?
+    | throw s!"missing task {taskIdx} (only {tasks.size} tasks)"
+  match task.writes.find? (fun w => w.byteAddr == regAddr) with
+  | some w => pure (info.textSection.offset.toNat + w.payloadOffset)
+  | none => throw s!"task {taskIdx} does not write register {toHex regAddr}"
+
+private def tamperM5aTaskReg (hwx : ByteArray) (info : HwxInfo) (taskIdx regAddr : Nat) (newVal : UInt32) :
+    Except String Unit := do
+  let fileOff ← findM5aTaskRegOffset hwx info taskIdx regAddr
+  let badHwx ← putU32LE hwx fileOff newVal
+  let badInfo ← validateHwx badHwx
+  let _ ← verifyHwxTasks badHwx badInfo (requireKnownTask := true)
+  pure ()
+
+/-- Build a 6-layer camera-denoise-shaped CNN (`3 -> 32 -> 32 -> 32 -> 32 -> 32 -> 3`,
+    five 3x3 stride-1 conv+ReLU layers followed by a 1x1 projection) for spatial H-strip tests. -/
+private def mkDenoiseGraphSpec (target : Target) (h w : Nat) (stripMode : Vane.Graph.StripMode) :
+    Vane.Graph.GraphSpec := {
+  target := target
+  defaultPlacement := .auto
+  stripMode := stripMode
+  inputs := #[{ name := "x", shape := { c := 3, h := h, w := w } }]
+  nodes := #[
+    { id := "c0", inputs := #["x"],  op := .conv3x3 .dense 3 32 1 .same (mkM5aW3x3 3 32 false) (some (mkM5aBias 32)) .relu },
+    { id := "c1", inputs := #["c0"], op := .conv3x3 .dense 32 32 1 .same (mkM5aW3x3 32 32 false) (some (mkM5aBias 32)) .relu },
+    { id := "c2", inputs := #["c1"], op := .conv3x3 .dense 32 32 1 .same (mkM5aW3x3 32 32 false) (some (mkM5aBias 32)) .relu },
+    { id := "c3", inputs := #["c2"], op := .conv3x3 .dense 32 32 1 .same (mkM5aW3x3 32 32 false) (some (mkM5aBias 32)) .relu },
+    { id := "c4", inputs := #["c3"], op := .conv3x3 .dense 32 32 1 .same (mkM5aW3x3 32 32 false) (some (mkM5aBias 32)) .relu },
+    { id := "c5", inputs := #["c4"], op := .conv1x1 32 3 (mkM5aW1x1 32 3 7) (some (mkM5aBias 3)) .none }
+  ]
+}
+
+private def runM5aTests : IO (Array TestResult) := do
+  let mut results : Array TestResult := #[]
+
+  -- 1. Positive: all 4 asymmetric vertical 3x3 strip padding modes (dense + depthwise, H16 + H17)
+  results := results.push (checkOk "m5a: PadMode.strip (full/top/mid/bot) single-task conv3x3 on H16 & H17 passes verifier" (do
+    let stripCases : Array (Nat × Nat × Nat × Nat) := #[
+      (8, 1, 1, 8), -- full frame
+      (9, 1, 0, 8), -- top strip
+      (10, 0, 0, 8), -- middle strip
+      (9, 0, 1, 8)  -- bottom strip
+    ]
+    for tgt in #[Target.h16, Target.h17] do
+      for mode in #[Conv3x3Mode.dense, Conv3x3Mode.depthwise] do
+        for (hIn, pt, pb, expHo) in stripCases do
+          let sh : ConvSpec := {
+            kernelSize := 3, mode := mode, h := hIn, w := 32, cin := 16, cout := 16,
+            stride := 1, pad := .strip pt pb
+          }
+          if sh.outH != expHo || sh.outW != 32 || sh.padTop != pt || sh.padLeft != 1 then
+            throw s!"strip({pt},{pb}) geometry mismatch: out=({sh.outH}x{sh.outW}), pad=({sh.padTop},{sh.padLeft})"
+          let w := mkM5aW3x3 16 16 (mode == .depthwise)
+          let c ← compileConv tgt sh w none true
+          let s ← verifyHwxTasksSummary c.hwx c.info (requireKnownTask := true)
+          if s.neConv != 1 then
+            throw s!"expected 1 verified conv task, got {s.neConv}"
+    pure ()
+  ))
+
+  -- 2. Positive: 6-layer camera-denoise CNN (VGA 240x320) on H16 & H17 with stripMode = .auto -> 0 B scratch & shared __KERN_0
+  for tgt in #[Target.h16, Target.h17] do
+    results := results.push (checkOk s!"m5a: {tgt.name} 6-layer denoise VGA (240x320) auto-strip achieves 0B scratch & shared __KERN_0" (do
+      let unstripped ← Vane.Graph.compileGraph (mkDenoiseGraphSpec tgt 240 320 .off)
+      if unstripped.scratchBytes == 0 then
+        throw "expected unstripped VGA denoise CNN to spill to DRAM scratch"
+      let stripped ← Vane.Graph.compileGraph (mkDenoiseGraphSpec tgt 240 320 .auto)
+      let _ ← verifyM5aGraph stripped stripped.taskCount
+      if stripped.stripCount <= 1 || stripped.stripHeight == 0 then
+        throw s!"expected stripped VGA denoise CNN (stripCount={stripped.stripCount}, stripHeight={stripped.stripHeight})"
+      if stripped.taskCount != stripped.stripCount * 6 then
+        throw s!"taskCount {stripped.taskCount} != stripCount({stripped.stripCount}) * 6"
+      if stripped.scratchBytes != 0 then
+        throw s!"expected 0 B DRAM scratch for stripped VGA denoise CNN, got {stripped.scratchBytes}B"
+      if stripped.kernelBytes != unstripped.kernelBytes then
+        throw s!"expected shared __KERN_0 size {unstripped.kernelBytes}B, got {stripped.kernelBytes}B (no Sx duplication)"
+      pure ()
+    ))
+
+  -- 3. Positive: 6-layer camera-denoise CNN (1080p 540x960) on H16 & H17 with stripMode = .auto -> <= 2 MiB scratch & shared __KERN_0
+  for tgt in #[Target.h16, Target.h17] do
+    results := results.push (checkOk s!"m5a: {tgt.name} 6-layer denoise 1080p (540x960) auto-strip <= 2 MiB scratch & shared __KERN_0" (do
+      let singleStrip ← Vane.Graph.compileGraph (mkDenoiseGraphSpec tgt 16 960 .off)
+      let stripped ← Vane.Graph.compileGraph (mkDenoiseGraphSpec tgt 540 960 .auto)
+      let _ ← verifyM5aGraph stripped stripped.taskCount
+      if stripped.stripCount <= 1 || stripped.taskCount > 255 then
+        throw s!"expected stripped 1080p with 2..255 tasks, got strips={stripped.stripCount}, tasks={stripped.taskCount}"
+      if stripped.scratchBytes > 2 * 1024 * 1024 then
+        throw s!"expected 1080p stripped scratch <= 2 MiB, got {stripped.scratchBytes}B"
+      if stripped.kernelBytes != singleStrip.kernelBytes then
+        throw s!"expected shared __KERN_0 size {singleStrip.kernelBytes}B, got {stripped.kernelBytes}B"
+      pure ()
+    ))
+
+  -- 4. Positive: uneven remainder strip (H % h_out != 0) + mixed NE/LUT/PE input-skip + single-strip edge case
+  let unevenStripped ← match Vane.Graph.compileGraph {
+      target := .h17, defaultPlacement := .auto, stripMode := .fixed 8
+      inputs := #[{ name := "x", shape := { c := 8, h := 25, w := 32 } }]
+      nodes := #[
+        { id := "c0", inputs := #["x"], op := .conv3x3 .dense 8 8 1 .same (mkM5aW3x3 8 8 false) none .relu },
+        { id := "l0", inputs := #["c0"], op := .lut (.lut .silu) },
+        { id := "p0", inputs := #["l0"], op := .pe1 (.chain (some 0x3800) none none) },
+        { id := "res", inputs := #["p0", "x"], op := .pe2 .add false }
+      ]
+    } with
+    | .ok g => pure g
+    | .error e => throw (IO.userError s!"unevenStripped setup failed: {e}")
+
+  results := results.push (checkOk "m5a: uneven remainder strip (H=25, h_out=8 -> 4 strips) mixed conv3x3/lut/pe+input-skip passes S1-S5 & shares __KERN_0" (do
+    let single ← Vane.Graph.compileGraph {
+      target := .h17, defaultPlacement := .auto, stripMode := .fixed 25
+      inputs := #[{ name := "x", shape := { c := 8, h := 25, w := 32 } }]
+      nodes := #[
+        { id := "c0", inputs := #["x"], op := .conv3x3 .dense 8 8 1 .same (mkM5aW3x3 8 8 false) none .relu },
+        { id := "l0", inputs := #["c0"], op := .lut (.lut .silu) },
+        { id := "p0", inputs := #["l0"], op := .pe1 (.chain (some 0x3800) none none) },
+        { id := "res", inputs := #["p0", "x"], op := .pe2 .add false }
+      ]
+    }
+    let _ ← verifyM5aGraph single 4
+    if single.stripCount != 1 then
+      throw s!"expected single-strip edge case stripCount=1, got {single.stripCount}"
+    let _ ← verifyM5aGraph unevenStripped 16
+    if unevenStripped.stripCount != 4 || unevenStripped.stripHeight != 8 then
+      throw s!"expected 4 strips of height 8, got strips={unevenStripped.stripCount}, h={unevenStripped.stripHeight}"
+    if unevenStripped.kernelBytes != single.kernelBytes then
+      throw s!"expected shared __KERN_0 (conv+lut) {single.kernelBytes}B, got {unevenStripped.kernelBytes}B"
+    -- Final remainder strip (strip 3, task 15) must have output height 1 (25 - 3*8)
+    if unevenStripped.nodes[15]!.outDims.h != 1 then
+      throw s!"expected remainder strip height 1, got {unevenStripped.nodes[15]!.outDims.h}"
+    pure ()
+  ))
+
+  -- 5. Negative tamper: illegal strip padding pb = 2 (Hin=5, pt=0, Hout=5) rejected by verifier
+  let baseStripPadConv ← match compileConv .h17 {
+      kernelSize := 3, mode := .dense, h := 5, w := 32, cin := 4, cout := 4, stride := 1, pad := .strip 1 1
+    } (mkM5aW3x3 4 4 false) none false with
+    | .ok c => pure c
+    | .error e => throw (IO.userError s!"baseStripPadConv setup failed: {e}")
+
+  results := results.push (checkErr "m5a neg: illegal strip padding pb=2 (Hin=5, pt=0, Hout=5) rejected by verifier" (do
+    let fCfg ← findM5aTaskRegOffset baseStripPadConv.hwx baseStripPadConv.info 0 regConvCfg
+    let origCfg ← readU32LE baseStripPadConv.hwx fCfg
+    -- Clear pt bits [27:22] from 1 to 0 while keeping Hin=5, Hout=5 -> implies pb = 5+2-5-0 = 2
+    let badCfg := origCfg &&& (~~~((0x3f : UInt32) <<< 22))
+    tamperM5aTaskReg baseStripPadConv.hwx baseStripPadConv.info 0 regConvCfg badCfg
+  ) "3x3 spatial geometry mismatch")
+
+  -- 6. Negative tamper: illegal strip padding pb < 0 (Hin=5, pt=1, Hout=3) rejected by verifier
+  results := results.push (checkErr "m5a neg: illegal strip padding pb<0 (Hin=5, pt=1, Hout=3) rejected by verifier" (do
+    let fHo ← findM5aTaskRegOffset baseStripPadConv.hwx baseStripPadConv.info 0 regHout
+    let fTh ← findM5aTaskRegOffset baseStripPadConv.hwx baseStripPadConv.info 0 regTH
+    let h1 ← putU32LE baseStripPadConv.hwx fHo 3
+    let h2 ← putU32LE h1 fTh 3
+    let badInfo ← validateHwx h2
+    let _ ← verifyHwxTasks h2 badInfo (requireKnownTask := true)
+    pure ()
+  ) "3x3 spatial geometry mismatch")
+
+  -- 7. Negative tamper: surface DMA row offset causing inter-channel plane bleed rejected by verifier
+  let base2StripConv ← match Vane.Graph.compileGraph {
+      target := .h17, defaultPlacement := .auto, stripMode := .fixed 4
+      inputs := #[{ name := "x", shape := { c := 4, h := 16, w := 32 } }]
+      nodes := #[
+        { id := "c0", inputs := #["x"], op := .conv1x1 4 4 (mkM5aW1x1 4 4 1) none .none }
+      ]
+    } with
+    | .ok g => pure g
+    | .error e => throw (IO.userError s!"base2StripConv setup failed: {e}")
+
+  results := results.push (checkErr "m5a neg: sub-height surface DMA offset causing plane bleed rejected by verifier" (do
+    -- Surface is C=4, H_full=16, W=32 -> rowStride=64, span=4096.
+    -- Task 0 reads h=4 rows; shrink planeStride to 4*64=256 and set src1BaseLo=64:
+    -- baseOff + extent = 64 + 3*256 + 256 = 1088 <= 4096 (fits in surface capacity),
+    -- yet baseOff + h*rowStride = 64 + 256 = 320 > 256 = planeStride (inter-channel plane bleed!).
+    let fBase ← findM5aTaskRegOffset base2StripConv.hwx base2StripConv.info 0 regSrc1BaseLo
+    let fPlane ← findM5aTaskRegOffset base2StripConv.hwx base2StripConv.info 0 regSrc1DmaPlaneStride
+    let h1 ← putU32LE base2StripConv.hwx fPlane (4 * 64)
+    let h2 ← putU32LE h1 fBase 64
+    let badInfo ← validateHwx h2
+    let _ ← verifyHwxTasks h2 badInfo (requireKnownTask := true)
+    pure ()
+  ) "plane bleed")
+
+  -- 8. Negative tamper: non-last strip setting 0x5500 kernelStage isLast=1 rejected by verifier
+  results := results.push (checkErr "m5a neg: non-last strip output-surface write setting 0x5500 isLast=1 rejected by verifier" (do
+    let fKs ← findM5aTaskRegOffset base2StripConv.hwx base2StripConv.info 0 regKernelStage
+    let origKs ← readU32LE base2StripConv.hwx fKs
+    tamperM5aTaskReg base2StripConv.hwx base2StripConv.info 0 regKernelStage (origKs ||| ((1 : UInt32) <<< 7))
+  ) "kernelStage isLast=1 != expected 0")
+
+  -- 9. Negative tamper: non-last strip emitting 0x5900 output stage on multi-strip output-surface write rejected
+  results := results.push (checkErr "m5a neg: non-last strip output-surface write emitting 0x5900 output stage rejected by verifier" (do
+    let textBytes ← readSlice base2StripConv.hwx base2StripConv.info.textSection.offset.toNat base2StripConv.info.textSection.size.toNat
+    let decoded ← decodeTaskStream .h17 textBytes
+    let t0 := decoded[0]!
+    let t1 := decoded[1]!
+    let rebuildTask := fun (t : DecodedTask) (extraPlain : Array RegWrite) => do
+      let ene ← decodeFieldChecked taskHeader8MultiLayout t.header[8]! "ene"
+      let mut plain : Array RegWrite := #[]
+      let mut bars : Array BarRegWrite := #[]
+      let mut kRelocs : Array TaskReloc := #[]
+      let mut i := 0
+      while i < t.writes.size do
+        let w := t.writes[i]!
+        match w.barSlot with
+        | none =>
+          plain := plain.push { byteAddr := w.byteAddr, value := w.value }
+          i := i + 1
+        | some slot =>
+          if i + 1 < t.writes.size && t.writes[i + 1]!.barSlot == some slot && t.writes[i + 1]!.byteAddr == w.byteAddr + 4 then
+            let bIdx := bars.size
+            bars := bars.push { baseByteAddr := w.byteAddr, barSlot := slot, values := #[w.value, t.writes[i + 1]!.value] }
+            if w.byteAddr == regKernelBaseLo then
+              kRelocs := kRelocs.push { barRecIndex := bIdx, payloadWordIndex := 0 }
+            i := i + 2
+          else
+            bars := bars.push { baseByteAddr := w.byteAddr, barSlot := slot, values := #[w.value] }
+            i := i + 1
+      pure ({
+        taskId := t.taskIndex
+        logNE := 0
+        eneOverride := some ene.toNat
+        isFirst := t.taskIndex == 0
+        isLast := t.taskIndex == 1
+        liveL2Mask := t.header[7]!
+        plainWrites := plain ++ extraPlain
+        barWrites := bars
+        kernelRelocs := kRelocs
+      } : TaskDesc)
+    let badOutStage : Array RegWrite := #[
+      { byteAddr := regOut0, value := out0Value },
+      { byteAddr := regOut1, value := out1Value },
+      { byteAddr := regOut2, value := (out2FormValue <<< 24) },
+      { byteAddr := regOut3, value := out3Value },
+      { byteAddr := regOut4, value := out4Value },
+      { byteAddr := regOut5, value := out5Value }
+    ]
+    let kSec := base2StripConv.info.kernelSection.get!
+    let kBytes ← readSlice base2StripConv.hwx kSec.offset.toNat kSec.size.toNat
+    let inSurf ← makeFp16Surface .h17 "x" "input_x" .input 4 16 32
+    let outSurf ← makeFp16Surface .h17 "y" "output_c0" .output 4 16 32
+    let td0 ← rebuildTask t0 badOutStage
+    let td1 ← rebuildTask t1 #[]
+    let em ← emitProgram {
+      target := .h17
+      surfaces := #[inSurf, outSurf]
+      tasks := #[td0, td1]
+      kernel := some kBytes
+      scratch := none
+      constants := zeroBytes textConstBytes
+      ident := some "vane"
+    }
+    let _ ← verifyHwxTasksSummary em.hwx em.info (requireKnownTask := true)
+    pure ()
+  ) "non-last task must omit out0")
+
+  -- 10. Negative compiler checks: over-limit (>255 tasks) and ineligible graphs (stride-2, skip-halo mismatch, broadcast pe2)
+  results := results.push (checkErr "m5a neg: fixed strip height exceeding 255 kernel-bearing tasks rejected" (do
+    let _ ← Vane.Graph.compileGraph (mkDenoiseGraphSpec .h17 64 32 (.fixed 1))
+    pure ()
+  ) "exceeding limit 255")
+
+  results := results.push (checkErr "m5a neg: fixed strip height on stride-2 conv3x3 graph rejected" (do
+    let _ ← Vane.Graph.compileGraph {
+      target := .h17, stripMode := .fixed 4
+      inputs := #[{ name := "x", shape := { c := 8, h := 16, w := 16 } }]
+      nodes := #[
+        { id := "c0", inputs := #["x"], op := .conv3x3 .dense 8 8 2 .same (mkM5aW3x3 8 8 false) none .none }
+      ]
+    }
+    pure ()
+  ) "requires stride=1 and pad=same")
+
+  results := results.push (checkErr "m5a neg: fixed strip height on skip-halo mismatch graph rejected" (do
+    let _ ← Vane.Graph.compileGraph {
+      target := .h17, stripMode := .fixed 4
+      inputs := #[{ name := "x", shape := { c := 8, h := 16, w := 16 } }]
+      nodes := #[
+        { id := "c0", inputs := #["x"], op := .conv3x3 .dense 8 8 1 .same (mkM5aW3x3 8 8 false) none .relu },
+        { id := "c1", inputs := #["c0"], op := .conv3x3 .dense 8 8 1 .same (mkM5aW3x3 8 8 false) none .relu },
+        { id := "add", inputs := #["c1", "c0"], op := .pe2 .add false }
+      ]
+    }
+    pure ()
+  ) "skip-halo interval mismatch")
+
+  results := results.push (checkErr "m5a neg: fixed strip height on broadcast pe2 graph rejected" (do
+    let _ ← Vane.Graph.compileGraph {
+      target := .h17, stripMode := .fixed 4
+      inputs := #[
+        { name := "x", shape := { c := 8, h := 16, w := 16 } },
+        { name := "b", shape := { c := 8, h := 1, w := 1 } }
+      ]
+      nodes := #[
+        { id := "add", inputs := #["x", "b"], op := .pe2 .add false }
+      ]
+    }
+    pure ()
+  ) "spatial strip fusion ineligible")
+
+  pure results
+
 def main : IO UInt32 := do
-  let results := (← runAllTests) ++ (← runM4Tests)
+  let results := (← runAllTests) ++ (← runM4Tests) ++ (← runM5aTests)
   let mut passed := 0
   let mut failed := 0
   for r in results do

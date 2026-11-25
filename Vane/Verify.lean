@@ -178,7 +178,7 @@ private def vMaxBlockSlots (isDepthwise : Bool) (cin cout f effOcg : Nat) : Nat 
         best := slots
   return best
 
-/-- Independently verify 3x3 `(same | valid)` spatial geometry and return expected `(Win, Hin)`. -/
+/-- Independently verify 3x3 `(same | valid | strip)` spatial geometry and return expected `(Win, Hin)`. -/
 private def vVerify3x3Geometry (fullH fullW stride hout wout pt pl : Nat) : Except String (Nat × Nat) := do
   let sameHo := vCeilDiv fullH stride
   let sameWo := vCeilDiv fullW stride
@@ -190,8 +190,11 @@ private def vVerify3x3Geometry (fullH fullW stride hout wout pt pl : Nat) : Exce
     (fullH - 3) / stride + 1 == hout &&
     (fullW - 3) / stride + 1 == wout &&
     pt == 0 && pl == 0
-  if !matchesSame && !matchesValid then
-    throw s!"3x3 spatial geometry mismatch: input=({fullH}x{fullW}), stride={stride}, output=({hout}x{wout}), pad=(pt={pt}, pl={pl}) matches neither same nor valid"
+  let matchesStrip :=
+    stride == 1 && pl == 1 && wout == fullW && pt <= 1 && hout >= 1 &&
+    hout + 2 >= fullH + pt && hout + 2 - fullH - pt <= 1
+  if !matchesSame && !matchesValid && !matchesStrip then
+    throw s!"3x3 spatial geometry mismatch: input=({fullH}x{fullW}), stride={stride}, output=({hout}x{wout}), pad=(pt={pt}, pl={pl}) matches neither same, valid, nor strip"
   if stride == 1 then
     pure (fullW, fullH)
   else
@@ -649,10 +652,13 @@ private def vDecodeSrcDep
   pure (depKind, depDist)
 
 /-- Verify a DMA stride pair `(rowStride, planeStride)` for shape `(c, h, w)` against a
-    capacity bound `cap` and return the verified byte `extent`. -/
+    capacity bound `cap` and return the verified exact strided byte `extent`.
+    When `isSurface` and `c > 1`, additionally enforces `baseOff + h * rowStride <= planeStride`
+    to prevent inter-channel plane bleed. -/
 private def vVerifyDmaStridesAndBounds
     (writes : Array DecodedWrite)
     (c h w baseOff cap : Nat)
+    (isSurface : Bool)
     (rowAddr planeAddr : Nat)
     (rowName planeName dirLabel targetLabel prefixMsg : String) : Except String Nat := do
   if baseOff % vDmaLineBytes != 0 then
@@ -666,17 +672,20 @@ private def vVerifyDmaStridesAndBounds
     | none =>
       if h == 1 then pure (alignUp (2 * w) vDmaLineBytes)
       else throw s!"{prefixMsg}: missing required register {rowName} ({toHex rowAddr}) for H={h} > 1"
-  let extent ← match findDecodedWrite writes planeAddr with
+  let planeStride ← match findDecodedWrite writes planeAddr with
     | some wp =>
       let ps := wp.value.toNat
       if ps < h * rowStride then
         throw s!"{prefixMsg}: {dirLabel} plane stride ({planeName}={ps}) < H * rowStride ({h * rowStride})"
-      pure (c * ps)
+      pure ps
     | none =>
       if c == 1 then pure (h * rowStride)
       else throw s!"{prefixMsg}: missing required register {planeName} ({toHex planeAddr}) for C={c} > 1"
+  let extent := if c == 0 || h == 0 then 0 else (c - 1) * planeStride + h * rowStride
   if extent == 0 || baseOff + extent > cap then
     throw s!"{prefixMsg}: {dirLabel} range [{toHex baseOff}, {toHex (baseOff + extent)}) exceeds {targetLabel} capacity {cap}"
+  if isSurface && c > 1 && baseOff + h * rowStride > planeStride then
+    throw s!"{prefixMsg}: {dirLabel} {targetLabel} plane bleed: baseOff ({toHex baseOff}) + H * rowStride ({h * rowStride}) > planeStride ({planeStride})"
   pure extent
 
 /-- Verify that a set of register addresses are all absent (omitted). -/
@@ -905,11 +914,18 @@ def verifyConvTaskMulti
           throw s!"{prefixMsg}: single-batch input surface required (got n={s.n})"
         if s.channels.toNat != cin then
           throw s!"{prefixMsg}: Cin={cin} != bound input surface channels {s.channels}"
-        let fh := s.height.toNat
-        let fw := s.width.toNat
-        if fh == 0 || fh > 65535 || fw == 0 || fw > 65535 then
-          throw s!"{prefixMsg}: bound input surface dims ({fh}x{fw}) outside 1..65535"
-        pure (fh, fw, some (inBarSlot, inTarget, srcBaseOff))
+        let sfh := s.height.toNat
+        let sfw := s.width.toNat
+        if sfh == 0 || sfh > 65535 || sfw == 0 || sfw > 65535 then
+          throw s!"{prefixMsg}: bound input surface dims ({sfh}x{sfw}) outside 1..65535"
+        let fh ←
+          if kw == 1 || (kw == 3 && sx == 1) then
+            if hinReg > sfh then
+              throw s!"{prefixMsg}: Hin={hinReg} exceeds bound input surface height {sfh}"
+            pure hinReg
+          else
+            pure sfh
+        pure (fh, sfw, some (inBarSlot, inTarget, srcBaseOff))
       | .scratch _ =>
         if inBarSlot != barSlotScratch then
           throw s!"{prefixMsg}: scratch src1Base must use BAR slot {barSlotScratch}, got {inBarSlot}"
@@ -936,8 +952,11 @@ def verifyConvTaskMulti
           throw s!"{prefixMsg}: resBase BAR slot {outBarSlot} bound to non-output surface '{s.shortName}'"
         if s.n != 1 then
           throw s!"{prefixMsg}: single-batch output surface required (got n={s.n})"
-        if s.channels.toNat != cout || s.height.toNat != hout || s.width.toNat != wout then
-          throw s!"{prefixMsg}: output dims ({cout}x{hout}x{wout}) != bound output surface ({s.channels}x{s.height}x{s.width})"
+        let outHeightOk :=
+          if kw == 3 && sx == 2 then s.height.toNat == hout
+          else hout <= s.height.toNat
+        if s.channels.toNat != cout || !outHeightOk || s.width.toNat != wout then
+          throw s!"{prefixMsg}: output dims ({cout}x{hout}x{wout}) incompatible with bound output surface ({s.channels}x{s.height}x{s.width})"
         pure (some (outBarSlot, outTarget, resBaseOff))
       | .scratch _ =>
         if outBarSlot != barSlotScratch then
@@ -1252,11 +1271,11 @@ def verifyConvTaskMulti
     let wSrc1Fmt ← requireDecodedWrite task.writes regSrc1Fmt "src1Fmt"
     if wSrc1Fmt.value != srcFmtWordP1 then
       throw s!"{prefixMsg}: src1Fmt {toHex wSrc1Fmt.value.toNat} != expected {toHex srcFmtWordP1.toNat}"
-    let (resId, cap, lbl) := match inTarget with
-      | .surface s => (BarResource.surface (findSurfaceIndex info s) s.shortName, min s.span.toNat s.sect.size.toNat, s!"surface '{s.shortName}'")
-      | .scratch sc => (BarResource.scratch, sc.size.toNat, "scratch (__DATA,__bss)")
-      | _ => (BarResource.scratch, 0, "invalid")
-    let inExtent ← vVerifyDmaStridesAndBounds task.writes cin fullH fullW srcBaseOff cap
+    let (resId, cap, isSurf, lbl) := match inTarget with
+      | .surface s => (BarResource.surface (findSurfaceIndex info s) s.shortName, min s.span.toNat s.sect.size.toNat, true, s!"surface '{s.shortName}'")
+      | .scratch sc => (BarResource.scratch, sc.size.toNat, false, "scratch (__DATA,__bss)")
+      | _ => (BarResource.scratch, 0, false, "invalid")
+    let inExtent ← vVerifyDmaStridesAndBounds task.writes cin fullH fullW srcBaseOff cap isSurf
       regSrc1DmaRowStride regSrc1DmaPlaneStride "src1DmaRowStride" "src1DmaPlaneStride" "input DMA" lbl prefixMsg
     dramAccs := dramAccs.push { resource := resId, lo := srcBaseOff, hi := srcBaseOff + inExtent, isWrite := false, port := .src1Dma }
 
@@ -1282,11 +1301,11 @@ def verifyConvTaskMulti
     let wResFmt ← requireDecodedWrite task.writes regResFmt "resFmt"
     if wResFmt.value != resFmtWordP1 then
       throw s!"{prefixMsg}: resFmt {toHex wResFmt.value.toNat} != expected {toHex resFmtWordP1.toNat}"
-    let (resId, cap, lbl) := match outTarget with
-      | .surface s => (BarResource.surface (findSurfaceIndex info s) s.shortName, min s.span.toNat s.sect.size.toNat, s!"surface '{s.shortName}'")
-      | .scratch sc => (BarResource.scratch, sc.size.toNat, "scratch (__DATA,__bss)")
-      | _ => (BarResource.scratch, 0, "invalid")
-    let outExtent ← vVerifyDmaStridesAndBounds task.writes cout hout wout resBaseOff cap
+    let (resId, cap, isSurf, lbl) := match outTarget with
+      | .surface s => (BarResource.surface (findSurfaceIndex info s) s.shortName, min s.span.toNat s.sect.size.toNat, true, s!"surface '{s.shortName}'")
+      | .scratch sc => (BarResource.scratch, sc.size.toNat, false, "scratch (__DATA,__bss)")
+      | _ => (BarResource.scratch, 0, false, "invalid")
+    let outExtent ← vVerifyDmaStridesAndBounds task.writes cout hout wout resBaseOff cap isSurf
       regResDmaRowStride regResDmaPlaneStride "resDmaRowStride" "resDmaPlaneStride" "output DMA" lbl prefixMsg
     dramAccs := dramAccs.push { resource := resId, lo := resBaseOff, hi := resBaseOff + outExtent, isWrite := true, port := .resDma }
 
@@ -1541,7 +1560,8 @@ def verifyPeTaskMulti
           throw s!"{prefixMsg}: src1Base BAR slot {slot} bound to non-input surface '{s.shortName}'"
         if s.n != 1 then
           throw s!"{prefixMsg}: src1 surface must be single-batch (n=1), got {s.n}"
-        if s.channels.toNat != s1C || s.height.toNat != s1H || s.width.toNat != s1W then
+        let s1HOk := if s1H != outH then s.height.toNat == s1H else s1H <= s.height.toNat
+        if s.channels.toNat != s1C || !s1HOk || s.width.toNat != s1W then
           throw s!"{prefixMsg}: peBcast mismatches src1 surface ({s.channels}x{s.height}x{s.width}) vs expected ({s1C}x{s1H}x{s1W})"
         pure (some (slot, tgt, off))
       | .scratch _ =>
@@ -1571,7 +1591,8 @@ def verifyPeTaskMulti
             throw s!"{prefixMsg}: src2Base BAR slot {slot} bound to non-input surface '{s.shortName}'"
           if s.n != 1 then
             throw s!"{prefixMsg}: src2 surface must be single-batch (n=1), got {s.n}"
-          if s.channels.toNat != s2C || s.height.toNat != s2H || s.width.toNat != s2W then
+          let s2HOk := if s2H != outH then s.height.toNat == s2H else s2H <= s.height.toNat
+          if s.channels.toNat != s2C || !s2HOk || s.width.toNat != s2W then
             throw s!"{prefixMsg}: peBcast mismatches src2 surface ({s.channels}x{s.height}x{s.width}) vs expected ({s2C}x{s2H}x{s2W})"
           pure (some (slot, tgt, off))
         | .scratch _ =>
@@ -1599,8 +1620,8 @@ def verifyPeTaskMulti
           throw s!"{prefixMsg}: resBase BAR slot {slot} bound to non-output surface '{s.shortName}'"
         if s.n != 1 then
           throw s!"{prefixMsg}: output surface must be single-batch (n=1), got {s.n}"
-        if s.channels.toNat != outC || s.height.toNat != outH || s.width.toNat != outW then
-          throw s!"{prefixMsg}: output surface ({s.channels}x{s.height}x{s.width}) != PE dims ({outC}x{outH}x{outW})"
+        if s.channels.toNat != outC || outH > s.height.toNat || s.width.toNat != outW then
+          throw s!"{prefixMsg}: output surface ({s.channels}x{s.height}x{s.width}) incompatible with PE dims ({outC}x{outH}x{outW})"
         if let some (s1Slot, .surface _, _) := src1DmaTarget? then
           if slot == s1Slot then throw s!"{prefixMsg}: output BAR slot {slot} aliases src1 BAR slot"
         if let some (s2Slot, .surface _, _) := src2DmaTarget? then
@@ -1767,11 +1788,11 @@ def verifyPeTaskMulti
     let wFmt ← requireDecodedWrite task.writes regSrc1Fmt "src1Fmt"
     if wFmt.value != srcFmtWordP1 then
       throw s!"{prefixMsg}: src1Fmt {toHex wFmt.value.toNat} != {toHex srcFmtWordP1.toNat}"
-    let (resId, cap, lbl) := match tgt with
-      | .surface s => (BarResource.surface (findSurfaceIndex info s) s.shortName, min s.span.toNat s.sect.size.toNat, s!"surface '{s.shortName}'")
-      | .scratch sc => (BarResource.scratch, sc.size.toNat, "scratch (__DATA,__bss)")
-      | _ => (BarResource.scratch, 0, "invalid")
-    let ext ← vVerifyDmaStridesAndBounds task.writes s1C s1H s1W off cap
+    let (resId, cap, isSurf, lbl) := match tgt with
+      | .surface s => (BarResource.surface (findSurfaceIndex info s) s.shortName, min s.span.toNat s.sect.size.toNat, true, s!"surface '{s.shortName}'")
+      | .scratch sc => (BarResource.scratch, sc.size.toNat, false, "scratch (__DATA,__bss)")
+      | _ => (BarResource.scratch, 0, false, "invalid")
+    let ext ← vVerifyDmaStridesAndBounds task.writes s1C s1H s1W off cap isSurf
       regSrc1DmaRowStride regSrc1DmaPlaneStride "src1DmaRowStride" "src1DmaPlaneStride" "input DMA" lbl prefixMsg
     dramAccs := dramAccs.push { resource := resId, lo := off, hi := off + ext, isWrite := false, port := .src1Dma }
 
@@ -1781,11 +1802,11 @@ def verifyPeTaskMulti
     let wFmt ← requireDecodedWrite task.writes regSrc2Fmt "src2Fmt"
     if wFmt.value != srcFmtWordP1 then
       throw s!"{prefixMsg}: src2Fmt {toHex wFmt.value.toNat} != {toHex srcFmtWordP1.toNat}"
-    let (resId, cap, lbl) := match tgt with
-      | .surface s => (BarResource.surface (findSurfaceIndex info s) s.shortName, min s.span.toNat s.sect.size.toNat, s!"surface '{s.shortName}'")
-      | .scratch sc => (BarResource.scratch, sc.size.toNat, "scratch (__DATA,__bss)")
-      | _ => (BarResource.scratch, 0, "invalid")
-    let ext ← vVerifyDmaStridesAndBounds task.writes s2C s2H s2W off cap
+    let (resId, cap, isSurf, lbl) := match tgt with
+      | .surface s => (BarResource.surface (findSurfaceIndex info s) s.shortName, min s.span.toNat s.sect.size.toNat, true, s!"surface '{s.shortName}'")
+      | .scratch sc => (BarResource.scratch, sc.size.toNat, false, "scratch (__DATA,__bss)")
+      | _ => (BarResource.scratch, 0, false, "invalid")
+    let ext ← vVerifyDmaStridesAndBounds task.writes s2C s2H s2W off cap isSurf
       regSrc2DmaRowStride regSrc2DmaPlaneStride "src2DmaRowStride" "src2DmaPlaneStride" "input DMA" lbl prefixMsg
     dramAccs := dramAccs.push { resource := resId, lo := off, hi := off + ext, isWrite := false, port := .src2Dma }
 
@@ -1808,11 +1829,11 @@ def verifyPeTaskMulti
     let wResFmt ← requireDecodedWrite task.writes regResFmt "resFmt"
     if wResFmt.value != resFmtWordP1 then
       throw s!"{prefixMsg}: resFmt {toHex wResFmt.value.toNat} != {toHex resFmtWordP1.toNat}"
-    let (resId, cap, lbl) := match tgt with
-      | .surface s => (BarResource.surface (findSurfaceIndex info s) s.shortName, min s.span.toNat s.sect.size.toNat, s!"surface '{s.shortName}'")
-      | .scratch sc => (BarResource.scratch, sc.size.toNat, "scratch (__DATA,__bss)")
-      | _ => (BarResource.scratch, 0, "invalid")
-    let ext ← vVerifyDmaStridesAndBounds task.writes outC outH outW off cap
+    let (resId, cap, isSurf, lbl) := match tgt with
+      | .surface s => (BarResource.surface (findSurfaceIndex info s) s.shortName, min s.span.toNat s.sect.size.toNat, true, s!"surface '{s.shortName}'")
+      | .scratch sc => (BarResource.scratch, sc.size.toNat, false, "scratch (__DATA,__bss)")
+      | _ => (BarResource.scratch, 0, false, "invalid")
+    let ext ← vVerifyDmaStridesAndBounds task.writes outC outH outW off cap isSurf
       regResDmaRowStride regResDmaPlaneStride "resDmaRowStride" "resDmaPlaneStride" "output DMA" lbl prefixMsg
     dramAccs := dramAccs.push { resource := resId, lo := off, hi := off + ext, isWrite := true, port := .resDma }
 
@@ -2003,7 +2024,7 @@ def verifyNeActTaskMulti
         if s.direction != .input then
           throw s!"{prefixMsg}: src1Base BAR slot {slot} bound to non-input surface '{s.shortName}'"
         if s.n != 1 then throw s!"{prefixMsg}: single-batch input surface required"
-        if s.channels.toNat != c || s.height.toNat != h || s.width.toNat != w then
+        if s.channels.toNat != c || h > s.height.toNat || s.width.toNat != w then
           throw s!"{prefixMsg}: input surface dims mismatch"
         pure (some (slot, tgt, off))
       | .scratch _ =>
@@ -2028,7 +2049,7 @@ def verifyNeActTaskMulti
         if s.direction != .output then
           throw s!"{prefixMsg}: resBase BAR slot {slot} bound to non-output surface '{s.shortName}'"
         if s.n != 1 then throw s!"{prefixMsg}: single-batch output surface required"
-        if s.channels.toNat != c || s.height.toNat != h || s.width.toNat != w then
+        if s.channels.toNat != c || h > s.height.toNat || s.width.toNat != w then
           throw s!"{prefixMsg}: output surface dims mismatch"
         pure (some (slot, tgt, off))
       | .scratch _ =>
@@ -2187,11 +2208,11 @@ def verifyNeActTaskMulti
     let wFmt ← requireDecodedWrite task.writes regSrc1Fmt "src1Fmt"
     if wFmt.value != srcFmtWordP1 then
       throw s!"{prefixMsg}: src1Fmt mismatch"
-    let (resId, cap, lbl) := match tgt with
-      | .surface s => (BarResource.surface (findSurfaceIndex info s) s.shortName, min s.span.toNat s.sect.size.toNat, s!"surface '{s.shortName}'")
-      | .scratch sc => (BarResource.scratch, sc.size.toNat, "scratch (__DATA,__bss)")
-      | _ => (BarResource.scratch, 0, "invalid")
-    let ext ← vVerifyDmaStridesAndBounds task.writes c h w off cap
+    let (resId, cap, isSurf, lbl) := match tgt with
+      | .surface s => (BarResource.surface (findSurfaceIndex info s) s.shortName, min s.span.toNat s.sect.size.toNat, true, s!"surface '{s.shortName}'")
+      | .scratch sc => (BarResource.scratch, sc.size.toNat, false, "scratch (__DATA,__bss)")
+      | _ => (BarResource.scratch, 0, false, "invalid")
+    let ext ← vVerifyDmaStridesAndBounds task.writes c h w off cap isSurf
       regSrc1DmaRowStride regSrc1DmaPlaneStride "src1DmaRowStride" "src1DmaPlaneStride" "input DMA" lbl prefixMsg
     dramAccs := dramAccs.push { resource := resId, lo := off, hi := off + ext, isWrite := false, port := .src1Dma }
 
@@ -2214,11 +2235,11 @@ def verifyNeActTaskMulti
     let wResFmt ← requireDecodedWrite task.writes regResFmt "resFmt"
     if wResFmt.value != resFmtWordP1 then
       throw s!"{prefixMsg}: resFmt mismatch"
-    let (resId, cap, lbl) := match tgt with
-      | .surface s => (BarResource.surface (findSurfaceIndex info s) s.shortName, min s.span.toNat s.sect.size.toNat, s!"surface '{s.shortName}'")
-      | .scratch sc => (BarResource.scratch, sc.size.toNat, "scratch (__DATA,__bss)")
-      | _ => (BarResource.scratch, 0, "invalid")
-    let ext ← vVerifyDmaStridesAndBounds task.writes c h w off cap
+    let (resId, cap, isSurf, lbl) := match tgt with
+      | .surface s => (BarResource.surface (findSurfaceIndex info s) s.shortName, min s.span.toNat s.sect.size.toNat, true, s!"surface '{s.shortName}'")
+      | .scratch sc => (BarResource.scratch, sc.size.toNat, false, "scratch (__DATA,__bss)")
+      | _ => (BarResource.scratch, 0, false, "invalid")
+    let ext ← vVerifyDmaStridesAndBounds task.writes c h w off cap isSurf
       regResDmaRowStride regResDmaPlaneStride "resDmaRowStride" "resDmaPlaneStride" "output DMA" lbl prefixMsg
     dramAccs := dramAccs.push { resource := resId, lo := off, hi := off + ext, isWrite := true, port := .resDma }
 
@@ -2333,11 +2354,61 @@ def stepHBL (fps : Array VerifiedTaskFootprint) (j i : Nat) : Bool :=
     stepHB fps j i ||
       (fps[i]!.engine == .ne && vLatestEngBefore fps .ne i == some j)
 
+/-- Precompute `(latestNeBefore, latestPeBefore)` in O(N) time for all `i < fps.size`. -/
+private def vLatestEngArrays (fps : Array VerifiedTaskFootprint) : Array (Option Nat) × Array (Option Nat) := Id.run do
+  let n := fps.size
+  let mut neArr : Array (Option Nat) := Array.mkEmpty n
+  let mut peArr : Array (Option Nat) := Array.mkEmpty n
+  let mut lastNe : Option Nat := none
+  let mut lastPe : Option Nat := none
+  for i in [:n] do
+    neArr := neArr.push lastNe
+    peArr := peArr.push lastPe
+    match fps[i]!.engine with
+    | .ne => lastNe := some i
+    | .pe => lastPe := some i
+  return (neArr, peArr)
+
+/-- Build transitive-closure reachability tables `(hbTbl, hblTbl)` for `stepHB` and `stepHBL`
+    by precomputing the direct-edge boolean matrices in O(N^2) time before running `reachTable`. -/
+def buildHBReachTables (fps : Array VerifiedTaskFootprint) : Array (Array Bool) × Array (Array Bool) :=
+  let n := fps.size
+  let (latestNeArr, latestPeArr) := vLatestEngArrays fps
+  let hbMat : Array (Array Bool) := Array.ofFn (n := n) fun iFin =>
+    let i := iFin.val
+    let ti := fps[i]!
+    let latestPe := latestPeArr[i]!
+    let latestNe := latestNeArr[i]!
+    Array.ofFn (n := i) fun jFin =>
+      let j := jFin.val
+      let tj := fps[j]!
+      let poPe := ti.engine == .pe && latestPe == some j
+      let poNeComp := ti.engine == .ne && tj.engine == .ne && latestNe == some j && tj.isNeCompute && ti.isNeCompute
+      let w5 := tj.engine == .ne && (ti.sync.src1WaitNe5 || (ti.engine == .pe && ti.sync.src2WaitNe5))
+      let wPe := tj.engine == .pe && latestPe == some j && (ti.sync.src1WaitPe22 || (ti.engine == .pe && ti.sync.src2WaitPe22))
+      let depNonRaw :=
+        j + 1 == i && ti.sync.hasSrc1Dma &&
+        (ti.sync.src1DepKind == 1 || ti.sync.src1DepKind == 2) &&
+        ti.sync.src1DepDist == 0 &&
+        !vSrc1DramReadsFromWrite tj ti
+      poPe || poNeComp || w5 || wPe || depNonRaw
+  let hblMat : Array (Array Bool) := Array.ofFn (n := n) fun iFin =>
+    let i := iFin.val
+    let ti := fps[i]!
+    let latestNe := latestNeArr[i]!
+    let hbRow := hbMat[i]!
+    Array.ofFn (n := i) fun jFin =>
+      let j := jFin.val
+      hbRow[j]! || (ti.engine == .ne && latestNe == some j)
+  let hbStep := fun j i => if j < i && i < n then (hbMat[i]!)[j]! else false
+  let hblStep := fun j i => if j < i && i < n then (hblMat[i]!)[j]! else false
+  (reachTable hbStep n, reachTable hblStep n)
+
 /-- Verify Clause S5 (whole-program hazard freedom + live L2-resident integrity) across all `N` tasks. -/
 def verifyProgramHazards (fps : Array VerifiedTaskFootprint) : Except String Unit := do
   let n := fps.size
-  let hbTbl := reachTable (stepHB fps) n
-  let hblTbl := reachTable (stepHBL fps) n
+  let (hbTbl, hblTbl) := buildHBReachTables fps
+  let (latestNeArr, latestPeArr) := vLatestEngArrays fps
   let hb := fun a b => reachB hbTbl a b
   let hbl := fun a b => reachB hblTbl a b
   let hbEq := fun a b => a == b || hb a b
@@ -2396,8 +2467,8 @@ def verifyProgramHazards (fps : Array VerifiedTaskFootprint) : Except String Uni
   -- 2. Pairwise hazard verification across all 0 <= k < i < n
   for i in [1 : n] do
     let ti := fps[i]!
-    let latestNe := vLatestEngBefore fps .ne i
-    let latestPe := vLatestEngBefore fps .pe i
+    let latestNe := latestNeArr[i]!
+    let latestPe := latestPeArr[i]!
 
     for k in [:i] do
       let tk := fps[k]!
@@ -2424,11 +2495,13 @@ def verifyProgramHazards (fps : Array VerifiedTaskFootprint) : Except String Uni
 
       let src2Wait5 : Bool :=
         (ti.sync.src1WaitNe5 || ti.sync.src2WaitNe5) &&
-        (Id.run do
+        (if tk.engine == .ne then true
+         else Id.run do
           let mut ok := false
           for j in [:i] do
             if fps[j]!.engine == .ne && hbEq k j then
               ok := true
+              break
           return ok)
 
       -- A. Check all conflicting L2 pairs

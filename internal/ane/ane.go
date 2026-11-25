@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"math/bits"
 	"os"
 	"path/filepath"
@@ -18,7 +19,7 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/niteria/vane/internal/ref"
+	"github.com/aurora-silicon/vane/internal/ref"
 )
 
 // Linux accel/ane ABI v3 constants matching uapi/drm/ane_accel.h.
@@ -769,6 +770,7 @@ func LoadProgram(tr Transport, fd int, hwx []byte, sections map[uint32][]byte) (
 // ExecOptions configures program execution and optional reference checking.
 type ExecOptions struct {
 	Runs      int
+	Warmup    int
 	InPlace   bool
 	AltInputs [][]byte // Optional alternate input surfaces used on odd runs (run 2, 4, ...) when Runs > 1.
 	Expected  []byte
@@ -784,6 +786,7 @@ type RunReport struct {
 	ChipFamily        uint32                `json:"chip_family"`
 	Mode              string                `json:"mode"`
 	Runs              int                   `json:"runs"`
+	Warmup            int                   `json:"warmup"`
 	SurfaceCount      int                   `json:"surface_count"`
 	SurfaceSizes      []uint64              `json:"surface_sizes"`
 	SurfaceDirections []uint32              `json:"surface_directions"`
@@ -791,12 +794,51 @@ type RunReport struct {
 	OutputSHA256      string                `json:"output_sha256"`
 	AltOutputSHA256   string                `json:"alt_output_sha256,omitempty"`
 	LatenciesMS       []float64             `json:"latencies_ms"`
+	MinMS             float64               `json:"min_ms"`
+	MedianMS          float64               `json:"median_ms"`
+	P95MS             float64               `json:"p95_ms"`
+	MeanMS            float64               `json:"mean_ms"`
 	Repeatable        bool                  `json:"repeatable"`
 	Comparison        *ref.ComparisonResult `json:"comparison"`
 }
 
-// ExecuteProgram executes a loaded program opts.Runs times in copy or in-place mmap mode.
-// Copy mode poisons the output buffer with 0xff before every run.
+// ComputeLatencyStats computes (min, median, p95, mean) in milliseconds over a non-empty slice of latencies.
+// p95 uses standard linear interpolation across sorted samples (matching NumPy's default percentile method).
+func ComputeLatencyStats(latencies []float64) (minMS, medianMS, p95MS, meanMS float64) {
+	n := len(latencies)
+	if n == 0 {
+		return 0, 0, 0, 0
+	}
+	sorted := make([]float64, n)
+	sum := 0.0
+	for i, v := range latencies {
+		sorted[i] = v
+		sum += v
+	}
+	sort.Float64s(sorted)
+	minMS = sorted[0]
+	meanMS = sum / float64(n)
+	if n%2 == 1 {
+		medianMS = sorted[n/2]
+	} else {
+		medianMS = 0.5 * (sorted[n/2-1] + sorted[n/2])
+	}
+	if n == 1 {
+		p95MS = sorted[0]
+	} else {
+		pos := 0.95 * float64(n-1)
+		lo := int(math.Floor(pos))
+		hi := int(math.Ceil(pos))
+		frac := pos - float64(lo)
+		p95MS = sorted[lo] + frac*(sorted[hi]-sorted[lo])
+	}
+	return minMS, medianMS, p95MS, meanMS
+}
+
+// ExecuteProgram executes a loaded program opts.Warmup warmup runs followed by opts.Runs timed runs
+// in copy or in-place mmap mode. Copy mode poisons the output buffer with 0xff before every run.
+// Repeatability is checked across ALL (Warmup + Runs) executions, while LatenciesMS and summary stats
+// (MinMS, MedianMS, P95MS, MeanMS) are computed strictly over the opts.Runs timed runs.
 // When opts.AltInputs is non-empty and opts.Runs > 1, even runs (r=0,2,4,...) execute
 // inputs and odd runs (r=1,3,5,...) execute opts.AltInputs, checking independent
 // determinism for both input sets.
@@ -812,6 +854,11 @@ func ExecuteProgram(
 	if runs <= 0 {
 		runs = 1
 	}
+	warmup := opts.Warmup
+	if warmup < 0 {
+		return nil, RunReport{}, fmt.Errorf("--warmup must be >= 0, got %d", warmup)
+	}
+	totalRuns := warmup + runs
 
 	var inIndices []int
 	outIdx := -1
@@ -920,7 +967,7 @@ func ExecuteProgram(
 			mappings[i] = mm
 		}
 
-		for r := 0; r < runs; r++ {
+		for r := 0; r < totalRuns; r++ {
 			isAlt := resolvedAltInputs != nil && (r%2 == 1)
 			curInputs := resolvedInputs
 			if isAlt {
@@ -935,7 +982,9 @@ func ExecuteProgram(
 			if err != nil {
 				return nil, RunReport{}, fmt.Errorf("DRM_IOCTL_ANE_H16_EXEC (in-place run %d): %w", r+1, err)
 			}
-			latencies = append(latencies, dt)
+			if r >= warmup {
+				latencies = append(latencies, dt)
+			}
 
 			outBytes := make([]byte, outSize)
 			copy(outBytes, mappings[outIdx][:outSize])
@@ -950,7 +999,7 @@ func ExecuteProgram(
 			surfBufs[i] = make([]byte, int(loaded.SurfaceSizes[i]))
 		}
 
-		for r := 0; r < runs; r++ {
+		for r := 0; r < totalRuns; r++ {
 			isAlt := resolvedAltInputs != nil && (r%2 == 1)
 			curInputs := resolvedInputs
 			if isAlt {
@@ -968,7 +1017,9 @@ func ExecuteProgram(
 			if err != nil {
 				return nil, RunReport{}, fmt.Errorf("DRM_IOCTL_ANE_H16_EXEC (copy run %d): %w", r+1, err)
 			}
-			latencies = append(latencies, dt)
+			if r >= warmup {
+				latencies = append(latencies, dt)
+			}
 
 			outBytes := make([]byte, outSize)
 			copy(outBytes, surfBufs[outIdx])
@@ -977,6 +1028,8 @@ func ExecuteProgram(
 			}
 		}
 	}
+
+	minMS, medianMS, p95MS, meanMS := ComputeLatencyStats(latencies)
 
 	sum := sha256.Sum256(firstOutput)
 	var altSHA string
@@ -1003,6 +1056,7 @@ func ExecuteProgram(
 		ChipFamily:        caps.ChipFamily,
 		Mode:              mode,
 		Runs:              runs,
+		Warmup:            warmup,
 		SurfaceCount:      loaded.SurfaceCount,
 		SurfaceSizes:      loaded.SurfaceSizes,
 		SurfaceDirections: loaded.SurfaceDirections,
@@ -1010,6 +1064,10 @@ func ExecuteProgram(
 		OutputSHA256:      hex.EncodeToString(sum[:]),
 		AltOutputSHA256:   altSHA,
 		LatenciesMS:       latencies,
+		MinMS:             minMS,
+		MedianMS:          medianMS,
+		P95MS:             p95MS,
+		MeanMS:            meanMS,
 		Repeatable:        true,
 		Comparison:        compPtr,
 	}

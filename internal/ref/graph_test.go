@@ -5,7 +5,7 @@ import (
 	"math"
 	"testing"
 
-	"github.com/niteria/vane/internal/fp16"
+	"github.com/aurora-silicon/vane/internal/fp16"
 )
 
 func makeConstTensor(c, h, w int, vals []float64) Tensor {

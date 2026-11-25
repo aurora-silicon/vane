@@ -64,6 +64,31 @@ def parse? (s : String) : Option EdgePlacementMode :=
 
 end EdgePlacementMode
 
+/-- Spatial H-strip fusion mode for multi-task graphs. -/
+inductive StripMode where
+  | off
+  | auto
+  | fixed (height : Nat)
+  deriving Repr, BEq, DecidableEq, Inhabited
+
+namespace StripMode
+
+def name : StripMode → String
+  | .off => "off"
+  | .auto => "auto"
+  | .fixed h => toString h
+
+def parse? (s : String) : Option StripMode :=
+  match s.toLower with
+  | "off" => some .off
+  | "auto" => some .auto
+  | raw =>
+    match raw.toNat? with
+    | some n => if n >= 1 then some (.fixed n) else none
+    | none => none
+
+end StripMode
+
 /-- Supported node operations in a multi-task ANE DAG. -/
 inductive NodeOp where
   | conv1x1 (cin cout : Nat) (weights : ByteArray) (bias : Option ByteArray := none) (act : ConvActivation := .none)
@@ -89,6 +114,7 @@ structure GraphSpec where
   inputs : Array GraphInput
   nodes : Array GraphNode
   defaultPlacement : EdgePlacementMode := .auto
+  stripMode : StripMode := .off
   deriving BEq
 
 /-- Concrete storage location assigned to a graph tensor. -/
@@ -122,6 +148,8 @@ structure CompiledGraph where
   scratchBytes : Nat
   l2PeakBytes : Nat
   kernelBytes : Nat
+  stripCount : Nat := 1
+  stripHeight : Nat := 0
   nodes : Array CompiledGraphNode
   hwx : ByteArray
   info : HwxInfo
@@ -152,6 +180,21 @@ private def dramSpanBytes (d : TensorDims) : Nat :=
   let row := alignUp (2 * d.w) dmaLineBytes
   let plane := d.h * row
   d.c * plane
+
+/-- Optional horizontal row-band window on a full-frame network surface (`fullH == 0` means full frame). -/
+private structure SurfaceWindow where
+  rowOffset : Nat := 0
+  fullH : Nat := 0
+  deriving Repr, BEq, Inhabited
+
+/-- Compute `(baseOff, rowStride, planeStride, exactExtent)` for a `P = 1` surface DMA access. -/
+private def surfaceDmaWindow (win : SurfaceWindow) (c h w : Nat) : Nat × Nat × Nat × Nat :=
+  let effFullH := if win.fullH == 0 then h else win.fullH
+  let rowStride := alignUp (2 * w) dmaLineBytes
+  let planeStride := effFullH * rowStride
+  let baseOff := win.rowOffset * rowStride
+  let extent := if c == 0 || h == 0 then 0 else (c - 1) * planeStride + h * rowStride
+  (baseOff, rowStride, planeStride, extent)
 
 private def placeTempBuffers (occupied : List Range) : List Nat → Option (List Nat)
   | [] => some []
@@ -517,6 +560,7 @@ private instance : Inhabited PlannedOp := ⟨.pe2 .add false default default def
 private structure ValidatedNode where
   id : String
   nodeIdx : Nat
+  origNodeIdx : Nat := 0
   inputs : Array TensorRef
   op : PlannedOp
   outDims : TensorDims
@@ -525,6 +569,9 @@ private structure ValidatedNode where
   isNeCompute : Bool
   usesKernel : Bool
   opKind : String
+  src1Win : SurfaceWindow := {}
+  src2Win : SurfaceWindow := {}
+  resWin : SurfaceWindow := {}
   deriving Inhabited
 
 private inductive TaskPlanKind where
@@ -699,6 +746,7 @@ private def validateGraph (spec : GraphSpec) :
     vNodes := vNodes.push {
       id := nd.id
       nodeIdx := i
+      origNodeIdx := i
       inputs := inRefs
       op := plannedOp
       outDims := outDims
@@ -875,6 +923,14 @@ private def locToBarResource (loc : TensorLocation) (inputShortNames : Array Str
   | .dram _ _ => some .scratch
   | .l2 _ _ => none
 
+private structure ConvKernCacheKey where
+  origNodeIdx : Nat
+  logNE : Nat
+  f : Nat
+  fat : Nat
+  ocg : Nat
+  deriving BEq, DecidableEq
+
 private def buildPreLoweredTasks
     (spec : GraphSpec)
     (shortNames : Array String)
@@ -885,6 +941,8 @@ private def buildPreLoweredTasks
   let n := vNodes.size
   let outSurfIdx := spec.inputs.size
   let mut kernBuf := ByteArray.empty
+  let mut convKernCache : Array (ConvKernCacheKey × Nat × PackedKernel) := #[]
+  let mut lutKernCache : Array (Nat × Nat) := #[]
   let mut out : Array PreLoweredTask := Array.mkEmpty n
 
   let resolveRefLoc := fun (ref : TensorRef) =>
@@ -919,11 +977,24 @@ private def buildPreLoweredTasks
 
     match nd.op, plan with
     | .conv sh weights bias _ lutPayload? _, .conv cp =>
-      -- Pack weights/bias/LUT into shared __KERN_0
-      kernBuf := padToAlign kernBuf dmaLineBytes
-      kernBaseOff := kernBuf.size
-      let packed ← packConvKernelChunks spec.target sh cp.tiling weights bias lutPayload?
-      kernBuf := kernBuf ++ packed.bytes
+      -- Pack weights/bias/LUT into shared __KERN_0, deduplicating identical per-node payloads across strips
+      let cKey : ConvKernCacheKey := {
+        origNodeIdx := nd.origNodeIdx
+        logNE := cp.tiling.logNE
+        f := cp.tiling.f
+        fat := cp.tiling.fat
+        ocg := cp.tiling.ocg
+      }
+      let (kOff, packed) ← match convKernCache.find? (fun (k, _, _) => k == cKey) with
+        | some (_, cachedOff, cachedPacked) => pure (cachedOff, cachedPacked)
+        | none =>
+          kernBuf := padToAlign kernBuf dmaLineBytes
+          let newOff := kernBuf.size
+          let p ← packConvKernelChunks spec.target sh cp.tiling weights bias lutPayload?
+          kernBuf := kernBuf ++ p.bytes
+          convKernCache := convKernCache.push (cKey, newOff, p)
+          pure (newOff, p)
+      kernBaseOff := kOff
       packedKern? := some packed
       for cs in packed.slots do
         dramAccs := dramAccs.push {
@@ -944,8 +1015,8 @@ private def buildPreLoweredTasks
       | .surface idx _ =>
         let sz := srcL2BytesConv sh cp.tiling
         l2Accs := l2Accs.push { lo := cp.srcStageBase, hi := cp.srcStageBase + sz, isWrite := true, role := .src1Stage }
-        let span := dramSpanBytes { c := sh.cin, h := sh.h, w := sh.w }
-        dramAccs := dramAccs.push { resource := .surface idx shortNames[idx]!, lo := 0, hi := span, isWrite := false, port := .src1Dma }
+        let (baseOff, _, _, ext) := surfaceDmaWindow nd.src1Win sh.cin sh.h sh.w
+        dramAccs := dramAccs.push { resource := .surface idx shortNames[idx]!, lo := baseOff, hi := baseOff + ext, isWrite := false, port := .src1Dma }
 
       match resLoc with
       | .l2 base bytes =>
@@ -962,8 +1033,8 @@ private def buildPreLoweredTasks
           if cp.direct then ((1 : Nat) <<< (cp.tiling.f + effOcgConv sh cp.tiling + cp.tiling.fat)) * 512
           else cp.tiling.tileHeight * resRowStrideConv sh cp.tiling
         l2Accs := l2Accs.push { lo := cp.resStageBase, hi := cp.resStageBase + sz, isWrite := true, role := .resStage }
-        let span := dramSpanBytes nd.outDims
-        dramAccs := dramAccs.push { resource := .surface outSurfIdx "y", lo := 0, hi := span, isWrite := true, port := .resDma }
+        let (baseOff, _, _, ext) := surfaceDmaWindow nd.resWin nd.outDims.c nd.outDims.h nd.outDims.w
+        dramAccs := dramAccs.push { resource := .surface outSurfIdx "y", lo := baseOff, hi := baseOff + ext, isWrite := true, port := .resDma }
 
     | .pe1 _ dims, .pe pp =>
       let stripW := peStripWidth pp.tiling.k
@@ -971,24 +1042,32 @@ private def buildPreLoweredTasks
       match src1Loc with
       | .l2 base bytes =>
         l2Accs := l2Accs.push { lo := base, hi := base + bytes, isWrite := false, role := .src1L2 }
-      | _ =>
+      | .dram off _ =>
         let row1 := 2 * min (alignUp dims.w 8) effStripW
         let sz1 := (if dims.h > 1 then pp.tiling.tileHeight else 1) * (dims.c * row1)
         l2Accs := l2Accs.push { lo := pp.src1StageBase, hi := pp.src1StageBase + sz1, isWrite := true, role := .src1Stage }
-        let off := match src1Loc with | .dram o _ => o | _ => 0
-        let resId := (locToBarResource src1Loc shortNames outSurfIdx).get!
-        dramAccs := dramAccs.push { resource := resId, lo := off, hi := off + dramSpanBytes dims, isWrite := false, port := .src1Dma }
+        dramAccs := dramAccs.push { resource := .scratch, lo := off, hi := off + dramSpanBytes dims, isWrite := false, port := .src1Dma }
+      | .surface idx _ =>
+        let row1 := 2 * min (alignUp dims.w 8) effStripW
+        let sz1 := (if dims.h > 1 then pp.tiling.tileHeight else 1) * (dims.c * row1)
+        l2Accs := l2Accs.push { lo := pp.src1StageBase, hi := pp.src1StageBase + sz1, isWrite := true, role := .src1Stage }
+        let (baseOff, _, _, ext) := surfaceDmaWindow nd.src1Win dims.c dims.h dims.w
+        dramAccs := dramAccs.push { resource := .surface idx shortNames[idx]!, lo := baseOff, hi := baseOff + ext, isWrite := false, port := .src1Dma }
 
       match resLoc with
       | .l2 base bytes =>
         l2Accs := l2Accs.push { lo := base, hi := base + bytes, isWrite := true, role := .resL2 }
-      | _ =>
+      | .dram off _ =>
         let drow := 2 * min (alignUp dims.w 8) effStripW
         let szRes := if pp.direct then peDirectResBytes dims.c drow pp.tiling.tileHeight else pp.tiling.tileHeight * (dims.c * drow)
         l2Accs := l2Accs.push { lo := pp.resStageBase, hi := pp.resStageBase + szRes, isWrite := true, role := .resStage }
-        let off := match resLoc with | .dram o _ => o | _ => 0
-        let resId := (locToBarResource resLoc shortNames outSurfIdx).get!
-        dramAccs := dramAccs.push { resource := resId, lo := off, hi := off + dramSpanBytes dims, isWrite := true, port := .resDma }
+        dramAccs := dramAccs.push { resource := .scratch, lo := off, hi := off + dramSpanBytes dims, isWrite := true, port := .resDma }
+      | .surface _ _ =>
+        let drow := 2 * min (alignUp dims.w 8) effStripW
+        let szRes := if pp.direct then peDirectResBytes dims.c drow pp.tiling.tileHeight else pp.tiling.tileHeight * (dims.c * drow)
+        l2Accs := l2Accs.push { lo := pp.resStageBase, hi := pp.resStageBase + szRes, isWrite := true, role := .resStage }
+        let (baseOff, _, _, ext) := surfaceDmaWindow nd.resWin dims.c dims.h dims.w
+        dramAccs := dramAccs.push { resource := .surface outSurfIdx "y", lo := baseOff, hi := baseOff + ext, isWrite := true, port := .resDma }
 
     | .pe2 _ _ outDims hw1 hw2 r1 r2, .pe pp =>
       src1Loc := resolveRefLoc r1
@@ -1000,44 +1079,64 @@ private def buildPreLoweredTasks
       match src1Loc with
       | .l2 base bytes =>
         l2Accs := l2Accs.push { lo := base, hi := base + bytes, isWrite := false, role := .src1L2 }
-      | _ =>
+      | .dram off _ =>
         let whole1 := hw1.c == 1 && hw1.h == 1 && hw1.w > 1 && outDims.h > 1 && th < outDims.h
         let row1 := 2 * (if whole1 then alignUp hw1.w 8 else min (alignUp hw1.w 8) effStripW)
         let sz1 := (if hw1.h > 1 then th else 1) * (hw1.c * row1)
         l2Accs := l2Accs.push { lo := pp.src1StageBase, hi := pp.src1StageBase + sz1, isWrite := true, role := .src1Stage }
-        let off := match src1Loc with | .dram o _ => o | _ => 0
-        let resId := (locToBarResource src1Loc shortNames outSurfIdx).get!
-        dramAccs := dramAccs.push { resource := resId, lo := off, hi := off + dramSpanBytes hw1, isWrite := false, port := .src1Dma }
+        dramAccs := dramAccs.push { resource := .scratch, lo := off, hi := off + dramSpanBytes hw1, isWrite := false, port := .src1Dma }
+      | .surface idx _ =>
+        let whole1 := hw1.c == 1 && hw1.h == 1 && hw1.w > 1 && outDims.h > 1 && th < outDims.h
+        let row1 := 2 * (if whole1 then alignUp hw1.w 8 else min (alignUp hw1.w 8) effStripW)
+        let sz1 := (if hw1.h > 1 then th else 1) * (hw1.c * row1)
+        l2Accs := l2Accs.push { lo := pp.src1StageBase, hi := pp.src1StageBase + sz1, isWrite := true, role := .src1Stage }
+        let (baseOff, _, _, ext) := surfaceDmaWindow nd.src1Win hw1.c hw1.h hw1.w
+        dramAccs := dramAccs.push { resource := .surface idx shortNames[idx]!, lo := baseOff, hi := baseOff + ext, isWrite := false, port := .src1Dma }
 
       let s2Loc := src2Loc?.get!
       match s2Loc with
       | .l2 base bytes =>
         l2Accs := l2Accs.push { lo := base, hi := base + bytes, isWrite := false, role := .src2L2 }
-      | _ =>
+      | .dram off _ =>
         let whole2 := hw2.c == 1 && hw2.h == 1 && hw2.w > 1 && outDims.h > 1 && th < outDims.h
         let row2 := 2 * (if whole2 then alignUp hw2.w 8 else min (alignUp hw2.w 8) effStripW)
         let sz2 := (if hw2.h > 1 then th else 1) * (hw2.c * row2)
         l2Accs := l2Accs.push { lo := pp.src2StageBase, hi := pp.src2StageBase + sz2, isWrite := true, role := .src2Stage }
-        let off := match s2Loc with | .dram o _ => o | _ => 0
-        let resId := (locToBarResource s2Loc shortNames outSurfIdx).get!
-        dramAccs := dramAccs.push { resource := resId, lo := off, hi := off + dramSpanBytes hw2, isWrite := false, port := .src2Dma }
+        dramAccs := dramAccs.push { resource := .scratch, lo := off, hi := off + dramSpanBytes hw2, isWrite := false, port := .src2Dma }
+      | .surface idx _ =>
+        let whole2 := hw2.c == 1 && hw2.h == 1 && hw2.w > 1 && outDims.h > 1 && th < outDims.h
+        let row2 := 2 * (if whole2 then alignUp hw2.w 8 else min (alignUp hw2.w 8) effStripW)
+        let sz2 := (if hw2.h > 1 then th else 1) * (hw2.c * row2)
+        l2Accs := l2Accs.push { lo := pp.src2StageBase, hi := pp.src2StageBase + sz2, isWrite := true, role := .src2Stage }
+        let (baseOff, _, _, ext) := surfaceDmaWindow nd.src2Win hw2.c hw2.h hw2.w
+        dramAccs := dramAccs.push { resource := .surface idx shortNames[idx]!, lo := baseOff, hi := baseOff + ext, isWrite := false, port := .src2Dma }
 
       match resLoc with
       | .l2 base bytes =>
         l2Accs := l2Accs.push { lo := base, hi := base + bytes, isWrite := true, role := .resL2 }
-      | _ =>
+      | .dram off _ =>
         let drow := 2 * min (alignUp outDims.w 8) effStripW
         let szRes := if pp.direct then peDirectResBytes outDims.c drow th else th * (outDims.c * drow)
         l2Accs := l2Accs.push { lo := pp.resStageBase, hi := pp.resStageBase + szRes, isWrite := true, role := .resStage }
-        let off := match resLoc with | .dram o _ => o | _ => 0
-        let resId := (locToBarResource resLoc shortNames outSurfIdx).get!
-        dramAccs := dramAccs.push { resource := resId, lo := off, hi := off + dramSpanBytes outDims, isWrite := true, port := .resDma }
+        dramAccs := dramAccs.push { resource := .scratch, lo := off, hi := off + dramSpanBytes outDims, isWrite := true, port := .resDma }
+      | .surface _ _ =>
+        let drow := 2 * min (alignUp outDims.w 8) effStripW
+        let szRes := if pp.direct then peDirectResBytes outDims.c drow th else th * (outDims.c * drow)
+        l2Accs := l2Accs.push { lo := pp.resStageBase, hi := pp.resStageBase + szRes, isWrite := true, role := .resStage }
+        let (baseOff, _, _, ext) := surfaceDmaWindow nd.resWin outDims.c outDims.h outDims.w
+        dramAccs := dramAccs.push { resource := .surface outSurfIdx "y", lo := baseOff, hi := baseOff + ext, isWrite := true, port := .resDma }
 
     | .lut _ dims lutPayload?, .lut lp =>
       if let some payload := lutPayload? then
-        kernBuf := padToAlign kernBuf dmaLineBytes
-        kernBaseOff := kernBuf.size
-        kernBuf := kernBuf ++ payload.bytes
+        let lutOff ← match lutKernCache.find? (fun (nid, _) => nid == nd.origNodeIdx) with
+          | some (_, cachedOff) => pure cachedOff
+          | none =>
+            kernBuf := padToAlign kernBuf dmaLineBytes
+            let newOff := kernBuf.size
+            kernBuf := kernBuf ++ payload.bytes
+            lutKernCache := lutKernCache.push (nd.origNodeIdx, newOff)
+            pure newOff
+        kernBaseOff := lutOff
         dramAccs := dramAccs.push {
           resource := .kernel, lo := kernBaseOff, hi := kernBaseOff + lutTableBytes, isWrite := false, port := .lut
         }
@@ -1045,24 +1144,32 @@ private def buildPreLoweredTasks
       match src1Loc with
       | .l2 base bytes =>
         l2Accs := l2Accs.push { lo := base, hi := base + bytes, isWrite := false, role := .src1L2 }
-      | _ =>
+      | .dram off _ =>
         let row := 2 * min (alignUp dims.w 8) stripW
         let sz := lp.tiling.tileHeight * (dims.c * row)
         l2Accs := l2Accs.push { lo := lp.srcStageBase, hi := lp.srcStageBase + sz, isWrite := true, role := .src1Stage }
-        let off := match src1Loc with | .dram o _ => o | _ => 0
-        let resId := (locToBarResource src1Loc shortNames outSurfIdx).get!
-        dramAccs := dramAccs.push { resource := resId, lo := off, hi := off + dramSpanBytes dims, isWrite := false, port := .src1Dma }
+        dramAccs := dramAccs.push { resource := .scratch, lo := off, hi := off + dramSpanBytes dims, isWrite := false, port := .src1Dma }
+      | .surface idx _ =>
+        let row := 2 * min (alignUp dims.w 8) stripW
+        let sz := lp.tiling.tileHeight * (dims.c * row)
+        l2Accs := l2Accs.push { lo := lp.srcStageBase, hi := lp.srcStageBase + sz, isWrite := true, role := .src1Stage }
+        let (baseOff, _, _, ext) := surfaceDmaWindow nd.src1Win dims.c dims.h dims.w
+        dramAccs := dramAccs.push { resource := .surface idx shortNames[idx]!, lo := baseOff, hi := baseOff + ext, isWrite := false, port := .src1Dma }
 
       match resLoc with
       | .l2 base bytes =>
         l2Accs := l2Accs.push { lo := base, hi := base + bytes, isWrite := true, role := .resL2 }
-      | _ =>
+      | .dram off _ =>
         let drow := 2 * min (alignUp dims.w 8) (max stripW 32)
         let szRes := if lp.direct then neActDirectResBytes lp.tiling.f lp.tiling.fat else lp.tiling.tileHeight * (dims.c * drow)
         l2Accs := l2Accs.push { lo := lp.resStageBase, hi := lp.resStageBase + szRes, isWrite := true, role := .resStage }
-        let off := match resLoc with | .dram o _ => o | _ => 0
-        let resId := (locToBarResource resLoc shortNames outSurfIdx).get!
-        dramAccs := dramAccs.push { resource := resId, lo := off, hi := off + dramSpanBytes dims, isWrite := true, port := .resDma }
+        dramAccs := dramAccs.push { resource := .scratch, lo := off, hi := off + dramSpanBytes dims, isWrite := true, port := .resDma }
+      | .surface _ _ =>
+        let drow := 2 * min (alignUp dims.w 8) (max stripW 32)
+        let szRes := if lp.direct then neActDirectResBytes lp.tiling.f lp.tiling.fat else lp.tiling.tileHeight * (dims.c * drow)
+        l2Accs := l2Accs.push { lo := lp.resStageBase, hi := lp.resStageBase + szRes, isWrite := true, role := .resStage }
+        let (baseOff, _, _, ext) := surfaceDmaWindow nd.resWin dims.c dims.h dims.w
+        dramAccs := dramAccs.push { resource := .surface outSurfIdx "y", lo := baseOff, hi := baseOff + ext, isWrite := true, port := .resDma }
     | _, _ =>
       throw s!"internal error: op/plan mismatch on node '{nd.id}'"
 
@@ -1136,6 +1243,17 @@ private def computeSynchronization (pre : Array PreLoweredTask) : Array TaskSync
             else if b.port == .src2Dma then
               syncs := syncs.set! i { syncs[i]! with src2DepKind := 2, src2DepDist := dist }
 
+  let mut latestNeArr : Array (Option Nat) := Array.mkEmpty n
+  let mut latestPeArr : Array (Option Nat) := Array.mkEmpty n
+  let mut lastNe : Option Nat := none
+  let mut lastPe : Option Nat := none
+  for i in [:n] do
+    latestNeArr := latestNeArr.push lastNe
+    latestPeArr := latestPeArr.push lastPe
+    match pre[i]!.node.engine with
+    | .ne => lastNe := some i
+    | .pe => lastPe := some i
+
   -- Fixpoint loop: converge whenever no new wait/dep bits are added (monotone, <= 8*n steps)
   let maxIters := 8 * n + 2
   for _ in [:maxIters] do
@@ -1151,8 +1269,7 @@ private def computeSynchronization (pre : Array PreLoweredTask) : Array TaskSync
       dramAccesses := pre[i.val]!.dramAccesses
       sync := syncs[i.val]!
     }
-    let hbTbl := reachTable (stepHB fps) n
-    let hblTbl := reachTable (stepHBL fps) n
+    let (hbTbl, hblTbl) := buildHBReachTables fps
     let hb := fun a b => reachB hbTbl a b
     let hbl := fun a b => reachB hblTbl a b
     let hbEq := fun a b => a == b || hb a b
@@ -1162,8 +1279,8 @@ private def computeSynchronization (pre : Array PreLoweredTask) : Array TaskSync
 
     for i in [1 : n] do
       let ti := fps[i]!
-      let latestNe := latestEngineBefore pre .ne i
-      let latestPe := latestEngineBefore pre .pe i
+      let latestNe := latestNeArr[i]!
+      let latestPe := latestPeArr[i]!
 
       for k in [:i] do
         let tk := fps[k]!
@@ -1187,10 +1304,13 @@ private def computeSynchronization (pre : Array PreLoweredTask) : Array TaskSync
 
         let src2Wait5 : Bool :=
           (syncs[i]!.src1WaitNe5 || syncs[i]!.src2WaitNe5) &&
-          (Id.run do
+          (if tk.engine == .ne then true
+           else Id.run do
             let mut ok := false
             for j in [:i] do
-              if pre[j]!.node.engine == .ne && hbEq k j then ok := true
+              if pre[j]!.node.engine == .ne && hbEq k j then
+                ok := true
+                break
             return ok)
 
         -- 1. DRAM conflicts
@@ -1419,12 +1539,14 @@ private def emitTaskDesc
         { byteAddr := regSrc1RowStride, value := ← natToU32Checked l2Row "src1RowStride" }
       ]
     | loc =>
-      let inRowStride := alignUp (2 * sh.w) dmaLineBytes
-      let inPlaneStride := sh.h * inRowStride
-      let (slot, off) := match loc with
-        | .surface _ s => (s, 0)
-        | .dram o _ => (barSlotScratch, o)
-        | .l2 _ _ => (0, 0)
+      let (slot, off, inRowStride, inPlaneStride) := match loc with
+        | .surface _ s =>
+          let (bOff, rSt, pSt, _) := surfaceDmaWindow nd.src1Win sh.cin sh.h sh.w
+          (s, bOff, rSt, pSt)
+        | .dram o _ =>
+          let rSt := alignUp (2 * sh.w) dmaLineBytes
+          (barSlotScratch, o, rSt, sh.h * rSt)
+        | .l2 _ _ => (0, 0, 0, 0)
       plain := plain ++ #[
         { byteAddr := regSrc1Base, value := ← natToU32Checked cp.srcStageBase "src1Base" },
         { byteAddr := regSrc1ChanStride, value := ← natToU32Checked chs "src1ChanStride" },
@@ -1453,12 +1575,14 @@ private def emitTaskDesc
         { byteAddr := regResRowStride, value := ← natToU32Checked l2Row "resRowStride" }
       ]
     | loc =>
-      let outRowStride := alignUp (2 * wo) dmaLineBytes
-      let outPlaneStride := ho * outRowStride
-      let (slot, off, depCode) := match loc with
-        | .surface _ s => (s, 0, resDepCode target)
-        | .dram o _ => (barSlotScratch, o, resDepCode target ||| resDepScratchFlags)
-        | .l2 _ _ => (0, 0, resDepCode target)
+      let (slot, off, depCode, outRowStride, outPlaneStride) := match loc with
+        | .surface _ s =>
+          let (bOff, rSt, pSt, _) := surfaceDmaWindow nd.resWin sh.cout ho wo
+          (s, bOff, resDepCode target, rSt, pSt)
+        | .dram o _ =>
+          let rSt := alignUp (2 * wo) dmaLineBytes
+          (barSlotScratch, o, resDepCode target ||| resDepScratchFlags, rSt, ho * rSt)
+        | .l2 _ _ => (0, 0, resDepCode target, 0, 0)
       plain := plain ++ #[
         { byteAddr := regResBase, value := ← natToU32Checked cp.resStageBase "resBase" },
         { byteAddr := regResDmaRowStride, value := ← natToU32Checked outRowStride "resDmaRowStride" },
@@ -1565,9 +1689,14 @@ private def emitTaskDesc
     | loc =>
       let row1 := 2 * min (alignUp dims.w 8) (max stripW 32)
       let u1 := dims.c * row1
-      let dmaRow := alignUp (2 * dims.w) dmaLineBytes
-      let dmaPlane := dims.h * dmaRow
-      let (slot, off) := match loc with | .surface _ s => (s, 0) | .dram o _ => (barSlotScratch, o) | .l2 _ _ => (0, 0)
+      let (slot, off, dmaRow, dmaPlane) := match loc with
+        | .surface _ s =>
+          let (bOff, rSt, pSt, _) := surfaceDmaWindow nd.src1Win dims.c dims.h dims.w
+          (s, bOff, rSt, pSt)
+        | .dram o _ =>
+          let rSt := alignUp (2 * dims.w) dmaLineBytes
+          (barSlotScratch, o, rSt, dims.h * rSt)
+        | .l2 _ _ => (0, 0, 0, 0)
       plain := plain ++ #[
         { byteAddr := regSrc1Base, value := ← natToU32Checked pp.src1StageBase "src1Base" },
         { byteAddr := regSrc1ChanStride, value := ← natToU32Checked row1 "src1ChanStride" },
@@ -1595,12 +1724,14 @@ private def emitTaskDesc
         { byteAddr := regResRowStride, value := ← natToU32Checked l2Row "resRowStride" }
       ]
     | loc =>
-      let dmaRow := alignUp (2 * dims.w) dmaLineBytes
-      let dmaPlane := dims.h * dmaRow
-      let (slot, off, depCode) := match loc with
-        | .surface _ s => (s, 0, resDepCode target)
-        | .dram o _ => (barSlotScratch, o, resDepCode target ||| resDepScratchFlags)
-        | .l2 _ _ => (0, 0, resDepCode target)
+      let (slot, off, depCode, dmaRow, dmaPlane) := match loc with
+        | .surface _ s =>
+          let (bOff, rSt, pSt, _) := surfaceDmaWindow nd.resWin dims.c dims.h dims.w
+          (s, bOff, resDepCode target, rSt, pSt)
+        | .dram o _ =>
+          let rSt := alignUp (2 * dims.w) dmaLineBytes
+          (barSlotScratch, o, resDepCode target ||| resDepScratchFlags, rSt, dims.h * rSt)
+        | .l2 _ _ => (0, 0, resDepCode target, 0, 0)
       plain := plain ++ #[
         { byteAddr := regResBase, value := ← natToU32Checked pp.resStageBase "resBase" },
         { byteAddr := regResDmaRowStride, value := ← natToU32Checked dmaRow "resDmaRowStride" },
@@ -1692,9 +1823,14 @@ private def emitTaskDesc
       let whole1 := hw1.c == 1 && hw1.h == 1 && hw1.w > 1 && outDims.h > 1 && th < outDims.h
       let row1 := 2 * (if whole1 then alignUp hw1.w 8 else min (alignUp hw1.w 8) (max stripW 32))
       let u1 := hw1.c * row1
-      let dmaRow := alignUp (2 * hw1.w) dmaLineBytes
-      let dmaPlane := hw1.h * dmaRow
-      let (slot, off) := match loc with | .surface _ s => (s, 0) | .dram o _ => (barSlotScratch, o) | .l2 _ _ => (0, 0)
+      let (slot, off, dmaRow, dmaPlane) := match loc with
+        | .surface _ s =>
+          let (bOff, rSt, pSt, _) := surfaceDmaWindow nd.src1Win hw1.c hw1.h hw1.w
+          (s, bOff, rSt, pSt)
+        | .dram o _ =>
+          let rSt := alignUp (2 * hw1.w) dmaLineBytes
+          (barSlotScratch, o, rSt, hw1.h * rSt)
+        | .l2 _ _ => (0, 0, 0, 0)
       plain := plain ++ #[
         { byteAddr := regSrc1Base, value := ← natToU32Checked pp.src1StageBase "src1Base" },
         { byteAddr := regSrc1ChanStride, value := ← natToU32Checked row1 "src1ChanStride" },
@@ -1726,9 +1862,14 @@ private def emitTaskDesc
       let whole2 := hw2.c == 1 && hw2.h == 1 && hw2.w > 1 && outDims.h > 1 && th < outDims.h
       let row2 := 2 * (if whole2 then alignUp hw2.w 8 else min (alignUp hw2.w 8) (max stripW 32))
       let u2 := hw2.c * row2
-      let dmaRow := alignUp (2 * hw2.w) dmaLineBytes
-      let dmaPlane := hw2.h * dmaRow
-      let (slot, off) := match loc with | .surface _ s => (s, 0) | .dram o _ => (barSlotScratch, o) | .l2 _ _ => (0, 0)
+      let (slot, off, dmaRow, dmaPlane) := match loc with
+        | .surface _ s =>
+          let (bOff, rSt, pSt, _) := surfaceDmaWindow nd.src2Win hw2.c hw2.h hw2.w
+          (s, bOff, rSt, pSt)
+        | .dram o _ =>
+          let rSt := alignUp (2 * hw2.w) dmaLineBytes
+          (barSlotScratch, o, rSt, hw2.h * rSt)
+        | .l2 _ _ => (0, 0, 0, 0)
       plain := plain ++ #[
         { byteAddr := regSrc2Base, value := ← natToU32Checked pp.src2StageBase "src2Base" },
         { byteAddr := regSrc2ChanStride, value := ← natToU32Checked row2 "src2ChanStride" },
@@ -1757,12 +1898,14 @@ private def emitTaskDesc
         { byteAddr := regResRowStride, value := ← natToU32Checked l2Row "resRowStride" }
       ]
     | loc =>
-      let dmaRow := alignUp (2 * outDims.w) dmaLineBytes
-      let dmaPlane := outDims.h * dmaRow
-      let (slot, off, depCode) := match loc with
-        | .surface _ s => (s, 0, resDepCode target)
-        | .dram o _ => (barSlotScratch, o, resDepCode target ||| resDepScratchFlags)
-        | .l2 _ _ => (0, 0, resDepCode target)
+      let (slot, off, depCode, dmaRow, dmaPlane) := match loc with
+        | .surface _ s =>
+          let (bOff, rSt, pSt, _) := surfaceDmaWindow nd.resWin outDims.c outDims.h outDims.w
+          (s, bOff, resDepCode target, rSt, pSt)
+        | .dram o _ =>
+          let rSt := alignUp (2 * outDims.w) dmaLineBytes
+          (barSlotScratch, o, resDepCode target ||| resDepScratchFlags, rSt, outDims.h * rSt)
+        | .l2 _ _ => (0, 0, resDepCode target, 0, 0)
       plain := plain ++ #[
         { byteAddr := regResBase, value := ← natToU32Checked pp.resStageBase "resBase" },
         { byteAddr := regResDmaRowStride, value := ← natToU32Checked dmaRow "resDmaRowStride" },
@@ -1888,9 +2031,14 @@ private def emitTaskDesc
     | loc =>
       let row := 2 * min (alignUp dims.w 8) stripW
       let u := dims.c * row
-      let dmaRow := alignUp (2 * dims.w) dmaLineBytes
-      let dmaPlane := dims.h * dmaRow
-      let (slot, off) := match loc with | .surface _ s => (s, 0) | .dram o _ => (barSlotScratch, o) | .l2 _ _ => (0, 0)
+      let (slot, off, dmaRow, dmaPlane) := match loc with
+        | .surface _ s =>
+          let (bOff, rSt, pSt, _) := surfaceDmaWindow nd.src1Win dims.c dims.h dims.w
+          (s, bOff, rSt, pSt)
+        | .dram o _ =>
+          let rSt := alignUp (2 * dims.w) dmaLineBytes
+          (barSlotScratch, o, rSt, dims.h * rSt)
+        | .l2 _ _ => (0, 0, 0, 0)
       plain := plain ++ #[
         { byteAddr := regSrc1Base, value := ← natToU32Checked lp.srcStageBase "src1Base" },
         { byteAddr := regSrc1ChanStride, value := ← natToU32Checked row "src1ChanStride" },
@@ -1918,12 +2066,14 @@ private def emitTaskDesc
         { byteAddr := regResRowStride, value := ← natToU32Checked l2Row "resRowStride" }
       ]
     | loc =>
-      let dmaRow := alignUp (2 * dims.w) dmaLineBytes
-      let dmaPlane := dims.h * dmaRow
-      let (slot, off, depCode) := match loc with
-        | .surface _ s => (s, 0, resDepCode target)
-        | .dram o _ => (barSlotScratch, o, resDepCode target ||| resDepScratchFlags)
-        | .l2 _ _ => (0, 0, resDepCode target)
+      let (slot, off, depCode, dmaRow, dmaPlane) := match loc with
+        | .surface _ s =>
+          let (bOff, rSt, pSt, _) := surfaceDmaWindow nd.resWin dims.c dims.h dims.w
+          (s, bOff, resDepCode target, rSt, pSt)
+        | .dram o _ =>
+          let rSt := alignUp (2 * dims.w) dmaLineBytes
+          (barSlotScratch, o, resDepCode target ||| resDepScratchFlags, rSt, dims.h * rSt)
+        | .l2 _ _ => (0, 0, resDepCode target, 0, 0)
       plain := plain ++ #[
         { byteAddr := regResBase, value := ← natToU32Checked lp.resStageBase "resBase" },
         { byteAddr := regResDmaRowStride, value := ← natToU32Checked dmaRow "resDmaRowStride" },
@@ -1964,24 +2114,23 @@ private def emitTaskDesc
     throw s!"internal error: op/plan mismatch when lowering node '{nd.id}'"
 
 -- ============================================================================
--- Top-Level Multi-Task Graph Compiler
+-- L2 Placement Solver & Spatial H-Strip Graph Fusion
 -- ============================================================================
 
-/-- Compile an arbitrary multi-task DAG (`1..256` tasks, `1..3` inputs, `1` output) into a
-    statically verified HWX binary (checked by independent `Vane.Verify.verifyHwxTasksSummary`)
-    and its 4 host-built Linux LOAD sections. -/
-def compileGraph (spec : GraphSpec) : Except String CompiledGraph := do
-  let (shortNames, vNodes, lastConsumer) ← validateGraph spec
+/-- Partition intermediate nodes `(0 .. n - 2)` into L2-resident and DRAM-scratch sets
+    using deterministic iterative auto-spill until all `n` tasks fit inside 2 MiB L2. -/
+private def solveL2Placement
+    (target : Target) (defaultPlacement : EdgePlacementMode)
+    (vNodes : Array ValidatedNode) (lastConsumer : Array Nat) :
+    Except String (List PlacedBuf × Array TaskPlanKind × Nat × Array Nat) := do
   let n := vNodes.size
-
-  -- 1. Partition intermediate nodes (0 .. n - 2) into pinned L2, auto L2 candidates, and DRAM
   let mut pinnedL2 : Array Nat := #[]
   let mut autoL2 : Array Nat := #[]
   let mut dramIds : Array Nat := #[]
 
   for i in [:n - 1] do
     let nd := vNodes[i]!
-    let effMode := nd.outPlacement.getD spec.defaultPlacement
+    let effMode := nd.outPlacement.getD defaultPlacement
     let eligible := isNodeL2Eligible vNodes i
     match effMode with
     | .dram =>
@@ -1996,7 +2145,6 @@ def compileGraph (spec : GraphSpec) : Except String CompiledGraph := do
       else
         dramIds := dramIds.push i
 
-  -- 2. Iterative L2 allocation & deterministic auto-spill loop
   let mut curAutoL2 := autoL2
   let mut placedL2 : List PlacedBuf := []
   let mut plans : Array TaskPlanKind := #[]
@@ -2018,7 +2166,7 @@ def compileGraph (spec : GraphSpec) : Except String CompiledGraph := do
       if l2Top > l2CapacityBytes then
         .error (none, s!"live L2-resident buffers reach {l2Top}B > {l2CapacityBytes}B (2 MiB)")
       else
-        match tryPlanAllTasks spec.target vNodes trialPlaced with
+        match tryPlanAllTasks target vNodes trialPlaced with
         | .ok res => .ok res
         | .error (failTask, msg) => .error (some failTask, msg)
 
@@ -2034,62 +2182,232 @@ def compileGraph (spec : GraphSpec) : Except String CompiledGraph := do
           throw s!"forced L2 placement exceeds 2 MiB capacity: {msg}"
         else
           throw s!"graph compilation failed even with all intermediates in DRAM: {msg}"
-      -- Deterministically spill the largest auto-L2 tensor (preferring one live at failTask?)
+      -- Deterministically spill the highest-impact auto-L2 tensor:
+      -- prefer candidates live at `failTask?`; when spilling due to aggregate L2 overflow (`failTask? = none`),
+      -- maximize the number of over-capacity tasks covered by the candidate so a single spill resolves
+      -- multiple adjacent conflicts (breaking ties by largest byte footprint, then highest node index).
       let liveAuto : Array Nat := match failTask? with
         | some ft => curAutoL2.filter fun i => i <= ft && ft <= lastConsumer[i]!
         | none => #[]
       let pool : Array Nat := if liveAuto.isEmpty then curAutoL2 else liveAuto
+      let overCapCount : Nat → Nat :=
+        if failTask?.isSome then
+          fun _ => 0
+        else
+          fun cand => Id.run do
+            let mut cnt := 0
+            for t in [cand : lastConsumer[cand]! + 1] do
+              let mut sumBytes := 0
+              for j in l2Ids do
+                if j <= t && t <= lastConsumer[j]! then
+                  sumBytes := sumBytes + l2ResidentBytes vNodes[j]!.outDims
+              if sumBytes > l2CapacityBytes then
+                cnt := cnt + 1
+            return cnt
       let mut victim := pool[0]!
+      let mut bestHits := overCapCount victim
       let mut bestBytes := l2ResidentBytes vNodes[victim]!.outDims
       for cand in pool do
+        let hits := overCapCount cand
         let b := l2ResidentBytes vNodes[cand]!.outDims
-        if b > bestBytes || (b == bestBytes && cand > victim) then
+        if hits > bestHits || (hits == bestHits && (b > bestBytes || (b == bestBytes && cand > victim))) then
           victim := cand
+          bestHits := hits
           bestBytes := b
       curAutoL2 := curAutoL2.filter (fun x => x != victim)
       dramIds := dramIds.push victim
 
-  -- 3. Allocate DRAM scratch buffers with liveness-based reuse (first-fit 64B aligned)
-  let dramLiveBufs : List LiveBuf := dramIds.toList.map fun i => {
-    id := i
-    bytes := dramScratchBytes vNodes[i]!.outDims
-    first := i
-    last := lastConsumer[i]!
-    priority := lastConsumer[i]! - i
+  pure (placedL2, plans, peakL2, dramIds)
+
+/-- Reverse halo propagation for a single output row band `[y0, y1)` of node `M - 1`.
+    Verifies exact internal-edge interval matching for every multi-consumer internal node,
+    returning `(outIntervals, inIntervals)` per node `0..M-1`. -/
+private def propagateStripIntervals
+    (vNodes : Array ValidatedNode) (radii : Array Nat) (hFull y0 y1 : Nat) :
+    Except String (Array (Nat × Nat) × Array (Nat × Nat)) := do
+  let m := vNodes.size
+  if y0 >= y1 || y1 > hFull then
+    throw s!"invalid strip row band [{y0}, {y1}) for H={hFull}"
+  let mut reqOut : Array (Option (Nat × Nat)) := Array.replicate m none
+  let mut reqIn : Array (Nat × Nat) := Array.replicate m (0, 0)
+  reqOut := reqOut.set! (m - 1) (some (y0, y1))
+
+  for step in [:m] do
+    let u := m - 1 - step
+    let some (lo, hi) := reqOut[u]!
+      | throw s!"spatial strip fusion: node '{vNodes[u]!.id}' is unreachable from output"
+    let rad := radii[u]!
+    let inLo := if lo >= rad then lo - rad else 0
+    let inHi := min hFull (hi + rad)
+    if inLo >= inHi then
+      throw s!"spatial strip fusion: empty input interval [{inLo}, {inHi}) on node '{vNodes[u]!.id}'"
+    reqIn := reqIn.set! u (inLo, inHi)
+    for ref in vNodes[u]!.inputs do
+      match ref with
+      | .input _ => pure ()
+      | .node prodIdx =>
+        match reqOut[prodIdx]! with
+        | none =>
+          reqOut := reqOut.set! prodIdx (some (inLo, inHi))
+        | some (prevLo, prevHi) =>
+          if prevLo != inLo || prevHi != inHi then
+            throw s!"spatial strip fusion ineligible: skip-halo interval mismatch on internal node '{vNodes[prodIdx]!.id}' (consumer '{vNodes[u]!.id}' requires [{inLo}, {inHi}), another consumer requires [{prevLo}, {prevHi}))"
+
+  let mut outIntervals : Array (Nat × Nat) := Array.mkEmpty m
+  for u in [:m] do
+    match reqOut[u]! with
+    | some iv => outIntervals := outIntervals.push iv
+    | none => throw s!"spatial strip fusion: node '{vNodes[u]!.id}' missing interval"
+  pure (outIntervals, reqIn)
+
+/-- Check whether a validated graph is eligible for spatial H-strip fusion.
+    Returns `(hFull, wFull, radii, maxTasks)`. -/
+private def checkStripEligible
+    (spec : GraphSpec) (vNodes : Array ValidatedNode) :
+    Except String (Nat × Nat × Array Nat × Nat) := do
+  let m := vNodes.size
+  if m == 0 then
+    throw "spatial strip fusion ineligible: graph has 0 nodes"
+  let hFull := spec.inputs[0]!.shape.h
+  let wFull := spec.inputs[0]!.shape.w
+  if hFull <= 1 then
+    throw s!"spatial strip fusion ineligible: input height H={hFull} must be > 1"
+  for inp in spec.inputs do
+    if inp.shape.h != hFull || inp.shape.w != wFull then
+      throw s!"spatial strip fusion ineligible: input '{inp.name}' shape ({inp.shape.h}x{inp.shape.w}) != ({hFull}x{wFull})"
+
+  let mut radii : Array Nat := Array.mkEmpty m
+  for nd in vNodes do
+    let rad ← match nd.op with
+      | .conv sh _ _ _ _ _ =>
+        if sh.kernelSize == 1 then
+          if sh.w != wFull then
+            throw s!"spatial strip fusion ineligible: node '{nd.id}' width {sh.w} != {wFull}"
+          pure 0
+        else if sh.kernelSize == 3 && sh.stride == 1 && sh.pad == .same then
+          if sh.w != wFull then
+            throw s!"spatial strip fusion ineligible: node '{nd.id}' width {sh.w} != {wFull}"
+          pure 1
+        else
+          throw s!"spatial strip fusion ineligible: node '{nd.id}' conv3x3 requires stride=1 and pad=same (got stride={sh.stride}, pad={sh.pad.name})"
+      | .pe1 _ dims =>
+        if dims.w != wFull then
+          throw s!"spatial strip fusion ineligible: node '{nd.id}' width {dims.w} != {wFull}"
+        pure 0
+      | .pe2 _ _ outDims hw1 hw2 _ _ =>
+        if hw1.h != hFull || hw1.w != wFull || hw2.h != hFull || hw2.w != wFull ||
+           outDims.h != hFull || outDims.w != wFull then
+          throw s!"spatial strip fusion ineligible: node '{nd.id}' pe2 broadcast inputs are not supported"
+        pure 0
+      | .lut _ dims _ =>
+        if dims.w != wFull then
+          throw s!"spatial strip fusion ineligible: node '{nd.id}' width {dims.w} != {wFull}"
+        pure 0
+    radii := radii.push rad
+
+  -- Probe skip-halo exact interval match on top and interior 1-row bands
+  let _ ← propagateStripIntervals vNodes radii hFull 0 1
+  let mid := hFull / 2
+  let _ ← propagateStripIntervals vNodes radii hFull mid (mid + 1)
+
+  let anyKern := vNodes.any (fun nd => nd.usesKernel)
+  let maxTasks := if anyKern then 255 else 256
+  pure (hFull, wFull, radii, maxTasks)
+
+/-- Materialize the `M` strip-local `ValidatedNode`s for output row band `[y0, y1)`. -/
+private def buildStripNodes
+    (vNodes : Array ValidatedNode) (radii : Array Nat)
+    (hFull y0 y1 : Nat) (stripSuffix : String := "") : Except String (Array ValidatedNode) := do
+  let m := vNodes.size
+  let (outIntervals, inIntervals) ← propagateStripIntervals vNodes radii hFull y0 y1
+  let mut out : Array ValidatedNode := Array.mkEmpty m
+  for l in [:m] do
+    let nd := vNodes[l]!
+    let (outLo, outHi) := outIntervals[l]!
+    let (inLo, inHi) := inIntervals[l]!
+    let outH := outHi - outLo
+    let inH := inHi - inLo
+    let (newOp, s1Ref, s2Ref?) := match nd.op with
+      | .conv sh w b act lp bk =>
+        let sh' : ConvSpec :=
+          if sh.kernelSize == 1 then
+            { sh with h := inH }
+          else
+            let pt := if outLo == 0 then 1 else 0
+            let pb := if outHi == hFull then 1 else 0
+            { sh with h := inH, pad := .strip pt pb }
+        (PlannedOp.conv sh' w b act lp bk, nd.inputs[0]!, none)
+      | .pe1 op dims =>
+        (PlannedOp.pe1 op { dims with h := outH }, nd.inputs[0]!, none)
+      | .pe2 binOp rev outDims hw1 hw2 r1 r2 =>
+        (PlannedOp.pe2 binOp rev { outDims with h := outH } { hw1 with h := inH } { hw2 with h := inH } r1 r2,
+         r1, some r2)
+      | .lut act dims lp =>
+        (PlannedOp.lut act { dims with h := outH } lp, nd.inputs[0]!, none)
+    let src1Win : SurfaceWindow := match s1Ref with
+      | .input _ => { rowOffset := inLo, fullH := hFull }
+      | .node _ => {}
+    let src2Win : SurfaceWindow := match s2Ref? with
+      | some (.input _) => { rowOffset := inLo, fullH := hFull }
+      | _ => {}
+    let resWin : SurfaceWindow :=
+      if l + 1 == m then { rowOffset := outLo, fullH := hFull } else {}
+    let nodeId := if stripSuffix.isEmpty then nd.id else s!"{nd.id}{stripSuffix}"
+    out := out.push {
+      nd with
+      id := nodeId
+      nodeIdx := l
+      origNodeIdx := l
+      op := newOp
+      outDims := { nd.outDims with h := outH }
+      src1Win := src1Win
+      src2Win := src2Win
+      resWin := resWin
+    }
+  pure out
+
+private def shiftTensorRef (base : Nat) : TensorRef → TensorRef
+  | .input idx => .input idx
+  | .node idx => .node (base + idx)
+
+private def shiftValidatedNode (base : Nat) (nd : ValidatedNode) : ValidatedNode :=
+  let newOp := match nd.op with
+    | .pe2 binOp rev od hw1 hw2 r1 r2 =>
+      .pe2 binOp rev od hw1 hw2 (shiftTensorRef base r1) (shiftTensorRef base r2)
+    | other => other
+  {
+    nd with
+    nodeIdx := base + nd.nodeIdx
+    inputs := nd.inputs.map (shiftTensorRef base)
+    op := newOp
   }
-  let placedDram := allocate true dramLiveBufs
-  let scratchBytes := topOf placedDram
 
-  -- 4. Build final TensorLocation table for every node
-  let outSurfIdx := spec.inputs.size
-  let outBarSlot : UInt8 := barSlotFirstSurface + outSurfIdx.toUInt8
-  let mut nodeLocs : Array TensorLocation := Array.mkEmpty n
-  for i in [:n] do
-    if i + 1 == n then
-      nodeLocs := nodeLocs.push (.surface outSurfIdx outBarSlot)
-    else
-      match lookupPlaced placedL2 i with
-      | some pb => nodeLocs := nodeLocs.push (.l2 pb.base pb.bytes)
-      | none =>
-        match lookupPlaced placedDram i with
-        | some pb => nodeLocs := nodeLocs.push (.dram pb.base pb.bytes)
-        | none => throw s!"internal error: node {i} missing from both L2 and DRAM allocations"
-
-  -- 5. Assemble shared __KERN_0 & per-task memory footprints
-  let (preTasks, kernBuf) ← buildPreLoweredTasks spec shortNames vNodes plans placedL2 nodeLocs
-
-  -- 6. Compute silicon-proven synchronization (HB/HBL/srcReadNE/src2AheadPE/[XE]/DRAM WAR+WAW)
-  let syncs := computeSynchronization preTasks
-
-  -- 7. Lower all tasks to TaskDesc
+/-- Assemble, synchronize, emit, and statically verify a flat `N`-task stream
+    (used by both unstripped and strip-fused graph compilation). -/
+private def finalizeCompiledGraph
+    (spec : GraphSpec)
+    (shortNames : Array String)
+    (fullOutDims : TensorDims)
+    (fullOutId : String)
+    (flatNodes : Array ValidatedNode)
+    (flatPlans : Array TaskPlanKind)
+    (placedL2 : List PlacedBuf)
+    (peakL2 : Nat)
+    (nodeLocs : Array TensorLocation)
+    (scratchBytes : Nat)
+    (stripCount stripHeight : Nat) : Except String CompiledGraph := do
+  let n := flatNodes.size
   let totalSurfs := spec.inputs.size + 1
   let kernelBarSlot : UInt8 := barSlotFirstSurface + totalSurfs.toUInt8
+
+  let (preTasks, kernBuf) ← buildPreLoweredTasks spec shortNames flatNodes flatPlans placedL2 nodeLocs
+  let syncs := computeSynchronization preTasks
+
   let mut taskDescs : Array TaskDesc := Array.mkEmpty n
   for i in [:n] do
     let td ← emitTaskDesc spec.target n kernelBarSlot preTasks[i]! syncs[i]!
     taskDescs := taskDescs.push td
 
-  -- 8. Build network surfaces, optional scratch, optional kernel, and emit HWX
   let mut surfaces : Array SurfaceSpec := Array.mkEmpty totalSurfs
   for i in [:spec.inputs.size] do
     let inp := spec.inputs[i]!
@@ -2097,9 +2415,8 @@ def compileGraph (spec : GraphSpec) : Except String CompiledGraph := do
     let sym := s!"input_{inp.name}"
     let s ← makeFp16Surface spec.target sn sym .input inp.shape.c inp.shape.h inp.shape.w
     surfaces := surfaces.push s
-  let outNode := vNodes[n - 1]!
-  let outSurf ← makeFp16Surface spec.target "y" s!"output_{outNode.id}" .output
-    outNode.outDims.c outNode.outDims.h outNode.outDims.w
+  let outSurf ← makeFp16Surface spec.target "y" s!"output_{fullOutId}" .output
+    fullOutDims.c fullOutDims.h fullOutDims.w
   surfaces := surfaces.push outSurf
 
   let scratchSpec? : Option ScratchSpec ←
@@ -2121,13 +2438,12 @@ def compileGraph (spec : GraphSpec) : Except String CompiledGraph := do
     ident := some "vane"
   }
 
-  -- 9. Independent whole-program static safety verification (S1–S5)
   let summary ← verifyHwxTasksSummary emitted.hwx emitted.info (requireKnownTask := true)
   if summary.total != n then
     throw s!"internal error: verifier checked {summary.total} tasks != {n}"
 
   let compiledNodes : Array CompiledGraphNode := Array.ofFn (n := n) fun i =>
-    let nd := vNodes[i.val]!
+    let nd := flatNodes[i.val]!
     {
       id := nd.id
       taskId := i.val
@@ -2135,8 +2451,8 @@ def compileGraph (spec : GraphSpec) : Except String CompiledGraph := do
       opKind := nd.opKind
       outDims := nd.outDims
       outLocation := nodeLocs[i.val]!
-      direct := plans[i.val]!.direct
-      l2UseBytes := plans[i.val]!.l2Peak
+      direct := flatPlans[i.val]!.direct
+      l2UseBytes := flatPlans[i.val]!.l2Peak
     }
 
   pure {
@@ -2145,10 +2461,251 @@ def compileGraph (spec : GraphSpec) : Except String CompiledGraph := do
     scratchBytes := scratchBytes
     l2PeakBytes := peakL2
     kernelBytes := kernBuf.size
+    stripCount := stripCount
+    stripHeight := stripHeight
     nodes := compiledNodes
     hwx := emitted.hwx
     info := emitted.info
     sections := emitted.sections
   }
+
+private def finishUnstrippedGraph
+    (spec : GraphSpec) (shortNames : Array String)
+    (vNodes : Array ValidatedNode) (lastConsumer : Array Nat)
+    (placedL2 : List PlacedBuf) (plans : Array TaskPlanKind)
+    (peakL2 : Nat) (dramIds : Array Nat) : Except String CompiledGraph := do
+  let n := vNodes.size
+  let dramLiveBufs : List LiveBuf := dramIds.toList.map fun i => {
+    id := i
+    bytes := dramScratchBytes vNodes[i]!.outDims
+    first := i
+    last := lastConsumer[i]!
+    priority := lastConsumer[i]! - i
+  }
+  let placedDram := allocate true dramLiveBufs
+  let scratchBytes := topOf placedDram
+
+  let outSurfIdx := spec.inputs.size
+  let outBarSlot : UInt8 := barSlotFirstSurface + outSurfIdx.toUInt8
+  let mut nodeLocs : Array TensorLocation := Array.mkEmpty n
+  for i in [:n] do
+    if i + 1 == n then
+      nodeLocs := nodeLocs.push (.surface outSurfIdx outBarSlot)
+    else
+      match lookupPlaced placedL2 i with
+      | some pb => nodeLocs := nodeLocs.push (.l2 pb.base pb.bytes)
+      | none =>
+        match lookupPlaced placedDram i with
+        | some pb => nodeLocs := nodeLocs.push (.dram pb.base pb.bytes)
+        | none => throw s!"internal error: node {i} missing from both L2 and DRAM allocations"
+
+  let outNode := vNodes[n - 1]!
+  finalizeCompiledGraph spec shortNames outNode.outDims outNode.id vNodes plans placedL2 peakL2 nodeLocs scratchBytes 1 0
+
+private def compileStrippedAtHeight
+    (spec : GraphSpec) (shortNames : Array String)
+    (vNodes : Array ValidatedNode) (lastConsumer : Array Nat)
+    (hFull : Nat) (radii : Array Nat) (maxTasks hOut : Nat) : Except String CompiledGraph := do
+  if hOut == 0 then
+    throw "strip height must be >= 1"
+  let m := vNodes.size
+  let sCount := ceilDiv hFull hOut
+  let totalTasks := sCount * m
+  if totalTasks > maxTasks then
+    throw s!"strip height {hOut} expands {m} nodes across {sCount} strips to {totalTasks} tasks, exceeding limit {maxTasks}"
+
+  let mut flatNodes : Array ValidatedNode := Array.mkEmpty totalTasks
+  let mut flatPlans : Array TaskPlanKind := Array.mkEmpty totalTasks
+  let mut allPlacedL2 : List PlacedBuf := []
+  let mut allDramLiveBufs : List LiveBuf := []
+  let mut overallPeakL2 : Nat := 0
+
+  for s in [:sCount] do
+    let y0 := s * hOut
+    let y1 := min hFull (y0 + hOut)
+    let suffix := if sCount > 1 then s!"_s{s}" else ""
+    let stripNodes ← buildStripNodes vNodes radii hFull y0 y1 suffix
+    let (sPlacedL2, sPlans, sPeakL2, sDramIds) ← solveL2Placement spec.target spec.defaultPlacement stripNodes lastConsumer
+    let base := s * m
+    overallPeakL2 := max overallPeakL2 sPeakL2
+    for l in [:m] do
+      flatNodes := flatNodes.push (shiftValidatedNode base stripNodes[l]!)
+      flatPlans := flatPlans.push sPlans[l]!
+    let shiftedL2 := sPlacedL2.map fun pb => {
+      pb with
+      id := base + pb.id
+      first := base + pb.first
+      last := base + pb.last
+    }
+    allPlacedL2 := allPlacedL2 ++ shiftedL2
+    let shiftedDram : List LiveBuf := sDramIds.toList.map fun l => {
+      id := base + l
+      bytes := dramScratchBytes stripNodes[l]!.outDims
+      first := base + l
+      last := base + lastConsumer[l]!
+      priority := lastConsumer[l]! - l
+    }
+    allDramLiveBufs := allDramLiveBufs ++ shiftedDram
+
+  let placedDram := allocate true allDramLiveBufs
+  let scratchBytes := topOf placedDram
+
+  let outSurfIdx := spec.inputs.size
+  let outBarSlot : UInt8 := barSlotFirstSurface + outSurfIdx.toUInt8
+  let mut nodeLocs : Array TensorLocation := Array.mkEmpty totalTasks
+  for i in [:totalTasks] do
+    if i % m == m - 1 then
+      nodeLocs := nodeLocs.push (.surface outSurfIdx outBarSlot)
+    else
+      match lookupPlaced allPlacedL2 i with
+      | some pb => nodeLocs := nodeLocs.push (.l2 pb.base pb.bytes)
+      | none =>
+        match lookupPlaced placedDram i with
+        | some pb => nodeLocs := nodeLocs.push (.dram pb.base pb.bytes)
+        | none => throw s!"internal error: stripped task {i} missing from both L2 and DRAM allocations"
+
+  let outNode := vNodes[m - 1]!
+  finalizeCompiledGraph spec shortNames outNode.outDims outNode.id
+    flatNodes flatPlans allPlacedL2 overallPeakL2 nodeLocs scratchBytes sCount hOut
+
+private def isTextSizeExceededError (msg : String) : Bool :=
+  (msg.splitOn "task stream size").length > 1
+
+private def evalInteriorStripMetrics
+    (spec : GraphSpec) (vNodes : Array ValidatedNode) (lastConsumer : Array Nat)
+    (hFull : Nat) (radii : Array Nat) (h : Nat) : Option (Nat × Nat) :=
+  if h == 0 || h > hFull then none
+  else
+    let y0 := (hFull - h) / 2
+    let y1 := y0 + h
+    match buildStripNodes vNodes radii hFull y0 y1 with
+    | .error _ => none
+    | .ok stripNodes =>
+      match solveL2Placement spec.target spec.defaultPlacement stripNodes lastConsumer with
+      | .error _ => none
+      | .ok (_, _, _, dramIds) =>
+        if dramIds.isEmpty then
+          some (0, 0)
+        else
+          let dramBufs : List LiveBuf := dramIds.toList.map fun l => {
+            id := l
+            bytes := dramScratchBytes stripNodes[l]!.outDims
+            first := l
+            last := lastConsumer[l]!
+            priority := lastConsumer[l]! - l
+          }
+          some (dramIds.size, topOf (allocate true dramBufs))
+
+private def chooseAutoStripHeight
+    (spec : GraphSpec) (vNodes : Array ValidatedNode) (lastConsumer : Array Nat)
+    (hFull : Nat) (radii : Array Nat) (minH : Nat) : Option Nat := Id.run do
+  if minH == 0 || minH >= hFull then
+    return none
+  -- Fast path: if minH achieves 0 DRAM scratch, binary search for the largest h achieving 0 scratch.
+  if evalInteriorStripMetrics spec vNodes lastConsumer hFull radii minH == some (0, 0) then
+    let mut lo := minH
+    let mut hi := hFull - 1
+    let mut best := minH
+    while lo <= hi do
+      let mid := (lo + hi) / 2
+      if evalInteriorStripMetrics spec vNodes lastConsumer hFull radii mid == some (0, 0) then
+        best := mid
+        lo := mid + 1
+      else
+        if mid == 0 then break
+        hi := mid - 1
+    return some best
+
+  -- Fallback: minimize (stripScratchEdges, stripScratchBytes), breaking ties by largest h.
+  -- Since intermediate L2 and DRAM footprints grow monotonically with strip height h,
+  -- once consecutive heights strictly worsen (edges, bytes) beyond the best seen, stop early.
+  let mut best? : Option (Nat × Nat × Nat) := none
+  let mut worseStreak : Nat := 0
+  for h in [minH : hFull] do
+    match evalInteriorStripMetrics spec vNodes lastConsumer hFull radii h with
+    | none =>
+      worseStreak := worseStreak + 1
+      if best?.isSome && worseStreak >= 4 then
+        break
+    | some (edges, bytes) =>
+      let isBetter := match best? with
+        | none => true
+        | some (bh, bEdges, bBytes) =>
+          if edges != bEdges then edges < bEdges
+          else if bytes != bBytes then bytes < bBytes
+          else h > bh
+      if isBetter then
+        best? := some (h, edges, bytes)
+        worseStreak := 0
+      else
+        worseStreak := worseStreak + 1
+        if worseStreak >= 4 then
+          break
+
+  return best?.map (fun (h, _, _) => h)
+
+-- ============================================================================
+-- Top-Level Multi-Task Graph Compiler
+-- ============================================================================
+
+/-- Compile an arbitrary multi-task DAG (`1..256` tasks, `1..3` inputs, `1` output) into a
+    statically verified HWX binary (checked by independent `Vane.Verify.verifyHwxTasksSummary`)
+    and its 4 host-built Linux LOAD sections. Supports optional spatial H-strip fusion via `spec.stripMode`. -/
+def compileGraph (spec : GraphSpec) : Except String CompiledGraph := do
+  let (shortNames, vNodes, lastConsumer) ← validateGraph spec
+
+  match spec.stripMode with
+  | .off =>
+    let (placedL2, plans, peakL2, dramIds) ← solveL2Placement spec.target spec.defaultPlacement vNodes lastConsumer
+    finishUnstrippedGraph spec shortNames vNodes lastConsumer placedL2 plans peakL2 dramIds
+
+  | .fixed hOut =>
+    let (hFull, _, radii, maxTasks) ← checkStripEligible spec vNodes
+    compileStrippedAtHeight spec shortNames vNodes lastConsumer hFull radii maxTasks hOut
+
+  | .auto =>
+    -- 1. If unstripped already fits 100% in L2 (0 B DRAM scratch), keep it unstripped.
+    let unstrippedSolve := solveL2Placement spec.target spec.defaultPlacement vNodes lastConsumer
+    if let .ok (placedL2, plans, peakL2, dramIds) := unstrippedSolve then
+      if dramIds.isEmpty then
+        return (← finishUnstrippedGraph spec shortNames vNodes lastConsumer placedL2 plans peakL2 dramIds)
+
+    -- 2. Otherwise, attempt automatic spatial H-strip fusion if eligible.
+    match checkStripEligible spec vNodes with
+    | .error _ =>
+      let (placedL2, plans, peakL2, dramIds) ← unstrippedSolve
+      finishUnstrippedGraph spec shortNames vNodes lastConsumer placedL2 plans peakL2 dramIds
+    | .ok (hFull, _, radii, maxTasks) =>
+      let m := vNodes.size
+      let maxStrips := maxTasks / m
+      if maxStrips <= 1 then
+        let (placedL2, plans, peakL2, dramIds) ← unstrippedSolve
+        finishUnstrippedGraph spec shortNames vNodes lastConsumer placedL2 plans peakL2 dramIds
+      else
+        let minH := ceilDiv hFull maxStrips
+        match chooseAutoStripHeight spec vNodes lastConsumer hFull radii minH with
+        | none =>
+          let (placedL2, plans, peakL2, dramIds) ← unstrippedSolve
+          finishUnstrippedGraph spec shortNames vNodes lastConsumer placedL2 plans peakL2 dramIds
+        | some startH =>
+          let mut curH := startH
+          let mut result? : Option CompiledGraph := none
+          while result?.isNone && curH < hFull do
+            match compileStrippedAtHeight spec shortNames vNodes lastConsumer hFull radii maxTasks curH with
+            | .ok compiled =>
+              result? := some compiled
+            | .error msg =>
+              if isTextSizeExceededError msg then
+                let curS := ceilDiv hFull curH
+                if curS <= 2 then
+                  break
+                curH := ceilDiv hFull (curS - 1)
+              else
+                throw msg
+          match result? with
+          | some compiled => pure compiled
+          | none =>
+            let (placedL2, plans, peakL2, dramIds) ← unstrippedSolve
+            finishUnstrippedGraph spec shortNames vNodes lastConsumer placedL2 plans peakL2 dramIds
 
 end Vane.Graph

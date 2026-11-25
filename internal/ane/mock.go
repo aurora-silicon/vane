@@ -9,7 +9,7 @@ import (
 	"syscall"
 	"unsafe"
 
-	"github.com/niteria/vane/internal/ref"
+	"github.com/aurora-silicon/vane/internal/ref"
 )
 
 // MockDeviceSpec configures one virtual /dev/accel/accel* node for MockTransport.

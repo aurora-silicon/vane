@@ -1742,4 +1742,64 @@ theorem reachB_iff (step : Nat → Nat → Bool)
     Relation.TransGen (fun a b => step a b = true) k i :=
   reachB_aux_iff step hFwd n n (Nat.le_refl n) i hi k
 
+-- ============================================================================
+-- 9. Milestone 5A spatial H-strip padding & surface row-window safety theorems
+-- ============================================================================
+
+/-- For stride-1 3x3 asymmetric vertical strip padding `(pt, pb)` with `pt, pb <= 1`
+    and `h + pt + pb >= 3`, `ConvSpec.outH` equals `h + pt + pb - 2 >= 1` and
+    `inRows3x3Raw` equals the exact linear tile maximum. -/
+theorem conv3x3_strip_outH_and_inRows (mode : Conv3x3Mode) (h w cin cout pt pb th : Nat)
+    (hpt : pt ≤ 1) (hpb : pb ≤ 1) (hh : h + pt + pb ≥ 3) (hth : th ≥ 1) :
+    let sh : ConvSpec := {
+      kernelSize := 3, mode := mode, h := h, w := w, cin := cin, cout := cout,
+      stride := 1, pad := .strip pt pb
+    }
+    sh.outH = h + pt + pb - 2 ∧
+    sh.outH ≥ 1 ∧
+    inRowsConv sh th = maxTileInRowsLinear h 1 pt sh.outH th (ceilDiv sh.outH th) := by
+  intro sh
+  have hout : sh.outH = h + pt + pb - 2 := by
+    simp only [sh, ConvSpec.outH]
+    have hp1 : decide (pt > 1) = false := decide_eq_false (by omega)
+    have hp2 : decide (pb > 1) = false := decide_eq_false (by omega)
+    have hp3 : decide (h + pt + pb < 3) = false := decide_eq_false (by omega)
+    simp only [hp1, hp2, hp3]
+    rfl
+  have houtPos : sh.outH ≥ 1 := by omega
+  have hptEq : sh.padTop = pt := by
+    simp [sh, ConvSpec.padTop]
+  have hin : inRowsConv sh th = maxTileInRowsLinear h 1 pt sh.outH th (ceilDiv sh.outH th) := by
+    simp only [inRowsConv, sh, hptEq]
+    exact inRows3x3_eq_max h 1 pt sh.outH th (Or.inl rfl) hpt hth houtPos
+  exact ⟨hout, houtPos, hin⟩
+
+/-- Sub-height network surface DMA row-window no-bleed and span-bounds invariant:
+    for any channel count `c >= 1`, full surface height `hFull`, row stride `rowStride`,
+    and row band `[y0, y0 + h)` with `h >= 1` and `y0 + h <= hFull`,
+    setting `baseOff = y0 * rowStride` and `planeStride = hFull * rowStride` satisfies
+    both the per-plane no-bleed bound `baseOff + h * rowStride <= planeStride` and the
+    exact strided extent bound `baseOff + ((c - 1) * planeStride + h * rowStride) <= c * planeStride`. -/
+theorem surface_row_window_no_bleed_and_bounds
+    (c hFull y0 h rowStride : Nat)
+    (hc : c ≥ 1) (hy : y0 + h ≤ hFull) :
+    let planeStride := hFull * rowStride
+    let baseOff := y0 * rowStride
+    let extent := (c - 1) * planeStride + h * rowStride
+    baseOff + h * rowStride ≤ planeStride ∧
+    baseOff + extent ≤ c * planeStride := by
+  intro planeStride baseOff extent
+  have hPlane : baseOff + h * rowStride ≤ planeStride := by
+    show y0 * rowStride + h * rowStride ≤ hFull * rowStride
+    rw [← Nat.add_mul]
+    exact Nat.mul_le_mul_right rowStride hy
+  have hSpan : baseOff + extent ≤ c * planeStride := by
+    have hcEq : c = (c - 1) + 1 := by omega
+    have hmul : c * planeStride = (c - 1) * planeStride + planeStride := by
+      conv => lhs; rw [hcEq, Nat.add_mul, Nat.one_mul]
+    show baseOff + ((c - 1) * planeStride + h * rowStride) ≤ c * planeStride
+    rw [hmul]
+    omega
+  exact ⟨hPlane, hSpan⟩
+
 end Vane.Proofs

@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"math"
 
-	"github.com/niteria/vane/internal/fp16"
+	"github.com/aurora-silicon/vane/internal/fp16"
 )
 
 // Tensor is a contiguous 4D NCHW tensor of IEEE-754 binary16 values.

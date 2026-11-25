@@ -6,7 +6,7 @@ import (
 	"math"
 	"strings"
 
-	"github.com/niteria/vane/internal/fp16"
+	"github.com/aurora-silicon/vane/internal/fp16"
 )
 
 // GraphInputSpec describes a network input surface in a multi-task graph JSON spec.

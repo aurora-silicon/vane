@@ -15,9 +15,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/niteria/vane/internal/ane"
-	"github.com/niteria/vane/internal/fp16"
-	"github.com/niteria/vane/internal/ref"
+	"github.com/aurora-silicon/vane/internal/ane"
+	"github.com/aurora-silicon/vane/internal/fp16"
+	"github.com/aurora-silicon/vane/internal/ref"
 )
 
 type stringSliceFlag []string
@@ -57,7 +57,7 @@ func usage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  vane-runner probe [--device PATH] [--json]")
 	fmt.Fprintln(w, "  vane-runner run --hwx PATH [--sections-dir DIR] [--input PATH]... [--alt-input PATH]... [--output-out PATH]")
-	fmt.Fprintln(w, "                  [--expected PATH] [--runs N] [--in-place] [--atol F] [--rtol F]")
+	fmt.Fprintln(w, "                  [--expected PATH] [--runs N] [--warmup N] [--in-place] [--atol F] [--rtol F]")
 	fmt.Fprintln(w, "                  [--max-ulp N] [--device PATH] [--json] [--json-out PATH]")
 	fmt.Fprintln(w, "  vane-runner gen-conv1x1 --h H --w W --cin C --cout O [--bias] [--relu | --act NAME [act flags]] [--lut-bin PATH] [--seed N] --out-dir DIR [--json]")
 	fmt.Fprintln(w, "  vane-runner gen-conv3x3 --mode <dense|depthwise> --h H --w W --cin C --cout O --stride <1|2> --pad <same|valid> [--bias] [--relu | --act NAME [act flags]] [--lut-bin PATH] [--seed N] --out-dir DIR [--json]")
@@ -283,7 +283,8 @@ func cmdRun(args []string, tr ane.Transport, stdout, stderr io.Writer) int {
 	fs.Var(&altInputPaths, "alt-input", "Alternate input binary file used on odd runs when --runs > 1 (repeatable)")
 	outputOut := fs.String("output-out", "", "Write output surface bytes to this path")
 	expectedPath := fs.String("expected", "", "Expected output fp16 binary for direct byte comparison")
-	runs := fs.Int("runs", 1, "Number of consecutive runs for repeatability verification")
+	runs := fs.Int("runs", 1, "Number of consecutive timed runs for repeatability verification")
+	warmup := fs.Int("warmup", 0, "Number of unmeasured warmup runs before timed --runs (checked for determinism)")
 	inPlace := fs.Bool("in-place", false, "Use mmap in-place execution mode (requires 16 KiB pages)")
 	atol := fs.Float64("atol", 1e-3, "Absolute tolerance for reference comparison")
 	rtol := fs.Float64("rtol", 1e-3, "Relative tolerance for reference comparison")
@@ -301,6 +302,10 @@ func cmdRun(args []string, tr ane.Transport, stdout, stderr io.Writer) int {
 	}
 	if *runs < 1 {
 		fmt.Fprintf(stderr, "error: --runs must be >= 1, got %d\n", *runs)
+		return 1
+	}
+	if *warmup < 0 {
+		fmt.Fprintf(stderr, "error: --warmup must be >= 0, got %d\n", *warmup)
 		return 1
 	}
 
@@ -380,6 +385,7 @@ func cmdRun(args []string, tr ane.Transport, stdout, stderr io.Writer) int {
 
 	outBytes, report, err := ane.ExecuteProgram(tr, fd, caps, loaded, inputPayloads, ane.ExecOptions{
 		Runs:      *runs,
+		Warmup:    *warmup,
 		InPlace:   *inPlace,
 		AltInputs: altInputPayloads,
 		Expected:  expectedBytes,
@@ -427,13 +433,13 @@ func cmdRun(args []string, tr ane.Transport, stdout, stderr io.Writer) int {
 		}
 		fmt.Fprintln(stdout, string(raw))
 	} else {
-		sumMS := 0.0
-		for _, v := range report.LatenciesMS {
-			sumMS += v
+		fmt.Fprintf(stdout, "device=%s abi=v%d chip=H%d mode=%s runs=%d",
+			report.Device, report.ABIVersion, report.ChipFamily, report.Mode, report.Runs)
+		if report.Warmup > 0 {
+			fmt.Fprintf(stdout, " warmup=%d", report.Warmup)
 		}
-		meanMS := sumMS / float64(len(report.LatenciesMS))
-		fmt.Fprintf(stdout, "device=%s abi=v%d chip=H%d mode=%s runs=%d mean_ms=%.3f sha256=%s",
-			report.Device, report.ABIVersion, report.ChipFamily, report.Mode, report.Runs, meanMS, report.OutputSHA256)
+		fmt.Fprintf(stdout, " min_ms=%.3f median_ms=%.3f p95_ms=%.3f mean_ms=%.3f sha256=%s",
+			report.MinMS, report.MedianMS, report.P95MS, report.MeanMS, report.OutputSHA256)
 		if report.AltOutputSHA256 != "" {
 			fmt.Fprintf(stdout, " alt_sha256=%s", report.AltOutputSHA256)
 		}
