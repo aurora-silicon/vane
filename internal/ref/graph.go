@@ -169,6 +169,18 @@ type GraphNodeSpec struct {
 	InScale      *float64        `json:"in_scale,omitempty"`
 	Scale        *float64        `json:"scale,omitempty"`
 	Scalar       *float64        `json:"scalar,omitempty"`
+	KH           int             `json:"kh,omitempty"`
+	KW           int             `json:"kw,omitempty"`
+	SH           int             `json:"sh,omitempty"`
+	SW           int             `json:"sw,omitempty"`
+	PT           int             `json:"pt,omitempty"`
+	PB           int             `json:"pb,omitempty"`
+	PL           int             `json:"pl,omitempty"`
+	PR           int             `json:"pr,omitempty"`
+	ExcludePad   *bool           `json:"exclude_pad,omitempty"`
+	ReduceOp     string          `json:"reduce_op,omitempty"`
+	Axes         string          `json:"axes,omitempty"`
+	Eps          *float64        `json:"eps,omitempty"`
 }
 
 // ConvBiasSpec parses a conv node's Bias / HasBias fields, returning (wantsBias, path, err).
@@ -561,6 +573,57 @@ func evalGraph(spec GraphSpec, inputs map[string]Tensor, nodeWeights map[string]
 			} else {
 				out, err = ApplyActF64(x, actSpec)
 			}
+
+		case "max_pool", "avg_pool":
+			if len(nd.Inputs) != 1 {
+				return Tensor{}, nil, fmt.Errorf("node %q (%s): expected 1 input", nd.ID, nd.Op)
+			}
+			x, ok := env[nd.Inputs[0]]
+			if !ok {
+				return Tensor{}, nil, fmt.Errorf("node %q: unknown input %q", nd.ID, nd.Inputs[0])
+			}
+			excl := true
+			if nd.ExcludePad != nil {
+				excl = *nd.ExcludePad
+			}
+			pspec := PoolSpec{
+				Op:         strings.ToLower(nd.Op),
+				KH:         nd.KH,
+				KW:         nd.KW,
+				SH:         nd.SH,
+				SW:         nd.SW,
+				Pad:        nd.Pad,
+				PT:         nd.PT,
+				PB:         nd.PB,
+				PL:         nd.PL,
+				PR:         nd.PR,
+				ExcludePad: excl,
+			}
+			out, err = EvalPool(x, pspec)
+
+		case "reduce":
+			if len(nd.Inputs) != 1 {
+				return Tensor{}, nil, fmt.Errorf("node %q (reduce): expected 1 input", nd.ID)
+			}
+			x, ok := env[nd.Inputs[0]]
+			if !ok {
+				return Tensor{}, nil, fmt.Errorf("node %q: unknown input %q", nd.ID, nd.Inputs[0])
+			}
+			rc, rh, rw, errAx := ParseReduceAxes(nd.Axes)
+			if errAx != nil {
+				return Tensor{}, nil, fmt.Errorf("node %q: %w", nd.ID, errAx)
+			}
+			eps := 0.0
+			if nd.Eps != nil {
+				eps = *nd.Eps
+			}
+			out, err = EvalReduce(x, ReduceSpec{
+				Op:      nd.ReduceOp,
+				ReduceC: rc,
+				ReduceH: rh,
+				ReduceW: rw,
+				Eps:     eps,
+			})
 
 		default:
 			return Tensor{}, nil, fmt.Errorf("node %q: unsupported op %q", nd.ID, nd.Op)

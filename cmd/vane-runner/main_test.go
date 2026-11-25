@@ -1443,3 +1443,110 @@ func TestCompileGraphStripHeightCLI(t *testing.T) {
 		}
 	}
 }
+
+func TestPoolReduceAndNormGraphsCLI(t *testing.T) {
+	vaneBin := findVaneBin(t)
+	tmp := t.TempDir()
+
+	// 1. gen-pool + compile-pool + validate
+	poolVec := filepath.Join(tmp, "pool_vec")
+	poolComp := filepath.Join(tmp, "pool_comp")
+	var stdout, stderr bytes.Buffer
+	if rc := runCLI([]string{
+		"gen-pool", "--op", "max", "--h", "16", "--w", "16", "--c", "8",
+		"--kh", "3", "--kw", "3", "--sh", "2", "--sw", "2", "--pad", "same",
+		"--out-dir", poolVec, "--json",
+	}, nil, &stdout, &stderr); rc != 0 {
+		t.Fatalf("gen-pool failed rc=%d stderr=%s", rc, stderr.String())
+	}
+	runVane(t, vaneBin, "compile-pool",
+		"--target", "h17", "--op", "max", "--h", "16", "--w", "16", "--c", "8",
+		"--kh", "3", "--kw", "3", "--sh", "2", "--sw", "2", "--pad", "same",
+		"--out-dir", poolComp,
+	)
+	if out := runVane(t, vaneBin, "validate", "--hwx", filepath.Join(poolComp, "program.hwx"), "--sections", poolComp, "--check-tasks"); !strings.Contains(out, "pe_pool=1") {
+		t.Fatalf("expected pe_pool=1 in validate output:\n%s", out)
+	}
+
+	// 2. gen-reduce + compile-reduce + validate (PE reduce + NE channel reduce)
+	redVec := filepath.Join(tmp, "red_vec")
+	redComp := filepath.Join(tmp, "red_comp")
+	stdout.Reset()
+	stderr.Reset()
+	if rc := runCLI([]string{
+		"gen-reduce", "--op", "rsqrt_mean_square", "--h", "8", "--w", "32", "--c", "16",
+		"--axes", "w", "--eps", "0.001", "--out-dir", redVec, "--json",
+	}, nil, &stdout, &stderr); rc != 0 {
+		t.Fatalf("gen-reduce failed rc=%d stderr=%s", rc, stderr.String())
+	}
+	runVane(t, vaneBin, "compile-reduce",
+		"--target", "h16", "--op", "rsqrt_mean_square", "--h", "8", "--w", "32", "--c", "16",
+		"--axes", "w", "--eps", "0.001", "--out-dir", redComp,
+	)
+	if out := runVane(t, vaneBin, "validate", "--hwx", filepath.Join(redComp, "program.hwx"), "--sections", redComp, "--check-tasks"); !strings.Contains(out, "pe_reduce=1") {
+		t.Fatalf("expected pe_reduce=1 in validate output:\n%s", out)
+	}
+
+	// 3. End-to-end gen-graph + compile-graph for 100% L2-resident softmax and ResNet block
+	smSpec := filepath.Join(tmp, "softmax.json")
+	smVec := filepath.Join(tmp, "sm_vec")
+	smComp := filepath.Join(tmp, "sm_comp")
+	smJSON := `{
+		"target": "h16",
+		"placement": "auto",
+		"inputs": [{"name": "x", "c": 8, "h": 8, "w": 32}],
+		"nodes": [
+			{"id": "mx", "op": "reduce", "reduce_op": "max", "axes": "w", "inputs": ["x"]},
+			{"id": "shifted", "op": "pe", "pe_op": "sub", "inputs": ["x", "mx"]},
+			{"id": "scaled", "op": "pe", "pe_op": "smul", "scalar": 1.44269504, "inputs": ["shifted"]},
+			{"id": "ex", "op": "lut", "act": "exp2", "inputs": ["scaled"]},
+			{"id": "inv_s", "op": "reduce", "reduce_op": "inv_sum", "axes": "w", "inputs": ["ex"]},
+			{"id": "out", "op": "pe", "pe_op": "mul", "inputs": ["ex", "inv_s"]}
+		]
+	}`
+	if err := os.WriteFile(smSpec, []byte(smJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if rc := runCLI([]string{"gen-graph", "--spec", smSpec, "--out-dir", smVec, "--json"}, nil, &stdout, &stderr); rc != 0 {
+		t.Fatalf("gen-graph softmax failed rc=%d stderr=%s", rc, stderr.String())
+	}
+	compOut := runVane(t, vaneBin, "compile-graph", "--spec", filepath.Join(smVec, "graph_resolved.json"), "--out-dir", smComp)
+	if !strings.Contains(compOut, "scratch=0B") {
+		t.Fatalf("expected 0B scratch for softmax graph, got: %s", compOut)
+	}
+	if out := runVane(t, vaneBin, "validate", "--hwx", filepath.Join(smComp, "program.hwx"), "--sections", smComp, "--check-tasks"); !strings.Contains(out, "status: ok") {
+		t.Fatalf("softmax graph validate failed:\n%s", out)
+	}
+
+	// ResNet block
+	rnSpec := filepath.Join(tmp, "resnet.json")
+	rnVec := filepath.Join(tmp, "rn_vec")
+	rnComp := filepath.Join(tmp, "rn_comp")
+	rnJSON := `{
+		"target": "h17",
+		"placement": "auto",
+		"inputs": [{"name": "x", "c": 16, "h": 16, "w": 16}],
+		"nodes": [
+			{"id": "stem", "op": "conv3x3", "mode": "dense", "cout": 16, "stride": 1, "pad": "same", "relu": true, "inputs": ["x"]},
+			{"id": "pool", "op": "max_pool", "kh": 3, "kw": 3, "sh": 2, "sw": 2, "pad": "same", "inputs": ["stem"]},
+			{"id": "proj", "op": "conv1x1", "cout": 16, "relu": true, "inputs": ["pool"]},
+			{"id": "skip", "op": "pe", "pe_op": "add", "inputs": ["proj", "pool"]},
+			{"id": "gap", "op": "avg_pool", "kh": 8, "kw": 8, "sh": 1, "sw": 1, "pad": "valid", "inputs": ["skip"]},
+			{"id": "head", "op": "conv1x1", "cout": 8, "inputs": ["gap"]}
+		]
+	}`
+	if err := os.WriteFile(rnSpec, []byte(rnJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if rc := runCLI([]string{"gen-graph", "--spec", rnSpec, "--out-dir", rnVec, "--json"}, nil, &stdout, &stderr); rc != 0 {
+		t.Fatalf("gen-graph resnet failed rc=%d stderr=%s", rc, stderr.String())
+	}
+	runVane(t, vaneBin, "compile-graph", "--spec", filepath.Join(rnVec, "graph_resolved.json"), "--out-dir", rnComp)
+	if out := runVane(t, vaneBin, "validate", "--hwx", filepath.Join(rnComp, "program.hwx"), "--sections", rnComp, "--check-tasks"); !strings.Contains(out, "status: ok") {
+		t.Fatalf("resnet graph validate failed:\n%s", out)
+	}
+}

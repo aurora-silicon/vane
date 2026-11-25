@@ -11,6 +11,7 @@ import Vane.Program
 import Vane.Verify
 import Vane.Pe
 import Vane.Lut
+import Vane.Pool
 import Vane.Conv
 
 namespace Vane.Graph
@@ -28,6 +29,7 @@ open Vane.Program
 open Vane.Verify
 open Vane.Pe
 open Vane.Lut
+open Vane.Pool
 open Vane.Conv
 
 -- ============================================================================
@@ -96,6 +98,8 @@ inductive NodeOp where
   | pe1 (op : PeOp)
   | pe2 (op : PeBinOp) (rev : Bool := false)
   | lut (act : NeActSpec)
+  | pool (op : PoolKind) (kh kw sh sw : Nat) (pad : PoolPad) (excludePad : Bool := true)
+  | reduce (op : ReduceOp) (axes : ReduceAxes) (eps : UInt16 := 0)
   deriving BEq
 
 instance : Inhabited NodeOp := ⟨.pe2 .add false⟩
@@ -413,7 +417,11 @@ private def maxPeThForOccupied
     return none
   if let some (b1, b2, br, pk) := peStageBasesForTh target outDims hwSrc1 hwSrc2? src1IsL2 src2IsL2 resIsL2 occupied k outDims.h then
     return some (outDims.h, b1, b2, br, pk)
-  if outDims.h <= 1 then
+  -- L2-resident PE2 broadcast operands require th == outDims.h (otherwise spill to DRAM)
+  let hasL2Bcast :=
+    (src1IsL2 && hwSrc1 != outDims) ||
+    (match hwSrc2? with | some hw2 => src2IsL2 && hw2 != outDims | none => false)
+  if hasL2Bcast || outDims.h <= 1 then
     return none
   let mut lo : Nat := 1
   let mut hi : Nat := outDims.h - 1
@@ -554,6 +562,10 @@ private inductive PlannedOp where
   | pe1 (op : PeOp) (dims : TensorDims)
   | pe2 (op : PeBinOp) (rev : Bool) (outDims hwSrc1 hwSrc2 : TensorDims) (hwSrc1Ref hwSrc2Ref : TensorRef)
   | lut (act : NeActSpec) (dims : TensorDims) (lutPayload? : Option LutPayload)
+  | pePool (op : PoolKind) (excludePad : Bool) (dims : TensorDims) (gh gw : PoolAxisGeom)
+  | nePool (op : PoolKind) (dims : TensorDims) (gh gw : PoolAxisGeom)
+  | peReduce (op : ReduceOp) (axes : ReduceAxes) (eps : UInt16) (dims : TensorDims)
+  | neChannelReduce (op : ReduceOp) (dims : TensorDims)
 
 private instance : Inhabited PlannedOp := ⟨.pe2 .add false default default default default default⟩
 
@@ -578,6 +590,10 @@ private inductive TaskPlanKind where
   | conv (p : ConvTaskPlan)
   | pe (p : PeTaskPlan)
   | lut (p : NeActTaskPlan)
+  | pePool (p : PePoolPlan)
+  | peReduce (p : PeReducePlan)
+  | nePool (p : NeWeightlessPlan)
+  | neChannelReduce (p : NeWeightlessPlan)
 
 private instance : Inhabited TaskPlanKind :=
   ⟨.pe {
@@ -596,11 +612,19 @@ private def TaskPlanKind.direct : TaskPlanKind → Bool
   | .conv p => p.direct
   | .pe p => p.direct
   | .lut p => p.direct
+  | .pePool p => p.direct
+  | .peReduce _ => true
+  | .nePool p => p.direct
+  | .neChannelReduce p => p.direct
 
 private def TaskPlanKind.l2Peak : TaskPlanKind → Nat
   | .conv p => p.l2TaskPeak
   | .pe p => p.l2TaskPeak
   | .lut p => p.l2TaskPeak
+  | .pePool p => p.l2TaskPeak
+  | .peReduce p => p.l2TaskPeak
+  | .nePool p => p.l2TaskPeak
+  | .neChannelReduce p => p.l2TaskPeak
 
 private def deriveInputShortNames (inputs : Array GraphInput) : Except String (Array String) := do
   let mut names : Array String := #[]
@@ -742,6 +766,37 @@ private def validateGraph (spec : GraphSpec) :
           | _ => pure none
         let isLut := lutPayload?.isSome
         pure (PlannedOp.lut act d lutPayload?, d, Engine.ne, isLut, isLut, s!"lut_{act.name}")
+      | .pool op kh kw sh sw pad excl =>
+        if inRefs.size != 1 then
+          throw s!"node '{nd.id}' ({op.opName}): expected 1 input, got {inRefs.size}"
+        let d := inDims[0]!
+        let pspec : PoolSpec := {
+          target := spec.target, op := op, dims := d, kh := kh, kw := kw, sh := sh, sw := sw, pad := pad, excludePad := excl
+        }
+        let (backend, gh, gw) ← resolvePoolBackend pspec
+        let od : TensorDims := { c := d.c, h := gh.out, w := gw.out }
+        match backend with
+        | .pePool =>
+          pure (PlannedOp.pePool op excl d gh gw, od, Engine.pe, false, false, op.opName)
+        | .nePool =>
+          pure (PlannedOp.nePool op d gh gw, od, Engine.ne, false, false, op.opName)
+        | .peReduceGlobal =>
+          let redOp : ReduceOp := match op with | .max => .max | .avg => .mean
+          let axes : ReduceAxes := { reduceH := true, reduceW := true }
+          pure (PlannedOp.peReduce redOp axes 0 d, od, Engine.pe, false, false, op.opName)
+      | .reduce op axes eps =>
+        if inRefs.size != 1 then
+          throw s!"node '{nd.id}' (reduce_{op.name}): expected 1 input, got {inRefs.size}"
+        let d := inDims[0]!
+        let rspec : ReduceSpec := {
+          target := spec.target, op := op, dims := d, axes := axes, eps := eps
+        }
+        let (backend, od) ← resolveReduceBackend rspec
+        match backend with
+        | .peReduce =>
+          pure (PlannedOp.peReduce op axes eps d, od, Engine.pe, false, false, s!"reduce_{op.name}")
+        | .neChannelReduce =>
+          pure (PlannedOp.neChannelReduce op d, od, Engine.ne, false, false, s!"reduce_{op.name}")
 
     vNodes := vNodes.push {
       id := nd.id
@@ -776,15 +831,13 @@ private def isNodeL2Eligible (vNodes : Array ValidatedNode) (i : Nat) : Bool := 
   for j in [i + 1 : vNodes.size] do
     let cons := vNodes[j]!
     match cons.op with
-    | .pe2 _ _ outDims hwSrc1 hwSrc2 r1 r2 =>
-      if r1 == .node i && hwSrc1 != outDims then
-        return false
-      if r2 == .node i && hwSrc2 != outDims then
-        return false
     | .conv sh _ _ _ _ _ =>
       if cons.inputs[0]! == .node i && sh.kernelSize == 3 && sh.stride == 2 then
         if sh.winReg != sh.w || sh.hinReg != sh.h then
           return false
+    | .pePool _ _ inDims gh _ | .nePool _ inDims gh _ =>
+      if cons.inputs[0]! == .node i && gh.used != inDims.h then
+        return false
     | _ => pure ()
   return true
 
@@ -821,6 +874,19 @@ private def tryPlanAllTasks
       | .lut _ dims _ =>
         let srcIsL2 := isNodeL2 nd.inputs[0]!
         TaskPlanKind.lut <$> chooseNeActTilingForGraph target dims.c dims.h dims.w srcIsL2 resIsL2 liveRanges
+      | .pePool _ _ dims gh gw =>
+        let srcIsL2 := isNodeL2 nd.inputs[0]!
+        TaskPlanKind.pePool <$> choosePePoolTilingForL2 target dims.c gh gw srcIsL2 resIsL2 liveRanges
+      | .nePool _ dims gh gw =>
+        let srcIsL2 := isNodeL2 nd.inputs[0]!
+        TaskPlanKind.nePool <$> chooseNePoolTilingForL2 target dims.c gh gw srcIsL2 resIsL2 liveRanges
+      | .peReduce _ axes _ dims =>
+        let srcIsL2 := isNodeL2 nd.inputs[0]!
+        let ax := peReduceAxes dims.c dims.h axes.reduceC axes.reduceH
+        TaskPlanKind.peReduce <$> choosePeReduceTilingForL2 target dims.w ax srcIsL2 resIsL2 liveRanges
+      | .neChannelReduce _ dims =>
+        let srcIsL2 := isNodeL2 nd.inputs[0]!
+        TaskPlanKind.neChannelReduce <$> chooseNeChannelReduceTilingForL2 target dims srcIsL2 resIsL2 liveRanges
     match planRes with
     | .ok p =>
       peakL2 := max peakL2 p.l2Peak
@@ -1170,6 +1236,119 @@ private def buildPreLoweredTasks
         l2Accs := l2Accs.push { lo := lp.resStageBase, hi := lp.resStageBase + szRes, isWrite := true, role := .resStage }
         let (baseOff, _, _, ext) := surfaceDmaWindow nd.resWin dims.c dims.h dims.w
         dramAccs := dramAccs.push { resource := .surface outSurfIdx "y", lo := baseOff, hi := baseOff + ext, isWrite := true, port := .resDma }
+
+    | .pePool _ _ dims gh gw, .pePool pp =>
+      let stripW := (1 : Nat) <<< pp.k
+      let px := poolStripPx gw.used gw.k gw.sEff gw.padBefore stripW gw.out
+      let row := 2 * px
+      let u := dims.c * row
+      match src1Loc with
+      | .l2 base bytes =>
+        l2Accs := l2Accs.push { lo := base, hi := base + bytes, isWrite := false, role := .src1L2 }
+      | .dram off _ =>
+        let sz := alignUp (poolInRows gh.used gh.k gh.sEff gh.padBefore gh.out pp.tileHeight false * u) dmaLineBytes
+        l2Accs := l2Accs.push { lo := pp.srcStageBase, hi := pp.srcStageBase + sz, isWrite := true, role := .src1Stage }
+        dramAccs := dramAccs.push { resource := .scratch, lo := off, hi := off + dramSpanBytes dims, isWrite := false, port := .src1Dma }
+      | .surface idx _ =>
+        let sz := alignUp (poolInRows gh.used gh.k gh.sEff gh.padBefore gh.out pp.tileHeight false * u) dmaLineBytes
+        l2Accs := l2Accs.push { lo := pp.srcStageBase, hi := pp.srcStageBase + sz, isWrite := true, role := .src1Stage }
+        dramAccs := dramAccs.push { resource := .surface idx shortNames[idx]!, lo := 0, hi := dramSpanBytes dims, isWrite := false, port := .src1Dma }
+
+      let drow := 2 * min (alignUp gw.out 8) (max stripW 32)
+      let resSz := if pp.direct then peDirectResBytes dims.c drow pp.tileHeight else alignUp (pp.tileHeight * dims.c * drow) dmaLineBytes
+      match resLoc with
+      | .l2 base bytes =>
+        l2Accs := l2Accs.push { lo := base, hi := base + bytes, isWrite := true, role := .resL2 }
+      | .dram off _ =>
+        l2Accs := l2Accs.push { lo := pp.resStageBase, hi := pp.resStageBase + resSz, isWrite := true, role := .resStage }
+        dramAccs := dramAccs.push { resource := .scratch, lo := off, hi := off + dramSpanBytes nd.outDims, isWrite := true, port := .resDma }
+      | .surface _ _ =>
+        l2Accs := l2Accs.push { lo := pp.resStageBase, hi := pp.resStageBase + resSz, isWrite := true, role := .resStage }
+        dramAccs := dramAccs.push { resource := .surface outSurfIdx "y", lo := 0, hi := dramSpanBytes nd.outDims, isWrite := true, port := .resDma }
+
+    | .peReduce _ axes _ dims, .peReduce pr =>
+      let ax := peReduceAxes dims.c dims.h axes.reduceC axes.reduceH
+      let stripW := (1 : Nat) <<< pr.k
+      let px := min (alignUp dims.w 8) (max stripW 32)
+      let u := ax.sC * ax.sD * 2 * px
+      match src1Loc with
+      | .l2 base bytes =>
+        l2Accs := l2Accs.push { lo := base, hi := base + bytes, isWrite := false, role := .src1L2 }
+      | .dram off _ =>
+        let sz := alignUp (pr.tileHeight * u) dmaLineBytes
+        l2Accs := l2Accs.push { lo := pr.srcStageBase, hi := pr.srcStageBase + sz, isWrite := true, role := .src1Stage }
+        dramAccs := dramAccs.push { resource := .scratch, lo := off, hi := off + dramSpanBytes dims, isWrite := false, port := .src1Dma }
+      | .surface idx _ =>
+        let sz := alignUp (pr.tileHeight * u) dmaLineBytes
+        l2Accs := l2Accs.push { lo := pr.srcStageBase, hi := pr.srcStageBase + sz, isWrite := true, role := .src1Stage }
+        dramAccs := dramAccs.push { resource := .surface idx shortNames[idx]!, lo := 0, hi := dramSpanBytes dims, isWrite := false, port := .src1Dma }
+
+      match resLoc with
+      | .l2 base bytes =>
+        l2Accs := l2Accs.push { lo := base, hi := base + bytes, isWrite := true, role := .resL2 }
+      | .dram off _ =>
+        l2Accs := l2Accs.push { lo := pr.resStageBase, hi := pr.resStageBase + 2048, isWrite := true, role := .resStage }
+        dramAccs := dramAccs.push { resource := .scratch, lo := off, hi := off + dramSpanBytes nd.outDims, isWrite := true, port := .resDma }
+      | .surface _ _ =>
+        l2Accs := l2Accs.push { lo := pr.resStageBase, hi := pr.resStageBase + 2048, isWrite := true, role := .resStage }
+        dramAccs := dramAccs.push { resource := .surface outSurfIdx "y", lo := 0, hi := dramSpanBytes nd.outDims, isWrite := true, port := .resDma }
+
+    | .nePool _ dims gh gw, .nePool np =>
+      let stripW := np.stripWidth
+      let px := poolStripPx gw.used gw.k gw.sEff gw.padBefore stripW gw.out
+      let u := dims.c * 2 * px
+      match src1Loc with
+      | .l2 base bytes =>
+        l2Accs := l2Accs.push { lo := base, hi := base + bytes, isWrite := false, role := .src1L2 }
+      | .dram off _ =>
+        let sz := alignUp (poolInRows gh.used gh.k gh.sEff gh.padBefore gh.out np.tileHeight true * u) dmaLineBytes
+        l2Accs := l2Accs.push { lo := np.srcStageBase, hi := np.srcStageBase + sz, isWrite := true, role := .src1Stage }
+        dramAccs := dramAccs.push { resource := .scratch, lo := off, hi := off + dramSpanBytes dims, isWrite := false, port := .src1Dma }
+      | .surface idx _ =>
+        let sz := alignUp (poolInRows gh.used gh.k gh.sEff gh.padBefore gh.out np.tileHeight true * u) dmaLineBytes
+        l2Accs := l2Accs.push { lo := np.srcStageBase, hi := np.srcStageBase + sz, isWrite := true, role := .src1Stage }
+        dramAccs := dramAccs.push { resource := .surface idx shortNames[idx]!, lo := 0, hi := dramSpanBytes dims, isWrite := false, port := .src1Dma }
+
+      let drow := 2 * min (alignUp gw.out 8) (max stripW 32)
+      let resSz := if np.direct then neActDirectResBytes np.f np.fat else alignUp (np.tileHeight * dims.c * drow) dmaLineBytes
+      match resLoc with
+      | .l2 base bytes =>
+        l2Accs := l2Accs.push { lo := base, hi := base + bytes, isWrite := true, role := .resL2 }
+      | .dram off _ =>
+        l2Accs := l2Accs.push { lo := np.resStageBase, hi := np.resStageBase + resSz, isWrite := true, role := .resStage }
+        dramAccs := dramAccs.push { resource := .scratch, lo := off, hi := off + dramSpanBytes nd.outDims, isWrite := true, port := .resDma }
+      | .surface _ _ =>
+        l2Accs := l2Accs.push { lo := np.resStageBase, hi := np.resStageBase + resSz, isWrite := true, role := .resStage }
+        dramAccs := dramAccs.push { resource := .surface outSurfIdx "y", lo := 0, hi := dramSpanBytes nd.outDims, isWrite := true, port := .resDma }
+
+    | .neChannelReduce _ dims, .neChannelReduce nc =>
+      let stripW := nc.stripWidth
+      let px := min (alignUp dims.w 8) stripW
+      let u := dims.c * 2 * px
+      match src1Loc with
+      | .l2 base bytes =>
+        l2Accs := l2Accs.push { lo := base, hi := base + bytes, isWrite := false, role := .src1L2 }
+      | .dram off _ =>
+        let sz := alignUp (nc.tileHeight * u) dmaLineBytes
+        l2Accs := l2Accs.push { lo := nc.srcStageBase, hi := nc.srcStageBase + sz, isWrite := true, role := .src1Stage }
+        dramAccs := dramAccs.push { resource := .scratch, lo := off, hi := off + dramSpanBytes dims, isWrite := false, port := .src1Dma }
+      | .surface idx _ =>
+        let sz := alignUp (nc.tileHeight * u) dmaLineBytes
+        l2Accs := l2Accs.push { lo := nc.srcStageBase, hi := nc.srcStageBase + sz, isWrite := true, role := .src1Stage }
+        dramAccs := dramAccs.push { resource := .surface idx shortNames[idx]!, lo := 0, hi := dramSpanBytes dims, isWrite := false, port := .src1Dma }
+
+      let drow := 2 * min (alignUp dims.w 8) (max stripW 32)
+      let resSz := if nc.direct then neActDirectResBytes nc.f nc.fat else alignUp (nc.tileHeight * drow) dmaLineBytes
+      match resLoc with
+      | .l2 base bytes =>
+        l2Accs := l2Accs.push { lo := base, hi := base + bytes, isWrite := true, role := .resL2 }
+      | .dram off _ =>
+        l2Accs := l2Accs.push { lo := nc.resStageBase, hi := nc.resStageBase + resSz, isWrite := true, role := .resStage }
+        dramAccs := dramAccs.push { resource := .scratch, lo := off, hi := off + dramSpanBytes nd.outDims, isWrite := true, port := .resDma }
+      | .surface _ _ =>
+        l2Accs := l2Accs.push { lo := nc.resStageBase, hi := nc.resStageBase + resSz, isWrite := true, role := .resStage }
+        dramAccs := dramAccs.push { resource := .surface outSurfIdx "y", lo := 0, hi := dramSpanBytes nd.outDims, isWrite := true, port := .resDma }
+
     | _, _ =>
       throw s!"internal error: op/plan mismatch on node '{nd.id}'"
 
@@ -1214,12 +1393,21 @@ private def computeSynchronization (pre : Array PreLoweredTask) : Array TaskSync
     hasSrc2Dma := pre[i.val]!.hasSrc2Dma
   }
 
-  -- Seed L2 handoff bits on L2-resident src1 reads from immediately latest same/other engine producer
+  -- Seed L2 handoff bits on non-broadcast L2-resident src1 reads from immediately latest producer;
+  -- for L2-resident PE2 broadcast src1 reads, use whole-task wait (bit 22 for PE, bit 5 for NE).
   for i in [1 : n] do
     if let .l2 _ _ := pre[i]!.src1Loc then
+      let isBcastSrc1 : Bool := match pre[i]!.node.op with
+        | .pe2 _ _ outDims hw1 _ _ _ => hw1 != outDims
+        | _ => false
       if let some prod := pre[i]!.src1Producer? then
         let prodEng := pre[prod]!.node.engine
-        if prodEng == .ne && latestEngineBefore pre .ne i == some prod then
+        if isBcastSrc1 then
+          if prodEng == .ne then
+            syncs := syncs.set! i { syncs[i]! with src1WaitNe5 := true }
+          else
+            syncs := syncs.set! i { syncs[i]! with src1WaitPe22 := true }
+        else if prodEng == .ne && latestEngineBefore pre .ne i == some prod then
           syncs := syncs.set! i { syncs[i]! with src1HandoffNe := true }
         else if prodEng == .pe && latestEngineBefore pre .pe i == some prod then
           syncs := syncs.set! i { syncs[i]! with src1HandoffPe := true }
@@ -1262,6 +1450,10 @@ private def computeSynchronization (pre : Array PreLoweredTask) : Array TaskSync
       kind := match pre[i.val]!.node.op with
         | .conv .. => .neConv
         | .lut .. => .neAct
+        | .pePool .. => .pePool
+        | .peReduce .. => .peReduce
+        | .nePool .. => .nePool
+        | .neChannelReduce .. => .neChannelReduce
         | _ => .peOp
       engine := pre[i.val]!.node.engine
       isNeCompute := pre[i.val]!.node.isNeCompute
@@ -2110,6 +2302,38 @@ private def emitTaskDesc
       plainWrites := plain, barWrites := barRecs, kernelRelocs := relocs
     }
 
+  | .pePool op excl dims gh gw, .pePool pp =>
+    let toPortLoc := fun
+      | TensorLocation.surface _ slot => PoolPortLoc.surface slot
+      | TensorLocation.dram off _ => PoolPortLoc.dram off
+      | TensorLocation.l2 base _ => PoolPortLoc.l2 base
+    buildPePoolTaskMulti target op excl dims gh gw pp taskId totalTasks
+      (toPortLoc pt.src1Loc) (toPortLoc pt.resLoc) sync pt.liveL2Mask
+
+  | .peReduce op axes eps dims, .peReduce pr =>
+    let toPortLoc := fun
+      | TensorLocation.surface _ slot => PoolPortLoc.surface slot
+      | TensorLocation.dram off _ => PoolPortLoc.dram off
+      | TensorLocation.l2 base _ => PoolPortLoc.l2 base
+    buildPeReduceTaskMulti target op axes eps dims pr taskId totalTasks
+      (toPortLoc pt.src1Loc) (toPortLoc pt.resLoc) sync pt.liveL2Mask
+
+  | .nePool op dims gh gw, .nePool np =>
+    let toPortLoc := fun
+      | TensorLocation.surface _ slot => PoolPortLoc.surface slot
+      | TensorLocation.dram off _ => PoolPortLoc.dram off
+      | TensorLocation.l2 base _ => PoolPortLoc.l2 base
+    buildNePoolTaskMulti target op dims gh gw np taskId totalTasks
+      (toPortLoc pt.src1Loc) (toPortLoc pt.resLoc) sync pt.liveL2Mask
+
+  | .neChannelReduce op dims, .neChannelReduce nc =>
+    let toPortLoc := fun
+      | TensorLocation.surface _ slot => PoolPortLoc.surface slot
+      | TensorLocation.dram off _ => PoolPortLoc.dram off
+      | TensorLocation.l2 base _ => PoolPortLoc.l2 base
+    buildNeChannelReduceTaskMulti target op dims nc taskId totalTasks
+      (toPortLoc pt.src1Loc) (toPortLoc pt.resLoc) sync pt.liveL2Mask
+
   | _, _ =>
     throw s!"internal error: op/plan mismatch when lowering node '{nd.id}'"
 
@@ -2303,6 +2527,10 @@ private def checkStripEligible
         if dims.w != wFull then
           throw s!"spatial strip fusion ineligible: node '{nd.id}' width {dims.w} != {wFull}"
         pure 0
+      | .pePool .. | .nePool .. =>
+        throw s!"spatial strip fusion ineligible: node '{nd.id}' pool operation is not supported by spatial H-strip fusion"
+      | .peReduce .. | .neChannelReduce .. =>
+        throw s!"spatial strip fusion ineligible: node '{nd.id}' reduce operation is not supported by spatial H-strip fusion"
     radii := radii.push rad
 
   -- Probe skip-halo exact interval match on top and interior 1-row bands
@@ -2344,6 +2572,8 @@ private def buildStripNodes
          r1, some r2)
       | .lut act dims lp =>
         (PlannedOp.lut act { dims with h := outH } lp, nd.inputs[0]!, none)
+      | other =>
+        (other, nd.inputs[0]!, none)
     let src1Win : SurfaceWindow := match s1Ref with
       | .input _ => { rowOffset := inLo, fullH := hFull }
       | .node _ => {}

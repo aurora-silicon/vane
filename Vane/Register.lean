@@ -258,9 +258,11 @@ def encodeTaskHeader9 (taskId taskWords logNE : Nat) : Except String (Array UInt
 def regWin : Nat := 0x0004
 def regHin : Nat := 0x0008
 def regCin : Nat := 0x000c
+def regDin : Nat := 0x0010
 def regWout : Nat := 0x0014
 def regHout : Nat := 0x0018
 def regCout : Nat := 0x001c
+def regDout : Nat := 0x0020
 def regBatchN : Nat := 0x0024
 def regConvCfg : Nat := 0x0028
 def regDwGroups : Nat := 0x0030
@@ -274,6 +276,7 @@ def regTargetCfg : Nat := 0x004c
 def regNeActShiftEn : Nat := 0x0050
 
 -- L2 staging block (0x4100..0x4160)
+def regCmpFlags : Nat := 0x4100
 def regSrc1Cfg : Nat := 0x4104
 def regSrc2Cfg : Nat := 0x4108
 def regSrc1Base : Nat := 0x4110
@@ -293,11 +296,13 @@ def regResRowStride : Nat := 0x4154
 def regResRowBytesA : Nat := 0x4158
 def regResRowBytesB : Nat := 0x415c
 
--- Planar Engine (PE) arithmetic block (0x4500..0x4510)
+-- Planar Engine (PE) arithmetic block (0x4500..0x4514)
 def regPeOp : Nat := 0x4500
 def regPeBias : Nat := 0x4504
 def regPeScale : Nat := 0x4508
+def regPeEps : Nat := 0x450c
 def regPeInScale : Nat := 0x4510
+def regPeRedScale : Nat := 0x4514
 
 -- Neural Engine block (0x4900..0x4914)
 def regNeCfg : Nat := 0x4900
@@ -314,6 +319,8 @@ def regSrc1BaseLo : Nat := 0x4d10
 def regSrc1BaseHi : Nat := 0x4d14
 def regSrc1DmaRowStride : Nat := 0x4d18
 def regSrc1DmaPlaneStride : Nat := 0x4d1c
+def regSrc1DmaDStride : Nat := 0x4d20
+def regSrc1DmaNStride : Nat := 0x4d24
 def regSrc2BaseLo : Nat := 0x4d28
 def regSrc2BaseHi : Nat := 0x4d2c
 def regSrc2DmaRowStride : Nat := 0x4d30
@@ -327,6 +334,7 @@ def regResBaseLo : Nat := 0x5108
 def regResBaseHi : Nat := 0x510c
 def regResDmaRowStride : Nat := 0x5110
 def regResDmaPlaneStride : Nat := 0x5114
+def regResDmaNStride : Nat := 0x511c
 def regResFmt : Nat := 0x5138
 
 -- Kernel DMA, chunk table, and standalone LUT descriptor block (0x5500..0x561c)
@@ -389,6 +397,16 @@ def dwGroupsLayout : WordLayout := {
   ]
 }
 
+/-- `0x0030` neChanReduceGroups (channel-reduce mode): `fixed[15:0] = 0`, `chanCount[31:16]`. -/
+def neChanReduceGroupsLayout : WordLayout := {
+  name := "neChanReduceGroups"
+  fixedMask := 0x0000ffff
+  fixedValue := 0x00000000
+  fields := #[
+    { name := "chanCount", lo := 16, width := 16 }
+  ]
+}
+
 /-- `0x003c` neCommon: `kind[7:0]`, `shPref[10:8]`, `shMin[14:12]`, `shMax[18:16]`,
     `F[21:19]`, `wide3x3[27:27]` (all other bits must be 0). -/
 def neCommonLayout : WordLayout := {
@@ -413,11 +431,21 @@ def neTileLayout : WordLayout := {
   ]
 }
 
-/-- `0x003c` peCommon: `mode[7:0]` (`0x20` for 1-source, `0x30` for 2-source), bits `[31:8] = 0`. -/
+/-- `0x003c` peCommon: `mode[7:0]` (`0x10` pool, `0x20` 1-source, `0x30` 2-source, `0x50` reduce), bits `[31:8] = 0`. -/
 def peCommonLayout : WordLayout := {
   name := "peCommon"
   fields := #[
     { name := "mode", lo := 0, width := 8 }
+  ]
+}
+
+/-- `0x4500` peReduceOp (PE reduction mode): `reducer[1:0]`, `preOp[8:4]`, `postOp[13:12]`. -/
+def peReduceOpLayout : WordLayout := {
+  name := "peReduceOp"
+  fields := #[
+    { name := "reducer", lo := 0, width := 2 },
+    { name := "preOp", lo := 4, width := 5 },
+    { name := "postOp", lo := 12, width := 2 }
   ]
 }
 
@@ -678,8 +706,15 @@ def fp16OneBits : UInt32 := 0x3c00
 def fp16InvLn2Bits : UInt16 := 0x3dc5
 def neActCfgValue : UInt32 := 0x00010082
 def kernelStageNoKernValue : UInt32 := 0x00000080
+def peCommonPoolValue : UInt32 := 0x00000010
 def peCommonOneSrcValue : UInt32 := 0x00000020
 def peCommonTwoSrcValue : UInt32 := 0x00000030
+def peCommonReduceValue : UInt32 := 0x00000050
+def cmpFlagMaxValue : UInt32 := 0x00000004
+def cmpFlagMinValue : UInt32 := 0x0000000c
+def nePoolMaxOpValue : UInt32 := 0x00103c0b
+def nePoolMinOpValue : UInt32 := 0x00183c0b
+def nePoolSumOpValue : UInt32 := 0x00103c08
 def peOpAbsValue : UInt32 := 0x000001c0
 def peOpSquareValue : UInt32 := 0x00000010
 def peOpAddValue : UInt32 := 0x00080000

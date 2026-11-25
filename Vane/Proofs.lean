@@ -6,6 +6,7 @@ import Vane.Alloc
 import Vane.Tiling
 import Vane.Pe
 import Vane.Lut
+import Vane.Pool
 
 namespace Vane.Proofs
 
@@ -17,6 +18,7 @@ open Vane.Alloc
 open Vane.Tiling
 open Vane.Pe
 open Vane.Lut
+open Vane.Pool
 
 -- ============================================================================
 -- 1. Alignment soundness (alignUp_ge, alignUp_dvd)
@@ -1801,5 +1803,90 @@ theorem surface_row_window_no_bleed_and_bounds
     rw [hmul]
     omega
   exact ⟨hPlane, hSpan⟩
+
+-- ============================================================================
+-- 11. Milestone 5B pooling & reduction layouts, row bounds, and axis conservation
+-- ============================================================================
+
+theorem peReduceOpLayout_valid : (validateWordLayout peReduceOpLayout).isOk = true := by decide
+
+theorem neChanReduceGroupsLayout_valid : (validateWordLayout neChanReduceGroupsLayout).isOk = true := by decide
+
+theorem peReduceOp_roundTrip (reducer preOp postOp : UInt32)
+    (hr : reducer < 4) (hpre : preOp < 32) (hpost : postOp < 4) :
+    ∃ w, encodeWord peReduceOpLayout #[("reducer", reducer), ("preOp", preOp), ("postOp", postOp)] = .ok w ∧
+         decodeFieldChecked peReduceOpLayout w "reducer" = .ok reducer ∧
+         decodeFieldChecked peReduceOpLayout w "preOp" = .ok preOp ∧
+         decodeFieldChecked peReduceOpLayout w "postOp" = .ok postOp := by
+  have h1 : ¬ reducer.toNat ≥ 4 := u32_not_ge_of_lt hr
+  have h2 : ¬ preOp.toNat ≥ 32 := u32_not_ge_of_lt hpre
+  have h3 : ¬ postOp.toNat ≥ 4 := u32_not_ge_of_lt hpost
+  have henc : encodeWord peReduceOpLayout #[("reducer", reducer), ("preOp", preOp), ("postOp", postOp)] =
+      .ok ((((0 : UInt32) ||| (reducer <<< 0)) ||| (preOp <<< 4)) ||| (postOp <<< 12)) := by
+    change (if reducer.toNat ≥ 4 then _ else if preOp.toNat ≥ 32 then _ else if postOp.toNat ≥ 4 then _ else _) = _
+    simp only [h1, h2, h3, ↓reduceIte]
+    rfl
+  exact ⟨_, henc,
+    encodeWord_decodeFieldChecked _ _ _ "reducer" reducer henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "preOp" preOp henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "postOp" postOp henc rfl⟩
+
+theorem neChanReduceGroups_roundTrip (chanCount : UInt32) (hc : chanCount < 65536) :
+    ∃ w, encodeWord neChanReduceGroupsLayout #[("chanCount", chanCount)] = .ok w ∧
+         decodeFieldChecked neChanReduceGroupsLayout w "chanCount" = .ok chanCount := by
+  have h1 : ¬ chanCount.toNat ≥ 65536 := u32_not_ge_of_lt hc
+  have henc : encodeWord neChanReduceGroupsLayout #[("chanCount", chanCount)] =
+      .ok ((0 : UInt32) ||| (chanCount <<< 16)) := by
+    change (if chanCount.toNat ≥ 65536 then _ else _) = _
+    simp only [h1, ↓reduceIte]
+    rfl
+  exact ⟨_, henc, encodeWord_decodeFieldChecked _ _ _ "chanCount" chanCount henc rfl⟩
+
+private theorem poolTileRows_le_used (usedH kh sh pt oh th : Nat) (isNe : Bool) (i : Nat) :
+    poolTileRows usedH kh sh pt oh th isNe i ≤ usedH := by
+  unfold poolTileRows
+  dsimp only
+  split
+  · exact Nat.zero_le usedH
+  · exact Nat.le_trans (Nat.sub_le _ _) (Nat.min_le_left _ _)
+
+private theorem poolInRowsAux_le_used (usedH kh sh pt oh th : Nat) (isNe : Bool) (n : Nat) :
+    poolInRowsAux usedH kh sh pt oh th isNe n ≤ usedH := by
+  induction n with
+  | zero => exact Nat.zero_le usedH
+  | succ k ih =>
+    unfold poolInRowsAux
+    have ht := poolTileRows_le_used usedH kh sh pt oh th isNe k
+    omega
+
+/-- For any valid row tile height `th >= 1` (indeed any `th`), the maximum input rows buffered
+    per tile `poolInRows` never exceeds the active input extent `usedH`. -/
+theorem poolInRows_le_used (usedH kh sh pt oh th : Nat) (isNe : Bool) :
+    poolInRows usedH kh sh pt oh th isNe ≤ usedH := by
+  unfold poolInRows
+  split
+  · exact Nat.zero_le usedH
+  · exact poolInRowsAux_le_used usedH kh sh pt oh th isNe (ceilDiv oh th)
+
+/-- Conservation of `(C, H)` elements across all 4D PE reduction axis mappings:
+    `sN * sC * sH * sD = C * H` for every `(rc, rh)` subset. -/
+theorem peReduceAxes_product (c h : Nat) (rc rh : Bool) :
+    let m := peReduceAxes c h rc rh
+    m.sN * m.sC * m.sH * m.sD = c * h := by
+  cases rc <;> cases rh <;> unfold peReduceAxes <;> dsimp only
+  · split
+    · rename_i hc
+      have hc1 : c = 1 := by simpa using hc
+      subst hc1
+      simp
+    · simp only [Nat.mul_one]
+      exact Nat.mul_comm h c
+  · simp
+  · simp only [Nat.one_mul, Nat.mul_one]
+    exact Nat.mul_comm h c
+  · split
+    · simp
+    · simp only [Nat.one_mul]
+      exact Nat.mul_comm h c
 
 end Vane.Proofs

@@ -11,6 +11,7 @@ import Vane.Program
 import Vane.Verify
 import Vane.Pe
 import Vane.Lut
+import Vane.Pool
 import Vane.Conv
 import Vane.Conv1x1
 import Vane.Conv3x3

@@ -63,6 +63,8 @@ func usage(w io.Writer) {
 	fmt.Fprintln(w, "  vane-runner gen-conv3x3 --mode <dense|depthwise> --h H --w W --cin C --cout O --stride <1|2> --pad <same|valid> [--bias] [--relu | --act NAME [act flags]] [--lut-bin PATH] [--seed N] --out-dir DIR [--json]")
 	fmt.Fprintln(w, "  vane-runner gen-pe --op <abs|square|linear|chain|sadd|ssub|srsub|smul|sdiv|add|sub|rsub|mul|max|min> --h H --w W --c C [--z-h ZH --z-w ZW --z-c ZC] [--alpha F] [--beta F] [--in-scale F] [--bias F] [--scale F] [--scalar F] [--edge-values] [--seed N] --out-dir DIR [--json]")
 	fmt.Fprintln(w, "  vane-runner gen-lut --act NAME --h H --w W --c C [--alpha F] [--beta F] [--lo F] [--hi F] [--eps F] [--scalar F] [--all-fp16] [--lut-bin PATH] [--seed N] --out-dir DIR [--json]")
+	fmt.Fprintln(w, "  vane-runner gen-pool --op <max|avg> --h H --w W --c C --kh KH --kw KW [--sh SH] [--sw SW] [--pad <valid|same|custom>] [--pt N --pb N --pl N --pr N] [--exclude-pad] [--seed N] --out-dir DIR [--json]")
+	fmt.Fprintln(w, "  vane-runner gen-reduce --op <sum|mean|max|min|l1|sum_square|l2|inv_sum|rsqrt_sum_square|rsqrt_mean_square> --h H --w W --c C --axes <w|h|c|hw|cw|ch|chw> [--eps F] [--seed N] --out-dir DIR [--json]")
 	fmt.Fprintln(w, "  vane-runner gen-graph --spec PATH --out-dir DIR [--seed N] [--json]")
 	fmt.Fprintln(w, "  vane-runner compare-conv --manifest PATH --actual PATH --expected PATH [--atol F] [--rtol F] [--max-ulp N] [--json]")
 	fmt.Fprintln(w, "  vane-runner compare-conv1x1 --manifest PATH --actual PATH --expected PATH [--atol F] [--rtol F] [--max-ulp N] [--json]")
@@ -87,6 +89,10 @@ func runCLI(args []string, tr ane.Transport, stdout, stderr io.Writer) int {
 		return cmdGenPe(args[1:], stdout, stderr)
 	case "gen-lut":
 		return cmdGenLut(args[1:], stdout, stderr)
+	case "gen-pool":
+		return cmdGenPool(args[1:], stdout, stderr)
+	case "gen-reduce":
+		return cmdGenReduce(args[1:], stdout, stderr)
 	case "gen-graph":
 		return cmdGenGraph(args[1:], stdout, stderr)
 	case "compare-conv":
@@ -1285,6 +1291,212 @@ func cmdGenLut(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
+func cmdGenPool(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("gen-pool", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	opName := fs.String("op", "", "Pool op: max or avg")
+	h := fs.Int("h", 0, "Input height H")
+	w := fs.Int("w", 0, "Input width W")
+	c := fs.Int("c", 0, "Channels C")
+	kh := fs.Int("kh", 0, "Window height KH")
+	kw := fs.Int("kw", 0, "Window width KW")
+	sh := fs.Int("sh", 1, "Vertical stride SH (1 or 2)")
+	sw := fs.Int("sw", 1, "Horizontal stride SW (1 or 2)")
+	pad := fs.String("pad", "valid", "Padding mode: valid, same, or custom")
+	pt := fs.Int("pt", 0, "Custom top padding")
+	pb := fs.Int("pb", 0, "Custom bottom padding")
+	pl := fs.Int("pl", 0, "Custom left padding")
+	pr := fs.Int("pr", 0, "Custom right padding")
+	excludePad := fs.Bool("exclude-pad", true, "Exclude padded elements from avg_pool divisor")
+	seed := fs.Uint64("seed", 1, "Deterministic PRNG seed")
+	outDir := fs.String("out-dir", "", "Output directory")
+	asJSON := fs.Bool("json", false, "Emit JSON summary")
+
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	if *opName == "" || *h <= 0 || *w <= 0 || *c <= 0 || *kh <= 0 || *kw <= 0 || *outDir == "" {
+		fmt.Fprintln(stderr, "error: --op, --h, --w, --c, --kh, --kw, and --out-dir are required")
+		return 1
+	}
+
+	spec := ref.PoolSpec{
+		Op:         *opName,
+		KH:         *kh,
+		KW:         *kw,
+		SH:         *sh,
+		SW:         *sw,
+		Pad:        *pad,
+		PT:         *pt,
+		PB:         *pb,
+		PL:         *pl,
+		PR:         *pr,
+		ExcludePad: *excludePad,
+	}
+
+	rng := rand.New(rand.NewPCG(*seed, *seed^0x517cc1b727220a95))
+	x, err := ref.NewTensor(1, *c, *h, *w)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	for i := range x.Data {
+		x.Data[i] = fp16.FromFloat64(rng.Float64()*4.0 - 2.0)
+	}
+
+	y, err := ref.EvalPool(x, spec)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+
+	inBuf, err := packTensor64B(x)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: pack input: %v\n", err)
+		return 1
+	}
+	expBuf, err := packTensor64B(y)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: pack expected: %v\n", err)
+		return 1
+	}
+	if err := os.MkdirAll(*outDir, 0o755); err != nil {
+		fmt.Fprintf(stderr, "error: create out-dir: %v\n", err)
+		return 1
+	}
+	if err := os.WriteFile(filepath.Join(*outDir, "input.bin"), inBuf, 0o644); err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	if err := os.WriteFile(filepath.Join(*outDir, "expected_f64.bin"), expBuf, 0o644); err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+
+	summary := map[string]any{
+		"op":          strings.ToLower(*opName),
+		"in_shape":    []int{1, *c, *h, *w},
+		"out_shape":   []int{y.N, y.C, y.H, y.W},
+		"kh":          *kh,
+		"kw":          *kw,
+		"sh":          *sh,
+		"sw":          *sw,
+		"pad":         *pad,
+		"exclude_pad": *excludePad,
+		"in_bytes":    len(inBuf),
+		"out_bytes":   len(expBuf),
+		"seed":        *seed,
+		"out_dir":     *outDir,
+	}
+	if *asJSON {
+		raw, _ := json.MarshalIndent(summary, "", "  ")
+		fmt.Fprintln(stdout, string(raw))
+	} else {
+		fmt.Fprintf(stdout, "generated pool %s (%dx%dx%d -> %dx%dx%d, in=%dB, out=%dB) in %s\n",
+			strings.ToLower(*opName), *c, *h, *w, y.C, y.H, y.W, len(inBuf), len(expBuf), *outDir)
+	}
+	return 0
+}
+
+func cmdGenReduce(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("gen-reduce", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	opName := fs.String("op", "", "Reduce op (sum, mean, max, min, l1, sum_square, l2, inv_sum, rsqrt_sum_square, rsqrt_mean_square)")
+	h := fs.Int("h", 0, "Input height H")
+	w := fs.Int("w", 0, "Input width W")
+	c := fs.Int("c", 0, "Channels C")
+	axesStr := fs.String("axes", "", "Reduced axes: w, h, c, hw, cw, ch, or chw")
+	eps := fs.Float64("eps", 0.0, "Epsilon for rsqrt_sum_square / rsqrt_mean_square")
+	seed := fs.Uint64("seed", 1, "Deterministic PRNG seed")
+	outDir := fs.String("out-dir", "", "Output directory")
+	asJSON := fs.Bool("json", false, "Emit JSON summary")
+
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	if *opName == "" || *h <= 0 || *w <= 0 || *c <= 0 || *axesStr == "" || *outDir == "" {
+		fmt.Fprintln(stderr, "error: --op, --h, --w, --c, --axes, and --out-dir are required")
+		return 1
+	}
+	rc, rh, rw, err := ref.ParseReduceAxes(*axesStr)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+
+	opLow := strings.ToLower(*opName)
+	rng := rand.New(rand.NewPCG(*seed, *seed^0x94d049bb133111eb))
+	x, err := ref.NewTensor(1, *c, *h, *w)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	for i := range x.Data {
+		var v float64
+		if opLow == "inv_sum" {
+			v = 0.25 + rng.Float64()*1.5
+		} else {
+			v = rng.Float64()*2.0 - 1.0
+		}
+		x.Data[i] = fp16.FromFloat64(v)
+	}
+
+	y, err := ref.EvalReduce(x, ref.ReduceSpec{
+		Op:      opLow,
+		ReduceC: rc,
+		ReduceH: rh,
+		ReduceW: rw,
+		Eps:     *eps,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+
+	inBuf, err := packTensor64B(x)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: pack input: %v\n", err)
+		return 1
+	}
+	expBuf, err := packTensor64B(y)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: pack expected: %v\n", err)
+		return 1
+	}
+	if err := os.MkdirAll(*outDir, 0o755); err != nil {
+		fmt.Fprintf(stderr, "error: create out-dir: %v\n", err)
+		return 1
+	}
+	if err := os.WriteFile(filepath.Join(*outDir, "input.bin"), inBuf, 0o644); err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	if err := os.WriteFile(filepath.Join(*outDir, "expected_f64.bin"), expBuf, 0o644); err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+
+	summary := map[string]any{
+		"op":        opLow,
+		"axes":      strings.ToLower(*axesStr),
+		"eps":       *eps,
+		"in_shape":  []int{1, *c, *h, *w},
+		"out_shape": []int{y.N, y.C, y.H, y.W},
+		"in_bytes":  len(inBuf),
+		"out_bytes": len(expBuf),
+		"seed":      *seed,
+		"out_dir":   *outDir,
+	}
+	if *asJSON {
+		raw, _ := json.MarshalIndent(summary, "", "  ")
+		fmt.Fprintln(stdout, string(raw))
+	} else {
+		fmt.Fprintf(stdout, "generated reduce %s axes=%s (%dx%dx%d -> %dx%dx%d, in=%dB, out=%dB) in %s\n",
+			opLow, strings.ToLower(*axesStr), *c, *h, *w, y.C, y.H, y.W, len(inBuf), len(expBuf), *outDir)
+	}
+	return 0
+}
+
 func packTight64Surface(t ref.Tensor) ([]byte, int, int, int, error) {
 	rowStride := ref.AlignUp(2*t.W, 64)
 	planeStride := t.H * rowStride
@@ -1590,6 +1802,53 @@ func cmdGenGraph(args []string, stdout, stderr io.Writer) int {
 				return 1
 			}
 			shapes[nd.ID] = inD
+
+		case "max_pool", "avg_pool":
+			if len(nd.Inputs) != 1 {
+				fmt.Fprintf(stderr, "error: node %q (%s): expected 1 input\n", nd.ID, op)
+				return 1
+			}
+			inD, ok := shapes[nd.Inputs[0]]
+			if !ok {
+				fmt.Fprintf(stderr, "error: node %q: unknown input %q\n", nd.ID, nd.Inputs[0])
+				return 1
+			}
+			oh, ow, _, _, _, _, err := ref.PoolGeometry(inD.h, inD.w, ref.PoolSpec{
+				Op: op, KH: nd.KH, KW: nd.KW, SH: nd.SH, SW: nd.SW,
+				Pad: nd.Pad, PT: nd.PT, PB: nd.PB, PL: nd.PL, PR: nd.PR,
+			})
+			if err != nil {
+				fmt.Fprintf(stderr, "error: node %q: %v\n", nd.ID, err)
+				return 1
+			}
+			shapes[nd.ID] = dims3{inD.c, oh, ow}
+
+		case "reduce":
+			if len(nd.Inputs) != 1 {
+				fmt.Fprintf(stderr, "error: node %q (reduce): expected 1 input\n", nd.ID)
+				return 1
+			}
+			inD, ok := shapes[nd.Inputs[0]]
+			if !ok {
+				fmt.Fprintf(stderr, "error: node %q: unknown input %q\n", nd.ID, nd.Inputs[0])
+				return 1
+			}
+			rc, rh, rw, err := ref.ParseReduceAxes(nd.Axes)
+			if err != nil {
+				fmt.Fprintf(stderr, "error: node %q: %v\n", nd.ID, err)
+				return 1
+			}
+			oc, oh, ow := inD.c, inD.h, inD.w
+			if rc {
+				oc = 1
+			}
+			if rh {
+				oh = 1
+			}
+			if rw {
+				ow = 1
+			}
+			shapes[nd.ID] = dims3{oc, oh, ow}
 
 		default:
 			fmt.Fprintf(stderr, "error: node %q: unsupported op %q\n", nd.ID, nd.Op)
