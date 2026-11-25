@@ -6,7 +6,7 @@ import (
 	"math/rand/v2"
 	"testing"
 
-	"github.com/niteria/vane/internal/fp16"
+	"github.com/aurora-silicon/vane/internal/fp16"
 )
 
 func TestPeUnaryChainAndBinaryBroadcast(t *testing.T) {

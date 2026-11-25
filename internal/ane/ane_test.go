@@ -3,6 +3,7 @@ package ane
 import (
 	"bytes"
 	"errors"
+	"math"
 	"syscall"
 	"testing"
 	"unsafe"
@@ -166,5 +167,91 @@ func TestLoadProgramRejectsZeroSurfaceSize(t *testing.T) {
 	}
 	if _, err := LoadProgram(tr, fd, []byte{1, 2, 3, 4}, secs); err == nil {
 		t.Fatalf("expected LoadProgram to reject zero SurfaceSize[1]")
+	}
+}
+
+func TestComputeLatencyStatsAndWarmup(t *testing.T) {
+	approxEq := func(a, b float64) bool { return math.Abs(a-b) < 1e-9 }
+
+	// Single sample
+	mn, md, p95, mean := ComputeLatencyStats([]float64{4.25})
+	if !approxEq(mn, 4.25) || !approxEq(md, 4.25) || !approxEq(p95, 4.25) || !approxEq(mean, 4.25) {
+		t.Fatalf("single sample stats mismatch: min=%v med=%v p95=%v mean=%v", mn, md, p95, mean)
+	}
+
+	// Even count (unsorted input): [10, 2, 8, 4] -> sorted [2, 4, 8, 10]
+	// min=2, median=6, p95 at pos=0.95*3=2.85 -> 8 + 0.85*(10-8) = 9.7, mean=6
+	mn, md, p95, mean = ComputeLatencyStats([]float64{10, 2, 8, 4})
+	if !approxEq(mn, 2.0) || !approxEq(md, 6.0) || !approxEq(p95, 9.7) || !approxEq(mean, 6.0) {
+		t.Fatalf("even sample stats mismatch: min=%v med=%v p95=%v mean=%v", mn, md, p95, mean)
+	}
+
+	// Odd count 1..20 (21 values: 1..21) -> min=1, median=11, p95 at pos=0.95*20=19 -> 20, mean=11
+	vals := make([]float64, 21)
+	for i := range vals {
+		vals[i] = float64(21 - i)
+	}
+	mn, md, p95, mean = ComputeLatencyStats(vals)
+	if !approxEq(mn, 1.0) || !approxEq(md, 11.0) || !approxEq(p95, 20.0) || !approxEq(mean, 11.0) {
+		t.Fatalf("21-sample stats mismatch: min=%v med=%v p95=%v mean=%v", mn, md, p95, mean)
+	}
+
+	// Warmup executes warmup+runs total calls, checks determinism on warmup too, and records only timed runs
+	calls := 0
+	tr := NewMockTransport(map[string]MockDeviceSpec{
+		"/dev/accel/accel0": {ABIVersion: ABIV3, ChipFamily: ChipH17},
+	}, func(inputs [][]byte, _ int) []byte {
+		calls++
+		cp := make([]byte, len(inputs[0]))
+		copy(cp, inputs[0])
+		return cp
+	})
+	fd, caps, err := DiscoverDevice(tr, "", ChipH17)
+	if err != nil {
+		t.Fatalf("DiscoverDevice: %v", err)
+	}
+	defer tr.Close(fd)
+	loaded := LoadedProgram{
+		SurfaceCount:      2,
+		SurfaceSizes:      []uint64{64, 64},
+		SurfaceDirections: []uint32{1, 2},
+	}
+	tr.openFDs[fd].loaded = &loaded
+	tr.openFDs[fd].surfaces = [][]byte{make([]byte, PageSize16K), make([]byte, PageSize16K)}
+
+	inData := make([]byte, 64)
+	inData[0] = 0x42
+	_, rep, err := ExecuteProgram(tr, fd, caps, loaded, [][]byte{inData}, ExecOptions{Runs: 5, Warmup: 3})
+	if err != nil {
+		t.Fatalf("ExecuteProgram with warmup failed: %v", err)
+	}
+	if calls != 8 {
+		t.Fatalf("expected 8 total executions (3 warmup + 5 timed), got %d", calls)
+	}
+	if rep.Runs != 5 || rep.Warmup != 3 || len(rep.LatenciesMS) != 5 {
+		t.Fatalf("unexpected warmup report counts: runs=%d warmup=%d len(lat)=%d", rep.Runs, rep.Warmup, len(rep.LatenciesMS))
+	}
+	if !(rep.MinMS <= rep.MedianMS && rep.MedianMS <= rep.P95MS) {
+		t.Fatalf("latency ordering violated: min=%v med=%v p95=%v", rep.MinMS, rep.MedianMS, rep.P95MS)
+	}
+
+	// Non-determinism between a warmup run and a timed run must fail
+	badCalls := 0
+	tr.ComputeFn = func(inputs [][]byte, _ int) []byte {
+		badCalls++
+		cp := make([]byte, len(inputs[0]))
+		copy(cp, inputs[0])
+		if badCalls == 1 {
+			cp[0] ^= 0x01 // corrupt warmup run 1
+		}
+		return cp
+	}
+	if _, _, err := ExecuteProgram(tr, fd, caps, loaded, [][]byte{inData}, ExecOptions{Runs: 2, Warmup: 1}); err == nil {
+		t.Fatalf("expected non-determinism between warmup and timed run to fail")
+	}
+
+	// Negative warmup rejected
+	if _, _, err := ExecuteProgram(tr, fd, caps, loaded, [][]byte{inData}, ExecOptions{Runs: 1, Warmup: -1}); err == nil {
+		t.Fatalf("expected negative warmup to be rejected")
 	}
 }

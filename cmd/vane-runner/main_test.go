@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,9 +13,9 @@ import (
 	"syscall"
 	"testing"
 
-	"github.com/niteria/vane/internal/ane"
-	"github.com/niteria/vane/internal/fp16"
-	"github.com/niteria/vane/internal/ref"
+	"github.com/aurora-silicon/vane/internal/ane"
+	"github.com/aurora-silicon/vane/internal/fp16"
+	"github.com/aurora-silicon/vane/internal/ref"
 )
 
 func findVaneBin(t *testing.T) string {
@@ -1202,5 +1203,243 @@ func TestGraphCliValidationGuards(t *testing.T) {
 	outBytes, err := cmd.CombinedOutput()
 	if err == nil || !strings.Contains(string(outBytes), "overflows finite fp16") {
 		t.Fatalf("expected compile-graph fp16 overflow error, got err=%v output=%s", err, string(outBytes))
+	}
+}
+
+func TestRunWarmupAndLatencyStatsCLI(t *testing.T) {
+	vaneBin := findVaneBin(t)
+	tmp := t.TempDir()
+	demoDir := filepath.Join(tmp, "demo_warmup")
+	runVane(t, vaneBin, "emit-demo", "--target", "h17", "--out-dir", demoDir)
+
+	var calls int
+	tr := ane.NewMockTransport(map[string]ane.MockDeviceSpec{
+		"/dev/accel/accel0": {ABIVersion: ane.ABIV3, ChipFamily: ane.ChipH17},
+	}, func(inputs [][]byte, _ int) []byte {
+		calls++
+		cp := make([]byte, len(inputs[0]))
+		copy(cp, inputs[0])
+		return cp
+	})
+
+	// JSON output includes warmup, min_ms, median_ms, p95_ms, mean_ms and exact timed count
+	var stdout, stderr bytes.Buffer
+	rc := runCLI([]string{
+		"run",
+		"--hwx", filepath.Join(demoDir, "program.hwx"),
+		"--sections-dir", demoDir,
+		"--warmup", "2",
+		"--runs", "4",
+		"--json",
+	}, tr, &stdout, &stderr)
+	if rc != 0 {
+		t.Fatalf("run --warmup 2 --runs 4 --json failed rc=%d stderr=%s", rc, stderr.String())
+	}
+	if calls != 6 {
+		t.Fatalf("expected 6 total mock calls (2 warmup + 4 timed), got %d", calls)
+	}
+	var rep ane.RunReport
+	if err := json.Unmarshal(stdout.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal RunReport: %v", err)
+	}
+	if rep.Warmup != 2 || rep.Runs != 4 || len(rep.LatenciesMS) != 4 {
+		t.Fatalf("unexpected report counts: warmup=%d runs=%d len(latencies)=%d", rep.Warmup, rep.Runs, len(rep.LatenciesMS))
+	}
+	if rep.MinMS > rep.MedianMS || rep.MedianMS > rep.P95MS {
+		t.Fatalf("unexpected stats ordering: min=%v median=%v p95=%v", rep.MinMS, rep.MedianMS, rep.P95MS)
+	}
+
+	// Human-readable output prints warmup=, min_ms=, median_ms=, p95_ms=, mean_ms=
+	stdout.Reset()
+	stderr.Reset()
+	rc = runCLI([]string{
+		"run",
+		"--hwx", filepath.Join(demoDir, "program.hwx"),
+		"--sections-dir", demoDir,
+		"--warmup", "1",
+		"--runs", "3",
+	}, tr, &stdout, &stderr)
+	if rc != 0 {
+		t.Fatalf("run text output failed rc=%d stderr=%s", rc, stderr.String())
+	}
+	txt := stdout.String()
+	for _, want := range []string{"warmup=1", "min_ms=", "median_ms=", "p95_ms=", "mean_ms="} {
+		if !strings.Contains(txt, want) {
+			t.Fatalf("expected %q in run text output, got: %s", want, txt)
+		}
+	}
+
+	// Negative --warmup rejected cleanly
+	stdout.Reset()
+	stderr.Reset()
+	if rc := runCLI([]string{
+		"run",
+		"--hwx", filepath.Join(demoDir, "program.hwx"),
+		"--warmup", "-1",
+	}, tr, &stdout, &stderr); rc == 0 || !strings.Contains(stderr.String(), "--warmup must be >= 0") {
+		t.Fatalf("expected negative --warmup error, got rc=%d stderr=%s", rc, stderr.String())
+	}
+}
+
+func TestCompileGraphStripHeightCLI(t *testing.T) {
+	vaneBin := findVaneBin(t)
+	tmp := t.TempDir()
+	specFile := filepath.Join(tmp, "graph.json")
+	vecDir := filepath.Join(tmp, "vec")
+	compDirJSON := filepath.Join(tmp, "comp_json")
+	compDirCLI := filepath.Join(tmp, "comp_cli")
+
+	specJSON := `{
+		"target": "h17",
+		"placement": "auto",
+		"strip_height": 8,
+		"inputs": [{"name": "x", "c": 8, "h": 20, "w": 32}],
+		"nodes": [
+			{"id": "c0", "op": "conv3x3", "mode": "dense", "inputs": ["x"], "cout": 8, "stride": 1, "pad": "same", "relu": true},
+			{"id": "c1", "op": "conv3x3", "mode": "dense", "inputs": ["c0"], "cout": 8, "stride": 1, "pad": "same", "relu": true},
+			{"id": "c2", "op": "conv1x1", "inputs": ["c1"], "cout": 8}
+		]
+	}`
+	if err := os.WriteFile(specFile, []byte(specJSON), 0o644); err != nil {
+		t.Fatalf("write spec: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+	if rc := runCLI([]string{"gen-graph", "--spec", specFile, "--seed", "901", "--out-dir", vecDir, "--json"}, nil, &stdout, &stderr); rc != 0 {
+		t.Fatalf("gen-graph failed rc=%d stderr=%s", rc, stderr.String())
+	}
+
+	resolvedPath := filepath.Join(vecDir, "graph_resolved.json")
+
+	type stripManifest struct {
+		TaskCount   int `json:"task_count"`
+		StripCount  int `json:"strip_count"`
+		StripHeight int `json:"strip_height"`
+	}
+	readStripManifest := func(dir string) stripManifest {
+		t.Helper()
+		mRaw, err := os.ReadFile(filepath.Join(dir, "manifest.json"))
+		if err != nil {
+			t.Fatalf("read manifest in %s: %v", dir, err)
+		}
+		var man stripManifest
+		if err := json.Unmarshal(mRaw, &man); err != nil {
+			t.Fatalf("parse manifest in %s: %v", dir, err)
+		}
+		return man
+	}
+
+	// (a) Compile graph_resolved.json WITHOUT --strip-height CLI flag:
+	//     verifies gen-graph preserved JSON "strip_height": 8 and vane parsed it -> ceil(20/8)=3 strips * 3 nodes = 9 tasks.
+	compJSONOut := runVane(t, vaneBin, "compile-graph",
+		"--spec", resolvedPath,
+		"--out-dir", compDirJSON,
+	)
+	if !strings.Contains(compJSONOut, "strip_count=3, strip_height=8") {
+		t.Fatalf("expected JSON strip_height=8 summary in compile-graph output, got: %s", compJSONOut)
+	}
+	valJSONOut := runVane(t, vaneBin, "validate",
+		"--hwx", filepath.Join(compDirJSON, "program.hwx"),
+		"--sections", compDirJSON,
+		"--check-tasks",
+	)
+	if !strings.Contains(valJSONOut, "status: ok") {
+		t.Fatalf("JSON stripped graph validate failed:\n%s", valJSONOut)
+	}
+	manJSON := readStripManifest(compDirJSON)
+	if manJSON.TaskCount != 9 || manJSON.StripCount != 3 || manJSON.StripHeight != 8 {
+		t.Fatalf("unexpected JSON-stripped manifest: %+v (want tasks=9, strips=3, height=8)", manJSON)
+	}
+
+	// (b) Compile graph_resolved.json WITH CLI --strip-height 6:
+	//     verifies CLI flag overrides JSON strip_height=8 -> ceil(20/6)=4 strips * 3 nodes = 12 tasks.
+	compOut := runVane(t, vaneBin, "compile-graph",
+		"--spec", resolvedPath,
+		"--strip-height", "6",
+		"--out-dir", compDirCLI,
+	)
+	if !strings.Contains(compOut, "strip_count=4, strip_height=6") {
+		t.Fatalf("expected CLI override strip summary in compile-graph output, got: %s", compOut)
+	}
+	valOut := runVane(t, vaneBin, "validate",
+		"--hwx", filepath.Join(compDirCLI, "program.hwx"),
+		"--sections", compDirCLI,
+		"--check-tasks",
+	)
+	if !strings.Contains(valOut, "status: ok") {
+		t.Fatalf("CLI stripped graph validate failed:\n%s", valOut)
+	}
+	manCLI := readStripManifest(compDirCLI)
+	if manCLI.TaskCount != 12 || manCLI.StripCount != 4 || manCLI.StripHeight != 6 {
+		t.Fatalf("unexpected CLI-stripped manifest: %+v (want tasks=12, strips=4, height=6)", manCLI)
+	}
+
+	// (c) JSON "strip_height": "auto" without CLI flag is preserved by gen-graph and accepted by compile-graph.
+	autoSpecFile := filepath.Join(tmp, "graph_auto.json")
+	autoVecDir := filepath.Join(tmp, "vec_auto")
+	autoCompDir := filepath.Join(tmp, "comp_auto")
+	autoSpecJSON := `{
+		"target": "h17",
+		"placement": "auto",
+		"strip_height": "auto",
+		"inputs": [{"name": "x", "c": 8, "h": 20, "w": 32}],
+		"nodes": [
+			{"id": "c0", "op": "conv3x3", "mode": "dense", "inputs": ["x"], "cout": 8, "stride": 1, "pad": "same", "relu": true},
+			{"id": "c1", "op": "conv1x1", "inputs": ["c0"], "cout": 8}
+		]
+	}`
+	if err := os.WriteFile(autoSpecFile, []byte(autoSpecJSON), 0o644); err != nil {
+		t.Fatalf("write auto spec: %v", err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if rc := runCLI([]string{"gen-graph", "--spec", autoSpecFile, "--seed", "902", "--out-dir", autoVecDir, "--json"}, nil, &stdout, &stderr); rc != 0 {
+		t.Fatalf("gen-graph (auto) failed rc=%d stderr=%s", rc, stderr.String())
+	}
+	autoResolvedPath := filepath.Join(autoVecDir, "graph_resolved.json")
+	autoResolvedRaw, err := os.ReadFile(autoResolvedPath)
+	if err != nil {
+		t.Fatalf("read auto graph_resolved.json: %v", err)
+	}
+	if !strings.Contains(string(autoResolvedRaw), `"strip_height": "auto"`) {
+		t.Fatalf("expected gen-graph to preserve \"strip_height\": \"auto\", got:\n%s", string(autoResolvedRaw))
+	}
+	runVane(t, vaneBin, "compile-graph", "--spec", autoResolvedPath, "--out-dir", autoCompDir)
+	valAutoOut := runVane(t, vaneBin, "validate",
+		"--hwx", filepath.Join(autoCompDir, "program.hwx"),
+		"--sections", autoCompDir,
+		"--check-tasks",
+	)
+	if !strings.Contains(valAutoOut, "status: ok") {
+		t.Fatalf("auto-strip graph validate failed:\n%s", valAutoOut)
+	}
+	manAuto := readStripManifest(autoCompDir)
+	if manAuto.TaskCount != 2 || manAuto.StripCount != 1 || manAuto.StripHeight != 0 {
+		t.Fatalf("unexpected auto-strip manifest (small L2-fitting graph): %+v", manAuto)
+	}
+
+	// (d) Invalid JSON "strip_height" values ("bogus" and 0) are rejected cleanly by compile-graph.
+	for _, tc := range []struct {
+		name    string
+		rawVal  string
+		wantErr string
+	}{
+		{"invalid_string", `"bogus"`, "invalid strip_height"},
+		{"zero_height", `0`, "strip_height must be >= 1"},
+	} {
+		badSpec := filepath.Join(tmp, "bad_"+tc.name+".json")
+		badJSON := fmt.Sprintf(`{
+			"target": "h17",
+			"strip_height": %s,
+			"inputs": [{"name": "x", "c": 4, "h": 8, "w": 8}],
+			"nodes": [{"id": "p0", "op": "pe", "pe_op": "abs", "inputs": ["x"]}]
+		}`, tc.rawVal)
+		if err := os.WriteFile(badSpec, []byte(badJSON), 0o644); err != nil {
+			t.Fatalf("write %s spec: %v", tc.name, err)
+		}
+		cmd := exec.Command(vaneBin, "compile-graph", "--spec", badSpec, "--out-dir", filepath.Join(tmp, "out_"+tc.name))
+		outBytes, err := cmd.CombinedOutput()
+		if err == nil || !strings.Contains(string(outBytes), tc.wantErr) {
+			t.Fatalf("case %s: expected compile-graph error containing %q, got err=%v output=%s", tc.name, tc.wantErr, err, string(outBytes))
+		}
 	}
 }

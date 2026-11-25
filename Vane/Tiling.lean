@@ -31,10 +31,11 @@ def parse? : String → Option Conv3x3Mode
 
 end Conv3x3Mode
 
-/-- Padding mode for single-task fp16 3x3 convolution (`same` or `valid`). -/
+/-- Padding mode for single-task and stripped fp16 3x3 convolution (`same`, `valid`, or `strip pt pb`). -/
 inductive PadMode where
   | same
   | valid
+  | strip (padTop padBottom : Nat)
   deriving Repr, BEq, DecidableEq, Inhabited
 
 namespace PadMode
@@ -42,6 +43,7 @@ namespace PadMode
 def name : PadMode → String
   | .same => "same"
   | .valid => "valid"
+  | .strip pt pb => s!"strip({pt},{pb})"
 
 def parse? : String → Option PadMode
   | "same" => some .same
@@ -188,6 +190,9 @@ def outH (sh : ConvSpec) : Nat :=
     match sh.pad with
     | .same => ceilDiv sh.h sh.stride
     | .valid => if sh.h < 3 then 0 else (sh.h - 3) / sh.stride + 1
+    | .strip pt pb =>
+      if sh.stride != 1 || pt > 1 || pb > 1 || sh.h + pt + pb < 3 then 0
+      else sh.h + pt + pb - 2
 
 /-- Output spatial width `Wo`. -/
 def outW (sh : ConvSpec) : Nat :=
@@ -197,8 +202,9 @@ def outW (sh : ConvSpec) : Nat :=
     match sh.pad with
     | .same => ceilDiv sh.w sh.stride
     | .valid => if sh.w < 3 then 0 else (sh.w - 3) / sh.stride + 1
+    | .strip _ _ => if sh.stride != 1 then 0 else sh.w
 
-/-- Top padding `pt` (`0` for 1x1 and `valid`, floor of half total padding for 3x3 `same`). -/
+/-- Top padding `pt` (`0` for 1x1 and `valid`, floor of half total padding for 3x3 `same`, explicit `pt` for `strip`). -/
 def padTop (sh : ConvSpec) : Nat :=
   if sh.kernelSize == 1 then 0
   else
@@ -207,8 +213,9 @@ def padTop (sh : ConvSpec) : Nat :=
     | .same =>
       let ho := sh.outH
       if ho == 0 then 0 else ((ho - 1) * sh.stride + 3 - sh.h) / 2
+    | .strip pt _ => pt
 
-/-- Left padding `pl` (`0` for 1x1 and `valid`, floor of half total padding for 3x3 `same`). -/
+/-- Left padding `pl` (`0` for 1x1 and `valid`, floor of half total padding for 3x3 `same`, `1` for `strip`). -/
 def padLeft (sh : ConvSpec) : Nat :=
   if sh.kernelSize == 1 then 0
   else
@@ -217,6 +224,7 @@ def padLeft (sh : ConvSpec) : Nat :=
     | .same =>
       let wo := sh.outW
       if wo == 0 then 0 else ((wo - 1) * sh.stride + 3 - sh.w) / 2
+    | .strip _ _ => 1
 
 /-- Phase-rounded kernel extent `rk` (`1` for 1x1, `align_up(3, stride)` for 3x3). -/
 def rk (sh : ConvSpec) : Nat :=
@@ -422,8 +430,18 @@ def validateConvShape (sh : ConvSpec) : Except String Unit := do
       throw s!"invalid stride={sh.stride}: must be 1 or 2"
     if sh.mode == .depthwise && sh.cin != sh.cout then
       throw s!"invalid depthwise shape: Cin={sh.cin} != Cout={sh.cout}"
-    if sh.pad == .valid && (sh.h < 3 || sh.w < 3) then
-      throw s!"invalid valid-padded 3x3 shape ({sh.h}x{sh.w}): requires H >= 3 and W >= 3"
+    match sh.pad with
+    | .valid =>
+      if sh.h < 3 || sh.w < 3 then
+        throw s!"invalid valid-padded 3x3 shape ({sh.h}x{sh.w}): requires H >= 3 and W >= 3"
+    | .strip pt pb =>
+      if sh.stride != 1 then
+        throw s!"invalid strip-padded 3x3 stride={sh.stride}: requires stride=1"
+      if pt > 1 || pb > 1 then
+        throw s!"invalid strip padding (pt={pt}, pb={pb}): requires pt <= 1 and pb <= 1"
+      if sh.h + pt + pb < 3 then
+        throw s!"invalid strip-padded 3x3 height H={sh.h} with (pt={pt}, pb={pb}): requires H + pt + pb >= 3"
+    | .same => pure ()
     if sh.outH == 0 || sh.outW == 0 then
       throw s!"invalid 3x3 output shape ({sh.outH}x{sh.outW}): Ho and Wo must be >= 1"
   pure ()

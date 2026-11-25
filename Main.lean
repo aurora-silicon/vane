@@ -35,7 +35,7 @@ private def usage : String :=
   "                   --h <H> --w <W> --c <C>\n" ++
   "                   [--alpha F] [--beta F] [--lo F] [--hi F] [--eps F] [--scalar F]\n" ++
   "                   --out-dir <dir>\n" ++
-  "  vane compile-graph --spec <graph.json> --out-dir <dir>\n"
+  "  vane compile-graph --spec <graph.json> [--strip-height <off|auto|N>] --out-dir <dir>\n"
 
 private def requireArgValue (flag : String) (rest : List String) : Except String (String × List String) :=
   match rest with
@@ -1452,6 +1452,8 @@ private def renderGraphManifestJson (compiled : CompiledGraph) : String :=
   s!"  \"kernel_bytes\": {compiled.kernelBytes},\n" ++
   s!"  \"scratch_bytes\": {compiled.scratchBytes},\n" ++
   s!"  \"l2_peak_bytes\": {compiled.l2PeakBytes},\n" ++
+  s!"  \"strip_count\": {compiled.stripCount},\n" ++
+  s!"  \"strip_height\": {compiled.stripHeight},\n" ++
   "  \"nodes\": [\n" ++
   String.intercalate ",\n" nodeItems ++ "\n" ++
   "  ],\n" ++
@@ -1463,6 +1465,7 @@ private def renderGraphManifestJson (compiled : CompiledGraph) : String :=
 private def cmdCompileGraph (args : List String) : IO UInt32 := do
   let mut specPath : Option String := none
   let mut outDir : Option String := none
+  let mut stripFlag : Option StripMode := none
   let mut rest := args
   while !rest.isEmpty do
     match rest with
@@ -1473,6 +1476,13 @@ private def cmdCompileGraph (args : List String) : IO UInt32 := do
     | "--out-dir" :: tl =>
       match requireArgValue "--out-dir" tl with
       | .ok (v, tl') => outDir := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--strip-height" :: tl =>
+      match requireArgValue "--strip-height" tl with
+      | .ok (v, tl') =>
+        match StripMode.parse? v with
+        | some m => stripFlag := some m; rest := tl'
+        | none => IO.eprintln s!"error: invalid --strip-height '{v}' (expected off, auto, or positive integer)"; return 1
       | .error e => IO.eprintln s!"error: {e}"; return 1
     | flag :: _ =>
       IO.eprintln s!"error: unknown argument '{flag}' for compile-graph"
@@ -1515,6 +1525,25 @@ private def cmdCompileGraph (args : List String) : IO UInt32 := do
         | none => throw s!"unknown placement '{pStr}' (expected auto, l2, or dram)") with
     | .ok p => pure p
     | .error e => IO.eprintln s!"error: {e}"; return 1
+
+  let jsonStripMode : Option StripMode ← match ((do
+      match jsonObjField? root "strip_height" with
+      | none => pure none
+      | some v =>
+        match v.getStr? with
+        | .ok s =>
+          match StripMode.parse? s with
+          | some m => pure (some m)
+          | none => throw s!"invalid strip_height '{s}' (expected \"off\", \"auto\", or positive integer)"
+        | .error _ =>
+          match v.getNat? with
+          | .ok n =>
+            if n == 0 then throw "strip_height must be >= 1"
+            else pure (some (.fixed n))
+          | .error e => throw s!"invalid strip_height field ({e})") : Except String (Option StripMode)) with
+    | .ok m => pure m
+    | .error e => IO.eprintln s!"error: {e}"; return 1
+  let stripMode := stripFlag.getD (jsonStripMode.getD .off)
 
   let inputsArr ← match root.getObjValAs? (Array Json) "inputs" with
     | .ok a => pure a
@@ -1730,6 +1759,7 @@ private def cmdCompileGraph (args : List String) : IO UInt32 := do
     inputs := graphInputs
     nodes := graphNodes
     defaultPlacement := defaultPlacement
+    stripMode := stripMode
   }
 
   let compiled ← match compileGraph graphSpec with
@@ -1750,8 +1780,12 @@ private def cmdCompileGraph (args : List String) : IO UInt32 := do
     IO.eprintln s!"error: failed to write graph outputs to '{dirStr}': {e}"
     return 1
 
+  let stripInfo :=
+    if compiled.stripCount > 1 || compiled.stripHeight > 0 then
+      s!", strip_count={compiled.stripCount}, strip_height={compiled.stripHeight}"
+    else ""
   IO.println (
-    s!"compiled {target.name} graph ({compiled.taskCount} tasks, placement={defaultPlacement.name}) " ++
+    s!"compiled {target.name} graph ({compiled.taskCount} tasks, placement={defaultPlacement.name}{stripInfo}) " ++
     s!"to {dirStr}: hwx={compiled.hwx.size}B kernel={compiled.kernelBytes}B " ++
     s!"scratch={compiled.scratchBytes}B l2_peak={compiled.l2PeakBytes}B"
   )
