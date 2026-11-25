@@ -232,10 +232,11 @@ func (n GraphNodeSpec) ResolveConvAct() (ActSpec, bool, error) {
 
 // GraphSpec is the top-level multi-task DAG JSON specification shared with `vane compile-graph`.
 type GraphSpec struct {
-	Target    string           `json:"target"`
-	Placement string           `json:"placement,omitempty"`
-	Inputs    []GraphInputSpec `json:"inputs"`
-	Nodes     []GraphNodeSpec  `json:"nodes"`
+	Target      string           `json:"target"`
+	Placement   string           `json:"placement,omitempty"`
+	StripHeight json.RawMessage  `json:"strip_height,omitempty"`
+	Inputs      []GraphInputSpec `json:"inputs"`
+	Nodes       []GraphNodeSpec  `json:"nodes"`
 }
 
 // GraphNodeWeights supplies fp16 weights and optional fp16 bias for a conv node.

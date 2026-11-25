@@ -1743,7 +1743,7 @@ theorem reachB_iff (step : Nat → Nat → Bool)
   reachB_aux_iff step hFwd n n (Nat.le_refl n) i hi k
 
 -- ============================================================================
--- 9. Milestone 5A spatial H-strip padding & surface row-window safety theorems
+-- 10. Milestone 5A spatial H-strip padding & surface row-window safety theorems
 -- ============================================================================
 
 /-- For stride-1 3x3 asymmetric vertical strip padding `(pt, pb)` with `pt, pb <= 1`

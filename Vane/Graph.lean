@@ -2565,8 +2565,9 @@ private def compileStrippedAtHeight
         | none => throw s!"internal error: stripped task {i} missing from both L2 and DRAM allocations"
 
   let outNode := vNodes[m - 1]!
+  let effStripHeight := min hOut hFull
   finalizeCompiledGraph spec shortNames outNode.outDims outNode.id
-    flatNodes flatPlans allPlacedL2 overallPeakL2 nodeLocs scratchBytes sCount hOut
+    flatNodes flatPlans allPlacedL2 overallPeakL2 nodeLocs scratchBytes sCount effStripHeight
 
 private def isTextSizeExceededError (msg : String) : Bool :=
   (msg.splitOn "task stream size").length > 1

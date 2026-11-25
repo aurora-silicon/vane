@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1285,7 +1286,8 @@ func TestCompileGraphStripHeightCLI(t *testing.T) {
 	tmp := t.TempDir()
 	specFile := filepath.Join(tmp, "graph.json")
 	vecDir := filepath.Join(tmp, "vec")
-	compDir := filepath.Join(tmp, "comp")
+	compDirJSON := filepath.Join(tmp, "comp_json")
+	compDirCLI := filepath.Join(tmp, "comp_cli")
 
 	specJSON := `{
 		"target": "h17",
@@ -1306,38 +1308,138 @@ func TestCompileGraphStripHeightCLI(t *testing.T) {
 		t.Fatalf("gen-graph failed rc=%d stderr=%s", rc, stderr.String())
 	}
 
-	// CLI --strip-height 6 overrides JSON strip_height=8 -> ceil(20/6)=4 strips * 3 nodes = 12 tasks
-	compOut := runVane(t, vaneBin, "compile-graph",
-		"--spec", filepath.Join(vecDir, "graph_resolved.json"),
-		"--strip-height", "6",
-		"--out-dir", compDir,
-	)
-	if !strings.Contains(compOut, "strip_count=4, strip_height=6") {
-		t.Fatalf("expected strip summary in compile-graph output, got: %s", compOut)
-	}
+	resolvedPath := filepath.Join(vecDir, "graph_resolved.json")
 
-	valOut := runVane(t, vaneBin, "validate",
-		"--hwx", filepath.Join(compDir, "program.hwx"),
-		"--sections", compDir,
-		"--check-tasks",
-	)
-	if !strings.Contains(valOut, "status: ok") {
-		t.Fatalf("stripped graph validate failed:\n%s", valOut)
-	}
-
-	var man struct {
+	type stripManifest struct {
 		TaskCount   int `json:"task_count"`
 		StripCount  int `json:"strip_count"`
 		StripHeight int `json:"strip_height"`
 	}
-	mRaw, err := os.ReadFile(filepath.Join(compDir, "manifest.json"))
+	readStripManifest := func(dir string) stripManifest {
+		t.Helper()
+		mRaw, err := os.ReadFile(filepath.Join(dir, "manifest.json"))
+		if err != nil {
+			t.Fatalf("read manifest in %s: %v", dir, err)
+		}
+		var man stripManifest
+		if err := json.Unmarshal(mRaw, &man); err != nil {
+			t.Fatalf("parse manifest in %s: %v", dir, err)
+		}
+		return man
+	}
+
+	// (a) Compile graph_resolved.json WITHOUT --strip-height CLI flag:
+	//     verifies gen-graph preserved JSON "strip_height": 8 and vane parsed it -> ceil(20/8)=3 strips * 3 nodes = 9 tasks.
+	compJSONOut := runVane(t, vaneBin, "compile-graph",
+		"--spec", resolvedPath,
+		"--out-dir", compDirJSON,
+	)
+	if !strings.Contains(compJSONOut, "strip_count=3, strip_height=8") {
+		t.Fatalf("expected JSON strip_height=8 summary in compile-graph output, got: %s", compJSONOut)
+	}
+	valJSONOut := runVane(t, vaneBin, "validate",
+		"--hwx", filepath.Join(compDirJSON, "program.hwx"),
+		"--sections", compDirJSON,
+		"--check-tasks",
+	)
+	if !strings.Contains(valJSONOut, "status: ok") {
+		t.Fatalf("JSON stripped graph validate failed:\n%s", valJSONOut)
+	}
+	manJSON := readStripManifest(compDirJSON)
+	if manJSON.TaskCount != 9 || manJSON.StripCount != 3 || manJSON.StripHeight != 8 {
+		t.Fatalf("unexpected JSON-stripped manifest: %+v (want tasks=9, strips=3, height=8)", manJSON)
+	}
+
+	// (b) Compile graph_resolved.json WITH CLI --strip-height 6:
+	//     verifies CLI flag overrides JSON strip_height=8 -> ceil(20/6)=4 strips * 3 nodes = 12 tasks.
+	compOut := runVane(t, vaneBin, "compile-graph",
+		"--spec", resolvedPath,
+		"--strip-height", "6",
+		"--out-dir", compDirCLI,
+	)
+	if !strings.Contains(compOut, "strip_count=4, strip_height=6") {
+		t.Fatalf("expected CLI override strip summary in compile-graph output, got: %s", compOut)
+	}
+	valOut := runVane(t, vaneBin, "validate",
+		"--hwx", filepath.Join(compDirCLI, "program.hwx"),
+		"--sections", compDirCLI,
+		"--check-tasks",
+	)
+	if !strings.Contains(valOut, "status: ok") {
+		t.Fatalf("CLI stripped graph validate failed:\n%s", valOut)
+	}
+	manCLI := readStripManifest(compDirCLI)
+	if manCLI.TaskCount != 12 || manCLI.StripCount != 4 || manCLI.StripHeight != 6 {
+		t.Fatalf("unexpected CLI-stripped manifest: %+v (want tasks=12, strips=4, height=6)", manCLI)
+	}
+
+	// (c) JSON "strip_height": "auto" without CLI flag is preserved by gen-graph and accepted by compile-graph.
+	autoSpecFile := filepath.Join(tmp, "graph_auto.json")
+	autoVecDir := filepath.Join(tmp, "vec_auto")
+	autoCompDir := filepath.Join(tmp, "comp_auto")
+	autoSpecJSON := `{
+		"target": "h17",
+		"placement": "auto",
+		"strip_height": "auto",
+		"inputs": [{"name": "x", "c": 8, "h": 20, "w": 32}],
+		"nodes": [
+			{"id": "c0", "op": "conv3x3", "mode": "dense", "inputs": ["x"], "cout": 8, "stride": 1, "pad": "same", "relu": true},
+			{"id": "c1", "op": "conv1x1", "inputs": ["c0"], "cout": 8}
+		]
+	}`
+	if err := os.WriteFile(autoSpecFile, []byte(autoSpecJSON), 0o644); err != nil {
+		t.Fatalf("write auto spec: %v", err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if rc := runCLI([]string{"gen-graph", "--spec", autoSpecFile, "--seed", "902", "--out-dir", autoVecDir, "--json"}, nil, &stdout, &stderr); rc != 0 {
+		t.Fatalf("gen-graph (auto) failed rc=%d stderr=%s", rc, stderr.String())
+	}
+	autoResolvedPath := filepath.Join(autoVecDir, "graph_resolved.json")
+	autoResolvedRaw, err := os.ReadFile(autoResolvedPath)
 	if err != nil {
-		t.Fatalf("read manifest: %v", err)
+		t.Fatalf("read auto graph_resolved.json: %v", err)
 	}
-	if err := json.Unmarshal(mRaw, &man); err != nil {
-		t.Fatalf("parse manifest: %v", err)
+	if !strings.Contains(string(autoResolvedRaw), `"strip_height": "auto"`) {
+		t.Fatalf("expected gen-graph to preserve \"strip_height\": \"auto\", got:\n%s", string(autoResolvedRaw))
 	}
-	if man.TaskCount != 12 || man.StripCount != 4 || man.StripHeight != 6 {
-		t.Fatalf("unexpected stripped manifest: %+v", man)
+	runVane(t, vaneBin, "compile-graph", "--spec", autoResolvedPath, "--out-dir", autoCompDir)
+	valAutoOut := runVane(t, vaneBin, "validate",
+		"--hwx", filepath.Join(autoCompDir, "program.hwx"),
+		"--sections", autoCompDir,
+		"--check-tasks",
+	)
+	if !strings.Contains(valAutoOut, "status: ok") {
+		t.Fatalf("auto-strip graph validate failed:\n%s", valAutoOut)
+	}
+	manAuto := readStripManifest(autoCompDir)
+	if manAuto.TaskCount != 2 || manAuto.StripCount != 1 || manAuto.StripHeight != 0 {
+		t.Fatalf("unexpected auto-strip manifest (small L2-fitting graph): %+v", manAuto)
+	}
+
+	// (d) Invalid JSON "strip_height" values ("bogus" and 0) are rejected cleanly by compile-graph.
+	for _, tc := range []struct {
+		name    string
+		rawVal  string
+		wantErr string
+	}{
+		{"invalid_string", `"bogus"`, "invalid strip_height"},
+		{"zero_height", `0`, "strip_height must be >= 1"},
+	} {
+		badSpec := filepath.Join(tmp, "bad_"+tc.name+".json")
+		badJSON := fmt.Sprintf(`{
+			"target": "h17",
+			"strip_height": %s,
+			"inputs": [{"name": "x", "c": 4, "h": 8, "w": 8}],
+			"nodes": [{"id": "p0", "op": "pe", "pe_op": "abs", "inputs": ["x"]}]
+		}`, tc.rawVal)
+		if err := os.WriteFile(badSpec, []byte(badJSON), 0o644); err != nil {
+			t.Fatalf("write %s spec: %v", tc.name, err)
+		}
+		cmd := exec.Command(vaneBin, "compile-graph", "--spec", badSpec, "--out-dir", filepath.Join(tmp, "out_"+tc.name))
+		outBytes, err := cmd.CombinedOutput()
+		if err == nil || !strings.Contains(string(outBytes), tc.wantErr) {
+			t.Fatalf("case %s: expected compile-graph error containing %q, got err=%v output=%s", tc.name, tc.wantErr, err, string(outBytes))
+		}
 	}
 }

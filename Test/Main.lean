@@ -3932,8 +3932,19 @@ private def runM5aTests : IO (Array TestResult) := do
       ]
     }
     let _ ← verifyM5aGraph single 4
-    if single.stripCount != 1 then
-      throw s!"expected single-strip edge case stripCount=1, got {single.stripCount}"
+    if single.stripCount != 1 || single.stripHeight != 25 then
+      throw s!"expected single-strip edge case stripCount=1 stripHeight=25, got count={single.stripCount} h={single.stripHeight}"
+    -- [N1] Oversized fixed strip height (> H_full) clamps reported stripHeight to H_full
+    let clamped ← Vane.Graph.compileGraph {
+      target := .h17, defaultPlacement := .auto, stripMode := .fixed 100
+      inputs := #[{ name := "x", shape := { c := 8, h := 25, w := 32 } }]
+      nodes := #[
+        { id := "c0", inputs := #["x"], op := .conv3x3 .dense 8 8 1 .same (mkM5aW3x3 8 8 false) none .relu }
+      ]
+    }
+    let _ ← verifyM5aGraph clamped 1
+    if clamped.stripCount != 1 || clamped.stripHeight != 25 then
+      throw s!"expected clamped stripCount=1 stripHeight=25 for fixed 100 on H=25, got count={clamped.stripCount} h={clamped.stripHeight}"
     let _ ← verifyM5aGraph unevenStripped 16
     if unevenStripped.stripCount != 4 || unevenStripped.stripHeight != 8 then
       throw s!"expected 4 strips of height 8, got strips={unevenStripped.stripCount}, h={unevenStripped.stripHeight}"
@@ -4112,6 +4123,51 @@ private def runM5aTests : IO (Array TestResult) := do
     }
     pure ()
   ) "spatial strip fusion ineligible")
+
+  -- 11. [M2] Negative unit tests for validateConvShape / validateConvSafety on illegal PadMode.strip specs
+  let dummyTiling : Tiling := {
+    logNE := 4, f := 4, fat := 0, ocg := 0, shPref := 0, shMax := 0, tileHeight := 1
+  }
+  results := results.push (checkErr "m5a [M2] neg: PadMode.strip(1,0) with stride=2 rejected by validateConvShape" (do
+    validateConvShape { kernelSize := 3, mode := .dense, h := 8, w := 32, cin := 4, cout := 4, stride := 2, pad := .strip 1 0 }
+  ) "requires stride=1")
+
+  results := results.push (checkErr "m5a [M2] neg: PadMode.strip(1,0) with stride=2 rejected by validateConvSafety" (do
+    validateConvSafety .h17 { kernelSize := 3, mode := .dense, h := 8, w := 32, cin := 4, cout := 4, stride := 2, pad := .strip 1 0 } dummyTiling
+  ) "requires stride=1")
+
+  results := results.push (checkErr "m5a [M2] neg: PadMode.strip(2,0) rejected by validateConvShape" (do
+    validateConvShape { kernelSize := 3, mode := .dense, h := 8, w := 32, cin := 4, cout := 4, stride := 1, pad := .strip 2 0 }
+  ) "requires pt <= 1 and pb <= 1")
+
+  results := results.push (checkErr "m5a [M2] neg: PadMode.strip(0,2) rejected by validateConvSafety" (do
+    validateConvSafety .h17 { kernelSize := 3, mode := .dense, h := 8, w := 32, cin := 4, cout := 4, stride := 1, pad := .strip 0 2 } dummyTiling
+  ) "requires pt <= 1 and pb <= 1")
+
+  results := results.push (checkErr "m5a [M2] neg: PadMode.strip(1,0) with h=1 (h+pt+pb=2 < 3) rejected by validateConvShape" (do
+    validateConvShape { kernelSize := 3, mode := .dense, h := 1, w := 32, cin := 4, cout := 4, stride := 1, pad := .strip 1 0 }
+  ) "requires H + pt + pb >= 3")
+
+  results := results.push (checkErr "m5a [M2] neg: PadMode.strip(0,0) with h=2 (h+pt+pb=2 < 3) rejected by validateConvSafety" (do
+    validateConvSafety .h17 { kernelSize := 3, mode := .dense, h := 2, w := 32, cin := 4, cout := 4, stride := 1, pad := .strip 0 0 } dummyTiling
+  ) "requires H + pt + pb >= 3")
+
+  -- 12. [M2] Negative tamper: single-channel (C=1) sub-height surface window with baseOff + extent > cap rejected
+  let baseC1StripConv ← match Vane.Graph.compileGraph {
+      target := .h17, defaultPlacement := .auto, stripMode := .fixed 4
+      inputs := #[{ name := "x", shape := { c := 1, h := 16, w := 32 } }]
+      nodes := #[
+        { id := "c0", inputs := #["x"], op := .conv1x1 1 1 (mkM5aW1x1 1 1 3) none .none }
+      ]
+    } with
+    | .ok g => pure g
+    | .error e => throw (IO.userError s!"baseC1StripConv setup failed: {e}")
+
+  results := results.push (checkErr "m5a [M2] neg: C=1 sub-height surface window baseOff pushed past remaining rows (baseOff+extent > cap) rejected" (do
+    -- Surface is C=1, H_full=16, W=32 -> rowStride=64, span=cap=1024.
+    -- Task 0 reads h=4 rows (extent=256); setting src1BaseLo = 13*64 = 832 gives 832 + 256 = 1088 > 1024.
+    tamperM5aTaskReg baseC1StripConv.hwx baseC1StripConv.info 0 regSrc1BaseLo (13 * 64)
+  ) "exceeds")
 
   pure results
 
