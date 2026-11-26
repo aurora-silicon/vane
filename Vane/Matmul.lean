@@ -139,14 +139,14 @@ def planMatmulScratchTranspose (b rows cols : Nat) : Except String (ViewCopy × 
 private def maxEndOf (rs : List Range) : Nat :=
   rs.foldl (fun acc r => max acc r.hi) 0
 
-/-- Choose a legal tiling and L2 staging placement for a dynamic runtime-kernel `neMatmul` task
-    with `M` output rows, `K` inner dimension, and `N` output columns. -/
+/-- Choose a legal tiling and L2 staging placement for a single dynamic runtime-kernel `neMatmul` task
+    with `1 <= Mi <= 16` output rows, `K` inner dimension, and `N` output columns. -/
 def chooseMatmulTaskPlan
     (target : Target) (m k n : Nat)
     (srcIsL2 resIsL2 : Bool) (occupied : List Range := []) : Except String MatmulTaskPlan := do
-  if m == 0 || m > 2048 || k == 0 || n == 0 || n > 65535 then
-    throw s!"matmul tiling: invalid shape (M={m}, K={k}, N={n})"
-  let f := min 4 (ceilLog2 (min m 16))
+  if m == 0 || m > 16 || k == 0 || n == 0 || n > 65535 then
+    throw s!"matmul tiling: invalid single-task shape (Mi={m}, K={k}, N={n}; Mi must be in 1..16)"
+  let f := ceilLog2 m
   for wantDirect in #[true, false] do
     for shPref in [:5] do
       let stripW := (128 : Nat) >>> shPref
@@ -202,7 +202,8 @@ def chooseMatmulTaskPlan
                 }
   throw s!"no legal {target.name} dynamic matmul tiling fits 2 MiB L2 for (M={m}, K={k}, N={n})"
 
-/-- Lower one dynamic runtime-kernel NE `MatMul` task into a multi-task `TaskDesc`. -/
+/-- Lower one dynamic runtime-kernel NE `MatMul` task (`1 <= m <= 16`, full matrix rows `totalM >= m`)
+    into a multi-task `TaskDesc`. -/
 def buildMatmulTaskMulti
     (target : Target)
     (b m k n : Nat)
@@ -216,7 +217,12 @@ def buildMatmulTaskMulti
     (src1Loc resLoc : MatmulPortLoc)
     (sync : TaskSyncInfo)
     (liveL2Mask : UInt32 := 0)
-    (kernKeepLive : Bool := false) : Except String TaskDesc := do
+    (kernKeepLive : Bool := false)
+    (totalM : Nat := m) : Except String TaskDesc := do
+  if m == 0 || m > 16 then
+    throw s!"matmul task {taskId}: single-task Mi={m} must be in 1..16"
+  if totalM < m then
+    throw s!"matmul task {taskId}: totalM={totalM} < Mi={m}"
   if !f16IsFinite scaleBits then
     throw s!"matmul task {taskId}: scale ({toHex scaleBits.toNat}) must be finite fp16"
   if kernIsScratch && kernProducerTask?.isNone then
@@ -309,7 +315,7 @@ def buildMatmulTaskMulti
   if b > 1 then
     let wBatch ← encodeWord (dim16Layout "BatchN") #[("val", ← natToU32Checked b "BatchN")]
     plain := plain.push { byteAddr := regBatchN, value := wBatch }
-    plain := plain.push { byteAddr := regKernelBatchStride, value := ← natToU32Checked (m * chunkSize) "kernelBatchStride" }
+    plain := plain.push { byteAddr := regKernelBatchStride, value := ← natToU32Checked (totalM * chunkSize) "kernelBatchStride" }
 
   if isDyn then
     let roundSpan := (if m > 1 then m else b) * chunkSize
@@ -404,9 +410,11 @@ def buildMatmulTaskMulti
       { baseByteAddr := regSrc1Dep, barSlot := barSlotConfigZero, values := #[wSrc1Dep] }
     ]
 
-  -- Result (Y in [B, M, 1, N])
+  -- Result (Y in [B, Mi, 1, N] within [B, totalM, 1, N])
   match resLoc with
   | .l2 base =>
+    if totalM > m && b > 1 then
+      throw s!"matmul task {taskId}: row-sliced multi-batch output (B={b}, totalM={totalM} > Mi={m}) must use DRAM/surface"
     let l2Chs := 2 * alignUp n 8
     let l2Batch := m * l2Chs
     plain := plain ++ #[
@@ -438,7 +446,7 @@ def buildMatmulTaskMulti
     if m > 1 then
       plain := plain.push { byteAddr := regResDmaPlaneStride, value := ← natToU32Checked rowBN "resDmaPlaneStride" }
     if b > 1 then
-      plain := plain.push { byteAddr := regResDmaNStride, value := ← natToU32Checked (m * rowBN) "resDmaNStride" }
+      plain := plain.push { byteAddr := regResDmaNStride, value := ← natToU32Checked (totalM * rowBN) "resDmaNStride" }
     let wResDep ← encodeWord resDepLayout #[
       ("code", depCode),
       ("task", taskIdU32),
@@ -486,8 +494,11 @@ def compileMatmul (target : Target) (spec : MatmulSpec) : Except String Compiled
   let bSlot : UInt8 := barSlotFirstSurface + 1
   let ySlot : UInt8 := barSlotFirstSurface + 2
 
+  let numSlices : Nat := ceilDiv spec.m 16
   let totalTasks : Nat :=
-    1 + (if spec.transposeA then 1 else 0) + (if spec.transposeB then 1 else 0)
+    numSlices + (if spec.transposeA then 1 else 0) + (if spec.transposeB then 1 else 0)
+  if totalTasks > 255 then
+    throw s!"matmul: expanded task count {totalTasks} exceeds 8-bit kernelStage limit 255"
 
   let mut tasks : Array TaskDesc := Array.mkEmpty totalTasks
   let mut scratchCursor : Nat := 0
@@ -526,18 +537,33 @@ def compileMatmul (target : Target) (spec : MatmulSpec) : Except String Compiled
     src1DepKind := if spec.b > 1 then 1 else 2
     scratchCursor := scratchCursor + szB
 
-  let mp ← chooseMatmulTaskPlan target spec.m spec.k spec.n false false []
-  peakL2 := max peakL2 mp.l2TaskPeak
-  let mmTid := tasks.size
-  let syncMM : TaskSyncInfo := {
-    src1WaitNe5 := mmTid > 0
-    src1DepKind := src1DepKind
-    src1DepDist := 0
-    hasSrc1Dma := true
-  }
-  let tdMM ← buildMatmulTaskMulti target spec.b spec.m spec.k spec.n spec.scaleBits mp
-    mmTid totalTasks kernSlot kernOff kernIsScratch kernProd? src1Loc (.surface ySlot 0) syncMM 0
-  tasks := tasks.push tdMM
+  let chunkSize := matmulChunkSize spec.k
+  let rowBN := alignUp (2 * spec.n) dmaLineBytes
+  let mut firstPlan? : Option MatmulTaskPlan := none
+  for si in [:numSlices] do
+    let m0 := si * 16
+    let mi := min 16 (spec.m - m0)
+    let mp ← chooseMatmulTaskPlan target mi spec.k spec.n false false []
+    if firstPlan?.isNone then
+      firstPlan? := some mp
+    peakL2 := max peakL2 mp.l2TaskPeak
+    let mmTid := tasks.size
+    -- Every slice anchors srcReadNE via depDist = 0 + HB(bProdTid, mmTid - 1),
+    -- which holds across all slices because src1WaitNe5 = true on every slice task.
+    let syncMM : TaskSyncInfo := {
+      src1WaitNe5 := mmTid > 0
+      src1DepKind := src1DepKind
+      src1DepDist := 0
+      hasSrc1Dma := true
+    }
+    let sliceKernOff := kernOff + m0 * chunkSize
+    let sliceResOff := m0 * rowBN
+    let kernKeepLive := kernIsScratch && (si + 1 < numSlices)
+    let tdMM ← buildMatmulTaskMulti target spec.b mi spec.k spec.n spec.scaleBits mp
+      mmTid totalTasks kernSlot sliceKernOff kernIsScratch kernProd? src1Loc (.surface ySlot sliceResOff)
+      syncMM 0 kernKeepLive spec.m
+    tasks := tasks.push tdMM
+  let firstPlan := firstPlan?.get!
 
   let (aC, aW) := if spec.transposeA then (spec.k, spec.m) else (spec.m, spec.k)
   let (bC, bW) := if spec.transposeB then (spec.n, spec.k) else (spec.k, spec.n)
@@ -563,15 +589,15 @@ def compileMatmul (target : Target) (spec : MatmulSpec) : Except String Compiled
   }
 
   let summary ← verifyHwxTasksSummary emitted.hwx emitted.info (requireKnownTask := true)
-  if summary.neMatmul != 1 || summary.total != totalTasks then
-    throw s!"internal error: verifier checked {summary.neMatmul} matmul / {summary.total} total tasks != 1/{totalTasks}"
+  if summary.neMatmul != numSlices || summary.total != totalTasks then
+    throw s!"internal error: verifier checked {summary.neMatmul} matmul / {summary.total} total tasks != {numSlices}/{totalTasks}"
 
   pure {
     target := target
     spec := spec
     taskCount := totalTasks
-    tiling := mp.tiling
-    direct := mp.direct
+    tiling := firstPlan.tiling
+    direct := firstPlan.direct
     l2PeakBytes := peakL2
     scratchBytes := scratchCursor
     hwx := emitted.hwx

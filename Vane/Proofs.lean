@@ -2478,4 +2478,54 @@ theorem dynKernelBatch_end_le_total (h b m chunkSize : Nat) (hh : h < b) :
   have hmul : (h + 1) * (m * chunkSize) ≤ b * (m * chunkSize) := Nat.mul_le_mul_right _ hhb
   simpa [Nat.add_mul, Nat.one_mul] using hmul
 
+/-- Row-slicing `M` into chunks of at most 16 rows produces valid slice bounds
+    `1 ≤ Mi ≤ 16` and `m0 + Mi ≤ M` for every slice index `si < ceilDiv M 16`. -/
+theorem matmulRowSlice_partition_bounds (m si : Nat) (hsi : si < ceilDiv m 16) :
+    let m0 := si * 16
+    let mi := min 16 (m - m0)
+    1 ≤ mi ∧ mi ≤ 16 ∧ m0 + mi ≤ m := by
+  dsimp only
+  simp [ceilDiv] at hsi
+  omega
+
+/-- Every per-batch interval `[bIdx * (totalM * row) + m0 * row, bIdx * (totalM * row) + (m0 + mi) * row)`
+    of a row slice `(m0, mi)` with `m0 + mi ≤ totalM` lies within `[0, b * (totalM * row))`. -/
+theorem matmulRowSlice_end_le_total (bIdx b m0 mi totalM row : Nat)
+    (hb : bIdx < b) (hslice : m0 + mi ≤ totalM) :
+    bIdx * (totalM * row) + m0 * row + mi * row ≤ b * (totalM * row) := by
+  have h1 : m0 * row + mi * row ≤ totalM * row := by
+    rw [← Nat.add_mul]
+    exact Nat.mul_le_mul_right row hslice
+  have h2 : bIdx * (totalM * row) + totalM * row ≤ b * (totalM * row) :=
+    dynKernelBatch_end_le_total bIdx b totalM row hb
+  omega
+
+/-- Any two disjoint row slices `(m0a, ma)` and `(m0b, mb)` (`m0a + ma ≤ m0b`, `m0b + mb ≤ totalM`)
+    have pairwise disjoint per-batch byte intervals across all batch pairs `(ba, bb)`. -/
+theorem matmulRowSlice_disjoint (ba bb m0a ma m0b mb totalM row : Nat)
+    (hab : m0a + ma ≤ m0b) (hb : m0b + mb ≤ totalM) :
+    let loA := ba * (totalM * row) + m0a * row
+    let hiA := loA + ma * row
+    let loB := bb * (totalM * row) + m0b * row
+    let hiB := loB + mb * row
+    hiA ≤ loB ∨ hiB ≤ loA := by
+  dsimp only
+  by_cases hlt : ba < bb
+  · left
+    have h1 : ba * (totalM * row) + m0a * row + ma * row ≤ bb * (totalM * row) :=
+      matmulRowSlice_end_le_total ba bb m0a ma totalM row hlt (by omega)
+    omega
+  · by_cases heq : ba = bb
+    · left
+      subst heq
+      have h1 : m0a * row + ma * row ≤ m0b * row := by
+        rw [← Nat.add_mul]
+        exact Nat.mul_le_mul_right row hab
+      omega
+    · right
+      have hgt : bb < ba := by omega
+      have h1 : bb * (totalM * row) + m0b * row + mb * row ≤ ba * (totalM * row) :=
+        matmulRowSlice_end_le_total bb ba m0b mb totalM row hgt hb
+      omega
+
 end Vane.Proofs

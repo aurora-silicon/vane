@@ -4401,9 +4401,12 @@ def verifyNeMatmulTaskMulti
   let (taskId, ene, h7, extProd?) ← vVerifyTaskHeaderMatmul target task taskCount prefixMsg
   let logNE := ene - 1
 
-  -- 2. Reject duplicate writes and unmodelled DMA registers
+  -- 2. Reject duplicate writes, unmodelled DMA registers, and Mach-O __KERN_0 relocations on neMatmul
   vCheckNoDuplicateWrites task.writes prefixMsg
   vCheckNoUnmodelledDmaRegs task.writes prefixMsg
+  for w in task.writes do
+    if info.relocPatchOffsets.contains w.payloadOffset.toUInt32 then
+      throw s!"{prefixMsg}: neMatmul register {toHex w.byteAddr} must not carry a Mach-O __KERN_0 relocation"
 
   -- 3. Decode common dimensions, convCfg, TH, neCommon, neTile, targetCfg
   let wWin ← requireDecodedWrite task.writes regWin "Win"
@@ -4435,8 +4438,8 @@ def verifyNeMatmulTaskMulti
     throw s!"{prefixMsg}: neMatmul requires Win == Wout >= 1 (got Win={n}, Wout={wout})"
   if k == 0 || m == 0 || b == 0 then
     throw s!"{prefixMsg}: neMatmul requires B >= 1, M >= 1, K >= 1 (got B={b}, M={m}, K={k})"
-  if m > 2048 then
-    throw s!"{prefixMsg}: neMatmul M={m} exceeds single-task hardware limit 2048"
+  if m > 16 then
+    throw s!"{prefixMsg}: neMatmul ocg=0 task Cout={m} exceeds 16 chunk slots (slice M > 16 into Mi <= 16 tasks)"
   if th != 1 then
     throw s!"{prefixMsg}: neMatmul requires TH=1 (Hin=1), got TH={th}"
 
@@ -4478,8 +4481,8 @@ def verifyNeMatmulTaskMulti
     throw s!"{prefixMsg}: neMatmul requires ocg=0, fat=0, WU=0 (got ocg={ocg}, fat={fat}, WU={wu})"
   if f > 4 || logNE != f then
     throw s!"{prefixMsg}: neMatmul requires F <= 4 and logNE == F (got F={f}, logNE={logNE})"
-  if ((1 : Nat) <<< f) < min m 16 then
-    throw s!"{prefixMsg}: neMatmul 2^F={(1 : Nat) <<< f} < min(M={m}, 16)={min m 16}"
+  if ((1 : Nat) <<< f) < m then
+    throw s!"{prefixMsg}: neMatmul 2^F={(1 : Nat) <<< f} < M={m}"
 
   let stripW := vStripW 0 shPref
   if stripW < 8 || stripW > 256 then
@@ -4527,10 +4530,8 @@ def verifyNeMatmulTaskMulti
     throw s!"{prefixMsg}: neMatmul kernelStage h17Dyn={ksH17Dyn} != expected {expH17Dyn} for {target.name} (dynKern={isDyn})"
 
   -- 6. Verify kernelBaseLo/Hi (0x5510/0x5514), produced vs external-input mode, and extended header consistency
-  let (kSlot, kTarget, kOff, kLoPayloadOff) ←
+  let (kSlot, kTarget, kOff, _) ←
     resolveBasePair info task.writes regKernelBaseLo regKernelBaseHi "kernelBaseLo" "kernelBaseHi" prefixMsg
-  if info.relocPatchOffsets.contains kLoPayloadOff.toUInt32 then
-    throw s!"{prefixMsg}: neMatmul kernelBaseLo must not carry a Mach-O __KERN_0 relocation"
   if kOff % vDmaLineBytes != 0 then
     throw s!"{prefixMsg}: neMatmul kernelBaseLo offset {toHex kOff} is not {vDmaLineBytes}-byte aligned"
 
@@ -4560,13 +4561,16 @@ def verifyNeMatmulTaskMulti
   if chunkSize == 0 || chunkSize > vMaxKernelChunkBytes then
     throw s!"{prefixMsg}: neMatmul chunkSize={chunkSize}B exceeds hardware limit {vMaxKernelChunkBytes}B (64 KiB)"
 
-  if b > 1 then
-    let wBs ← requireDecodedWrite task.writes regKernelBatchStride "kernelBatchStride"
-    let expBs := m * chunkSize
-    if wBs.value.toNat != expBs then
-      throw s!"{prefixMsg}: neMatmul kernelBatchStride={wBs.value} != expected M*chunkSize={expBs}"
-  else
-    vCheckOmitted task.writes #[(regKernelBatchStride, "kernelBatchStride")] "neMatmul B=1" prefixMsg
+  let kBatchSt ←
+    if b > 1 then
+      let wBs ← requireDecodedWrite task.writes regKernelBatchStride "kernelBatchStride"
+      let bs := wBs.value.toNat
+      if bs < m * chunkSize || bs % chunkSize != 0 then
+        throw s!"{prefixMsg}: neMatmul kernelBatchStride={bs} must be >= M*chunkSize ({m * chunkSize}) and a multiple of chunkSize ({chunkSize})"
+      pure bs
+    else
+      vCheckOmitted task.writes #[(regKernelBatchStride, "kernelBatchStride")] "neMatmul B=1" prefixMsg
+      pure (m * chunkSize)
 
   if isDyn then
     let wRs ← requireDecodedWrite task.writes regKernelRoundStride "kernelRoundStride"
@@ -4581,7 +4585,7 @@ def verifyNeMatmulTaskMulti
     | .configZero => pure ()
     | _ => throw s!"{prefixMsg}: BAR slot {barSlotConfigZero} must have VM base 0"
 
-  let numSlots := min 16 m
+  let numSlots := m
   for s in [:16] do
     let slotW? := findDecodedWrite task.writes (regChunkSlot s)
     let offW? := findDecodedWrite task.writes (regChunkOffset s)
@@ -4607,6 +4611,8 @@ def verifyNeMatmulTaskMulti
           throw s!"{prefixMsg}: external-input neMatmul chunk slot {s} must encode 0x21 (got {toHex sw.value.toNat})"
         if sw.barSlot != some barSlotConfigZero then
           throw s!"{prefixMsg}: external-input neMatmul chunk slot {s} ({toHex (regChunkSlot s)}) must use BAR slot {barSlotConfigZero} config relocation"
+        if sw.recordLen != 1 then
+          throw s!"{prefixMsg}: external-input neMatmul chunk slot {s} ({toHex (regChunkSlot s)}) must be a single-word BAR slot {barSlotConfigZero} record (got {sw.recordLen} words)"
       else
         if on20 != 0 || prodBit != 1 then
           throw s!"{prefixMsg}: scratch-produced neMatmul chunk slot {s} must encode 0x41/0xc1 (got {toHex sw.value.toNat})"
@@ -4637,17 +4643,30 @@ def verifyNeMatmulTaskMulti
         if en != 0 || on20 != 1 || prodBit != 0 || keepLiveBit != 0 || slotTask.toNat != taskId then
           throw s!"{prefixMsg}: neMatmul disabled chunk slot {s} invalid encoding {toHex sw.value.toNat}"
 
-  let kSpan := b * m * chunkSize
-  if kSpan == 0 || kOff + kSpan > kCap then
-    throw s!"{prefixMsg}: neMatmul kernel DMA range [{toHex kOff}, {toHex (kOff + kSpan)}) exceeds {kLbl} capacity {kCap}"
+  let kEnd := kOff + (if b > 1 then (b - 1) * kBatchSt else 0) + m * chunkSize
+  if m * chunkSize == 0 || kEnd > kCap then
+    throw s!"{prefixMsg}: neMatmul kernel DMA range [{toHex kOff}, {toHex kEnd}) exceeds {kLbl} capacity {kCap}"
 
-  let mut dramAccs : Array VerifiedDramAccess := #[{
-    resource := kRes
-    lo := kOff
-    hi := kOff + kSpan
-    isWrite := false
-    port := .kernel
-  }]
+  let mut dramAccs : Array VerifiedDramAccess := #[]
+  if b > 1 && kBatchSt > m * chunkSize then
+    for bIdx in [:b] do
+      let lo := kOff + bIdx * kBatchSt
+      let hi := lo + m * chunkSize
+      dramAccs := dramAccs.push {
+        resource := kRes
+        lo := lo
+        hi := hi
+        isWrite := false
+        port := .kernel
+      }
+  else
+    dramAccs := dramAccs.push {
+      resource := kRes
+      lo := kOff
+      hi := kOff + b * m * chunkSize
+      isWrite := false
+      port := .kernel
+    }
 
   -- 8. Decode L2/DMA port configs for src1 (B) and res (Y)
   let wSrc1Cfg ← requireDecodedWrite task.writes regSrc1Cfg "src1Cfg"
@@ -4896,18 +4915,40 @@ def verifyNeMatmulTaskMulti
     let outNSt ← match findDecodedWrite task.writes regResDmaNStride with
       | some wn =>
         let ns := wn.value.toNat
-        if ns < m * outPlaneSt || ns % vDmaLineBytes != 0 then
-          throw s!"{prefixMsg}: neMatmul resDmaNStride ({ns}) must be >= M*planeStride ({m * outPlaneSt}) and 64B-aligned"
+        if ns < m * outPlaneSt || ns % rowBN != 0 then
+          throw s!"{prefixMsg}: neMatmul resDmaNStride ({ns}) must be >= M*planeStride ({m * outPlaneSt}) and a multiple of rowBN ({rowBN})"
         pure ns
       | none =>
         if b > 1 then
           throw s!"{prefixMsg}: neMatmul missing resDmaNStride for B={b} > 1"
         pure (m * outPlaneSt)
-    let outExt := (b - 1) * outNSt + (m - 1) * outPlaneSt + rowBN
+    let outExt := (if b > 1 then (b - 1) * outNSt else 0) + (m - 1) * outPlaneSt + rowBN
     if off + outExt > cap then
       throw s!"{prefixMsg}: neMatmul output DMA range [{toHex off}, {toHex (off + outExt)}) exceeds {lbl} capacity {cap}"
-    let outCov := classifyStridedWriteCoverage b 1 m 1 n off outNSt 0 outPlaneSt rowBN
-    dramAccs := dramAccs.push { resource := resId, lo := off, hi := off + outExt, isWrite := true, port := .resDma, coverage := outCov }
+    if b > 1 && outPlaneSt == rowBN && outNSt > m * rowBN then
+      for bIdx in [:b] do
+        let lo := off + bIdx * outNSt
+        let hi := lo + m * rowBN
+        dramAccs := dramAccs.push {
+          resource := resId
+          lo := lo
+          hi := hi
+          isWrite := true
+          port := .resDma
+          coverage := .dense lo hi
+        }
+    else
+      let outCov := classifyStridedWriteCoverage b 1 m 1 n off outNSt 0 outPlaneSt rowBN
+      dramAccs := dramAccs.push { resource := resId, lo := off, hi := off + outExt, isWrite := true, port := .resDma, coverage := outCov }
+
+  -- Reject pairwise intra-task BAR 3 scratch read/write or write/write overlap
+  for idx1 in [:dramAccs.size] do
+    for idx2 in [idx1 + 1 : dramAccs.size] do
+      let a := dramAccs[idx1]!
+      let bAcc := dramAccs[idx2]!
+      if a.resource == .scratch && bAcc.resource == .scratch && (a.isWrite || bAcc.isWrite) &&
+         a.lo < bAcc.hi && bAcc.lo < a.hi then
+        throw s!"{prefixMsg}: intra-task BAR 3 scratch overlap between {a.port.name} [{toHex a.lo}, {toHex a.hi}) and {bAcc.port.name} [{toHex bAcc.lo}, {toHex bAcc.hi})"
 
   -- 12. Output stage and strict mode-conditional register allowlist
   vVerifyOutputStageMulti task.writes taskId isLast prefixMsg
@@ -4957,6 +4998,19 @@ def verifyNeMatmulTaskMulti
     else if !isFirst || (findDecodedWrite task.writes (regChunkSlot s)).isSome then
       allowed := allowed.push (regChunkSlot s)
   vCheckAllowedRegs task.writes allowed prefixMsg
+
+  let mut barAllowed : Array Nat := #[regKernelBaseLo, regKernelBaseHi]
+  if !src1Cfg.isL2 then
+    barAllowed := barAllowed ++ #[regSrc1BaseLo, regSrc1BaseHi, regSrc1Dep]
+  if !resIsL2 then
+    barAllowed := barAllowed ++ #[regResBaseLo, regResBaseHi, regResDep]
+  if !produced then
+    for s in [:numSlots] do
+      barAllowed := barAllowed.push (regChunkSlot s)
+  for w in task.writes do
+    if let some slot := w.barSlot then
+      if !barAllowed.contains w.byteAddr then
+        throw s!"{prefixMsg}: neMatmul register {toHex w.byteAddr} has unexpected BAR slot {slot}"
 
   pure {
     taskIndex := task.taskIndex
@@ -5371,7 +5425,13 @@ def verifyProgramHazards (fps : Array VerifiedTaskFootprint) : Except String Uni
         let writerIvs : List (Nat × Nat) := effectiveCoveredIntervals (priorWriters.toList.map (fun (_, a) => a.coverage))
         if !intervalsCover writerIvs b.lo b.hi then
           throw s!"S5 DRAM scratch integrity: task {i} {b.port.name} scratch read [{toHex b.lo}, {toHex b.hi}) is only partially covered by prior resDma writers (uninitialized gap)"
-        -- Check [multiBatchRaw] on every active (not completely superseded by later dense/periodic writers) multi-batch writer
+        -- Check [multiBatchRaw] whenever the consumer itself is multi-batch or any active
+        -- (not completely superseded by later dense/periodic writers) contributing writer has BatchN > 1.
+        if ti.isMultiBatch then
+          if b.port == .src1Dma && ti.sync.src1DepKind != 1 then
+            throw s!"S5 DRAM scratch coherence [multiBatchRaw]: multi-batch task {i} src1Dma reading scratch [{toHex b.lo}, {toHex b.hi}) must set 0x4d00 depKind to 1 (got {ti.sync.src1DepKind})"
+          if b.port == .src2Dma && ti.sync.src2DepKind != 1 then
+            throw s!"S5 DRAM scratch coherence [multiBatchRaw]: multi-batch task {i} src2Dma reading scratch [{toHex b.lo}, {toHex b.hi}) must set 0x4d04 depKind to 1 (got {ti.sync.src2DepKind})"
         for idx in [:priorWriters.size] do
           let (p, a) := priorWriters[idx]!
           if fps[p]!.isMultiBatch then
@@ -5388,6 +5448,17 @@ def verifyProgramHazards (fps : Array VerifiedTaskFootprint) : Except String Uni
                 throw s!"S5 DRAM scratch coherence [multiBatchRaw]: task {i} src1Dma reading multi-batch (BatchN > 1) scratch [{toHex b.lo}, {toHex b.hi}) written by task {p} must set 0x4d00 depKind to 1 (got {ti.sync.src1DepKind})"
               if b.port == .src2Dma && ti.sync.src2DepKind != 1 then
                 throw s!"S5 DRAM scratch coherence [multiBatchRaw]: task {i} src2Dma reading multi-batch (BatchN > 1) scratch [{toHex b.lo}, {toHex b.hi}) written by task {p} must set 0x4d04 depKind to 1 (got {ti.sync.src2DepKind})"
+
+  -- 4. Reject pairwise intra-task BAR 3 scratch read/write or write/write overlap on any task
+  for i in [:n] do
+    let accs := fps[i]!.dramAccesses
+    for idx1 in [:accs.size] do
+      for idx2 in [idx1 + 1 : accs.size] do
+        let a := accs[idx1]!
+        let b := accs[idx2]!
+        if a.resource == .scratch && b.resource == .scratch && (a.isWrite || b.isWrite) &&
+           vIntervalsOverlap a.lo a.hi b.lo b.hi then
+          throw s!"S5 intra-task scratch hazard: task {i} has overlapping BAR 3 scratch accesses {a.port.name} [{toHex a.lo}, {toHex a.hi}) and {b.port.name} [{toHex b.lo}, {toHex b.hi})"
 
   pure ()
 

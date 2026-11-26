@@ -978,6 +978,7 @@ structure DecodedWrite where
   value : UInt32
   barSlot : Option UInt8
   payloadOffset : Nat
+  recordLen : Nat := 1
   deriving Repr, BEq, Inhabited
 
 /-- A single decoded task from `__TEXT,__text`. -/
@@ -1030,6 +1031,7 @@ def decodeTaskStream (target : Target) (bs : ByteArray) : Except String (Array D
               value := v
               barSlot := none
               payloadOffset := pOff
+              recordLen := addrs.size
             }
           recPos := recPos + 4 * addrs.size
         else
@@ -1047,6 +1049,7 @@ def decodeTaskStream (target : Target) (bs : ByteArray) : Except String (Array D
               value := v
               barSlot := slot?
               payloadOffset := pOff
+              recordLen := cnt
             }
           recPos := recPos + 4 * cnt
 

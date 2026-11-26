@@ -578,7 +578,7 @@ private inductive PlannedOp where
   | peReduce (op : ReduceOp) (axes : ReduceAxes) (eps : UInt16) (dims : TensorDims)
   | neChannelReduce (op : ReduceOp) (dims : TensorDims)
   | neView (copy : ViewCopy)
-  | neMatmul (heads m k n : Nat) (scaleBits : UInt16) (refA refB : TensorRef)
+  | neMatmul (heads m0 m totalM k n : Nat) (scaleBits : UInt16) (refA refB : TensorRef)
 
 private instance : Inhabited PlannedOp := ⟨.pe2 .add false default default default default default⟩
 
@@ -1076,28 +1076,34 @@ private def validateGraph (spec : GraphSpec) :
             opKind := "matmul_trB"
           }
           effRefB := .node trIdx
-        let mmIdx := repIdx + mmNodes.size
-        if mmIdx >= 255 then
-          throw s!"node '{nd.id}' (matmul, taskId={mmIdx}) exceeds kernelStage 8-bit limit 254"
+        let mmRepIdx := repIdx + mmNodes.size
+        let numSlices := ceilDiv m 16
         let fullOd : TensorDims := { c := heads * m, h := 1, w := n }
-        mmNodes := mmNodes.push {
-          id := nd.id
-          logicalId := nd.id
-          nodeIdx := mmIdx
-          origNodeIdx := mmIdx
-          inputs := #[effRefA, effRefB]
-          op := PlannedOp.neMatmul heads m k n scaleBits effRefA effRefB
-          outDims := fullOd
-          groupOutDims := fullOd
-          outByteOffset := 0
-          sharedOutGroup := none
-          isFinalGroup := isLastLogical
-          outPlacement := nd.outPlacement
-          engine := Engine.ne
-          isNeCompute := true
-          usesKernel := false
-          opKind := "matmul"
-        }
+        let rowBN := alignUp (2 * n) dmaLineBytes
+        for si in [:numSlices] do
+          let mmIdx := mmRepIdx + si
+          if mmIdx >= 255 then
+            throw s!"node '{nd.id}' (matmul slice {si}, taskId={mmIdx}) exceeds kernelStage 8-bit limit 254"
+          let m0 := si * 16
+          let mi := min 16 (m - m0)
+          mmNodes := mmNodes.push {
+            id := if numSlices == 1 then nd.id else s!"{nd.id}_s{si}"
+            logicalId := nd.id
+            nodeIdx := mmIdx
+            origNodeIdx := mmIdx
+            inputs := #[effRefA, effRefB]
+            op := PlannedOp.neMatmul heads m0 mi m k n scaleBits effRefA effRefB
+            outDims := { c := heads * mi, h := 1, w := n }
+            groupOutDims := fullOd
+            outByteOffset := m0 * rowBN
+            sharedOutGroup := if numSlices > 1 then some mmRepIdx else none
+            isFinalGroup := isLastLogical
+            outPlacement := nd.outPlacement
+            engine := Engine.ne
+            isNeCompute := true
+            usesKernel := false
+            opKind := "matmul"
+          }
         pure (mmNodes, fullOd)
 
     for en in expandedNodes do
@@ -1111,10 +1117,12 @@ private def validateGraph (spec : GraphSpec) :
       lastConsumer := lastConsumer.push 0
 
     let endIdx := vNodes.size - 1
-    let isChainedOut := match nd.op with
-      | .matmul .. => true
-      | _ => false
-    let outRefIdx := if isChainedOut then endIdx else repIdx
+    let outRefIdx := match nd.op with
+      | .matmul .. =>
+        match expandedNodes.findIdx? (fun en => match en.op with | .neMatmul .. => true | _ => false) with
+        | some offIdx => repIdx + offIdx
+        | none => repIdx
+      | _ => repIdx
     logicalReps := logicalReps.push (outRefIdx, endIdx, isLastLogical)
     nameMap := nameMap.push (nd.id, .node outRefIdx, fullOutDims)
 
@@ -1138,8 +1146,8 @@ private def isNodeL2Eligible (vNodes : Array ValidatedNode) (i : Nat) : Bool := 
     return false
   if let .neView _ := nd.op then
     return false
-  if let .neMatmul heads _ _ _ _ _ _ := nd.op then
-    if heads > 1 then
+  if let .neMatmul heads _ _ totalM _ _ _ _ _ := nd.op then
+    if heads > 1 || totalM > 16 then
       return false
   if l2ResidentBytes nd.outDims >= l2CapacityBytes then
     return false
@@ -1156,7 +1164,7 @@ private def isNodeL2Eligible (vNodes : Array ValidatedNode) (i : Nat) : Bool := 
     | .neView _ =>
       if cons.inputs.any (fun r => r == .node i) then
         return false
-    | .neMatmul heads _ _ _ _ refA refB =>
+    | .neMatmul heads _ _ _ _ _ _ refA refB =>
       if refA == .node i || (refB == .node i && heads > 1) then
         return false
     | _ => pure ()
@@ -1211,7 +1219,7 @@ private def tryPlanAllTasks
         TaskPlanKind.neChannelReduce <$> chooseNeChannelReduceTilingForL2 target dims srcIsL2 resIsL2 liveRanges
       | .neView cp =>
         TaskPlanKind.neView <$> chooseViewTaskPlan target cp liveRanges
-      | .neMatmul _ m k n _ _ refB =>
+      | .neMatmul _ _ m _ k n _ _ refB =>
         let srcIsL2 := isNodeL2 refB
         TaskPlanKind.neMatmul <$> chooseMatmulTaskPlan target m k n srcIsL2 resIsL2 liveRanges
     match planRes with
@@ -1718,31 +1726,48 @@ private def buildPreLoweredTasks
       | .l2 _ _ =>
         throw s!"internal error: neView node '{nd.id}' received L2-resident output"
 
-    | .neMatmul heads m k n _ refA refB, .neMatmul mp =>
+    | .neMatmul heads m0 m totalM k n _ refA refB, .neMatmul mp =>
       let aLoc := resolveRefLoc refA
       let bLoc := resolveRefLoc refB
       src1Loc := bLoc
       src1Prod? := resolveRefProd refB
       kernLoc? := some aLoc
       let chunkSize := matmulChunkSize k
-      let kSpan := heads * m * chunkSize
+      let kBaseOff := m0 * chunkSize
+      let kBatchSt := totalM * chunkSize
       match aLoc with
       | .surface idx _ =>
-        dramAccs := dramAccs.push {
-          resource := .surface idx shortNames[idx]!, lo := 0, hi := kSpan, isWrite := false, port := .kernel
-        }
+        if heads > 1 && totalM > m then
+          for bIdx in [:heads] do
+            let lo := kBaseOff + bIdx * kBatchSt
+            dramAccs := dramAccs.push {
+              resource := .surface idx shortNames[idx]!, lo := lo, hi := lo + m * chunkSize, isWrite := false, port := .kernel
+            }
+        else
+          dramAccs := dramAccs.push {
+            resource := .surface idx shortNames[idx]!, lo := kBaseOff, hi := kBaseOff + heads * m * chunkSize, isWrite := false, port := .kernel
+          }
       | .dram off _ =>
-        dramAccs := dramAccs.push {
-          resource := .scratch, lo := off, hi := off + kSpan, isWrite := false, port := .kernel
-        }
+        let actKOff := off + kBaseOff
+        if heads > 1 && totalM > m then
+          for bIdx in [:heads] do
+            let lo := actKOff + bIdx * kBatchSt
+            dramAccs := dramAccs.push {
+              resource := .scratch, lo := lo, hi := lo + m * chunkSize, isWrite := false, port := .kernel
+            }
+        else
+          dramAccs := dramAccs.push {
+            resource := .scratch, lo := actKOff, hi := actKOff + heads * m * chunkSize, isWrite := false, port := .kernel
+          }
         let mut latestW? : Option Nat := none
         for j in [:out.size] do
           for a in out[j]!.dramAccesses do
-            if a.resource == .scratch && a.isWrite && a.lo < off + kSpan && off < a.hi then
-              latestW? := some j
+            if a.resource == .scratch && a.isWrite then
+              if dramAccs.any (fun kb => kb.port == .kernel && a.lo < kb.hi && kb.lo < a.hi) then
+                latestW? := some j
         match latestW? with
         | some p => extProd? := some p
-        | none => throw s!"internal error: matmul node '{nd.id}' scratch kernel [{toHex off}, {toHex (off + kSpan)}) has no prior writer"
+        | none => throw s!"internal error: matmul node '{nd.id}' scratch kernel at {toHex actKOff} has no prior writer"
       | .l2 _ _ =>
         throw s!"internal error: matmul node '{nd.id}' kernel operand A cannot be L2-resident"
 
@@ -1764,6 +1789,8 @@ private def buildPreLoweredTasks
         let bSpan := heads * k * rowBN
         dramAccs := dramAccs.push { resource := .surface idx shortNames[idx]!, lo := 0, hi := bSpan, isWrite := false, port := .src1Dma }
 
+      let yBaseOff := m0 * rowBN
+      let yBatchSt := totalM * rowBN
       match resLoc with
       | .l2 base bytes =>
         l2Accs := l2Accs.push { lo := base, hi := base + bytes, isWrite := true, role := .resL2 }
@@ -1771,14 +1798,27 @@ private def buildPreLoweredTasks
         let dchs := 2 * min (alignUp n 8) (max stripW 32)
         let szRes := if mp.direct then ((1 : Nat) <<< mp.tiling.f) * 512 else m * dchs
         l2Accs := l2Accs.push { lo := mp.resStageBase, hi := mp.resStageBase + szRes, isWrite := true, role := .resStage }
-        let ySpan := heads * m * rowBN
-        dramAccs := dramAccs.push { resource := .scratch, lo := off, hi := off + ySpan, isWrite := true, port := .resDma, coverage := .dense off (off + ySpan) }
+        let actYOff := off + yBaseOff
+        if heads > 1 && totalM > m then
+          for bIdx in [:heads] do
+            let lo := actYOff + bIdx * yBatchSt
+            let hi := lo + m * rowBN
+            dramAccs := dramAccs.push { resource := .scratch, lo := lo, hi := hi, isWrite := true, port := .resDma, coverage := .dense lo hi }
+        else
+          let ySpan := heads * m * rowBN
+          dramAccs := dramAccs.push { resource := .scratch, lo := actYOff, hi := actYOff + ySpan, isWrite := true, port := .resDma, coverage := .dense actYOff (actYOff + ySpan) }
       | .surface _ _ =>
         let dchs := 2 * min (alignUp n 8) (max stripW 32)
         let szRes := if mp.direct then ((1 : Nat) <<< mp.tiling.f) * 512 else m * dchs
         l2Accs := l2Accs.push { lo := mp.resStageBase, hi := mp.resStageBase + szRes, isWrite := true, role := .resStage }
-        let ySpan := heads * m * rowBN
-        dramAccs := dramAccs.push { resource := .surface outSurfIdx "y", lo := 0, hi := ySpan, isWrite := true, port := .resDma }
+        if heads > 1 && totalM > m then
+          for bIdx in [:heads] do
+            let lo := yBaseOff + bIdx * yBatchSt
+            let hi := lo + m * rowBN
+            dramAccs := dramAccs.push { resource := .surface outSurfIdx "y", lo := lo, hi := hi, isWrite := true, port := .resDma, coverage := .dense lo hi }
+        else
+          let ySpan := heads * m * rowBN
+          dramAccs := dramAccs.push { resource := .surface outSurfIdx "y", lo := yBaseOff, hi := yBaseOff + ySpan, isWrite := true, port := .resDma, coverage := .dense yBaseOff (yBaseOff + ySpan) }
 
     | _, _ =>
       throw s!"internal error: op/plan mismatch on node '{nd.id}'"
@@ -1847,14 +1887,15 @@ private def anyActiveMultiBatchScratchWriterBefore (pre : Array PreLoweredTask) 
       let ovHi := min a.hi hi
       let mut laterCovs : List WriteCoverage := []
       for idx2 in [idx + 1 : writers.size] do
-        let (_, a2) := writers[idx2]!
-        let cov2 := match a2.coverage with
-          | .sparse =>
-            match pre[writers[idx2]!.1]!.node.op with
-            | .neView _ => .sparse
-            | _ => .dense a2.lo a2.hi
-          | other => other
-        laterCovs := cov2 :: laterCovs
+        let (j2, a2) := writers[idx2]!
+        if j2 > j then
+          let cov2 := match a2.coverage with
+            | .sparse =>
+              match pre[j2]!.node.op with
+              | .neView _ => .sparse
+              | _ => .dense a2.lo a2.hi
+            | other => other
+          laterCovs := cov2 :: laterCovs
       let laterIvs := effectiveCoveredIntervals laterCovs
       if !intervalsCover laterIvs ovLo ovHi then
         return true
@@ -1894,7 +1935,7 @@ private def computeSynchronization (pre : Array PreLoweredTask) : Array TaskSync
       for b in pre[i]!.dramAccesses do
         if b.resource == .scratch && !b.isWrite then
           if let some j := latestScratchWriterBefore pre i b.lo b.hi then
-            let depKind := if anyActiveMultiBatchScratchWriterBefore pre i b.lo b.hi then 1 else 2
+            let depKind := if isMultiBatchOp pre[i]!.node.op || anyActiveMultiBatchScratchWriterBefore pre i b.lo b.hi then 1 else 2
             let dist := min 15 (i - j - 1)
             if b.port == .src1Dma then
               syncs := syncs.set! i { syncs[i]! with src1DepKind := depKind, src1DepDist := dist }
@@ -2838,20 +2879,26 @@ private def emitTaskDesc
     let cp' : ViewCopy := { cp with inOff := inBase + cp.inOff, outOff := outBase + cp.outOff }
     buildViewTaskMulti target cp' vp taskId totalTasks inSlot outSlot outIsScratch sync pt.liveL2Mask
 
-  | .neMatmul heads m k n scaleBits _ _, .neMatmul mp =>
+  | .neMatmul heads m0 m totalM k n scaleBits _ _, .neMatmul mp =>
     let some aLoc := pt.kernLoc?
       | throw s!"internal error: neMatmul node '{nd.id}' missing kernel location"
+    let chunkSize := matmulChunkSize k
+    let rowBN := alignUp (2 * n) dmaLineBytes
     let (kernSlot, kernOff, kernIsScratch) ← match aLoc with
-      | .surface _ slot => pure (slot, 0, false)
-      | .dram off _ => pure (barSlotScratch, off, true)
+      | .surface _ slot => pure (slot, m0 * chunkSize, false)
+      | .dram off _ => pure (barSlotScratch, off + m0 * chunkSize, true)
       | .l2 _ _ => throw s!"internal error: neMatmul node '{nd.id}' kernel cannot be L2-resident"
-    let toMmLoc := fun
+    let toMmSrcLoc := fun
       | TensorLocation.surface _ slot => MatmulPortLoc.surface slot 0
       | TensorLocation.dram off _ => MatmulPortLoc.dram off
       | TensorLocation.l2 base _ => MatmulPortLoc.l2 base
+    let toMmResLoc := fun
+      | TensorLocation.surface _ slot => MatmulPortLoc.surface slot (m0 * rowBN)
+      | TensorLocation.dram off _ => MatmulPortLoc.dram (off + m0 * rowBN)
+      | TensorLocation.l2 base _ => MatmulPortLoc.l2 base
     buildMatmulTaskMulti target heads m k n scaleBits mp taskId totalTasks
       kernSlot kernOff kernIsScratch pt.extProducerTask?
-      (toMmLoc pt.src1Loc) (toMmLoc pt.resLoc) sync pt.liveL2Mask kernKeepLive
+      (toMmSrcLoc pt.src1Loc) (toMmResLoc pt.resLoc) sync pt.liveL2Mask kernKeepLive totalM
 
   | _, _ =>
     throw s!"internal error: op/plan mismatch when lowering node '{nd.id}'"
@@ -3172,9 +3219,10 @@ private def finalizeCompiledGraph
       | some (.dram off bytes) =>
         Id.run do
           for j in [i + 1 : n] do
-            for a in preTasks[j]!.dramAccesses do
-              if a.resource == .scratch && a.port == .kernel && intervalsOverlap off (off + bytes) a.lo a.hi then
-                return true
+            if preTasks[j]!.dramAccesses.any (fun a => a.resource == .scratch && a.port == .kernel && intervalsOverlap off (off + bytes) a.lo a.hi) then
+              return true
+            if preTasks[j]!.dramAccesses.any (fun a => a.resource == .scratch && a.isWrite && intervalsOverlap off (off + bytes) a.lo a.hi) then
+              return false
           return false
       | _ => false
     let td ← emitTaskDesc spec.target n kernelBarSlot preTasks[i]! syncs[i]! kernKeepLive
