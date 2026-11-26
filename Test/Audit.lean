@@ -7,6 +7,7 @@ Loads the compiled `Vane` and `Vane.Proofs` modules from `LEAN_PATH` (no
 re-elaboration) and checks, for every constant defined in a `Vane.*` module:
 
 * no `axiom` declarations exist;
+* no constant is marked `unsafe`, `@[implemented_by]`, or `@[extern]`;
 * every theorem depends only on the standard axioms `propext`,
   `Classical.choice` and `Quot.sound` (so no `sorryAx`, `Lean.ofReduceBool`,
   `Lean.trustCompiler` or custom axioms);
@@ -25,7 +26,7 @@ def standardAxioms : List Name := [``propext, ``Classical.choice, ``Quot.sound]
 
 /-- Lower bound on user-declared theorems in `Vane.Proofs`; guards against an
 empty or truncated audit passing silently. -/
-def minProofTheorems : Nat := 70
+def minProofTheorems : Nat := 135
 
 def proofsModule : Name := `Vane.Proofs
 
@@ -61,6 +62,12 @@ def audit : CoreM Report := do
     r := { r with constants := r.constants + 1 }
     if let .axiomInfo _ := ci then
       r := { r with errors := r.errors.push s!"custom axiom {n} declared in {m}" }
+    if ci.isUnsafe then
+      r := { r with errors := r.errors.push s!"unsafe constant {n} declared in {m}" }
+    if let some impl := Lean.Compiler.implementedByAttr.getParam? env n then
+      r := { r with errors := r.errors.push s!"implemented_by attribute on {n} ({m}) -> {impl}" }
+    if Lean.isExtern env n then
+      r := { r with errors := r.errors.push s!"extern attribute on {n} ({m})" }
     let axs ← collectAxioms n
     let bad := axs.filter fun a => !standardAxioms.contains a
     unless bad.isEmpty do
@@ -86,7 +93,7 @@ def main : IO UInt32 := do
     IO.eprintln s!"[FAIL] proof-audit: {e}"
   if r.errors.isEmpty then
     IO.println s!"[PASS] proof-audit: {r.proofsTheorems} theorems in Vane.Proofs ({r.vaneTheorems} total across Vane.*) verified kernel-clean"
-    IO.println s!"       {r.constants} Vane.* constants checked; allowed axioms: {Vane.Audit.standardAxioms}"
+    IO.println s!"       {r.constants} Vane.* constants checked (no custom axioms, unsafe, implemented_by, or extern); allowed axioms: {Vane.Audit.standardAxioms}"
     return 0
   else
     IO.eprintln s!"[FAIL] proof-audit: {r.errors.size} problem(s) across {r.constants} Vane.* constants"

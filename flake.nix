@@ -134,7 +134,7 @@
           '';
 
           # Kernel-level audit of the compiled proofs, then a source scan for
-          # proof and trust shortcuts.
+          # proof and trust shortcuts, then full kernel replay with leanchecker.
           proof-audit = pkgs.runCommand "vane-proof-audit" {
             nativeBuildInputs = [ pkgs.python3 ];
           } ''
@@ -142,6 +142,7 @@
             export LEAN_PATH=${vanePkg}/lib/lean:${pkgs.lean4}/lib/lean
             ${vanePkg}/bin/vane-audit
             python3 ${self}/scripts/lean-guard.py forbidden ${self}
+            ${pkgs.lean4}/bin/leanchecker Vane Vane.Proofs
             touch $out
           '';
 
