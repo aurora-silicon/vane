@@ -2197,4 +2197,37 @@ theorem sliceIntervals_cover_point (sizes : List Nat) (x : Nat) (hx : x < sumSiz
   intervalsCover_sound (sliceIntervals sizes) 0 (sumSizes sizes) x
     (sliceIntervals_cover sizes) (Nat.zero_le x) hx
 
+/-- Soundness of periodic multi-writer coverage (`Vane.Verify.periodicGroupCovered`):
+    if `periodicGroupCovered outerBase outerCount outerStride innerIvs = some (lo, hi)`,
+    then every byte offset `x ∈ [lo, hi)` falls inside `[outerBase + j * outerStride + iv.1,
+    outerBase + j * outerStride + iv.2)` for some outer repetition `j < outerCount` and
+    some inner slice `iv ∈ innerIvs`. -/
+theorem periodicGroupCovered_sound
+    (outerBase outerCount outerStride : Nat) (innerIvs : List (Nat × Nat))
+    (lo hi x : Nat)
+    (h : periodicGroupCovered outerBase outerCount outerStride innerIvs = some (lo, hi))
+    (hlo : lo ≤ x) (hhi : x < hi) :
+    ∃ j < outerCount, ∃ iv ∈ innerIvs,
+      outerBase + j * outerStride + iv.1 ≤ x ∧
+      x < outerBase + j * outerStride + iv.2 := by
+  unfold periodicGroupCovered at h
+  split at h
+  · rename_i hcond
+    simp only [Option.some.injEq, Prod.mk.injEq] at h
+    rcases h with ⟨rfl, rfl⟩
+    simp only [Bool.and_eq_true, decide_eq_true_eq] at hcond
+    rcases hcond with ⟨⟨_, hStridePos⟩, hcov⟩
+    let d := x - outerBase
+    have hdLt : d < outerCount * outerStride := by omega
+    have hjLt : d / outerStride < outerCount := by
+      have hcomm : d < outerStride * outerCount := by rw [Nat.mul_comm]; exact hdLt
+      exact Nat.div_lt_of_lt_mul hcomm
+    have hrLt : d % outerStride < outerStride := Nat.mod_lt d hStridePos
+    have hdivMod : outerStride * (d / outerStride) + d % outerStride = d := Nat.div_add_mod d outerStride
+    have hmulComm : (d / outerStride) * outerStride = outerStride * (d / outerStride) := Nat.mul_comm _ _
+    obtain ⟨iv, hivMem, hivLo, hivHi⟩ :=
+      intervalsCover_sound innerIvs 0 outerStride (d % outerStride) hcov (Nat.zero_le _) hrLt
+    refine ⟨d / outerStride, hjLt, iv, hivMem, ?_, ?_⟩ <;> omega
+  · cases h
+
 end Vane.Proofs

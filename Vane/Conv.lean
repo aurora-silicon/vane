@@ -960,12 +960,13 @@ def compileConv1x1Split
   let outRowStride := alignUp (2 * shape.w) dmaLineBytes
   let outPlaneStride := shape.h * outRowStride
 
-  let mut kernBuf := ByteArray.empty
+  let mut packedSlices : Array (Nat × PackedKernel) := Array.mkEmpty k
   let mut tilings : Array Tiling := Array.mkEmpty k
   let mut taskDescs : Array TaskDesc := Array.mkEmpty k
   let mut prevResRanges : Array (Nat × Nat) := Array.mkEmpty k
   let mut peakL2 : Nat := 0
   let mut allDirect := true
+  let mut totalKernBytes : Nat := 0
 
   for i in [:k] do
     let c0 := starts[i]!
@@ -979,9 +980,9 @@ def compileConv1x1Split
     let t_i ← chooseConvTiling target sh_i extraLutBytes biasInK
     let packed_i ← packConvKernelChunks target sh_i t_i wSlice bSlice? lutPayload?
 
-    kernBuf := padToAlign kernBuf dmaLineBytes
-    let kernOff := kernBuf.size
-    kernBuf := kernBuf ++ packed_i.bytes
+    let kernOff := alignUp totalKernBytes dmaLineBytes
+    totalKernBytes := kernOff + packed_i.bytes.size
+    packedSlices := packedSlices.push (kernOff, packed_i)
 
     let srcEnd := srcL2BytesConv sh_i t_i
     let resLo := resBaseBytesConv sh_i t_i
@@ -998,6 +999,11 @@ def compileConv1x1Split
     let td ← lowerConv1x1SliceTask target sh_i t_i packed_i effectiveAct.isRelu i k kernOff outOff haz
     tilings := tilings.push t_i
     taskDescs := taskDescs.push td
+
+  -- Single linear pass copy into pre-sized kernel buffer (avoids O(k^2) ByteArray.append)
+  let mut kernBuf := zeroBytes totalKernBytes
+  for (kernOff, packed_i) in packedSlices do
+    kernBuf := ByteArray.copySlice packed_i.bytes 0 kernBuf kernOff packed_i.bytes.size true
 
   let inSurf ← makeFp16Surface target "x" "input_x" .input shape.cin shape.h shape.w
   let outSurf ← makeFp16Surface target "y" "output_y" .output shape.cout shape.h shape.w

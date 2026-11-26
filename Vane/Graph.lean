@@ -494,10 +494,11 @@ private structure NeActTaskPlan where
 
 private def neActStageBasesForTh
     (target : Target) (c _h w : Nat) (probe : NeActTiling)
-    (srcIsL2 resIsL2 : Bool) (occupied : List Range) (th : Nat) : Option (Nat × Nat × Nat) :=
+    (srcIsL2 resIsL2 : Bool) (occupied : List Range) (th : Nat) (srcFloor32 : Bool := false) : Option (Nat × Nat × Nat) :=
   let stripW := probe.stripWidth
   let direct := if resIsL2 then false else neActIsDirect target w probe
-  let row := 2 * min (alignUp w 8) stripW
+  let effSrcStrip := if srcFloor32 then max stripW 32 else stripW
+  let row := 2 * min (alignUp w 8) effSrcStrip
   let u := c * row
   let srcSz := if srcIsL2 then 0 else th * u
   let drow := 2 * min (alignUp w 8) (max stripW 32)
@@ -523,12 +524,12 @@ private def neActStageBasesForTh
 
 private def chooseNeActTilingForGraph
     (target : Target) (c h w : Nat)
-    (srcIsL2 resIsL2 : Bool) (occupied : List Range) : Except String NeActTaskPlan := do
+    (srcIsL2 resIsL2 : Bool) (occupied : List Range) (srcFloor32 : Bool := false) : Except String NeActTaskPlan := do
   for shPref in [:5] do
     let probe : NeActTiling := {
       logNE := 0, f := 0, fat := 0, shPref := shPref, shMax := shPref, tileHeight := 1
     }
-    if let some (sb, rb, pk) := neActStageBasesForTh target c h w probe srcIsL2 resIsL2 occupied h then
+    if let some (sb, rb, pk) := neActStageBasesForTh target c h w probe srcIsL2 resIsL2 occupied h srcFloor32 then
       let direct := if resIsL2 then false else neActIsDirect target w probe
       return {
         tiling := { probe with tileHeight := h }
@@ -540,7 +541,7 @@ private def chooseNeActTilingForGraph
       let mut best : Option (Nat × Nat × Nat × Nat) := none
       while lo <= hi do
         let mid := (lo + hi) / 2
-        match neActStageBasesForTh target c h w probe srcIsL2 resIsL2 occupied mid with
+        match neActStageBasesForTh target c h w probe srcIsL2 resIsL2 occupied mid srcFloor32 with
         | some (sb, rb, pk) =>
           best := some (mid, sb, rb, pk)
           lo := mid + 1
@@ -1077,9 +1078,10 @@ private def tryPlanAllTasks
         let s1L2 := isNodeL2 r1
         let s2L2 := isNodeL2 r2
         TaskPlanKind.pe <$> choosePeTilingForGraph target outDims hw1 (some hw2) s1L2 s2L2 resIsL2 liveRanges
-      | .lut _ dims _ =>
+      | .lut act dims _ =>
         let srcIsL2 := isNodeL2 nd.inputs[0]!
-        TaskPlanKind.lut <$> chooseNeActTilingForGraph target dims.c dims.h dims.w srcIsL2 resIsL2 liveRanges
+        let srcFloor32 := act == .copy && vNodes.size > 1
+        TaskPlanKind.lut <$> chooseNeActTilingForGraph target dims.c dims.h dims.w srcIsL2 resIsL2 liveRanges srcFloor32
       | .pePool _ _ dims gh gw =>
         let srcIsL2 := isNodeL2 nd.inputs[0]!
         TaskPlanKind.pePool <$> choosePePoolTilingForL2 target dims.c gh gw srcIsL2 resIsL2 liveRanges
@@ -1402,7 +1404,7 @@ private def buildPreLoweredTasks
         let (baseOff, _, _, ext) := surfaceDmaWindow nd.resWin outDims.c outDims.h outDims.w
         dramAccs := dramAccs.push { resource := .surface outSurfIdx "y", lo := baseOff, hi := baseOff + ext, isWrite := true, port := .resDma }
 
-    | .lut _ dims lutPayload?, .lut lp =>
+    | .lut act dims lutPayload?, .lut lp =>
       if let some payload := lutPayload? then
         let lutOff ← match lutKernCache.find? (fun (nid, _) => nid == nd.origNodeIdx) with
           | some (_, cachedOff) => pure cachedOff
@@ -1417,16 +1419,17 @@ private def buildPreLoweredTasks
           resource := .kernel, lo := kernBaseOff, hi := kernBaseOff + lutTableBytes, isWrite := false, port := .lut
         }
       let stripW := lp.tiling.stripWidth
+      let effSrcStrip := if act == .copy && n > 1 then max stripW 32 else stripW
       match src1Loc with
       | .l2 base bytes =>
         l2Accs := l2Accs.push { lo := base, hi := base + bytes, isWrite := false, role := .src1L2 }
       | .dram off _ =>
-        let row := 2 * min (alignUp dims.w 8) stripW
+        let row := 2 * min (alignUp dims.w 8) effSrcStrip
         let sz := lp.tiling.tileHeight * (dims.c * row)
         l2Accs := l2Accs.push { lo := lp.srcStageBase, hi := lp.srcStageBase + sz, isWrite := true, role := .src1Stage }
         dramAccs := dramAccs.push { resource := .scratch, lo := off, hi := off + dramSpanBytes dims, isWrite := false, port := .src1Dma }
       | .surface idx _ =>
-        let row := 2 * min (alignUp dims.w 8) stripW
+        let row := 2 * min (alignUp dims.w 8) effSrcStrip
         let sz := lp.tiling.tileHeight * (dims.c * row)
         l2Accs := l2Accs.push { lo := lp.srcStageBase, hi := lp.srcStageBase + sz, isWrite := true, role := .src1Stage }
         let (baseOff, _, _, ext) := surfaceDmaWindow nd.src1Win dims.c dims.h dims.w
@@ -1439,7 +1442,8 @@ private def buildPreLoweredTasks
         let drow := 2 * min (alignUp dims.w 8) (max stripW 32)
         let szRes := if lp.direct then neActDirectResBytes lp.tiling.f lp.tiling.fat else lp.tiling.tileHeight * (dims.c * drow)
         l2Accs := l2Accs.push { lo := lp.resStageBase, hi := lp.resStageBase + szRes, isWrite := true, role := .resStage }
-        dramAccs := dramAccs.push { resource := .scratch, lo := off, hi := off + dramSpanBytes dims, isWrite := true, port := .resDma }
+        let span := dramSpanBytes dims
+        dramAccs := dramAccs.push { resource := .scratch, lo := off, hi := off + span, isWrite := true, port := .resDma, coverage := .dense off (off + span) }
       | .surface _ _ =>
         let drow := 2 * min (alignUp dims.w 8) (max stripW 32)
         let szRes := if lp.direct then neActDirectResBytes lp.tiling.f lp.tiling.fat else lp.tiling.tileHeight * (dims.c * drow)
@@ -1584,7 +1588,8 @@ private def buildPreLoweredTasks
       | .dram off _ =>
         let actOutOff := off + cp.outOff
         let actOutEnd := alignUp (actOutOff + rawOutExt) dmaLineBytes
-        dramAccs := dramAccs.push { resource := .scratch, lo := actOutOff, hi := actOutEnd, isWrite := true, port := .resDma }
+        let cov := classifyStridedWriteCoverage cp.n cp.d rch cp.h rw actOutOff cp.outNStride cp.outDStride cp.outPlaneStride cp.outRowStride
+        dramAccs := dramAccs.push { resource := .scratch, lo := actOutOff, hi := actOutEnd, isWrite := true, port := .resDma, coverage := cov }
       | .surface _ _ =>
         let actOutOff := cp.outOff
         let actOutEnd := alignUp (actOutOff + rawOutExt) dmaLineBytes
@@ -1644,20 +1649,27 @@ private def latestScratchWriterBefore (pre : Array PreLoweredTask) (i lo hi : Na
   return latestW?
 
 private def anyActiveMultiBatchScratchWriterBefore (pre : Array PreLoweredTask) (i lo hi : Nat) : Bool := Id.run do
-  let mut writers : Array (Nat × Nat × Nat) := #[]
+  let mut writers : Array (Nat × VerifiedDramAccess) := #[]
   for j in [:i] do
     for a in pre[j]!.dramAccesses do
       if a.resource == .scratch && a.isWrite && intervalsOverlap a.lo a.hi lo hi then
-        writers := writers.push (j, a.lo, a.hi)
+        writers := writers.push (j, a)
   for idx in [:writers.size] do
-    let (j, alo, ahi) := writers[idx]!
+    let (j, a) := writers[idx]!
     if isMultiBatchOp pre[j]!.node.op then
-      let ovLo := max alo lo
-      let ovHi := min ahi hi
-      let mut laterIvs : List (Nat × Nat) := []
+      let ovLo := max a.lo lo
+      let ovHi := min a.hi hi
+      let mut laterCovs : List WriteCoverage := []
       for idx2 in [idx + 1 : writers.size] do
-        let (_, alo2, ahi2) := writers[idx2]!
-        laterIvs := (alo2, ahi2) :: laterIvs
+        let (_, a2) := writers[idx2]!
+        let cov2 := match a2.coverage with
+          | .sparse =>
+            match pre[writers[idx2]!.1]!.node.op with
+            | .neView _ => .sparse
+            | _ => .dense a2.lo a2.hi
+          | other => other
+        laterCovs := cov2 :: laterCovs
+      let laterIvs := effectiveCoveredIntervals laterCovs
       if !intervalsCover laterIvs ovLo ovHi then
         return true
   return false
@@ -2499,7 +2511,8 @@ private def emitTaskDesc
         { byteAddr := regSrc1RowStride, value := ← natToU32Checked l2Row "src1RowStride" }
       ]
     | loc =>
-      let row := 2 * min (alignUp dims.w 8) stripW
+      let effSrcStrip := if act == .copy && totalTasks > 1 then max stripW 32 else stripW
+      let row := 2 * min (alignUp dims.w 8) effSrcStrip
       let u := dims.c * row
       let (slot, off, dmaRow, dmaPlane) := match loc with
         | .surface _ s =>

@@ -2418,7 +2418,12 @@ private def cmdCompileGraph (args : List String) : IO UInt32 := do
             if ndInputs.size != 1 then throw s!"{ctx} ({ndOpStr}): expected 1 input"
             let some inDims := lookupShape ndInputs[0]!
               | throw s!"{ctx} ({ndOpStr}): unknown input '{ndInputs[0]!}'"
-            let cin := (← jsonOptPosNat nj "cin" ctx).orElse (fun () => (jsonOptPosNat nj "k" ctx).toOption.join) |>.getD inDims.c
+            let cin ← match ← jsonOptPosNat nj "cin" ctx with
+              | some v => pure v
+              | none =>
+                match ← jsonOptPosNat nj "k" ctx with
+                | some v => pure v
+                | none => pure inDims.c
             let cout ← match ← jsonOptPosNat nj "cout" ctx with
               | some v => pure v
               | none =>

@@ -430,6 +430,42 @@ def DramAccessPort.name : DramAccessPort → String
   | .kernel => "kernel"
   | .lut => "lut"
 
+/-- Exact written-byte coverage descriptor for a DRAM `resDma` write, used by S5 scratch
+    read coverage and `[multiBatchRaw]` superseding. Bounding box `[lo, hi)` remains on
+    `VerifiedDramAccess` for conservative hazard detection. -/
+inductive WriteCoverage where
+  | dense (lo hi : Nat)
+  | periodic (start innerLen outerCount outerStride : Nat)
+  | sparse
+  deriving Repr, BEq, DecidableEq, Inhabited
+
+/-- Classify the exact written byte set of a 4D/5D strided fp16 `resDma` write
+    `(batchN, dOut, rch, h, rw)` at `outOff` with strides `(outNSt, outDSt, outPlaneSt, outRowSt)`. -/
+def classifyStridedWriteCoverage
+    (batchN dOut rch h rw outOff outNSt outDSt outPlaneSt outRowSt : Nat) : WriteCoverage :=
+  let rowBytes := alignUp (2 * rw) vDmaLineBytes
+  let rowTight := h <= 1 || outRowSt == rowBytes
+  let planeTight := rch <= 1 || outPlaneSt == h * rowBytes
+  let dTight := dOut <= 1 || outDSt == rch * h * rowBytes
+  let nTight := batchN <= 1 || outNSt == dOut * rch * h * rowBytes
+  if batchN == 0 || dOut == 0 || rch == 0 || h == 0 || rw == 0 then
+    .sparse
+  else if rowTight && planeTight && dTight && nTight then
+    let totalLen := batchN * dOut * rch * h * rowBytes
+    .dense outOff (outOff + totalLen)
+  else if batchN == 1 && dOut == 1 && rowTight &&
+          outPlaneSt > 0 && h * rowBytes <= outPlaneSt then
+    let innerLen := h * rowBytes
+    if rch == 1 then .dense outOff (outOff + innerLen)
+    else .periodic outOff innerLen rch outPlaneSt
+  else if batchN == 1 && dOut == 1 && (rch <= 1 || outPlaneSt == h * outRowSt) &&
+          outRowSt > 0 && rowBytes <= outRowSt then
+    let outerCount := rch * h
+    if outerCount == 1 then .dense outOff (outOff + rowBytes)
+    else .periodic outOff rowBytes outerCount outRowSt
+  else
+    .sparse
+
 /-- A verified half-open DRAM access `[lo, hi)` on a resolved `BarResource`. -/
 structure VerifiedDramAccess where
   resource : BarResource
@@ -437,6 +473,7 @@ structure VerifiedDramAccess where
   hi : Nat
   isWrite : Bool
   port : DramAccessPort
+  coverage : WriteCoverage := .sparse
   deriving Repr, BEq, Inhabited
 
 /-- Decoded synchronization bits and DMA dependency fields for one task. -/
@@ -807,15 +844,15 @@ private def vDecodeSrcDep
   pure (depKind, depDist)
 
 /-- Verify a DMA stride pair `(rowStride, planeStride)` for shape `(c, h, w)` against a
-    capacity bound `cap` and return the verified exact strided byte `extent`.
-    When `isSurface` and `c > 1`, additionally enforces `baseOff + h * rowStride <= planeStride`
+    capacity bound `cap` and return the verified exact strided byte `(extent, coverage)`.
+    When `isSurface` and `c > 1`, additionally enforces `(baseOff % planeStride) + h * rowStride <= planeStride`
     to prevent inter-channel plane bleed. -/
 private def vVerifyDmaStridesAndBounds
     (writes : Array DecodedWrite)
     (c h w baseOff cap : Nat)
     (isSurface : Bool)
     (rowAddr planeAddr : Nat)
-    (rowName planeName dirLabel targetLabel prefixMsg : String) : Except String Nat := do
+    (rowName planeName dirLabel targetLabel prefixMsg : String) : Except String (Nat × WriteCoverage) := do
   if baseOff % vDmaLineBytes != 0 then
     throw s!"{prefixMsg}: {dirLabel} {targetLabel} base offset {toHex baseOff} is not {vDmaLineBytes}-byte aligned"
   let rowStride ← match findDecodedWrite writes rowAddr with
@@ -841,7 +878,8 @@ private def vVerifyDmaStridesAndBounds
     throw s!"{prefixMsg}: {dirLabel} range [{toHex baseOff}, {toHex (baseOff + extent)}) exceeds {targetLabel} capacity {cap}"
   if isSurface && c > 1 && planeStride > 0 && (baseOff % planeStride) + h * rowStride > planeStride then
     throw s!"{prefixMsg}: {dirLabel} {targetLabel} plane bleed: (baseOff % planeStride) ({toHex (baseOff % planeStride)}) + H * rowStride ({h * rowStride}) > planeStride ({planeStride})"
-  pure extent
+  let cov := classifyStridedWriteCoverage 1 1 c h w baseOff 0 0 planeStride rowStride
+  pure (extent, cov)
 
 /-- Verify that a set of register addresses are all absent (omitted). -/
 private def vCheckOmitted (writes : Array DecodedWrite) (addrs : Array (Nat × String)) (reason prefixMsg : String) :
@@ -1426,7 +1464,7 @@ def verifyConvTaskMulti
       | .surface s => (BarResource.surface (findSurfaceIndex info s) s.shortName, min s.span.toNat s.sect.size.toNat, true, s!"surface '{s.shortName}'")
       | .scratch sc => (BarResource.scratch, sc.size.toNat, false, "scratch (__DATA,__bss)")
       | _ => (BarResource.scratch, 0, false, "invalid")
-    let inExtent ← vVerifyDmaStridesAndBounds task.writes cin fullH fullW srcBaseOff cap isSurf
+    let (inExtent, _) ← vVerifyDmaStridesAndBounds task.writes cin fullH fullW srcBaseOff cap isSurf
       regSrc1DmaRowStride regSrc1DmaPlaneStride "src1DmaRowStride" "src1DmaPlaneStride" "input DMA" lbl prefixMsg
     dramAccs := dramAccs.push { resource := resId, lo := srcBaseOff, hi := srcBaseOff + inExtent, isWrite := false, port := .src1Dma }
 
@@ -1456,9 +1494,9 @@ def verifyConvTaskMulti
       | .surface s => (BarResource.surface (findSurfaceIndex info s) s.shortName, min s.span.toNat s.sect.size.toNat, true, s!"surface '{s.shortName}'")
       | .scratch sc => (BarResource.scratch, sc.size.toNat, false, "scratch (__DATA,__bss)")
       | _ => (BarResource.scratch, 0, false, "invalid")
-    let outExtent ← vVerifyDmaStridesAndBounds task.writes cout hout wout resBaseOff cap isSurf
+    let (outExtent, outCov) ← vVerifyDmaStridesAndBounds task.writes cout hout wout resBaseOff cap isSurf
       regResDmaRowStride regResDmaPlaneStride "resDmaRowStride" "resDmaPlaneStride" "output DMA" lbl prefixMsg
-    dramAccs := dramAccs.push { resource := resId, lo := resBaseOff, hi := resBaseOff + outExtent, isWrite := true, port := .resDma }
+    dramAccs := dramAccs.push { resource := resId, lo := resBaseOff, hi := resBaseOff + outExtent, isWrite := true, port := .resDma, coverage := outCov }
 
   -- 11. Output stage block (only on final task)
   vVerifyOutputStageMulti task.writes taskId isLast prefixMsg
@@ -1950,7 +1988,7 @@ def verifyPeTaskMulti
       | .surface s => (BarResource.surface (findSurfaceIndex info s) s.shortName, min s.span.toNat s.sect.size.toNat, true, s!"surface '{s.shortName}'")
       | .scratch sc => (BarResource.scratch, sc.size.toNat, false, "scratch (__DATA,__bss)")
       | _ => (BarResource.scratch, 0, false, "invalid")
-    let ext ← vVerifyDmaStridesAndBounds task.writes s1C s1H s1W off cap isSurf
+    let (ext, _) ← vVerifyDmaStridesAndBounds task.writes s1C s1H s1W off cap isSurf
       regSrc1DmaRowStride regSrc1DmaPlaneStride "src1DmaRowStride" "src1DmaPlaneStride" "input DMA" lbl prefixMsg
     dramAccs := dramAccs.push { resource := resId, lo := off, hi := off + ext, isWrite := false, port := .src1Dma }
 
@@ -1964,7 +2002,7 @@ def verifyPeTaskMulti
       | .surface s => (BarResource.surface (findSurfaceIndex info s) s.shortName, min s.span.toNat s.sect.size.toNat, true, s!"surface '{s.shortName}'")
       | .scratch sc => (BarResource.scratch, sc.size.toNat, false, "scratch (__DATA,__bss)")
       | _ => (BarResource.scratch, 0, false, "invalid")
-    let ext ← vVerifyDmaStridesAndBounds task.writes s2C s2H s2W off cap isSurf
+    let (ext, _) ← vVerifyDmaStridesAndBounds task.writes s2C s2H s2W off cap isSurf
       regSrc2DmaRowStride regSrc2DmaPlaneStride "src2DmaRowStride" "src2DmaPlaneStride" "input DMA" lbl prefixMsg
     dramAccs := dramAccs.push { resource := resId, lo := off, hi := off + ext, isWrite := false, port := .src2Dma }
 
@@ -1991,9 +2029,9 @@ def verifyPeTaskMulti
       | .surface s => (BarResource.surface (findSurfaceIndex info s) s.shortName, min s.span.toNat s.sect.size.toNat, true, s!"surface '{s.shortName}'")
       | .scratch sc => (BarResource.scratch, sc.size.toNat, false, "scratch (__DATA,__bss)")
       | _ => (BarResource.scratch, 0, false, "invalid")
-    let ext ← vVerifyDmaStridesAndBounds task.writes outC outH outW off cap isSurf
+    let (ext, outCov) ← vVerifyDmaStridesAndBounds task.writes outC outH outW off cap isSurf
       regResDmaRowStride regResDmaPlaneStride "resDmaRowStride" "resDmaPlaneStride" "output DMA" lbl prefixMsg
-    dramAccs := dramAccs.push { resource := resId, lo := off, hi := off + ext, isWrite := true, port := .resDma }
+    dramAccs := dramAccs.push { resource := resId, lo := off, hi := off + ext, isWrite := true, port := .resDma, coverage := outCov }
 
   -- 10. Kernel stage, output stage, and strict mode-conditional register allowlist
   vVerifyKernelStageMulti task.writes taskId isLast false false prefixMsg
@@ -2370,7 +2408,7 @@ def verifyNeActTaskMulti
       | .surface s => (BarResource.surface (findSurfaceIndex info s) s.shortName, min s.span.toNat s.sect.size.toNat, true, s!"surface '{s.shortName}'")
       | .scratch sc => (BarResource.scratch, sc.size.toNat, false, "scratch (__DATA,__bss)")
       | _ => (BarResource.scratch, 0, false, "invalid")
-    let ext ← vVerifyDmaStridesAndBounds task.writes c h w off cap isSurf
+    let (ext, _) ← vVerifyDmaStridesAndBounds task.writes c h w off cap isSurf
       regSrc1DmaRowStride regSrc1DmaPlaneStride "src1DmaRowStride" "src1DmaPlaneStride" "input DMA" lbl prefixMsg
     dramAccs := dramAccs.push { resource := resId, lo := off, hi := off + ext, isWrite := false, port := .src1Dma }
 
@@ -2397,9 +2435,9 @@ def verifyNeActTaskMulti
       | .surface s => (BarResource.surface (findSurfaceIndex info s) s.shortName, min s.span.toNat s.sect.size.toNat, true, s!"surface '{s.shortName}'")
       | .scratch sc => (BarResource.scratch, sc.size.toNat, false, "scratch (__DATA,__bss)")
       | _ => (BarResource.scratch, 0, false, "invalid")
-    let ext ← vVerifyDmaStridesAndBounds task.writes c h w off cap isSurf
+    let (ext, outCov) ← vVerifyDmaStridesAndBounds task.writes c h w off cap isSurf
       regResDmaRowStride regResDmaPlaneStride "resDmaRowStride" "resDmaPlaneStride" "output DMA" lbl prefixMsg
-    dramAccs := dramAccs.push { resource := resId, lo := off, hi := off + ext, isWrite := true, port := .resDma }
+    dramAccs := dramAccs.push { resource := resId, lo := off, hi := off + ext, isWrite := true, port := .resDma, coverage := outCov }
 
   vVerifyOutputStageMulti task.writes taskId isLast prefixMsg
 
@@ -2720,7 +2758,7 @@ def verifyPePoolTaskMulti
       | .surface s => (BarResource.surface (findSurfaceIndex info s) s.shortName, min s.span.toNat s.sect.size.toNat, true, s!"surface '{s.shortName}'")
       | .scratch sc => (BarResource.scratch, sc.size.toNat, false, "scratch (__DATA,__bss)")
       | _ => (BarResource.scratch, 0, false, "invalid")
-    let ext ← vVerifyDmaStridesAndBounds task.writes cin fullH fullW off cap isSurf
+    let (ext, _) ← vVerifyDmaStridesAndBounds task.writes cin fullH fullW off cap isSurf
       regSrc1DmaRowStride regSrc1DmaPlaneStride "src1DmaRowStride" "src1DmaPlaneStride" "input DMA" lbl prefixMsg
     dramAccs := dramAccs.push { resource := resId, lo := off, hi := off + ext, isWrite := false, port := .src1Dma }
 
@@ -2747,9 +2785,9 @@ def verifyPePoolTaskMulti
       | .surface s => (BarResource.surface (findSurfaceIndex info s) s.shortName, min s.span.toNat s.sect.size.toNat, true, s!"surface '{s.shortName}'")
       | .scratch sc => (BarResource.scratch, sc.size.toNat, false, "scratch (__DATA,__bss)")
       | _ => (BarResource.scratch, 0, false, "invalid")
-    let ext ← vVerifyDmaStridesAndBounds task.writes cout hout wout off cap isSurf
+    let (ext, outCov) ← vVerifyDmaStridesAndBounds task.writes cout hout wout off cap isSurf
       regResDmaRowStride regResDmaPlaneStride "resDmaRowStride" "resDmaPlaneStride" "output DMA" lbl prefixMsg
-    dramAccs := dramAccs.push { resource := resId, lo := off, hi := off + ext, isWrite := true, port := .resDma }
+    dramAccs := dramAccs.push { resource := resId, lo := off, hi := off + ext, isWrite := true, port := .resDma, coverage := outCov }
 
   vVerifyKernelStageMulti task.writes taskId isLast false false prefixMsg
   vVerifyOutputStageMulti task.writes taskId isLast prefixMsg
@@ -3117,7 +3155,12 @@ def verifyPeReduceTaskMulti
     let ext := (sC - 1) * outC + (sN - 1) * outN + vDmaLineBytes
     if off + ext > cap then
       throw s!"{prefixMsg}: output DMA range [{toHex off}, {toHex (off + ext)}) exceeds {lbl} capacity {cap}"
-    dramAccs := dramAccs.push { resource := resId, lo := off, hi := off + ext, isWrite := true, port := .resDma }
+    let stdTight := (sC <= 1 || outC == vDmaLineBytes) && (sN <= 1 || outN == sC * vDmaLineBytes)
+    let swapTight := (sN <= 1 || outN == vDmaLineBytes) && (sC <= 1 || outC == sN * vDmaLineBytes)
+    let outCov : WriteCoverage :=
+      if stdTight || swapTight then .dense off (off + sN * sC * vDmaLineBytes)
+      else .sparse
+    dramAccs := dramAccs.push { resource := resId, lo := off, hi := off + ext, isWrite := true, port := .resDma, coverage := outCov }
 
   vVerifyKernelStageMulti task.writes taskId isLast false false prefixMsg
   vVerifyOutputStageMulti task.writes taskId isLast prefixMsg
@@ -3453,7 +3496,7 @@ def verifyNePoolTaskMulti
       | .surface s => (BarResource.surface (findSurfaceIndex info s) s.shortName, min s.span.toNat s.sect.size.toNat, true, s!"surface '{s.shortName}'")
       | .scratch sc => (BarResource.scratch, sc.size.toNat, false, "scratch (__DATA,__bss)")
       | _ => (BarResource.scratch, 0, false, "invalid")
-    let ext ← vVerifyDmaStridesAndBounds task.writes cin fullH fullW off cap isSurf
+    let (ext, _) ← vVerifyDmaStridesAndBounds task.writes cin fullH fullW off cap isSurf
       regSrc1DmaRowStride regSrc1DmaPlaneStride "src1DmaRowStride" "src1DmaPlaneStride" "input DMA" lbl prefixMsg
     dramAccs := dramAccs.push { resource := resId, lo := off, hi := off + ext, isWrite := false, port := .src1Dma }
 
@@ -3480,9 +3523,9 @@ def verifyNePoolTaskMulti
       | .surface s => (BarResource.surface (findSurfaceIndex info s) s.shortName, min s.span.toNat s.sect.size.toNat, true, s!"surface '{s.shortName}'")
       | .scratch sc => (BarResource.scratch, sc.size.toNat, false, "scratch (__DATA,__bss)")
       | _ => (BarResource.scratch, 0, false, "invalid")
-    let ext ← vVerifyDmaStridesAndBounds task.writes cout hout wout off cap isSurf
+    let (ext, outCov) ← vVerifyDmaStridesAndBounds task.writes cout hout wout off cap isSurf
       regResDmaRowStride regResDmaPlaneStride "resDmaRowStride" "resDmaPlaneStride" "output DMA" lbl prefixMsg
-    dramAccs := dramAccs.push { resource := resId, lo := off, hi := off + ext, isWrite := true, port := .resDma }
+    dramAccs := dramAccs.push { resource := resId, lo := off, hi := off + ext, isWrite := true, port := .resDma, coverage := outCov }
 
   vVerifyKernelStageMulti task.writes taskId isLast false false prefixMsg
   vVerifyOutputStageMulti task.writes taskId isLast prefixMsg
@@ -3794,7 +3837,7 @@ def verifyNeChannelReduceTaskMulti
       | .surface s => (BarResource.surface (findSurfaceIndex info s) s.shortName, min s.span.toNat s.sect.size.toNat, true, s!"surface '{s.shortName}'")
       | .scratch sc => (BarResource.scratch, sc.size.toNat, false, "scratch (__DATA,__bss)")
       | _ => (BarResource.scratch, 0, false, "invalid")
-    let ext ← vVerifyDmaStridesAndBounds task.writes cin h w off cap isSurf
+    let (ext, _) ← vVerifyDmaStridesAndBounds task.writes cin h w off cap isSurf
       regSrc1DmaRowStride regSrc1DmaPlaneStride "src1DmaRowStride" "src1DmaPlaneStride" "input DMA" lbl prefixMsg
     dramAccs := dramAccs.push { resource := resId, lo := off, hi := off + ext, isWrite := false, port := .src1Dma }
 
@@ -3821,9 +3864,9 @@ def verifyNeChannelReduceTaskMulti
       | .surface s => (BarResource.surface (findSurfaceIndex info s) s.shortName, min s.span.toNat s.sect.size.toNat, true, s!"surface '{s.shortName}'")
       | .scratch sc => (BarResource.scratch, sc.size.toNat, false, "scratch (__DATA,__bss)")
       | _ => (BarResource.scratch, 0, false, "invalid")
-    let ext ← vVerifyDmaStridesAndBounds task.writes 1 h w off cap isSurf
+    let (ext, outCov) ← vVerifyDmaStridesAndBounds task.writes 1 h w off cap isSurf
       regResDmaRowStride regResDmaPlaneStride "resDmaRowStride" "resDmaPlaneStride" "output DMA" lbl prefixMsg
-    dramAccs := dramAccs.push { resource := resId, lo := off, hi := off + ext, isWrite := true, port := .resDma }
+    dramAccs := dramAccs.push { resource := resId, lo := off, hi := off + ext, isWrite := true, port := .resDma, coverage := outCov }
 
   vVerifyKernelStageMulti task.writes taskId isLast false false prefixMsg
   vVerifyOutputStageMulti task.writes taskId isLast prefixMsg
@@ -4128,6 +4171,8 @@ def verifyNeViewTaskMulti
       let resDirectBytes := ((1 : Nat) <<< (f + ocg + fat)) * 512
       l2Accs := l2Accs.push { lo := resL2Base, hi := resL2Base + resDirectBytes, isWrite := true, role := .resStage }
     else
+      if dOut > 1 then
+        throw s!"{prefixMsg}: staged mode (direct=false) requires D=1, got D={dOut}"
       let wResChs ← requireDecodedWrite task.writes regResChanStride "resChanStride"
       let wResRow ← requireDecodedWrite task.writes regResRowStride "resRowStride"
       let wResRowA ← requireDecodedWrite task.writes regResRowBytesA "resRowBytesA"
@@ -4224,7 +4269,8 @@ def verifyNeViewTaskMulti
     let alignedActualOutEnd := alignUp (off + rawActualOutExt) vDmaLineBytes
     if alignedActualOutEnd > cap then
       throw s!"{prefixMsg}: output DMA write range [{toHex off}, {toHex alignedActualOutEnd}) exceeds {lbl} capacity {cap}"
-    dramAccs := dramAccs.push { resource := resId, lo := off, hi := alignedActualOutEnd, isWrite := true, port := .resDma }
+    let outCov := classifyStridedWriteCoverage batchN dOut rch h rw off outNSt outDSt outPlaneSt outRowSt
+    dramAccs := dramAccs.push { resource := resId, lo := off, hi := alignedActualOutEnd, isWrite := true, port := .resDma, coverage := outCov }
 
   -- 8. Kernel stage, output stage, and strict mode-conditional register allowlist
   vVerifyKernelStageMulti task.writes taskId isLast false false prefixMsg
@@ -4304,6 +4350,73 @@ def sweepCover : List (Nat × Nat) → Nat → Nat
 def intervalsCover (ivs : List (Nat × Nat)) (lo hi : Nat) : Bool :=
   if lo >= hi then true
   else sweepCover (sortIntervals ivs) lo >= hi
+
+/-- Check whether periodic inner-block intervals `innerIvs` cover `[0, outerStride)` with
+    `outerCount > 0` and `outerStride > 0`, yielding the dense combined byte range
+    `[outerBase, outerBase + outerCount * outerStride)`. -/
+def periodicGroupCovered
+    (outerBase outerCount outerStride : Nat) (innerIvs : List (Nat × Nat)) : Option (Nat × Nat) :=
+  if outerCount > 0 && outerStride > 0 && intervalsCover innerIvs 0 outerStride then
+    some (outerBase, outerBase + outerCount * outerStride)
+  else
+    none
+
+/-- Convert exact `WriteCoverage` descriptors into guaranteed-written dense byte intervals:
+    - `.dense lo hi` emits `(lo, hi)` directly;
+    - `.periodic start innerLen outerCount outerStride` entries with matching `(outerCount, outerStride)`
+      are clustered by `start` within one `outerStride` window and emit `(clusterBase, clusterBase + outerCount * outerStride)`
+      iff `periodicGroupCovered` proves `[0, outerStride)` is completely covered;
+    - `.sparse` contributes nothing. -/
+def effectiveCoveredIntervals (covs : List WriteCoverage) : List (Nat × Nat) := Id.run do
+  let mut denseIvs : List (Nat × Nat) := []
+  let mut periodicKeys : Array (Nat × Nat) := #[]
+  let mut periodicEntries : Array (Nat × Nat × Nat × Nat) := #[]
+  for c in covs do
+    match c with
+    | .dense lo hi =>
+      if lo < hi then
+        denseIvs := (lo, hi) :: denseIvs
+    | .periodic start innerLen outerCount outerStride =>
+      if innerLen > 0 && outerCount > 0 && outerStride > 0 then
+        periodicEntries := periodicEntries.push (start, innerLen, outerCount, outerStride)
+        let key := (outerCount, outerStride)
+        if !periodicKeys.contains key then
+          periodicKeys := periodicKeys.push key
+    | .sparse => pure ()
+
+  for (outerCount, outerStride) in periodicKeys do
+    let mut group : List (Nat × Nat) := []
+    for (st, len, oc, os) in periodicEntries do
+      if oc == outerCount && os == outerStride then
+        group := insertInterval (st, len) group
+    -- Cluster sorted `(start, innerLen)` entries by contiguous `outerStride` windows
+    let mut curBase? : Option Nat := none
+    let mut curInner : List (Nat × Nat) := []
+    for (st, len) in group do
+      match curBase? with
+      | none =>
+        if len <= outerStride then
+          curBase? := some st
+          curInner := [(0, len)]
+      | some base =>
+        if st >= base + outerStride then
+          if let some iv := periodicGroupCovered base outerCount outerStride curInner then
+            denseIvs := iv :: denseIvs
+          if len <= outerStride then
+            curBase? := some st
+            curInner := [(0, len)]
+          else
+            curBase? := none
+            curInner := []
+        else
+          let rel := st - base
+          if rel + len <= outerStride then
+            curInner := (rel, rel + len) :: curInner
+    if let some base := curBase? then
+      if let some iv := periodicGroupCovered base outerCount outerStride curInner then
+        denseIvs := iv :: denseIvs
+
+  return denseIvs
 
 private def vLatestEngBefore (fps : Array VerifiedTaskFootprint) (eng : Engine) (i : Nat) : Option Nat := Id.run do
   let mut best : Option Nat := none
@@ -4594,18 +4707,19 @@ def verifyProgramHazards (fps : Array VerifiedTaskFootprint) : Except String Uni
               priorWriters := priorWriters.push (k, a)
         if priorWriters.isEmpty then
           throw s!"S5 DRAM scratch integrity: task {i} {b.port.name} reads uninitialized scratch [{toHex b.lo}, {toHex b.hi}) with no prior overlapping resDma write"
-        let writerIvs : List (Nat × Nat) := priorWriters.toList.map (fun (_, a) => (a.lo, a.hi))
+        let writerIvs : List (Nat × Nat) := effectiveCoveredIntervals (priorWriters.toList.map (fun (_, a) => a.coverage))
         if !intervalsCover writerIvs b.lo b.hi then
           throw s!"S5 DRAM scratch integrity: task {i} {b.port.name} scratch read [{toHex b.lo}, {toHex b.hi}) is only partially covered by prior resDma writers (uninitialized gap)"
-        -- Check [multiBatchRaw] on every active (not completely superseded by later writers) multi-batch writer
+        -- Check [multiBatchRaw] on every active (not completely superseded by later dense/periodic writers) multi-batch writer
         for idx in [:priorWriters.size] do
           let (p, a) := priorWriters[idx]!
           if fps[p]!.isMultiBatch then
-            let mut laterIvs : List (Nat × Nat) := []
+            let mut laterCovs : List WriteCoverage := []
             for idx2 in [idx + 1 : priorWriters.size] do
               let (p2, a2) := priorWriters[idx2]!
               if p2 > p then
-                laterIvs := (a2.lo, a2.hi) :: laterIvs
+                laterCovs := a2.coverage :: laterCovs
+            let laterIvs := effectiveCoveredIntervals laterCovs
             let clipLo := max a.lo b.lo
             let clipHi := min a.hi b.hi
             if !intervalsCover laterIvs clipLo clipHi then

@@ -5317,6 +5317,257 @@ private def runM5cTests : IO (Array TestResult) := do
     tamperM5aTaskReg baseConcatH.hwx baseConcatH.info 1 regSrc1Cfg (orig &&& (~~~cfgBitWaitNe5))
   ) "S5 ")
 
+  -- 17. Positive multi-task graph with T-mode transpose (C<->W, perm #[0, 3, 2, 1]) on H16 & H17
+  results := results.push (checkOk "m5c: multi-task graph conv1x1 -> T-mode transpose [0,3,2,1] -> conv1x1 on H16 & H17 (auto & dram)" (do
+    for tgt in #[Target.h16, Target.h17] do
+      for pl in #[Vane.Graph.EdgePlacementMode.auto, Vane.Graph.EdgePlacementMode.dram] do
+        let g ← Vane.Graph.compileGraph {
+          target := tgt
+          defaultPlacement := pl
+          inputs := #[{ name := "x", shape := { c := 16, h := 4, w := 32 } }]
+          nodes := #[
+            { id := "c0", inputs := #["x"],  op := .conv1x1 16 32 (mkM5aW1x1 16 32 11) none .none },
+            { id := "tr", inputs := #["c0"], op := .transpose #[0, 3, 2, 1] },
+            { id := "c1", inputs := #["tr"], op := .conv1x1 32 16 (mkM5aW1x1 32 16 12) none .none }
+          ]
+        }
+        matrixVerify tgt g.hwx g.sections { total := 3, neConv := 2, neAct := 0, peOp := 0, neView := 1 }
+    pure ()
+  ))
+
+  -- 18. [M2] Regression: multi-task NodeOp.lut .copy under tight L2 budget uses 64B src1ChanStride floor matching verifyNeViewTaskMulti
+  results := results.push (checkOk "m5c [M2]: multi-task lut .copy under tight L2 budget compiles & verifies on H16 & H17" (do
+    for tgt in #[Target.h16, Target.h17] do
+      let g ← Vane.Graph.compileGraph {
+        target := tgt
+        defaultPlacement := .auto
+        inputs := #[{ name := "x", shape := { c := 12288, h := 1, w := 64 } }]
+        nodes := #[
+          { id := "cp", inputs := #["x"],  op := .lut .copy },
+          { id := "ab", inputs := #["cp"], op := .pe1 .abs }
+        ]
+      }
+      matrixVerify tgt g.hwx g.sections { total := 2, neConv := 0, neAct := 0, peOp := 1, neView := 1 }
+    pure ()
+  ))
+
+  -- 19. [B1] Negative tamper (a): single strided-hole scratch write with full bounding box rejected
+  let baseSingleViewGraph ← match Vane.Graph.compileGraph {
+      target := .h17
+      defaultPlacement := .dram
+      inputs := #[{ name := "x", shape := { c := 4, h := 4, w := 32 } }]
+      nodes := #[
+        { id := "v0", inputs := #["x"],  op := .transpose #[0, 1, 2, 3] },
+        { id := "c0", inputs := #["v0"], op := .conv1x1 4 4 (mkM5aW1x1 4 4 13) none .none }
+      ]
+    } with
+    | .ok g => pure g
+    | .error e => throw (IO.userError s!"baseSingleViewGraph setup failed: {e}")
+
+  results := results.push (checkErr "m5c [B1] neg tamper: single strided-hole scratch write with full bounding box rejected" (do
+    -- Task 0 originally writes C=4, H=4, W=32, outRowSt=64, outPlaneSt=256 (dense [0, 1024)).
+    -- Tamper to C=3, outPlaneSt=384: bounding box is still [0, 2*384+256) = [0, 1024),
+    -- yet [256, 384) and [640, 768) are unwritten holes!
+    let fCin ← findM5aTaskRegOffset baseSingleViewGraph.hwx baseSingleViewGraph.info 0 regCin
+    let fCout ← findM5aTaskRegOffset baseSingleViewGraph.hwx baseSingleViewGraph.info 0 regCout
+    let fRow ← findM5aTaskRegOffset baseSingleViewGraph.hwx baseSingleViewGraph.info 0 regSrc1RowStride
+    let fRowA ← findM5aTaskRegOffset baseSingleViewGraph.hwx baseSingleViewGraph.info 0 regSrc1RowBytesA
+    let fRowB ← findM5aTaskRegOffset baseSingleViewGraph.hwx baseSingleViewGraph.info 0 regSrc1RowBytesB
+    let fPl ← findM5aTaskRegOffset baseSingleViewGraph.hwx baseSingleViewGraph.info 0 regResDmaPlaneStride
+    let chs := (← readU32LE baseSingleViewGraph.hwx (← findM5aTaskRegOffset baseSingleViewGraph.hwx baseSingleViewGraph.info 0 regSrc1ChanStride)).toNat
+    let newU := (3 * chs).toUInt32
+    let h1 ← putU32LE baseSingleViewGraph.hwx fCin 3
+    let h2 ← putU32LE h1 fCout 3
+    let h3 ← putU32LE h2 fRow newU
+    let h4 ← putU32LE h3 fRowA newU
+    let h5 ← putU32LE h4 fRowB newU
+    let h6 ← putU32LE h5 fPl 384
+    let badInfo ← validateHwx h6
+    let _ ← verifyHwxTasksSummary h6 badInfo (requireKnownTask := true)
+    pure ()
+  ) "partially covered")
+
+  -- 20. [B1] Negative tamper (b): partial H-concat leaving interior per-channel row gaps despite full bounding-box union
+  let baseConcatHGraph ← match Vane.Graph.compileGraph {
+      target := .h17
+      defaultPlacement := .dram
+      inputs := #[
+        { name := "a", shape := { c := 8, h := 4, w := 32 } },
+        { name := "b", shape := { c := 8, h := 4, w := 32 } }
+      ]
+      nodes := #[
+        { id := "cat", inputs := #["a", "b"], op := .concat 2 },
+        { id := "c0",  inputs := #["cat"], op := .conv1x1 8 8 (mkM5aW1x1 8 8 14) none .none }
+      ]
+    } with
+    | .ok g => pure g
+    | .error e => throw (IO.userError s!"baseConcatHGraph setup failed: {e}")
+
+  results := results.push (checkErr "m5c [B1] neg tamper: partial H-concat with interior channel gaps (full bbox union) rejected" (do
+    -- Shrink task 0 Hin/Hout/TH from 4 to 3: bounding boxes [0, 3776) U [256, 4096) == [0, 4096),
+    -- yet row 3 ([192, 256)) of every channel is unwritten!
+    let fHin ← findM5aTaskRegOffset baseConcatHGraph.hwx baseConcatHGraph.info 0 regHin
+    let fHout ← findM5aTaskRegOffset baseConcatHGraph.hwx baseConcatHGraph.info 0 regHout
+    let fTh ← findM5aTaskRegOffset baseConcatHGraph.hwx baseConcatHGraph.info 0 regTH
+    let h1 ← putU32LE baseConcatHGraph.hwx fHin 3
+    let h2 ← putU32LE h1 fHout 3
+    let h3 ← putU32LE h2 fTh 3
+    let badInfo ← validateHwx h3
+    let _ ← verifyHwxTasksSummary h3 badInfo (requireKnownTask := true)
+    pure ()
+  ) "partially covered")
+
+  -- 21. [B1+M3] Multi-writer [multiBatchRaw] superseding: full dense supersede passes, partial dense & strided bbox-full rejected
+  let baseMbSupersede ← match Vane.Graph.compileGraph {
+      target := .h17
+      defaultPlacement := .dram
+      inputs := #[{ name := "x", shape := { c := 4, h := 4, w := 16 } }]
+      nodes := #[
+        { id := "red", inputs := #["x"],          op := .reduce .sum { reduceW := true } },
+        { id := "cpy", inputs := #["x"],          op := .transpose #[0, 1, 2, 3] },
+        { id := "out", inputs := #["cpy", "red"], op := .pe2 .add false }
+      ]
+    } with
+    | .ok g => pure g
+    | .error e => throw (IO.userError s!"baseMbSupersede setup failed: {e}")
+
+  let mkMbSupersedeHwx := fun (cpyMode : Nat) => do
+    -- Task 0 (red, PE, BatchN=4) writes scratch [0, 1024).
+    -- Task 1 (cpy, NE, BatchN=1) originally writes [1024, 2048); move its resBaseLo -> 0 and add waitPe22 (task 0 -> task 1 WAW).
+    -- Task 2 (out, PE2) reads [0, 1024) on both src1 (depKind=2) and src2 (tampered depKind 1 -> 2).
+    -- cpyMode = 0: full dense [0, 1024) (completely supersedes task 0 -> MUST PASS)
+    -- cpyMode = 1: partial dense [0, 512) (Cin=Cout=2 -> MUST FAIL [multiBatchRaw])
+    -- cpyMode = 2: strided holes C=3, outPlaneSt=384, bbox [0, 1024) -> MUST FAIL [multiBatchRaw]
+    let fCfg1 ← findM5aTaskRegOffset baseMbSupersede.hwx baseMbSupersede.info 1 regSrc1Cfg
+    let origCfg1 ← readU32LE baseMbSupersede.hwx fCfg1
+    let fRes1 ← findM5aTaskRegOffset baseMbSupersede.hwx baseMbSupersede.info 1 regResBaseLo
+    let fSrc12 ← findM5aTaskRegOffset baseMbSupersede.hwx baseMbSupersede.info 2 regSrc1BaseLo
+    let fDep22 ← findM5aTaskRegOffset baseMbSupersede.hwx baseMbSupersede.info 2 regSrc2Dep
+    let origDep22 ← readU32LE baseMbSupersede.hwx fDep22
+    let badDep22 := (origDep22 &&& (~~~((0x3 : UInt32) <<< 28))) ||| ((2 : UInt32) <<< 28)
+    let mut h ← putU32LE baseMbSupersede.hwx fCfg1 (origCfg1 ||| cfgBitWaitPe22)
+    h ← putU32LE h fRes1 0
+    h ← putU32LE h fSrc12 0
+    h ← putU32LE h fDep22 badDep22
+    if cpyMode == 1 || cpyMode == 2 then
+      let newC : Nat := if cpyMode == 1 then 2 else 3
+      let fCin ← findM5aTaskRegOffset h baseMbSupersede.info 1 regCin
+      let fCout ← findM5aTaskRegOffset h baseMbSupersede.info 1 regCout
+      let fRow ← findM5aTaskRegOffset h baseMbSupersede.info 1 regSrc1RowStride
+      let fRowA ← findM5aTaskRegOffset h baseMbSupersede.info 1 regSrc1RowBytesA
+      let fRowB ← findM5aTaskRegOffset h baseMbSupersede.info 1 regSrc1RowBytesB
+      let chs := (← readU32LE h (← findM5aTaskRegOffset h baseMbSupersede.info 1 regSrc1ChanStride)).toNat
+      let newU := (newC * chs).toUInt32
+      h ← putU32LE h fCin newC.toUInt32
+      h ← putU32LE h fCout newC.toUInt32
+      h ← putU32LE h fRow newU
+      h ← putU32LE h fRowA newU
+      h ← putU32LE h fRowB newU
+      if cpyMode == 2 then
+        let fPl ← findM5aTaskRegOffset h baseMbSupersede.info 1 regResDmaPlaneStride
+        h ← putU32LE h fPl 384
+    let info ← validateHwx h
+    let _ ← verifyHwxTasksSummary h info (requireKnownTask := true)
+    pure ()
+
+  results := results.push (checkOk "m5c [B1] pos: full dense BatchN=1 overwrite supersedes prior BatchN>1 scratch writer" (mkMbSupersedeHwx 0))
+  results := results.push (checkErr "m5c [B1+M3] neg tamper: partial dense overwrite fails to supersede BatchN>1 scratch writer ([multiBatchRaw])" (mkMbSupersedeHwx 1) "[multiBatchRaw]")
+  results := results.push (checkErr "m5c [B1+M3] neg tamper: strided-hole overwrite (full bbox) fails to supersede BatchN>1 scratch writer ([multiBatchRaw])" (mkMbSupersedeHwx 2) "[multiBatchRaw]")
+
+  -- 22. [M3] Negative tamper: T-mode alignedActualOutEnd > cap while alignedKernelOutEnd <= cap
+  let baseTModeSmallC ← match (do
+      let vp ← planTranspose { n := 1, c := 8, h := 4, w := 32 } #[0, 3, 2, 1]
+      compileView .h17 vp) with
+    | .ok c => pure c
+    | .error e => throw (IO.userError s!"baseTModeSmallC setup failed: {e}")
+
+  results := results.push (checkErr "m5c [M3] neg tamper: T-mode actual output write range > cap while kernel ane_hx_dma_tile <= cap rejected" (do
+    -- Output surface cap = 32*4*64 = 8192. Kernel bound = 64 + 2048 = 2112 <= 8192,
+    -- actual hardware write bound = alignUp(64 + 8144, 64) = 8256 > 8192.
+    tamperM5aTaskReg baseTModeSmallC.hwx baseTModeSmallC.info 0 regResBaseLo 64
+  ) "output DMA write range")
+
+  -- 23. [M3] Negative tamper: neView resCfg.direct mismatch (T-mode staged rule 9<=C<=16, shMin==0, W<32)
+  let baseTModeStaged ← match (do
+      let vp ← planTranspose { n := 1, c := 12, h := 4, w := 16 } #[0, 3, 2, 1]
+      compileView .h17 vp) with
+    | .ok c => pure c
+    | .error e => throw (IO.userError s!"baseTModeStaged setup failed: {e}")
+
+  results := results.push (checkErr "m5c [M3] neg tamper: T-mode staged neView resCfg/resDep direct=1 rejected by verifier" (do
+    let fCfg ← findM5aTaskRegOffset baseTModeStaged.hwx baseTModeStaged.info 0 regResCfg
+    let fDep ← findM5aTaskRegOffset baseTModeStaged.hwx baseTModeStaged.info 0 regResDep
+    let origCfg ← readU32LE baseTModeStaged.hwx fCfg
+    let origDep ← readU32LE baseTModeStaged.hwx fDep
+    let h1 ← putU32LE baseTModeStaged.hwx fCfg (origCfg ||| ((1 : UInt32) <<< 3))
+    let h2 ← putU32LE h1 fDep (origDep ||| ((1 : UInt32) <<< 24))
+    let badInfo ← validateHwx h2
+    let _ ← verifyHwxTasksSummary h2 badInfo (requireKnownTask := true)
+    pure ()
+  ) "resCfg direct=true disagrees with expected direct=false")
+
+  -- 24. [M3] Negative tamper: neView unaligned src1BaseLo/resBaseLo & unaligned DMA strides (% 64 != 0)
+  results := results.push (checkErr "m5c [M3] neg tamper: neView unaligned src1BaseLo (32 % 64 != 0) rejected" (do
+    tamperM5aTaskReg baseViewCopy.hwx baseViewCopy.info 0 regSrc1BaseLo 32
+  ) "not 64-byte aligned")
+
+  results := results.push (checkErr "m5c [M3] neg tamper: neView unaligned resBaseLo (32 % 64 != 0) rejected" (do
+    tamperM5aTaskReg baseViewCopy.hwx baseViewCopy.info 0 regResBaseLo 32
+  ) "not 64-byte aligned")
+
+  results := results.push (checkErr "m5c [M3] neg tamper: neView unaligned src1DmaRowStride (% 64 != 0) rejected" (do
+    let fSt ← findM5aTaskRegOffset baseViewCopy.hwx baseViewCopy.info 0 regSrc1DmaRowStride
+    let orig ← readU32LE baseViewCopy.hwx fSt
+    tamperM5aTaskReg baseViewCopy.hwx baseViewCopy.info 0 regSrc1DmaRowStride (orig + 32)
+  ) "not 64-byte aligned")
+
+  results := results.push (checkErr "m5c [M3] neg tamper: neView unaligned resDmaRowStride (% 64 != 0) rejected" (do
+    let fSt ← findM5aTaskRegOffset baseViewCopy.hwx baseViewCopy.info 0 regResDmaRowStride
+    let orig ← readU32LE baseViewCopy.hwx fSt
+    tamperM5aTaskReg baseViewCopy.hwx baseViewCopy.info 0 regResDmaRowStride (orig + 32)
+  ) "not 64-byte aligned")
+
+  -- 25. [M3] Negative tamper: neView L2 staging overflow (> 2 MiB)
+  results := results.push (checkErr "m5c [M3] neg tamper: neView L2 resBase past 2 MiB rejected" (do
+    tamperM5aTaskReg baseViewCopy.hwx baseViewCopy.info 0 regResBase 0x001fffc0
+  ) "exceeds 2 MiB")
+
+  -- 26. [Q1] Staged neView with D > 1 rejected by both compiler (viewStageBasesForTh) and verifier
+  results := results.push (checkOk "m5c [Q1]: chooseViewTaskPlan uses staged shPref=0 for D=1 but forbids staged for D=2 (promotes shPref=1 direct=true)" (do
+    let cp1 : ViewCopy := { n := 1, c := 12, h := 4, d := 1, w := 16, transposeCW := true }
+    let p1 ← chooseViewTaskPlan .h17 cp1 []
+    if p1.direct || p1.tiling.shPref != 0 then
+      throw s!"expected D=1 to choose staged shPref=0, got direct={p1.direct} shPref={p1.tiling.shPref}"
+    let cp2 : ViewCopy := { cp1 with d := 2 }
+    let p2 ← chooseViewTaskPlan .h17 cp2 []
+    if !p2.direct || p2.tiling.shPref == 0 then
+      throw s!"expected D=2 to reject staged shPref=0 and promote to direct=true, got direct={p2.direct} shPref={p2.tiling.shPref}"
+    pure ()
+  ))
+
+  results := results.push (checkErr "m5c [Q1] neg tamper: staged neView with D=2 rejected by verifier" (do
+    let fRow ← findM5aTaskRegOffset baseTModeStaged.hwx baseTModeStaged.info 0 regSrc1RowStride
+    let fRowB ← findM5aTaskRegOffset baseTModeStaged.hwx baseTModeStaged.info 0 regSrc1RowBytesB
+    let origRowA := (← readU32LE baseTModeStaged.hwx (← findM5aTaskRegOffset baseTModeStaged.hwx baseTModeStaged.info 0 regSrc1RowBytesA)).toNat
+    let newDU := (2 * origRowA).toUInt32
+    let h1 ← putU32LE baseTModeStaged.hwx fRow newDU
+    let h2 ← putU32LE h1 fRowB newDU
+    let textBytes ← readSlice h2 baseTModeStaged.info.textSection.offset.toNat baseTModeStaged.info.textSection.size.toNat
+    let decoded ← decodeTaskStream .h17 textBytes
+    let td ← rebuildTaskWithExtraWrites decoded[0]! 1 #[
+      { byteAddr := regDin, value := 2 },
+      { byteAddr := regDout, value := 2 }
+    ]
+    let inSurf ← makeFp16Surface .h17 "x" "input_x" .input 12 4 16
+    let outSurf ← makeFp16Surface .h17 "y" "output_y" .output 16 4 12
+    let em ← emitProgram {
+      target := .h17, surfaces := #[inSurf, outSurf], tasks := #[td],
+      kernel := none, scratch := none, constants := zeroBytes textConstBytes, ident := some "vane"
+    }
+    let _ ← verifyHwxTasksSummary em.hwx em.info (requireKnownTask := true)
+    pure ()
+  ) "staged mode (direct=false) requires D=1")
+
   pure results
 
 def main : IO UInt32 := do

@@ -591,19 +591,22 @@ private def viewStageBasesForTh
     (occupied : List Range) (th : Nat) : Option (Nat × Nat × Nat × Bool) :=
   let cand : Tiling := { probe with tileHeight := th }
   let direct := viewIsDirect target cp cand
-  let srcSz := viewSrcL2Bytes cp cand
-  let resSz := viewResL2Bytes target cp cand
-  let srcAligned := alignUp srcSz dmaLineBytes
-  let resAligned := alignUp resSz dmaLineBytes
-  match findFreeOffset occupied srcAligned l2CapacityBytes with
-  | none => none
-  | some sb =>
-    let occ2 := { base := sb, bytes := srcAligned } :: occupied
-    match findFreeOffset occ2 resAligned l2CapacityBytes with
+  if cp.d > 1 && !direct then
+    none
+  else
+    let srcSz := viewSrcL2Bytes cp cand
+    let resSz := viewResL2Bytes target cp cand
+    let srcAligned := alignUp srcSz dmaLineBytes
+    let resAligned := alignUp resSz dmaLineBytes
+    match findFreeOffset occupied srcAligned l2CapacityBytes with
     | none => none
-    | some rb =>
-      let peak := max (maxEndRanges occupied) (max (sb + srcSz) (rb + resSz))
-      some (sb, rb, peak, direct)
+    | some sb =>
+      let occ2 := { base := sb, bytes := srcAligned } :: occupied
+      match findFreeOffset occ2 resAligned l2CapacityBytes with
+      | none => none
+      | some rb =>
+        let peak := max (maxEndRanges occupied) (max (sb + srcSz) (rb + resSz))
+        some (sb, rb, peak, direct)
 
 /-- Budget-aware view tiling chooser (supports both standalone `occupied = []` and multi-task graphs). -/
 def chooseViewTaskPlan
