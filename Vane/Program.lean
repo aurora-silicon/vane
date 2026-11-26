@@ -25,7 +25,7 @@ structure TaskReloc where
   payloadWordIndex : Nat := 0
   deriving Repr, BEq, Inhabited
 
-/-- High-level task descriptor reusable across NE conv, NE act, PE ops, and multi-task graphs. -/
+/-- High-level task descriptor reusable across NE conv, NE act, NE matmul, PE ops, and multi-task graphs. -/
 structure TaskDesc where
   taskId : Nat := 0
   logNE : Nat := 0
@@ -35,6 +35,7 @@ structure TaskDesc where
   isFirst : Bool := true
   isLast : Bool := true
   liveL2Mask : UInt32 := 0
+  extProducerTask : Option Nat := none
   plainWrites : Array RegWrite
   barWrites : Array BarRegWrite
   kernelRelocs : Array TaskReloc := #[]
@@ -110,7 +111,8 @@ def emitProgram (spec : ProgramSpec) : Except String EmittedProgram := do
     let td := spec.tasks[ti]!
     let (plainRecs, barRecs) ← packTaskRecordsSplit td.plainWrites td.barWrites
     let allRecs := plainRecs ++ barRecs
-    let totalTaskWords := 9 + recordWordsCount allRecs
+    let headerWords := if td.extProducerTask.isSome then 10 else 9
+    let totalTaskWords := headerWords + recordWordsCount allRecs
     let ene ← match td.eneOverride with
       | some e => pure e
       | none =>
@@ -125,8 +127,8 @@ def emitProgram (spec : ProgramSpec) : Except String EmittedProgram := do
           some td.header4
         else
           none
-    let header ← encodeTaskHeader9Multi spec.target td.taskId totalTaskWords ene
-      td.isFirst td.isLast td.liveL2Mask h4Override
+    let header ← encodeTaskHeaderMulti spec.target td.taskId totalTaskWords ene
+      td.isFirst td.isLast td.liveL2Mask h4Override td.extProducerTask
     tasks := tasks.push { header := header, records := allRecs }
     for rel in td.kernelRelocs do
       if rel.barRecIndex >= td.barWrites.size then

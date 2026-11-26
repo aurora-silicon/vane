@@ -163,6 +163,21 @@ def taskHeader8MultiLayout : WordLayout := {
   ]
 }
 
+/-- Task header word 8 (extended 10-word header): `active[0:0] = 1`, `hasExtHdr[1:1]`,
+    `isLast[3:3]`, `ene[18:16]`, other bits 0. -/
+def taskHeader8ExtLayout : WordLayout := {
+  name := "taskHeader[8]Ext"
+  fields := #[
+    { name := "active", lo := 0, width := 1 },
+    { name := "hasExtHdr", lo := 1, width := 1 },
+    { name := "isLast", lo := 3, width := 1 },
+    { name := "ene", lo := 16, width := 3 }
+  ]
+}
+
+/-- Bit 1 (`0x2`) of task header word 8 indicating a 10-word extended task header. -/
+def taskHeader8ExtBit : UInt32 := 0x00000002
+
 /-- Named constants for 9-word task header words 2 and 4. -/
 def taskHeader2FirstFlags : UInt32 := 0x68
 def taskHeader4FirstBit : UInt32 := 0x00000008
@@ -194,21 +209,23 @@ def l2BlockMask (lo hi : Nat) : UInt32 :=
           mask := mask ||| ((1 : UInt32) <<< b.toUInt32)
       return mask
 
-/-- Encode a 9-word task header for single-task or multi-task streams.
-    Sets `header[2]`, `header[4]`, `header[7]` (live-L2 64 KiB block bitmask, forced 0 on `isLast`),
-    and `header[8]` (`active = 1`, `isLast`, `ene`). -/
-def encodeTaskHeader9Multi
+/-- Encode a 9-word or 10-word extended task header for single-task or multi-task streams.
+    When `extProducerTask = some prodId`, sets `header[8]` bit 1 (`hasExtHdr = 1`) and appends
+    `header[9] = prodId` (requiring `taskWords >= 10`). -/
+def encodeTaskHeaderMulti
     (target : Target)
     (taskId taskWords ene : Nat)
     (isFirst isLast : Bool)
     (liveL2Mask : UInt32 := 0)
-    (header4Override : Option UInt32 := none) : Except String (Array UInt32) := do
+    (header4Override : Option UInt32 := none)
+    (extProducerTask : Option Nat := none) : Except String (Array UInt32) := do
   if taskId > 0xffff then
     throw s!"task header: taskId {taskId} exceeds 16-bit maximum 65535"
   if ene > 5 then
     throw s!"task header: ene {ene} exceeds maximum 5"
-  if taskWords < 9 || taskWords > 0x7ff then
-    throw s!"task header: taskWords {taskWords} out of range 9..{0x7ff}"
+  let minWords := if extProducerTask.isSome then 10 else 9
+  if taskWords < minWords || taskWords > 0x7ff then
+    throw s!"task header: taskWords {taskWords} out of range {minWords}..{0x7ff}"
   let taskIdU32 ← natToU32Checked taskId "task header taskId"
   let taskWordsU32 ← natToU32Checked taskWords "task header taskWords"
   let eneU32 ← natToU32Checked ene "task header ene"
@@ -222,12 +239,34 @@ def encodeTaskHeader9Multi
   ]
   let w4 := header4Override.getD (taskHeaderWord4Multi target isFirst isLast)
   let w7 := if isLast then 0 else liveL2Mask
-  let w8 ← encodeWord taskHeader8MultiLayout #[
-    ("active", 1),
-    ("isLast", if isLast then 1 else 0),
-    ("ene", eneU32)
-  ]
-  pure #[w0, 0, w2, 0, w4, 0, 0, w7, w8]
+  match extProducerTask with
+  | none =>
+    let w8 ← encodeWord taskHeader8MultiLayout #[
+      ("active", 1),
+      ("isLast", if isLast then 1 else 0),
+      ("ene", eneU32)
+    ]
+    pure #[w0, 0, w2, 0, w4, 0, 0, w7, w8]
+  | some prodTask =>
+    let prodU32 ← natToU32Checked prodTask "task header extProducerTask"
+    let w8 ← encodeWord taskHeader8ExtLayout #[
+      ("active", 1),
+      ("hasExtHdr", 1),
+      ("isLast", if isLast then 1 else 0),
+      ("ene", eneU32)
+    ]
+    pure #[w0, 0, w2, 0, w4, 0, 0, w7, w8, prodU32]
+
+/-- Encode a 9-word task header for single-task or multi-task streams.
+    Sets `header[2]`, `header[4]`, `header[7]` (live-L2 64 KiB block bitmask, forced 0 on `isLast`),
+    and `header[8]` (`active = 1`, `isLast`, `ene`). -/
+def encodeTaskHeader9Multi
+    (target : Target)
+    (taskId taskWords ene : Nat)
+    (isFirst isLast : Bool)
+    (liveL2Mask : UInt32 := 0)
+    (header4Override : Option UInt32 := none) : Except String (Array UInt32) :=
+  encodeTaskHeaderMulti target taskId taskWords ene isFirst isLast liveL2Mask header4Override none
 
 /-- Encode the 9-word task header with explicit `ene` (`0` for PE, `1..5` for NE) and
     optional `header4` override (default `0x00fff868`). -/
@@ -338,6 +377,8 @@ def regSrc1DmaCrop : Nat := 0x4d84
 def regKernelStage : Nat := 0x5500
 def regKernelBaseLo : Nat := 0x5510
 def regKernelBaseHi : Nat := 0x5514
+def regKernelBatchStride : Nat := 0x5518
+def regKernelRoundStride : Nat := 0x551c
 def regChunkSlot (s : Nat) : Nat := 0x5520 + 4 * s
 def regChunkOffset (s : Nat) : Nat := 0x5560 + 4 * s
 def regChunkSize (s : Nat) : Nat := 0x55a0 + 4 * s
@@ -431,6 +472,20 @@ def neViewCommonLayout : WordLayout := {
     { name := "F", lo := 19, width := 3 },
     { name := "transposeOut", lo := 28, width := 1 },
     { name := "transposeWideGroup", lo := 29, width := 1 }
+  ]
+}
+
+/-- `0x003c` neMatmulCommon (dynamic runtime-kernel NE matmul): `lo2[2:2]` (`alignUp(N, 8) <= 64`),
+    `shPref[10:8]`, `shMin[14:12]`, `shMax[18:16]`, `F[21:19]`, `dynKern[29:29]` (`M * B > 1`). -/
+def neMatmulCommonLayout : WordLayout := {
+  name := "neMatmulCommon"
+  fields := #[
+    { name := "lo2", lo := 2, width := 1 },
+    { name := "shPref", lo := 8, width := 3 },
+    { name := "shMin", lo := 12, width := 3 },
+    { name := "shMax", lo := 16, width := 3 },
+    { name := "F", lo := 19, width := 3 },
+    { name := "dynKern", lo := 29, width := 1 }
   ]
 }
 
@@ -645,12 +700,38 @@ def kernelStageMultiLayout : WordLayout := {
   ]
 }
 
+/-- `0x5500` kernelStage (dynamic runtime-kernel): adds H17 `h17Dyn[10:10]` (`0x400`). -/
+def kernelStageDynLayout : WordLayout := {
+  name := "kernelStageDyn"
+  fields := #[
+    { name := "sparse", lo := 5, width := 1 },
+    { name := "kernEn", lo := 6, width := 1 },
+    { name := "isLast", lo := 7, width := 1 },
+    { name := "kernCfg", lo := 9, width := 1 },
+    { name := "h17Dyn", lo := 10, width := 1 },
+    { name := "stage", lo := 16, width := 8 }
+  ]
+}
+
 /-- `0x5520 + 4*s` chunkSlot[s]: `enable[0:0]`, `on20[5:5]`, `task[23:16]`. -/
 def chunkSlotLayout : WordLayout := {
   name := "chunkSlot"
   fields := #[
     { name := "enable", lo := 0, width := 1 },
     { name := "on20", lo := 5, width := 1 },
+    { name := "task", lo := 16, width := 8 }
+  ]
+}
+
+/-- `0x5520 + 4*s` chunkSlot[s] (dynamic runtime-kernel): `enable[0:0]`, `on20[5:5]`,
+    `produced[6:6]` (BAR 3 scratch kernel), `keepLive[7:7]`, `task[23:16]`. -/
+def chunkSlotDynLayout : WordLayout := {
+  name := "chunkSlotDyn"
+  fields := #[
+    { name := "enable", lo := 0, width := 1 },
+    { name := "on20", lo := 5, width := 1 },
+    { name := "produced", lo := 6, width := 1 },
+    { name := "keepLive", lo := 7, width := 1 },
     { name := "task", lo := 16, width := 8 }
   ]
 }
@@ -680,6 +761,26 @@ def neCfgLayout (target : Target) : WordLayout := {
     { name := "sparse", lo := 8, width := 1 }
   ]
 }
+
+/-- Dynamic runtime-kernel bit 16 (`0x00010000`) in `0x4900` (`neCfg`). -/
+def neCfgDynKernBit : UInt32 := (1 : UInt32) <<< 16
+
+/-- Dynamic runtime-kernel `0x4900` (`neCfg`) constant (`0x00010082` on H16, `0x10010082` on H17). -/
+def neCfgDynValue (target : Target) : UInt32 :=
+  neCfgValue target ||| neCfgDynKernBit
+
+/-- `0x4900` neMatmulCfg: target base (`0x00000082` on H16, `0x10000082` on H17), `dynKern[16:16]`. -/
+def neMatmulCfgLayout (target : Target) : WordLayout := {
+  name := "neMatmulCfg"
+  fixedMask := 0xfffeffff
+  fixedValue := neCfgValue target
+  fields := #[
+    { name := "dynKern", lo := 16, width := 1 }
+  ]
+}
+
+def kernelStageH17DynBit : UInt32 := (1 : UInt32) <<< 10
+def neOpMatmul : UInt32 := 0x00103c00
 
 def resDepCode (target : Target) : UInt32 :=
   target.profile.resDepCode
