@@ -112,6 +112,16 @@
         let
           vanePkg = self.packages.${system}.vane;
 
+          leanGuard = pkgs.buildGoModule {
+            pname = "lean-guard";
+            version = "0.1.0";
+            src = self;
+            vendorHash = null;
+            subPackages = [ "cmd/lean-guard" ];
+            env.CGO_ENABLED = "0";
+            doCheck = false;
+          };
+
           goCheck = name: script: pkgs.runCommandCC name {
             nativeBuildInputs = [ pkgs.go ];
           } ''
@@ -135,22 +145,19 @@
 
           # Kernel-level audit of the compiled proofs, then a source scan for
           # proof and trust shortcuts, then full kernel replay with leanchecker.
-          proof-audit = pkgs.runCommand "vane-proof-audit" {
-            nativeBuildInputs = [ pkgs.python3 ];
-          } ''
+          proof-audit = pkgs.runCommand "vane-proof-audit" { } ''
             export LEAN_SYSROOT=${pkgs.lean4}
             export LEAN_PATH=${vanePkg}/lib/lean:${pkgs.lean4}/lib/lean
             ${vanePkg}/bin/vane-audit
-            python3 ${self}/scripts/lean-guard.py forbidden ${self}
+            ${leanGuard}/bin/lean-guard selftest
+            ${leanGuard}/bin/lean-guard forbidden ${self}
             ${pkgs.lean4}/bin/leanchecker Vane Vane.Proofs
             touch $out
           '';
 
           # The verifier's import closure must stay inside the TCB allowlist.
-          tcb-check = pkgs.runCommand "vane-tcb-check" {
-            nativeBuildInputs = [ pkgs.python3 ];
-          } ''
-            python3 ${self}/scripts/lean-guard.py tcb ${self}
+          tcb-check = pkgs.runCommand "vane-tcb-check" { } ''
+            ${leanGuard}/bin/lean-guard tcb ${self}
             touch $out
           '';
 
