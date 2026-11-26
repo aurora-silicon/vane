@@ -6,7 +6,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"math"
 	"os"
 	"path/filepath"
 
@@ -37,6 +36,10 @@ func cmdRunV2(args []string, tr ane.Transport, stdout, stderr io.Writer) int {
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
+	if fs.NArg() > 0 {
+		fmt.Fprintf(stderr, "error: unexpected positional arguments: %v\n", fs.Args())
+		return 1
+	}
 	if *bundlePath == "" {
 		fmt.Fprintln(stderr, "error: --bundle PATH is required")
 		return 1
@@ -61,14 +64,14 @@ func cmdRunV2(args []string, tr ane.Transport, stdout, stderr io.Writer) int {
 		return 1
 	}
 	if visited["priority"] {
-		if *priority < 0 || *priority > math.MaxUint32 {
+		if *priority < ane.MinPriorityV2 || *priority > ane.MaxPriorityV2 {
 			fmt.Fprintf(stderr, "error: --priority %d out of range [%d, %d]\n", *priority, ane.MinPriorityV2, ane.MaxPriorityV2)
 			return 1
 		}
 		bundle.Priority = uint32(*priority)
 	}
 	if visited["timeout-ms"] {
-		if *timeoutMS < 0 || *timeoutMS > math.MaxUint32 {
+		if *timeoutMS < 0 || *timeoutMS > ane.MaxTimeoutMSV2 {
 			fmt.Fprintf(stderr, "error: --timeout-ms %d out of range [0, %d]\n", *timeoutMS, ane.MaxTimeoutMSV2)
 			return 1
 		}

@@ -234,6 +234,7 @@ func TestRunV2CLISkipAndErrors(t *testing.T) {
 		{"bad_priority_neg", []string{"run-v2", "--bundle", bundlePath, "--priority", "-1"}},
 		{"bad_timeout_high", []string{"run-v2", "--bundle", bundlePath, "--timeout-ms", "5001"}},
 		{"bad_timeout_neg", []string{"run-v2", "--bundle", bundlePath, "--timeout-ms", "-1"}},
+		{"unexpected_positional", []string{"run-v2", "--bundle", bundlePath, "extra.bin"}},
 	}
 	for _, tc := range errCases {
 		t.Run("err_"+tc.name, func(t *testing.T) {
@@ -241,6 +242,9 @@ func TestRunV2CLISkipAndErrors(t *testing.T) {
 			rc := runCLI(tc.args, emptyTr, &stdout, &stderr)
 			if rc != 1 {
 				t.Fatalf("run-v2 (%s) rc=%d, want 1 (stderr=%s)", tc.name, rc, stderr.String())
+			}
+			if tc.name == "unexpected_positional" && !strings.Contains(stderr.String(), "unexpected positional arguments") {
+				t.Fatalf("expected positional argument error message, got stderr=%q", stderr.String())
 			}
 		})
 	}

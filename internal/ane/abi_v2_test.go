@@ -157,12 +157,12 @@ func TestParseAndValidateV2Bundle(t *testing.T) {
 			{"id": 9, "file": "sub/sec9.bin", "offset": 64},
 		},
 		"generic_binds": []map[string]any{
-			{"buffer_id": 4, "type": 1, "size": 4096},
+			{"buffer_id": 10, "type": 1, "size": 8192},
 		},
 		"ios": []map[string]any{
-			{"buffer_id": 5, "type": 0, "direction": "input", "size": 4096},
-			{"buffer_id": 6, "type": 2, "direction": "scratch", "size": 1024},
-			{"buffer_id": 4, "type": 1, "direction": "output", "size": 4096},
+			{"buffer_id": 11, "type": 0, "direction": "input", "size": 8192},
+			{"buffer_id": 12, "type": 2, "direction": "scratch", "size": 1024},
+			{"buffer_id": 10, "type": 1, "direction": "output", "size": 8192},
 		},
 		"priority":   5,
 		"timeout_ms": 4000,
@@ -210,11 +210,22 @@ func TestParseAndValidateV2Bundle(t *testing.T) {
 		{"missing_section_file_field", `{"sections":[{"id":1}],"ios":[{"buffer_id":4,"type":1,"direction":"output","size":64}]}`},
 		{"nonexistent_section_file", `{"sections":[{"id":1,"file":"missing.bin"}],"ios":[{"buffer_id":4,"type":1,"direction":"output","size":64}]}`},
 		{"empty_section_file", `{"sections":[{"id":1,"file":"empty.bin"}],"ios":[{"buffer_id":4,"type":1,"direction":"output","size":64}]}`},
+		{"pre_read_zero_sections", `{"sections":[],"ios":[{"buffer_id":4,"type":1,"direction":"output","size":64}]}`},
+		{"pre_read_too_many_sections", `{"sections":[{"id":1,"file":"nope.bin"},{"id":2,"file":"nope.bin"},{"id":3,"file":"nope.bin"},{"id":4,"file":"nope.bin"},{"id":5,"file":"nope.bin"},{"id":6,"file":"nope.bin"},{"id":7,"file":"nope.bin"},{"id":8,"file":"nope.bin"},{"id":9,"file":"nope.bin"},{"id":1,"file":"nope.bin"}],"ios":[{"buffer_id":4,"type":1,"direction":"output","size":64}]}`},
+		{"pre_read_bad_section_id", `{"sections":[{"id":10,"file":"nope.bin"}],"ios":[{"buffer_id":4,"type":1,"direction":"output","size":64}]}`},
+		{"pre_read_dup_section_id", `{"sections":[{"id":2,"file":"nope1.bin"},{"id":2,"file":"nope2.bin"}],"ios":[{"buffer_id":4,"type":1,"direction":"output","size":64}]}`},
 	}
 	for _, tc := range badJSONs {
 		t.Run("json_"+tc.name, func(t *testing.T) {
-			if _, err := ParseV2Bundle([]byte(tc.raw), tmp); err == nil {
+			_, err := ParseV2Bundle([]byte(tc.raw), tmp)
+			if err == nil {
 				t.Fatalf("ParseV2Bundle unexpectedly accepted %s", tc.name)
+			}
+			if tc.name == "pre_read_zero_sections" || tc.name == "pre_read_too_many_sections" ||
+				tc.name == "pre_read_bad_section_id" || tc.name == "pre_read_dup_section_id" {
+				if errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("ParseV2Bundle(%s) touched disk before validating sections: %v", tc.name, err)
+				}
 			}
 		})
 	}

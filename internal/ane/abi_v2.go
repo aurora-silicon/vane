@@ -311,11 +311,25 @@ func ParseV2Bundle(data []byte, baseDir string) (*V2Bundle, error) {
 		timeoutMS = *raw.TimeoutMS
 	}
 
-	sections := make([]V2SectionSpec, len(raw.Sections))
+	if len(raw.Sections) < 1 || len(raw.Sections) > MaxSectionsV2 {
+		return nil, fmt.Errorf("v2 bundle section count %d out of range [1, %d]", len(raw.Sections), MaxSectionsV2)
+	}
+	seenSecIDs := make(map[uint32]bool, len(raw.Sections))
 	for i, s := range raw.Sections {
+		if s.ID < 1 || s.ID > MaxSectionsV2 {
+			return nil, fmt.Errorf("v2 bundle sections[%d] id %d out of range [1, %d]", i, s.ID, MaxSectionsV2)
+		}
+		if seenSecIDs[s.ID] {
+			return nil, fmt.Errorf("v2 bundle duplicate section id %d", s.ID)
+		}
+		seenSecIDs[s.ID] = true
 		if s.File == "" {
 			return nil, fmt.Errorf("v2 bundle sections[%d] (id=%d) missing file path", i, s.ID)
 		}
+	}
+
+	sections := make([]V2SectionSpec, len(raw.Sections))
+	for i, s := range raw.Sections {
 		secPath := s.File
 		if !filepath.IsAbs(secPath) {
 			secPath = filepath.Join(baseDir, secPath)
