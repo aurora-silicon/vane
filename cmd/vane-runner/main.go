@@ -69,6 +69,7 @@ func usage(w io.Writer) {
 	fmt.Fprintln(w, "  vane-runner gen-lut --act NAME --h H --w W --c C [--alpha F] [--beta F] [--lo F] [--hi F] [--eps F] [--scalar F] [--all-fp16] [--lut-bin PATH] [--seed N] --out-dir DIR [--json]")
 	fmt.Fprintln(w, "  vane-runner gen-pool --op <max|avg> --h H --w W --c C --kh KH --kw KW [--sh SH] [--sw SW] [--pad <valid|same|custom>] [--pt N --pb N --pl N --pr N] [--exclude-pad] [--seed N] --out-dir DIR [--json]")
 	fmt.Fprintln(w, "  vane-runner gen-reduce --op <sum|mean|max|min|l1|sum_square|l2|inv_sum|rsqrt_sum_square|rsqrt_mean_square> --h H --w W --c C --axes <w|h|c|hw|cw|ch|chw> [--eps F] [--seed N] --out-dir DIR [--json]")
+	fmt.Fprintln(w, "  vane-runner gen-view --op <transpose|slice|concat|split|reshape> [op flags] [--seed N] --out-dir DIR [--json]")
 	fmt.Fprintln(w, "  vane-runner gen-graph --spec PATH --out-dir DIR [--seed N] [--json]")
 	fmt.Fprintln(w, "  vane-runner compare-conv --manifest PATH --actual PATH --expected PATH [--atol F] [--rtol F] [--max-ulp N] [--json]")
 	fmt.Fprintln(w, "  vane-runner compare-conv1x1 --manifest PATH --actual PATH --expected PATH [--atol F] [--rtol F] [--max-ulp N] [--json]")
@@ -99,6 +100,8 @@ func runCLI(args []string, tr ane.Transport, stdout, stderr io.Writer) int {
 		return cmdGenPool(args[1:], stdout, stderr)
 	case "gen-reduce":
 		return cmdGenReduce(args[1:], stdout, stderr)
+	case "gen-view":
+		return cmdGenView(args[1:], stdout, stderr)
 	case "gen-graph":
 		return cmdGenGraph(args[1:], stdout, stderr)
 	case "compare-conv":
@@ -1076,7 +1079,7 @@ func packTensor64B(t ref.Tensor) ([]byte, error) {
 	rs := ref.AlignUp(2*t.W, 64)
 	ps := t.H * rs
 	bs := t.C * ps
-	return ref.PackSurface(t, bs, ps, rs, bs)
+	return ref.PackSurface(t, bs, ps, rs, t.N*bs)
 }
 
 func cmdGenPe(args []string, stdout, stderr io.Writer) int {
@@ -1683,6 +1686,271 @@ func cmdGenReduce(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
+func parseIntCSV(raw string) ([]int, error) {
+	parts := strings.Split(raw, ",")
+	if len(parts) == 0 || (len(parts) == 1 && strings.TrimSpace(parts[0]) == "") {
+		return nil, fmt.Errorf("expected comma-separated integers, got %q", raw)
+	}
+	out := make([]int, 0, len(parts))
+	for _, p := range parts {
+		v, err := strconv.Atoi(strings.TrimSpace(p))
+		if err != nil {
+			return nil, fmt.Errorf("invalid integer %q in %q", p, raw)
+		}
+		out = append(out, v)
+	}
+	return out, nil
+}
+
+func parseViewShapeToken(tok string) ([4]int, error) {
+	parts := strings.Split(strings.TrimSpace(tok), "x")
+	if len(parts) == 3 {
+		h, err1 := strconv.Atoi(parts[0])
+		w, err2 := strconv.Atoi(parts[1])
+		c, err3 := strconv.Atoi(parts[2])
+		if err1 != nil || err2 != nil || err3 != nil || h <= 0 || w <= 0 || c <= 0 {
+			return [4]int{}, fmt.Errorf("invalid HxWxC shape %q", tok)
+		}
+		return [4]int{1, c, h, w}, nil
+	}
+	if len(parts) == 4 {
+		n, err0 := strconv.Atoi(parts[0])
+		c, err1 := strconv.Atoi(parts[1])
+		h, err2 := strconv.Atoi(parts[2])
+		w, err3 := strconv.Atoi(parts[3])
+		if err0 != nil || err1 != nil || err2 != nil || err3 != nil || n <= 0 || c <= 0 || h <= 0 || w <= 0 {
+			return [4]int{}, fmt.Errorf("invalid NxCxHxW shape %q", tok)
+		}
+		return [4]int{n, c, h, w}, nil
+	}
+	return [4]int{}, fmt.Errorf("invalid shape %q (expected HxWxC or NxCxHxW)", tok)
+}
+
+func cmdGenView(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("gen-view", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	opName := fs.String("op", "", "View op: transpose|slice|concat|split|reshape")
+	n := fs.Int("n", 1, "Batch size N")
+	c := fs.Int("c", 0, "Channels C")
+	h := fs.Int("h", 0, "Height H")
+	w := fs.Int("w", 0, "Width W")
+	permStr := fs.String("perm", "", "Transpose permutation p0,p1,p2,p3")
+	beginStr := fs.String("begin", "", "Slice begin b0,b1,b2,b3")
+	endStr := fs.String("end", "", "Slice end e0,e1,e2,e3")
+	stepStr := fs.String("step", "", "Slice step s0,s1,s2,s3 (default 1,1,1,1)")
+	axis := fs.Int("axis", -1, "Concat/split axis (1, 2, or 3)")
+	shapesStr := fs.String("shapes", "", "Concat input shapes H0xW0xC0,... or N0xC0xH0xW0,...")
+	sizesStr := fs.String("sizes", "", "Split sizes s0,s1,...")
+	part := fs.Int("part", -1, "Split partition index")
+	outShapeStr := fs.String("out-shape", "", "Reshape output shape No,Co,Ho,Wo")
+	seed := fs.Uint64("seed", 1, "Deterministic PRNG seed")
+	outDir := fs.String("out-dir", "", "Output directory")
+	asJSON := fs.Bool("json", false, "Emit JSON summary")
+
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	if *opName == "" || *outDir == "" {
+		fmt.Fprintln(stderr, "error: --op and --out-dir are required")
+		return 1
+	}
+
+	opLow := strings.ToLower(*opName)
+	rng := rand.New(rand.NewPCG(*seed, *seed^0x2545f4914f6cdd1d))
+	makeRandTensor := func(sh [4]int) (ref.Tensor, error) {
+		t, err := ref.NewTensor(sh[0], sh[1], sh[2], sh[3])
+		if err != nil {
+			return ref.Tensor{}, err
+		}
+		for i := range t.Data {
+			t.Data[i] = fp16.FromFloat64(rng.Float64()*4.0 - 2.0)
+		}
+		return t, nil
+	}
+
+	var inputs []ref.Tensor
+	var y ref.Tensor
+	var err error
+
+	switch opLow {
+	case "transpose":
+		if *n <= 0 || *c <= 0 || *h <= 0 || *w <= 0 || *permStr == "" {
+			fmt.Fprintln(stderr, "error: transpose requires --c, --h, --w, and --perm")
+			return 1
+		}
+		pv, errP := parseIntCSV(*permStr)
+		if errP != nil || len(pv) != 4 {
+			fmt.Fprintf(stderr, "error: --perm must have 4 integers: %v\n", errP)
+			return 1
+		}
+		x, errX := makeRandTensor([4]int{*n, *c, *h, *w})
+		if errX != nil {
+			fmt.Fprintf(stderr, "error: %v\n", errX)
+			return 1
+		}
+		inputs = []ref.Tensor{x}
+		y, err = ref.Transpose(x, [4]int{pv[0], pv[1], pv[2], pv[3]})
+
+	case "slice":
+		if *n <= 0 || *c <= 0 || *h <= 0 || *w <= 0 || *beginStr == "" || *endStr == "" {
+			fmt.Fprintln(stderr, "error: slice requires --c, --h, --w, --begin, and --end")
+			return 1
+		}
+		bv, errB := parseIntCSV(*beginStr)
+		ev, errE := parseIntCSV(*endStr)
+		if errB != nil || len(bv) != 4 || errE != nil || len(ev) != 4 {
+			fmt.Fprintln(stderr, "error: --begin and --end must each have 4 integers")
+			return 1
+		}
+		step := [4]int{1, 1, 1, 1}
+		if *stepStr != "" {
+			sv, errS := parseIntCSV(*stepStr)
+			if errS != nil || len(sv) != 4 {
+				fmt.Fprintln(stderr, "error: --step must have 4 integers")
+				return 1
+			}
+			step = [4]int{sv[0], sv[1], sv[2], sv[3]}
+		}
+		x, errX := makeRandTensor([4]int{*n, *c, *h, *w})
+		if errX != nil {
+			fmt.Fprintf(stderr, "error: %v\n", errX)
+			return 1
+		}
+		inputs = []ref.Tensor{x}
+		y, err = ref.Slice(x, [4]int{bv[0], bv[1], bv[2], bv[3]}, [4]int{ev[0], ev[1], ev[2], ev[3]}, step)
+
+	case "concat":
+		if *axis < 1 || *axis > 3 || *shapesStr == "" {
+			fmt.Fprintln(stderr, "error: concat requires --axis <1|2|3> and --shapes")
+			return 1
+		}
+		toks := strings.Split(*shapesStr, ",")
+		if len(toks) < 2 {
+			fmt.Fprintln(stderr, "error: concat requires at least 2 shapes")
+			return 1
+		}
+		inputs = make([]ref.Tensor, 0, len(toks))
+		for _, tok := range toks {
+			sh, errS := parseViewShapeToken(tok)
+			if errS != nil {
+				fmt.Fprintf(stderr, "error: %v\n", errS)
+				return 1
+			}
+			t, errT := makeRandTensor(sh)
+			if errT != nil {
+				fmt.Fprintf(stderr, "error: %v\n", errT)
+				return 1
+			}
+			inputs = append(inputs, t)
+		}
+		y, err = ref.Concat(inputs, *axis)
+
+	case "split":
+		if *n <= 0 || *c <= 0 || *h <= 0 || *w <= 0 || *axis < 1 || *axis > 3 || *sizesStr == "" || *part < 0 {
+			fmt.Fprintln(stderr, "error: split requires --c, --h, --w, --axis <1|2|3>, --sizes, and --part")
+			return 1
+		}
+		szv, errS := parseIntCSV(*sizesStr)
+		if errS != nil {
+			fmt.Fprintf(stderr, "error: --sizes: %v\n", errS)
+			return 1
+		}
+		x, errX := makeRandTensor([4]int{*n, *c, *h, *w})
+		if errX != nil {
+			fmt.Fprintf(stderr, "error: %v\n", errX)
+			return 1
+		}
+		inputs = []ref.Tensor{x}
+		y, err = ref.SplitPart(x, *axis, szv, *part)
+
+	case "reshape":
+		if *n <= 0 || *c <= 0 || *h <= 0 || *w <= 0 || *outShapeStr == "" {
+			fmt.Fprintln(stderr, "error: reshape requires --c, --h, --w, and --out-shape")
+			return 1
+		}
+		ov, errO := parseIntCSV(*outShapeStr)
+		if errO != nil || len(ov) != 4 {
+			fmt.Fprintln(stderr, "error: --out-shape must have 4 integers No,Co,Ho,Wo")
+			return 1
+		}
+		x, errX := makeRandTensor([4]int{*n, *c, *h, *w})
+		if errX != nil {
+			fmt.Fprintf(stderr, "error: %v\n", errX)
+			return 1
+		}
+		inputs = []ref.Tensor{x}
+		y, err = ref.Reshape(x, [4]int{ov[0], ov[1], ov[2], ov[3]})
+
+	default:
+		fmt.Fprintf(stderr, "error: unknown view op %q (expected transpose, slice, concat, split, or reshape)\n", *opName)
+		return 1
+	}
+
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+
+	if err := os.MkdirAll(*outDir, 0o755); err != nil {
+		fmt.Fprintf(stderr, "error: create out-dir: %v\n", err)
+		return 1
+	}
+	inFiles := make([]string, 0, len(inputs))
+	inBytes := make([]int, 0, len(inputs))
+	for i, inp := range inputs {
+		buf, errP := packTensor64B(inp)
+		if errP != nil {
+			fmt.Fprintf(stderr, "error: pack input %d: %v\n", i, errP)
+			return 1
+		}
+		fname := fmt.Sprintf("input%d.bin", i)
+		if errW := os.WriteFile(filepath.Join(*outDir, fname), buf, 0o644); errW != nil {
+			fmt.Fprintf(stderr, "error: write %s: %v\n", fname, errW)
+			return 1
+		}
+		if len(inputs) == 1 {
+			if errW := os.WriteFile(filepath.Join(*outDir, "input.bin"), buf, 0o644); errW != nil {
+				fmt.Fprintf(stderr, "error: write input.bin: %v\n", errW)
+				return 1
+			}
+		}
+		inFiles = append(inFiles, fname)
+		inBytes = append(inBytes, len(buf))
+	}
+
+	expBuf, err := packTensor64B(y)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: pack expected: %v\n", err)
+		return 1
+	}
+	if err := os.WriteFile(filepath.Join(*outDir, "expected_f64.bin"), expBuf, 0o644); err != nil {
+		fmt.Fprintf(stderr, "error: write expected_f64.bin: %v\n", err)
+		return 1
+	}
+	if err := os.WriteFile(filepath.Join(*outDir, "expected_q1516.bin"), expBuf, 0o644); err != nil {
+		fmt.Fprintf(stderr, "error: write expected_q1516.bin: %v\n", err)
+		return 1
+	}
+
+	summary := map[string]any{
+		"op":          opLow,
+		"input_files": inFiles,
+		"in_bytes":    inBytes,
+		"out_shape":   []int{y.N, y.C, y.H, y.W},
+		"out_bytes":   len(expBuf),
+		"seed":        *seed,
+		"out_dir":     *outDir,
+	}
+	if *asJSON {
+		raw, _ := json.MarshalIndent(summary, "", "  ")
+		fmt.Fprintln(stdout, string(raw))
+	} else {
+		fmt.Fprintf(stdout, "generated view %s (out=%dx%dx%dx%d, inputs=%d, out=%dB) in %s\n",
+			opLow, y.N, y.C, y.H, y.W, len(inputs), len(expBuf), *outDir)
+	}
+	return 0
+}
+
 func packTight64Surface(t ref.Tensor) ([]byte, int, int, int, error) {
 	rowStride := ref.AlignUp(2*t.W, 64)
 	planeStride := t.H * rowStride
@@ -1788,9 +2056,9 @@ func cmdGenGraph(args []string, stdout, stderr io.Writer) int {
 		nd := &resolved.Nodes[i]
 		op := strings.ToLower(nd.Op)
 		switch op {
-		case "conv1x1":
+		case "conv1x1", "linear":
 			if len(nd.Inputs) != 1 {
-				fmt.Fprintf(stderr, "error: node %q (conv1x1): expected 1 input\n", nd.ID)
+				fmt.Fprintf(stderr, "error: node %q (%s): expected 1 input\n", nd.ID, op)
 				return 1
 			}
 			inD, ok := shapes[nd.Inputs[0]]
@@ -1798,17 +2066,19 @@ func cmdGenGraph(args []string, stdout, stderr io.Writer) int {
 				fmt.Fprintf(stderr, "error: node %q: unknown input %q\n", nd.ID, nd.Inputs[0])
 				return 1
 			}
-			if nd.Cin != 0 && nd.Cin != inD.c {
-				fmt.Fprintf(stderr, "error: node %q (conv1x1): cin %d != input channels %d\n", nd.ID, nd.Cin, inD.c)
+			effCin := nd.EffectiveCin()
+			if effCin != 0 && effCin != inD.c {
+				fmt.Fprintf(stderr, "error: node %q (%s): cin %d != input channels %d\n", nd.ID, op, effCin, inD.c)
 				return 1
 			}
 			cin := inD.c
-			if nd.Cout <= 0 {
-				fmt.Fprintf(stderr, "error: node %q (conv1x1): cout must be > 0\n", nd.ID)
+			cout := nd.EffectiveCout()
+			if cout <= 0 {
+				fmt.Fprintf(stderr, "error: node %q (%s): cout/n must be > 0\n", nd.ID, op)
 				return 1
 			}
 			wScale := math.Min(0.4, 1.5/math.Sqrt(float64(cin)))
-			w := make([]uint16, nd.Cout*cin)
+			w := make([]uint16, cout*cin)
 			for j := range w {
 				w[j] = fp16.FromFloat64((rng.Float64()*2.0 - 1.0) * wScale)
 			}
@@ -1819,6 +2089,7 @@ func cmdGenGraph(args []string, stdout, stderr io.Writer) int {
 			}
 			nd.Weights = wName
 			nd.Cin = cin
+			nd.Cout = cout
 
 			wantsBias, _, err := nd.ConvBiasSpec()
 			if err != nil {
@@ -1827,7 +2098,7 @@ func cmdGenGraph(args []string, stdout, stderr io.Writer) int {
 			}
 			var b []uint16
 			if wantsBias {
-				b = make([]uint16, nd.Cout)
+				b = make([]uint16, cout)
 				for j := range b {
 					b[j] = fp16.FromFloat64((rng.Float64() - 0.5) * 0.5)
 				}
@@ -1843,7 +2114,7 @@ func cmdGenGraph(args []string, stdout, stderr io.Writer) int {
 			}
 			nd.HasBias = false
 			nodeWeights[nd.ID] = ref.GraphNodeWeights{Weights: w, Bias: b}
-			shapes[nd.ID] = dims3{nd.Cout, inD.h, inD.w}
+			shapes[nd.ID] = dims3{cout, inD.h, inD.w}
 
 		case "conv3x3":
 			if len(nd.Inputs) != 1 {
@@ -2035,6 +2306,128 @@ func cmdGenGraph(args []string, stdout, stderr io.Writer) int {
 				ow = 1
 			}
 			shapes[nd.ID] = dims3{oc, oh, ow}
+
+		case "transpose":
+			if len(nd.Inputs) != 1 {
+				fmt.Fprintf(stderr, "error: node %q (transpose): expected 1 input\n", nd.ID)
+				return 1
+			}
+			inD, ok := shapes[nd.Inputs[0]]
+			if !ok {
+				fmt.Fprintf(stderr, "error: node %q: unknown input %q\n", nd.ID, nd.Inputs[0])
+				return 1
+			}
+			if len(nd.Perm) != 4 {
+				fmt.Fprintf(stderr, "error: node %q (transpose): perm must have length 4\n", nd.ID)
+				return 1
+			}
+			var seen [4]bool
+			for idx, p := range nd.Perm {
+				if p < 0 || p > 3 {
+					fmt.Fprintf(stderr, "error: node %q (transpose): perm[%d]=%d out of range 0..3\n", nd.ID, idx, p)
+					return 1
+				}
+				if seen[p] {
+					fmt.Fprintf(stderr, "error: node %q (transpose): duplicate axis %d in perm\n", nd.ID, p)
+					return 1
+				}
+				seen[p] = true
+			}
+			in4 := [4]int{1, inD.c, inD.h, inD.w}
+			out4 := [4]int{in4[nd.Perm[0]], in4[nd.Perm[1]], in4[nd.Perm[2]], in4[nd.Perm[3]]}
+			if out4[0] != 1 {
+				fmt.Fprintf(stderr, "error: node %q (transpose): graph output requires N=1, got %d\n", nd.ID, out4[0])
+				return 1
+			}
+			shapes[nd.ID] = dims3{out4[1], out4[2], out4[3]}
+
+		case "slice":
+			if len(nd.Inputs) != 1 {
+				fmt.Fprintf(stderr, "error: node %q (slice): expected 1 input\n", nd.ID)
+				return 1
+			}
+			inD, ok := shapes[nd.Inputs[0]]
+			if !ok {
+				fmt.Fprintf(stderr, "error: node %q: unknown input %q\n", nd.ID, nd.Inputs[0])
+				return 1
+			}
+			if len(nd.Begin) != 4 || len(nd.End) != 4 {
+				fmt.Fprintf(stderr, "error: node %q (slice): begin and end must each have length 4\n", nd.ID)
+				return 1
+			}
+			step := [4]int{1, 1, 1, 1}
+			if len(nd.Step) > 0 {
+				if len(nd.Step) != 4 {
+					fmt.Fprintf(stderr, "error: node %q (slice): step must have length 4\n", nd.ID)
+					return 1
+				}
+				step = [4]int{nd.Step[0], nd.Step[1], nd.Step[2], nd.Step[3]}
+			}
+			in4 := [4]int{1, inD.c, inD.h, inD.w}
+			var out4 [4]int
+			for ax := 0; ax < 4; ax++ {
+				if step[ax] <= 0 || nd.Begin[ax] < 0 || nd.Begin[ax] >= nd.End[ax] || nd.End[ax] > in4[ax] {
+					fmt.Fprintf(stderr, "error: node %q (slice): invalid range on axis %d\n", nd.ID, ax)
+					return 1
+				}
+				out4[ax] = (nd.End[ax] - nd.Begin[ax] + step[ax] - 1) / step[ax]
+			}
+			if out4[0] != 1 {
+				fmt.Fprintf(stderr, "error: node %q (slice): graph output requires N=1, got %d\n", nd.ID, out4[0])
+				return 1
+			}
+			shapes[nd.ID] = dims3{out4[1], out4[2], out4[3]}
+
+		case "concat":
+			if len(nd.Inputs) < 2 {
+				fmt.Fprintf(stderr, "error: node %q (concat): expected >= 2 inputs\n", nd.ID)
+				return 1
+			}
+			if nd.Axis == nil || *nd.Axis < 1 || *nd.Axis > 3 {
+				fmt.Fprintf(stderr, "error: node %q (concat): axis must be 1, 2, or 3\n", nd.ID)
+				return 1
+			}
+			ax := *nd.Axis
+			d0, ok := shapes[nd.Inputs[0]]
+			if !ok {
+				fmt.Fprintf(stderr, "error: node %q (concat): unknown input %q\n", nd.ID, nd.Inputs[0])
+				return 1
+			}
+			out := [4]int{1, d0.c, d0.h, d0.w}
+			total := out[ax]
+			for _, inpName := range nd.Inputs[1:] {
+				di, ok := shapes[inpName]
+				if !ok {
+					fmt.Fprintf(stderr, "error: node %q (concat): unknown input %q\n", nd.ID, inpName)
+					return 1
+				}
+				d4 := [4]int{1, di.c, di.h, di.w}
+				total += d4[ax]
+			}
+			out[ax] = total
+			shapes[nd.ID] = dims3{out[1], out[2], out[3]}
+
+		case "reshape":
+			if len(nd.Inputs) != 1 {
+				fmt.Fprintf(stderr, "error: node %q (reshape): expected 1 input\n", nd.ID)
+				return 1
+			}
+			if _, ok := shapes[nd.Inputs[0]]; !ok {
+				fmt.Fprintf(stderr, "error: node %q: unknown input %q\n", nd.ID, nd.Inputs[0])
+				return 1
+			}
+			if len(nd.OutShape) == 4 {
+				if nd.OutShape[0] != 1 {
+					fmt.Fprintf(stderr, "error: node %q (reshape): graph output requires N=1\n", nd.ID)
+					return 1
+				}
+				shapes[nd.ID] = dims3{nd.OutShape[1], nd.OutShape[2], nd.OutShape[3]}
+			} else if len(nd.OutShape) == 3 {
+				shapes[nd.ID] = dims3{nd.OutShape[0], nd.OutShape[1], nd.OutShape[2]}
+			} else {
+				fmt.Fprintf(stderr, "error: node %q (reshape): out_shape must have length 4 or 3\n", nd.ID)
+				return 1
+			}
 
 		default:
 			fmt.Fprintf(stderr, "error: node %q: unsupported op %q\n", nd.ID, nd.Op)

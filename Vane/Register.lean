@@ -323,12 +323,16 @@ def regSrc2Fmt : Nat := 0x4d6c
 
 -- Result DMA block (0x5100..0x513c)
 def regResDep : Nat := 0x5100
+def regResDmaWarWait : Nat := 0x5104
 def regResBaseLo : Nat := 0x5108
 def regResBaseHi : Nat := 0x510c
 def regResDmaRowStride : Nat := 0x5110
 def regResDmaPlaneStride : Nat := 0x5114
+def regResDmaDStride : Nat := 0x5118
 def regResDmaNStride : Nat := 0x511c
 def regResFmt : Nat := 0x5138
+def regResDmaViewOff : Nat := 0x5150
+def regSrc1DmaCrop : Nat := 0x4d84
 
 -- Kernel DMA, chunk table, and standalone LUT descriptor block (0x5500..0x561c)
 def regKernelStage : Nat := 0x5500
@@ -411,6 +415,22 @@ def neCommonLayout : WordLayout := {
     { name := "shMax", lo := 16, width := 3 },
     { name := "F", lo := 19, width := 3 },
     { name := "wide3x3", lo := 27, width := 1 }
+  ]
+}
+
+/-- `0x003c` neViewCommon (weightless NE copy/view): `kind[7:0]`, `shPref[10:8]`,
+    `shMin[14:12]`, `shMax[18:16]`, `F[21:19]`, `transposeOut[28:28]`,
+    `transposeWideGroup[29:29]` (all other bits must be 0). -/
+def neViewCommonLayout : WordLayout := {
+  name := "neViewCommon"
+  fields := #[
+    { name := "kind", lo := 0, width := 8 },
+    { name := "shPref", lo := 8, width := 3 },
+    { name := "shMin", lo := 12, width := 3 },
+    { name := "shMax", lo := 16, width := 3 },
+    { name := "F", lo := 19, width := 3 },
+    { name := "transposeOut", lo := 28, width := 1 },
+    { name := "transposeWideGroup", lo := 29, width := 1 }
   ]
 }
 
@@ -693,6 +713,8 @@ def src2CfgValue : UInt32 := cfgFirstTaskMask ||| ((1 : UInt32) <<< 8) ||| portM
 def src2CfgEnabledValue : UInt32 := cfgFirstTaskMask ||| ((1 : UInt32) <<< 8) ||| cfgDmaFlag ||| portModeDma
 def src1DmaCfgValue : UInt32 := 0x000000ce
 def fp16OneBits : UInt32 := 0x3c00
+def neScaleOne : UInt32 := 0x00003c00
+def neOpViewCopy : UInt32 := 0x00103c0c
 def fp16InvLn2Bits : UInt16 := 0x3dc5
 def neActCfgValue : UInt32 := 0x00010082
 def kernelStageNoKernValue : UInt32 := 0x00000080

@@ -156,6 +156,8 @@ type GraphNodeSpec struct {
 	Mode         string          `json:"mode,omitempty"`
 	Cin          int             `json:"cin,omitempty"`
 	Cout         int             `json:"cout,omitempty"`
+	K            int             `json:"k,omitempty"`
+	N            int             `json:"n,omitempty"`
 	Stride       int             `json:"stride,omitempty"`
 	Pad          string          `json:"pad,omitempty"`
 	Weights      string          `json:"weights,omitempty"`
@@ -181,6 +183,28 @@ type GraphNodeSpec struct {
 	ReduceOp     string          `json:"reduce_op,omitempty"`
 	Axes         string          `json:"axes,omitempty"`
 	Eps          *float64        `json:"eps,omitempty"`
+	Perm         []int           `json:"perm,omitempty"`
+	Begin        []int           `json:"begin,omitempty"`
+	End          []int           `json:"end,omitempty"`
+	Step         []int           `json:"step,omitempty"`
+	Axis         *int            `json:"axis,omitempty"`
+	OutShape     []int           `json:"out_shape,omitempty"`
+}
+
+// EffectiveCin returns Cin if set, otherwise K (for linear nodes).
+func (n GraphNodeSpec) EffectiveCin() int {
+	if n.Cin > 0 {
+		return n.Cin
+	}
+	return n.K
+}
+
+// EffectiveCout returns Cout if set, otherwise N (for linear nodes).
+func (n GraphNodeSpec) EffectiveCout() int {
+	if n.Cout > 0 {
+		return n.Cout
+	}
+	return n.N
 }
 
 // ConvBiasSpec parses a conv node's Bias / HasBias fields, returning (wantsBias, path, err).
@@ -401,9 +425,9 @@ func evalGraph(spec GraphSpec, inputs map[string]Tensor, nodeWeights map[string]
 		var out Tensor
 		var err error
 		switch strings.ToLower(nd.Op) {
-		case "conv1x1":
+		case "conv1x1", "linear":
 			if len(nd.Inputs) != 1 {
-				return Tensor{}, nil, fmt.Errorf("node %q (conv1x1): expected 1 input, got %d", nd.ID, len(nd.Inputs))
+				return Tensor{}, nil, fmt.Errorf("node %q (%s): expected 1 input, got %d", nd.ID, nd.Op, len(nd.Inputs))
 			}
 			x, ok := env[nd.Inputs[0]]
 			if !ok {
@@ -412,6 +436,10 @@ func evalGraph(spec GraphSpec, inputs map[string]Tensor, nodeWeights map[string]
 			nw, ok := nodeWeights[nd.ID]
 			if !ok {
 				return Tensor{}, nil, fmt.Errorf("node %q: missing weights", nd.ID)
+			}
+			cout := nd.EffectiveCout()
+			if cout <= 0 {
+				return Tensor{}, nil, fmt.Errorf("node %q (%s): cout/n must be > 0", nd.ID, nd.Op)
 			}
 			actSpec, isLut, errAct := nd.ResolveConvAct()
 			if errAct != nil {
@@ -423,12 +451,12 @@ func evalGraph(spec GraphSpec, inputs map[string]Tensor, nodeWeights map[string]
 					if errL != nil {
 						return Tensor{}, nil, fmt.Errorf("node %q: %w", nd.ID, errL)
 					}
-					out, err = Conv2d1x1Q1516Lut(x, nw.Weights, nd.Cout, nw.Bias, tbl, preScale, shift)
+					out, err = Conv2d1x1Q1516Lut(x, nw.Weights, cout, nw.Bias, tbl, preScale, shift)
 				} else {
-					out, err = Conv2d1x1Q1516(x, nw.Weights, nd.Cout, nw.Bias, actSpec.Name == "relu")
+					out, err = Conv2d1x1Q1516(x, nw.Weights, cout, nw.Bias, actSpec.Name == "relu")
 				}
 			} else {
-				out, err = Conv2d1x1Act(x, nw.Weights, nd.Cout, nw.Bias, actSpec)
+				out, err = Conv2d1x1Act(x, nw.Weights, cout, nw.Bias, actSpec)
 			}
 
 		case "conv3x3":
@@ -624,6 +652,74 @@ func evalGraph(spec GraphSpec, inputs map[string]Tensor, nodeWeights map[string]
 				ReduceW: rw,
 				Eps:     eps,
 			})
+
+		case "transpose":
+			if len(nd.Inputs) != 1 {
+				return Tensor{}, nil, fmt.Errorf("node %q (transpose): expected 1 input", nd.ID)
+			}
+			x, ok := env[nd.Inputs[0]]
+			if !ok {
+				return Tensor{}, nil, fmt.Errorf("node %q: unknown input %q", nd.ID, nd.Inputs[0])
+			}
+			if len(nd.Perm) != 4 {
+				return Tensor{}, nil, fmt.Errorf("node %q (transpose): perm must have length 4", nd.ID)
+			}
+			out, err = Transpose(x, [4]int{nd.Perm[0], nd.Perm[1], nd.Perm[2], nd.Perm[3]})
+
+		case "slice":
+			if len(nd.Inputs) != 1 {
+				return Tensor{}, nil, fmt.Errorf("node %q (slice): expected 1 input", nd.ID)
+			}
+			x, ok := env[nd.Inputs[0]]
+			if !ok {
+				return Tensor{}, nil, fmt.Errorf("node %q: unknown input %q", nd.ID, nd.Inputs[0])
+			}
+			if len(nd.Begin) != 4 || len(nd.End) != 4 {
+				return Tensor{}, nil, fmt.Errorf("node %q (slice): begin and end must each have length 4", nd.ID)
+			}
+			step := [4]int{1, 1, 1, 1}
+			if len(nd.Step) > 0 {
+				if len(nd.Step) != 4 {
+					return Tensor{}, nil, fmt.Errorf("node %q (slice): step must have length 4", nd.ID)
+				}
+				step = [4]int{nd.Step[0], nd.Step[1], nd.Step[2], nd.Step[3]}
+			}
+			out, err = Slice(x, [4]int{nd.Begin[0], nd.Begin[1], nd.Begin[2], nd.Begin[3]}, [4]int{nd.End[0], nd.End[1], nd.End[2], nd.End[3]}, step)
+
+		case "concat":
+			if len(nd.Inputs) < 2 {
+				return Tensor{}, nil, fmt.Errorf("node %q (concat): expected >= 2 inputs", nd.ID)
+			}
+			if nd.Axis == nil {
+				return Tensor{}, nil, fmt.Errorf("node %q (concat): missing required field 'axis'", nd.ID)
+			}
+			inTs := make([]Tensor, len(nd.Inputs))
+			for idx, name := range nd.Inputs {
+				t, ok := env[name]
+				if !ok {
+					return Tensor{}, nil, fmt.Errorf("node %q (concat): unknown input %q", nd.ID, name)
+				}
+				inTs[idx] = t
+			}
+			out, err = Concat(inTs, *nd.Axis)
+
+		case "reshape":
+			if len(nd.Inputs) != 1 {
+				return Tensor{}, nil, fmt.Errorf("node %q (reshape): expected 1 input", nd.ID)
+			}
+			x, ok := env[nd.Inputs[0]]
+			if !ok {
+				return Tensor{}, nil, fmt.Errorf("node %q: unknown input %q", nd.ID, nd.Inputs[0])
+			}
+			var osh [4]int
+			if len(nd.OutShape) == 4 {
+				osh = [4]int{nd.OutShape[0], nd.OutShape[1], nd.OutShape[2], nd.OutShape[3]}
+			} else if len(nd.OutShape) == 3 {
+				osh = [4]int{1, nd.OutShape[0], nd.OutShape[1], nd.OutShape[2]}
+			} else {
+				return Tensor{}, nil, fmt.Errorf("node %q (reshape): out_shape must have length 4 or 3, got %d", nd.ID, len(nd.OutShape))
+			}
+			out, err = Reshape(x, osh)
 
 		default:
 			return Tensor{}, nil, fmt.Errorf("node %q: unsupported op %q", nd.ID, nd.Op)

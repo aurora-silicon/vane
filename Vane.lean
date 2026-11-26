@@ -15,5 +15,6 @@ import Vane.Pool
 import Vane.Conv
 import Vane.Conv1x1
 import Vane.Conv3x3
+import Vane.View
 import Vane.Graph
 import Vane.Proofs

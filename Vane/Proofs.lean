@@ -7,6 +7,8 @@ import Vane.Tiling
 import Vane.Pe
 import Vane.Lut
 import Vane.Pool
+import Vane.Verify
+import Vane.View
 
 namespace Vane.Proofs
 
@@ -19,6 +21,8 @@ open Vane.Tiling
 open Vane.Pe
 open Vane.Lut
 open Vane.Pool
+open Vane.Verify
+open Vane.View
 
 -- ============================================================================
 -- 1. Alignment soundness (alignUp_ge, alignUp_dvd)
@@ -1939,5 +1943,291 @@ theorem target_profile_conv1x1MaxCout_pos (t : Target) (f ocg : Nat) :
   unfold TargetProfile.conv1x1MaxCout
   rw [Nat.shiftLeft_eq, Nat.one_mul]
   exact Nat.two_pow_pos _
+
+-- ============================================================================
+-- 13. Milestone 5C view layouts, groupCode bounds, prefix partitions & S5 coverage
+-- ============================================================================
+
+theorem neViewCommonLayout_valid : (validateWordLayout neViewCommonLayout).isOk = true := by decide
+
+theorem neViewCommon_roundTrip
+    (kind shPref shMin shMax f transposeOut transposeWideGroup : UInt32)
+    (hk : kind < 256) (hsp : shPref < 8) (hsm : shMin < 8) (hsx : shMax < 8)
+    (hf : f < 8) (ht : transposeOut < 2) (hwg : transposeWideGroup < 2) :
+    ∃ w, encodeWord neViewCommonLayout #[
+        ("kind", kind), ("shPref", shPref), ("shMin", shMin), ("shMax", shMax),
+        ("F", f), ("transposeOut", transposeOut), ("transposeWideGroup", transposeWideGroup)
+      ] = .ok w ∧
+      decodeFieldChecked neViewCommonLayout w "kind" = .ok kind ∧
+      decodeFieldChecked neViewCommonLayout w "shPref" = .ok shPref ∧
+      decodeFieldChecked neViewCommonLayout w "shMin" = .ok shMin ∧
+      decodeFieldChecked neViewCommonLayout w "shMax" = .ok shMax ∧
+      decodeFieldChecked neViewCommonLayout w "F" = .ok f ∧
+      decodeFieldChecked neViewCommonLayout w "transposeOut" = .ok transposeOut ∧
+      decodeFieldChecked neViewCommonLayout w "transposeWideGroup" = .ok transposeWideGroup := by
+  have h1 : ¬ kind.toNat ≥ 256 := u32_not_ge_of_lt hk
+  have h2 : ¬ shPref.toNat ≥ 8 := u32_not_ge_of_lt hsp
+  have h3 : ¬ shMin.toNat ≥ 8 := u32_not_ge_of_lt hsm
+  have h4 : ¬ shMax.toNat ≥ 8 := u32_not_ge_of_lt hsx
+  have h5 : ¬ f.toNat ≥ 8 := u32_not_ge_of_lt hf
+  have h6 : ¬ transposeOut.toNat ≥ 2 := u32_not_ge_of_lt ht
+  have h7 : ¬ transposeWideGroup.toNat ≥ 2 := u32_not_ge_of_lt hwg
+  have henc : encodeWord neViewCommonLayout #[
+      ("kind", kind), ("shPref", shPref), ("shMin", shMin), ("shMax", shMax),
+      ("F", f), ("transposeOut", transposeOut), ("transposeWideGroup", transposeWideGroup)
+    ] = .ok ((((((((0 : UInt32) ||| (kind <<< 0)) ||| (shPref <<< 8)) ||| (shMin <<< 12)) |||
+        (shMax <<< 16)) ||| (f <<< 19)) ||| (transposeOut <<< 28)) ||| (transposeWideGroup <<< 29)) := by
+    change (if kind.toNat ≥ 256 then _ else if shPref.toNat ≥ 8 then _ else
+            if shMin.toNat ≥ 8 then _ else if shMax.toNat ≥ 8 then _ else
+            if f.toNat ≥ 8 then _ else if transposeOut.toNat ≥ 2 then _ else
+            if transposeWideGroup.toNat ≥ 2 then _ else _) = _
+    simp only [h1, h2, h3, h4, h5, h6, h7, ↓reduceIte]
+    rfl
+  exact ⟨_, henc,
+    encodeWord_decodeFieldChecked _ _ _ "kind" kind henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "shPref" shPref henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "shMin" shMin henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "shMax" shMax henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "F" f henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "transposeOut" transposeOut henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "transposeWideGroup" transposeWideGroup henc rfl⟩
+
+/-- `groupCode c` is always at least `1`. -/
+theorem groupCode_pos (c : Nat) : 1 ≤ groupCode c := by
+  unfold groupCode
+  split
+  · omega
+  · split
+    · omega
+    · split <;> omega
+
+/-- `groupCode c` is always at most `8`. -/
+theorem groupCode_le_eight (c : Nat) : groupCode c ≤ 8 := by
+  unfold groupCode
+  split
+  · omega
+  · split
+    · omega
+    · split <;> omega
+
+/-- `groupCodeLog2 c` always fits in the 2-bit range `0..3`. -/
+theorem groupCodeLog2_le_three (c : Nat) : groupCodeLog2 c ≤ 3 := by
+  unfold groupCodeLog2
+  split
+  · omega
+  · split
+    · omega
+    · split <;> omega
+
+/-- `groupCode c` is the exact power of two `1 <<< groupCodeLog2 c`. -/
+theorem groupCode_eq_pow (c : Nat) : groupCode c = 1 <<< groupCodeLog2 c := by
+  unfold groupCode groupCodeLog2
+  split
+  · rfl
+  · split
+    · rfl
+    · split <;> rfl
+
+/-- Single-task T-mode channel-group coverage bound: for all `c ≤ 128`,
+    `F = 4` with `ocg = groupCodeLog2 c` covers all `c` channels (`c ≤ 2 ^ (4 + groupCodeLog2 c)`). -/
+theorem tmode_channel_coverage_le_128 (c : Nat) (hc : c ≤ 128) :
+    c ≤ 2 ^ (4 + groupCodeLog2 c) := by
+  unfold groupCodeLog2
+  split
+  · omega
+  · split
+    · omega
+    · split <;> omega
+
+/-- `prefixStartsAux` preserves list length. -/
+theorem prefixStartsAux_length (acc : Nat) (sizes : List Nat) :
+    (prefixStartsAux acc sizes).length = sizes.length := by
+  induction sizes generalizing acc with
+  | nil => rfl
+  | cons sz rest ih =>
+    simp [prefixStartsAux, ih]
+
+/-- `prefixStarts` preserves list length. -/
+theorem prefixStarts_length (sizes : List Nat) :
+    (prefixStarts sizes).length = sizes.length :=
+  prefixStartsAux_length 0 sizes
+
+/-- Every interval `(a, b)` in `sliceIntervalsAux acc sizes` lies within `[acc, acc + sumSizes sizes]`. -/
+theorem sliceIntervalsAux_bounds (acc : Nat) (sizes : List Nat) :
+    ∀ iv ∈ sliceIntervalsAux acc sizes, acc ≤ iv.1 ∧ iv.1 ≤ iv.2 ∧ iv.2 ≤ acc + sumSizes sizes := by
+  induction sizes generalizing acc with
+  | nil =>
+    intro iv hiv
+    simp [sliceIntervalsAux] at hiv
+  | cons sz rest ih =>
+    intro iv hiv
+    simp only [sliceIntervalsAux, List.mem_cons] at hiv
+    rcases hiv with rfl | hmem
+    · simp only [sumSizes]
+      omega
+    · have h := ih (acc + sz) iv hmem
+      simp only [sumSizes]
+      omega
+
+/-- Every interval `(a, b)` in `sliceIntervals sizes` lies within `[0, sumSizes sizes]`. -/
+theorem sliceIntervals_bounds (sizes : List Nat) :
+    ∀ iv ∈ sliceIntervals sizes, iv.1 ≤ iv.2 ∧ iv.2 ≤ sumSizes sizes := by
+  intro iv hiv
+  have h := sliceIntervalsAux_bounds 0 sizes iv hiv
+  omega
+
+/-- Intervals generated by `sliceIntervalsAux` are pairwise strictly non-overlapping (`a.2 ≤ b.1`). -/
+theorem sliceIntervalsAux_pairwise_disjoint (acc : Nat) (sizes : List Nat) :
+    (sliceIntervalsAux acc sizes).Pairwise (fun a b => a.2 ≤ b.1) := by
+  induction sizes generalizing acc with
+  | nil =>
+    exact List.Pairwise.nil
+  | cons sz rest ih =>
+    simp only [sliceIntervalsAux]
+    apply List.Pairwise.cons
+    · intro iv hiv
+      exact (sliceIntervalsAux_bounds (acc + sz) rest iv hiv).1
+    · exact ih (acc + sz)
+
+/-- Intervals generated by `sliceIntervals` are pairwise non-overlapping (`a.2 ≤ b.1`). -/
+theorem sliceIntervals_pairwise_disjoint (sizes : List Nat) :
+    (sliceIntervals sizes).Pairwise (fun a b => a.2 ≤ b.1) :=
+  sliceIntervalsAux_pairwise_disjoint 0 sizes
+
+private theorem insertInterval_head_of_le (a : Nat × Nat) (xs : List (Nat × Nat))
+    (hle : ∀ b ∈ xs, a.1 ≤ b.1) :
+    insertInterval a xs = a :: xs := by
+  cases xs with
+  | nil => rfl
+  | cons hd tl =>
+    unfold insertInterval
+    have h1 : a.1 ≤ hd.1 := hle hd List.mem_cons_self
+    simp [h1]
+
+private theorem sortIntervals_sliceIntervalsAux (acc : Nat) (sizes : List Nat) :
+    sortIntervals (sliceIntervalsAux acc sizes) = sliceIntervalsAux acc sizes := by
+  induction sizes generalizing acc with
+  | nil => rfl
+  | cons sz rest ih =>
+    simp only [sliceIntervalsAux, sortIntervals]
+    rw [ih (acc + sz)]
+    apply insertInterval_head_of_le
+    intro iv hiv
+    have h := (sliceIntervalsAux_bounds (acc + sz) rest iv hiv).1
+    omega
+
+private theorem sweepCover_sliceIntervalsAux (acc : Nat) (sizes : List Nat) :
+    sweepCover (sliceIntervalsAux acc sizes) acc = acc + sumSizes sizes := by
+  induction sizes generalizing acc with
+  | nil =>
+    simp [sliceIntervalsAux, sweepCover, sumSizes]
+  | cons sz rest ih =>
+    simp only [sliceIntervalsAux, sweepCover, sumSizes, Nat.le_refl, ↓reduceIte]
+    have hmax : max acc (acc + sz) = acc + sz := by omega
+    rw [hmax, ih (acc + sz)]
+    omega
+
+/-- Contiguous `sliceIntervals sizes` completely cover `[0, sumSizes sizes)` under `Vane.Verify.intervalsCover`. -/
+theorem sliceIntervals_cover (sizes : List Nat) :
+    intervalsCover (sliceIntervals sizes) 0 (sumSizes sizes) = true := by
+  unfold intervalsCover sliceIntervals
+  split
+  · rfl
+  · rw [sortIntervals_sliceIntervalsAux 0 sizes, sweepCover_sliceIntervalsAux 0 sizes]
+    simp
+
+/-- Membership characterization for `Vane.Verify.insertInterval`. -/
+theorem mem_insertInterval (iv x : Nat × Nat) (xs : List (Nat × Nat)) :
+    x ∈ insertInterval iv xs ↔ x = iv ∨ x ∈ xs := by
+  induction xs with
+  | nil =>
+    simp [insertInterval]
+  | cons hd tl ih =>
+    unfold insertInterval
+    split
+    · simp [List.mem_cons]
+    · simp only [List.mem_cons, ih]
+      exact ⟨fun h => by rcases h with rfl | rfl | hm <;> simp [*],
+             fun h => by rcases h with rfl | rfl | hm <;> simp [*]⟩
+
+/-- Membership preservation for `Vane.Verify.sortIntervals`. -/
+theorem mem_sortIntervals (x : Nat × Nat) (xs : List (Nat × Nat)) :
+    x ∈ sortIntervals xs ↔ x ∈ xs := by
+  induction xs with
+  | nil => simp [sortIntervals]
+  | cons hd tl ih =>
+    simp only [sortIntervals, mem_insertInterval, ih, List.mem_cons]
+
+/-- Soundness of `Vane.Verify.sweepCover`: every byte offset `x ∈ [cur, sweepCover ivs cur)` is
+    covered by at least one interval in `ivs`. -/
+theorem sweepCover_sound (ivs : List (Nat × Nat)) (cur x : Nat)
+    (hcur : cur ≤ x) (hlt : x < sweepCover ivs cur) :
+    ∃ iv ∈ ivs, iv.1 ≤ x ∧ x < iv.2 := by
+  induction ivs generalizing cur with
+  | nil =>
+    simp [sweepCover] at hlt
+    omega
+  | cons iv rest ih =>
+    rcases iv with ⟨a, b⟩
+    simp only [sweepCover] at hlt
+    split at hlt
+    · rename_i hac
+      by_cases hxb : x < b
+      · exact ⟨(a, b), List.mem_cons_self, by omega, hxb⟩
+      · have hmax : max cur b ≤ x := by omega
+        obtain ⟨w, hwMem, hwLo, hwHi⟩ := ih (max cur b) hmax hlt
+        exact ⟨w, List.mem_cons_of_mem _ hwMem, hwLo, hwHi⟩
+    · omega
+
+/-- Soundness of `Vane.Verify.intervalsCover`: if `intervalsCover ivs lo hi = true`, then every
+    byte offset `x ∈ [lo, hi)` is written by at least one interval `(a, b) ∈ ivs`. -/
+theorem intervalsCover_sound (ivs : List (Nat × Nat)) (lo hi x : Nat)
+    (hcov : intervalsCover ivs lo hi = true) (hlo : lo ≤ x) (hhi : x < hi) :
+    ∃ iv ∈ ivs, iv.1 ≤ x ∧ x < iv.2 := by
+  unfold intervalsCover at hcov
+  have hnot : ¬ (lo ≥ hi) := by omega
+  simp only [hnot, ↓reduceIte, decide_eq_true_eq] at hcov
+  have hlt : x < sweepCover (sortIntervals ivs) lo := by omega
+  obtain ⟨iv, hivMem, hivLo, hivHi⟩ := sweepCover_sound (sortIntervals ivs) lo x hlo hlt
+  exact ⟨iv, (mem_sortIntervals iv ivs).mp hivMem, hivLo, hivHi⟩
+
+/-- Every element index `x < sumSizes sizes` belongs to a slice interval in `sliceIntervals sizes`. -/
+theorem sliceIntervals_cover_point (sizes : List Nat) (x : Nat) (hx : x < sumSizes sizes) :
+    ∃ iv ∈ sliceIntervals sizes, iv.1 ≤ x ∧ x < iv.2 :=
+  intervalsCover_sound (sliceIntervals sizes) 0 (sumSizes sizes) x
+    (sliceIntervals_cover sizes) (Nat.zero_le x) hx
+
+/-- Soundness of periodic multi-writer coverage (`Vane.Verify.periodicGroupCovered`):
+    if `periodicGroupCovered outerBase outerCount outerStride innerIvs = some (lo, hi)`,
+    then every byte offset `x ∈ [lo, hi)` falls inside `[outerBase + j * outerStride + iv.1,
+    outerBase + j * outerStride + iv.2)` for some outer repetition `j < outerCount` and
+    some inner slice `iv ∈ innerIvs`. -/
+theorem periodicGroupCovered_sound
+    (outerBase outerCount outerStride : Nat) (innerIvs : List (Nat × Nat))
+    (lo hi x : Nat)
+    (h : periodicGroupCovered outerBase outerCount outerStride innerIvs = some (lo, hi))
+    (hlo : lo ≤ x) (hhi : x < hi) :
+    ∃ j < outerCount, ∃ iv ∈ innerIvs,
+      outerBase + j * outerStride + iv.1 ≤ x ∧
+      x < outerBase + j * outerStride + iv.2 := by
+  unfold periodicGroupCovered at h
+  split at h
+  · rename_i hcond
+    simp only [Option.some.injEq, Prod.mk.injEq] at h
+    rcases h with ⟨rfl, rfl⟩
+    simp only [Bool.and_eq_true, decide_eq_true_eq] at hcond
+    rcases hcond with ⟨⟨_, hStridePos⟩, hcov⟩
+    let d := x - outerBase
+    have hdLt : d < outerCount * outerStride := by omega
+    have hjLt : d / outerStride < outerCount := by
+      have hcomm : d < outerStride * outerCount := by rw [Nat.mul_comm]; exact hdLt
+      exact Nat.div_lt_of_lt_mul hcomm
+    have hrLt : d % outerStride < outerStride := Nat.mod_lt d hStridePos
+    have hdivMod : outerStride * (d / outerStride) + d % outerStride = d := Nat.div_add_mod d outerStride
+    have hmulComm : (d / outerStride) * outerStride = outerStride * (d / outerStride) := Nat.mul_comm _ _
+    obtain ⟨iv, hivMem, hivLo, hivHi⟩ :=
+      intervalsCover_sound innerIvs 0 outerStride (d % outerStride) hcov (Nat.zero_le _) hrLt
+    refine ⟨d / outerStride, hjLt, iv, hivMem, ?_, ?_⟩ <;> omega
+  · cases h
 
 end Vane.Proofs
