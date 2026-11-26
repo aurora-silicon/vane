@@ -276,4 +276,43 @@ func TestSafeTensorsBoundsAndCorruptionGuards(t *testing.T) {
 			t.Fatalf("strict mode should reject overlapping spans, got: %v", err)
 		}
 	})
+
+	t.Run("trailing_non_json_garbage", func(t *testing.T) {
+		raw := makeRawSafeTensors(`{"w":{"dtype":"F16","shape":[1],"data_offsets":[0,2]}} GARBAGE`, make([]byte, 2))
+		if _, err := ParseSafeTensors(raw); err == nil {
+			t.Fatal("expected error for trailing non-JSON garbage in header")
+		}
+	})
+
+	t.Run("trailing_json_object", func(t *testing.T) {
+		raw := makeRawSafeTensors(`{"w":{"dtype":"F16","shape":[1],"data_offsets":[0,2]}}{"extra":1}`, make([]byte, 2))
+		if _, err := ParseSafeTensors(raw); err == nil {
+			t.Fatal("expected error for trailing JSON object in header")
+		}
+	})
+
+	t.Run("missing_shape_field", func(t *testing.T) {
+		raw := makeRawSafeTensors(`{"w":{"dtype":"F16","data_offsets":[0,2]}}`, make([]byte, 2))
+		if _, err := ParseSafeTensors(raw); err == nil || !strings.Contains(err.Error(), "shape") {
+			t.Fatalf("expected error for omitted shape field, got: %v", err)
+		}
+	})
+
+	t.Run("null_shape_field", func(t *testing.T) {
+		raw := makeRawSafeTensors(`{"w":{"dtype":"F16","shape":null,"data_offsets":[0,2]}}`, make([]byte, 2))
+		if _, err := ParseSafeTensors(raw); err == nil || !strings.Contains(err.Error(), "shape") {
+			t.Fatalf("expected error for null shape field, got: %v", err)
+		}
+	})
+
+	t.Run("explicit_scalar_empty_shape_allowed", func(t *testing.T) {
+		raw := makeRawSafeTensors(`{"s":{"dtype":"F16","shape":[],"data_offsets":[0,2]}}`, fp16.EncodeLE([]uint16{fp16.FromFloat64(1.5)}))
+		sf, err := ParseSafeTensors(raw)
+		if err != nil {
+			t.Fatalf("explicit empty scalar shape should succeed, got: %v", err)
+		}
+		if len(sf.Tensors["s"].Shape) != 0 {
+			t.Fatalf("expected scalar shape [], got %v", sf.Tensors["s"].Shape)
+		}
+	})
 }

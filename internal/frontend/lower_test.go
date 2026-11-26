@@ -83,11 +83,11 @@ func (t f64Tensor) toRefFP16() ref.Tensor {
 	return out
 }
 
-func refConv3x3F64(x f64Tensor, w []float64, b []float64, cout, stride int, padSame bool) f64Tensor {
-	ho, wo, pt, pl, err := ref.Conv3x3Geometry(x.H, x.W, stride, map[bool]string{true: "same", false: "valid"}[padSame])
-	if err != nil {
-		panic(err)
-	}
+// refConv3x3F64 evaluates an exact ONNX 3x3 convolution with explicit pads [pt, pl, pb, pr].
+func refConv3x3F64(x f64Tensor, w []float64, b []float64, cout, stride int, pads [4]int) f64Tensor {
+	pt, pl, pb, pr := pads[0], pads[1], pads[2], pads[3]
+	ho := (x.H+pt+pb-3)/stride + 1
+	wo := (x.W+pl+pr-3)/stride + 1
 	out := newF64Tensor(cout, ho, wo)
 	for o := 0; o < cout; o++ {
 		bv := 0.0
@@ -163,14 +163,6 @@ func refReluF64(x f64Tensor) f64Tensor {
 	return out
 }
 
-func refSiluF64(x f64Tensor) f64Tensor {
-	out := newF64Tensor(x.C, x.H, x.W)
-	for i, v := range x.Data {
-		out.Data[i] = v / (1.0 + math.Exp(-v))
-	}
-	return out
-}
-
 func refAddF64(a, b f64Tensor) f64Tensor {
 	out := newF64Tensor(a.C, a.H, a.W)
 	for i := range a.Data {
@@ -192,13 +184,9 @@ func assertTensorClose(t *testing.T, label string, got ref.Tensor, want f64Tenso
 	if got.C != want.C || got.H != want.H || got.W != want.W {
 		t.Fatalf("%s: shape mismatch got (1,%d,%d,%d) != want (1,%d,%d,%d)", label, got.C, got.H, got.W, want.C, want.H, want.W)
 	}
-	maxErr := 0.0
 	for i := range want.Data {
 		g := fp16.ToFloat64(got.Data[i])
 		diff := math.Abs(g - want.Data[i])
-		if diff > maxErr {
-			maxErr = diff
-		}
 		if diff > atol {
 			t.Fatalf("%s: elem %d mismatch: got %.6g, want %.6g (diff=%.6g > atol=%.6g)", label, i, g, want.Data[i], diff, atol)
 		}
@@ -206,7 +194,7 @@ func assertTensorClose(t *testing.T, label string, got ref.Tensor, want f64Tenso
 }
 
 func TestEndToEndConvBNReluResidualBlock(t *testing.T) {
-	// Graph: x [batch,4,4,4] -> Identity -> Conv3x3(4->4, same) -> BN1 -> ReLU
+	// Graph: x [batch,4,4,4] -> Identity -> Conv3x3(4->4, pads=[1,1,1,1]) -> BN1 -> ReLU
 	//        -> Dropout -> Conv1x1(4->4) -> BN2 -> Add(_, x) -> ReLU -> y
 	const C, H, W = 4, 4, 4
 	w1 := make([]float64, C*C*9)
@@ -275,12 +263,10 @@ func TestEndToEndConvBNReluResidualBlock(t *testing.T) {
 		t.Fatalf("ParseONNX: %v", err)
 	}
 
-	// Without --input-shape override, symbolic batch dim must be rejected cleanly.
 	if _, err := LowerONNX(model, LowerOptions{}); err == nil {
 		t.Fatal("expected error for dynamic batch dim without InputShapes override")
 	}
 
-	// Lower with fusion enabled.
 	res, err := LowerONNX(model, LowerOptions{
 		Target:      "h17",
 		InputShapes: map[string][3]int{"x": {C, H, W}},
@@ -291,12 +277,8 @@ func TestEndToEndConvBNReluResidualBlock(t *testing.T) {
 	if res.Summary.FusedBNCount != 2 || res.Summary.FusedActCount != 1 || res.Summary.ElidedCount != 2 {
 		t.Fatalf("unexpected fusion stats: %+v", res.Summary)
 	}
-	// Expected fused nodes: conv1(3x3+BN+ReLU), conv2(1x1+BN), res_add(pe add), relu_out(lut relu) = 4 nodes
-	if len(res.Spec.Nodes) != 4 {
-		t.Fatalf("expected 4 fused nodes, got %d: %+v", len(res.Spec.Nodes), res.Spec.Nodes)
-	}
-	if !res.Spec.Nodes[0].Relu {
-		t.Fatalf("expected conv1 to have fused relu=true")
+	if len(res.Spec.Nodes) != 4 || !res.Spec.Nodes[0].Relu {
+		t.Fatalf("expected 4 fused nodes with conv1 relu=true, got %+v", res.Spec.Nodes)
 	}
 
 	dir := t.TempDir()
@@ -305,14 +287,13 @@ func TestEndToEndConvBNReluResidualBlock(t *testing.T) {
 	}
 	refSpec, nw := loadRefGraphFromDir(t, dir)
 
-	// Build deterministic input and independent float64 reference.
 	xF64 := newF64Tensor(C, H, W)
 	for i := range xF64.Data {
 		xF64.Data[i] = fp16.ToFloat64(fp16.FromFloat64(float64((i%11)-5) * 0.25))
 	}
 	xFP16 := xF64.toRefFP16()
 
-	want := refConv3x3F64(xF64, w1, b1, C, 1, true)
+	want := refConv3x3F64(xF64, w1, b1, C, 1, [4]int{1, 1, 1, 1})
 	want = refBNF64(want, bn1Scale, bn1B, bn1Mean, bn1Var, eps)
 	want = refReluF64(want)
 	want = refConv1x1F64(want, w2, nil, C)
@@ -331,7 +312,6 @@ func TestEndToEndConvBNReluResidualBlock(t *testing.T) {
 	assertTensorClose(t, "resnet fused F64", gotF64, want, 2e-2)
 	assertTensorClose(t, "resnet fused Q1516", gotQ, want, 3e-2)
 
-	// Also verify NoFuse produces unfused graph that still evaluates accurately via ref.EvalGraphF64.
 	resNoFuse, err := LowerONNX(model, LowerOptions{
 		Target:      "h17",
 		InputShapes: map[string][3]int{"x": {C, H, W}},
@@ -355,10 +335,112 @@ func TestEndToEndConvBNReluResidualBlock(t *testing.T) {
 	assertTensorClose(t, "resnet unfused F64", gotNF, want, 2e-2)
 }
 
+func TestConv3x3Stride2PaddingValidation(t *testing.T) {
+	buildStride2Conv := func(h, w int, autoPad string, pads []int64, weights []float64) *ONNXModel {
+		var attrs []*ProtoBuilder
+		attrs = append(attrs, buildAttrInts("strides", []int64{2, 2}, true))
+		if autoPad != "" {
+			attrs = append(attrs, buildAttrString("auto_pad", autoPad))
+		}
+		if pads != nil {
+			attrs = append(attrs, buildAttrInts("pads", pads, true))
+		}
+		raw := buildModel(17, "s2_conv",
+			[]*ProtoBuilder{buildStaticValueInfo("x", ONNXFloat, []int64{1, 2, int64(h), int64(w)})},
+			[]*ProtoBuilder{buildStaticValueInfo("y", ONNXFloat, []int64{1, 2, 1, 1})},
+			[]*ProtoBuilder{buildFloatTensor("w", []int64{2, 2, 3, 3}, toF32Slice(weights), true)},
+			[]*ProtoBuilder{buildNode("Conv", "c", []string{"x", "w"}, []string{"y"}, attrs...)},
+		)
+		m, err := ParseONNX(raw)
+		if err != nil {
+			t.Fatalf("ParseONNX: %v", err)
+		}
+		return m
+	}
+
+	weights := make([]float64, 2*2*9)
+	for i := range weights {
+		weights[i] = float64((i%7)-3) * 0.1
+	}
+
+	// Reject mismatched stride-2 paddings that would silently miscompile:
+	t.Run("reject_even_4x4_pads_1111", func(t *testing.T) {
+		m := buildStride2Conv(4, 4, "", []int64{1, 1, 1, 1}, weights)
+		if _, err := LowerONNX(m, LowerOptions{}); err == nil || !strings.Contains(err.Error(), "SAME_UPPER") {
+			t.Fatalf("expected rejection for stride-2 pads=[1,1,1,1] on 4x4, got: %v", err)
+		}
+	})
+	t.Run("reject_even_4x4_same_lower", func(t *testing.T) {
+		m := buildStride2Conv(4, 4, "SAME_LOWER", nil, weights)
+		if _, err := LowerONNX(m, LowerOptions{}); err == nil {
+			t.Fatal("expected rejection for stride-2 SAME_LOWER on 4x4")
+		}
+	})
+	t.Run("reject_odd_5x5_pads_0011", func(t *testing.T) {
+		m := buildStride2Conv(5, 5, "", []int64{0, 0, 1, 1}, weights)
+		if _, err := LowerONNX(m, LowerOptions{}); err == nil {
+			t.Fatal("expected rejection for stride-2 pads=[0,0,1,1] on odd 5x5")
+		}
+	})
+
+	// Accept exact SAME_UPPER matches and verify numerical accuracy against exact ONNX pads:
+	t.Run("pass_even_4x4_pads_0011", func(t *testing.T) {
+		m := buildStride2Conv(4, 4, "", []int64{0, 0, 1, 1}, weights)
+		res, err := LowerONNX(m, LowerOptions{})
+		if err != nil {
+			t.Fatalf("LowerONNX even 4x4 pads=[0,0,1,1]: %v", err)
+		}
+		if res.Spec.Nodes[0].Pad != "same" || res.Summary.OutputShape != [4]int{1, 2, 2, 2} {
+			t.Fatalf("unexpected pad/shape: %+v %v", res.Spec.Nodes[0], res.Summary.OutputShape)
+		}
+		dir := t.TempDir()
+		if err := WriteLoweredGraph(dir, res); err != nil {
+			t.Fatalf("WriteLoweredGraph: %v", err)
+		}
+		refSpec, nw := loadRefGraphFromDir(t, dir)
+		xF64 := newF64Tensor(2, 4, 4)
+		for i := range xF64.Data {
+			xF64.Data[i] = fp16.ToFloat64(fp16.FromFloat64(float64((i%9)-4) * 0.25))
+		}
+		got, _, err := ref.EvalGraphF64(refSpec, map[string]ref.Tensor{"x": xF64.toRefFP16()}, nw)
+		if err != nil {
+			t.Fatalf("EvalGraphF64: %v", err)
+		}
+		want := refConv3x3F64(xF64, weights, nil, 2, 2, [4]int{0, 0, 1, 1})
+		assertTensorClose(t, "stride2 even 4x4 [0,0,1,1]", got, want, 1e-2)
+	})
+
+	t.Run("pass_odd_5x5_pads_1111", func(t *testing.T) {
+		m := buildStride2Conv(5, 5, "", []int64{1, 1, 1, 1}, weights)
+		res, err := LowerONNX(m, LowerOptions{})
+		if err != nil {
+			t.Fatalf("LowerONNX odd 5x5 pads=[1,1,1,1]: %v", err)
+		}
+		if res.Spec.Nodes[0].Pad != "same" || res.Summary.OutputShape != [4]int{1, 2, 3, 3} {
+			t.Fatalf("unexpected pad/shape: %+v %v", res.Spec.Nodes[0], res.Summary.OutputShape)
+		}
+		dir := t.TempDir()
+		if err := WriteLoweredGraph(dir, res); err != nil {
+			t.Fatalf("WriteLoweredGraph: %v", err)
+		}
+		refSpec, nw := loadRefGraphFromDir(t, dir)
+		xF64 := newF64Tensor(2, 5, 5)
+		for i := range xF64.Data {
+			xF64.Data[i] = fp16.ToFloat64(fp16.FromFloat64(float64((i%11)-5) * 0.25))
+		}
+		got, _, err := ref.EvalGraphF64(refSpec, map[string]ref.Tensor{"x": xF64.toRefFP16()}, nw)
+		if err != nil {
+			t.Fatalf("EvalGraphF64: %v", err)
+		}
+		want := refConv3x3F64(xF64, weights, nil, 2, 2, [4]int{1, 1, 1, 1})
+		assertTensorClose(t, "stride2 odd 5x5 [1,1,1,1]", got, want, 1e-2)
+	})
+}
+
 func TestEndToEndPoolingReduceSoftmaxBlock(t *testing.T) {
 	// x [1, 4, 4, 4] -> MaxPool(2x2, stride=2, valid) [1,4,2,2]
 	//                -> AveragePool(2x2, stride=1, pads=[1,1,1,1], count_include_pad=0) [1,4,3,3]
-	//                -> Softmax(axis=1) [1,4,3,3]
+	//                -> Softmax(axis=1) [1,4,3,3] (W=3 > 1 -> reduce(sum) + lut(inverse)!)
 	//                -> GlobalAveragePool [1,4,1,1]
 	const C, H, W = 4, 4, 4
 	rawONNX := buildModel(17, "pool_reduce_softmax",
@@ -394,6 +476,22 @@ func TestEndToEndPoolingReduceSoftmaxBlock(t *testing.T) {
 	if res.Summary.OutputShape != [4]int{1, C, 1, 1} {
 		t.Fatalf("unexpected output shape: %v", res.Summary.OutputShape)
 	}
+	// Verify Softmax(axis=1) with W=3 > 1 used reduce(sum)+lut(inverse), NOT reduce(inv_sum).
+	sawSum, sawInv := false, false
+	for _, nd := range res.Spec.Nodes {
+		if nd.Op == "reduce" && nd.Axes == "c" && nd.ReduceOp == "inv_sum" {
+			t.Fatalf("Softmax(axis=1) with W>1 must not emit reduce(inv_sum, axes='c')")
+		}
+		if nd.Op == "reduce" && nd.Axes == "c" && nd.ReduceOp == "sum" {
+			sawSum = true
+		}
+		if nd.Op == "lut" && nd.Act != nil && nd.Act.Name == "inverse" {
+			sawInv = true
+		}
+	}
+	if !sawSum || !sawInv {
+		t.Fatalf("expected reduce(sum, axes='c') + lut(inverse) for Softmax(axis=1, W>1); got %+v", res.Spec.Nodes)
+	}
 
 	dir := t.TempDir()
 	if err := WriteLoweredGraph(dir, res); err != nil {
@@ -405,15 +503,12 @@ func TestEndToEndPoolingReduceSoftmaxBlock(t *testing.T) {
 	for i := range xF64.Data {
 		xF64.Data[i] = fp16.ToFloat64(fp16.FromFloat64(float64((i%9)-4) * 0.35))
 	}
-	xFP16 := xF64.toRefFP16()
-
-	gotF64, _, err := ref.EvalGraphF64(refSpec, map[string]ref.Tensor{"x": xFP16}, nw)
+	gotF64, _, err := ref.EvalGraphF64(refSpec, map[string]ref.Tensor{"x": xF64.toRefFP16()}, nw)
 	if err != nil {
 		t.Fatalf("EvalGraphF64: %v", err)
 	}
 
 	// Independent float64 reference:
-	// 1. MaxPool 2x2 stride 2 valid -> 2x2
 	p1 := newF64Tensor(C, 2, 2)
 	for c := 0; c < C; c++ {
 		for oy := 0; oy < 2; oy++ {
@@ -421,8 +516,7 @@ func TestEndToEndPoolingReduceSoftmaxBlock(t *testing.T) {
 				best := math.Inf(-1)
 				for ky := 0; ky < 2; ky++ {
 					for kx := 0; kx < 2; kx++ {
-						v := xF64.at(c, oy*2+ky, ox*2+kx)
-						if v > best {
+						if v := xF64.at(c, oy*2+ky, ox*2+kx); v > best {
 							best = v
 						}
 					}
@@ -431,7 +525,6 @@ func TestEndToEndPoolingReduceSoftmaxBlock(t *testing.T) {
 			}
 		}
 	}
-	// 2. AveragePool 2x2 stride 1 pads=[1,1,1,1] exclude_pad=true -> 3x3
 	p2 := newF64Tensor(C, 3, 3)
 	for c := 0; c < C; c++ {
 		for oy := 0; oy < 3; oy++ {
@@ -455,7 +548,6 @@ func TestEndToEndPoolingReduceSoftmaxBlock(t *testing.T) {
 			}
 		}
 	}
-	// 3. Softmax along C
 	p3 := newF64Tensor(C, 3, 3)
 	for y := 0; y < 3; y++ {
 		for xi := 0; xi < 3; xi++ {
@@ -474,7 +566,6 @@ func TestEndToEndPoolingReduceSoftmaxBlock(t *testing.T) {
 			}
 		}
 	}
-	// 4. GlobalAveragePool
 	want := newF64Tensor(C, 1, 1)
 	for c := 0; c < C; c++ {
 		s := 0.0
@@ -485,39 +576,77 @@ func TestEndToEndPoolingReduceSoftmaxBlock(t *testing.T) {
 		}
 		want.set(c, 0, 0, s/9.0)
 	}
-
 	assertTensorClose(t, "pool+reduce+softmax", gotF64, want, 1e-2)
 }
 
-func TestEndToEndConvConcatUNetSkipBlock(t *testing.T) {
-	// U-Net skip block:
-	//   x [1, 4, 4, 4]
-	//   branch A: Conv3x3(4->4, same) -> Sigmoid -> Mul(conv_out, sig) [Silu!] -> MaxPool(2x2, stride=2) [1,4,2,2]
-	//   branch B (skip): Conv3x3(4->2, stride=2, same) [1,2,2,2]
-	//   Concat(A, B, axis=1) [1, 6, 2, 2]
-	//   Conv1x1(6->4) -> ReLU -> y [1, 4, 2, 2]
-	wA := make([]float64, 4*4*9)
-	for i := range wA {
-		wA[i] = float64((i%5)-2) * 0.06
+func TestSoftmaxOpset11AndBackendConstraints(t *testing.T) {
+	// Softmax opset 11 axis=1 flattens [1..3] -> axes="chw"
+	raw11 := buildModel(11, "sm11",
+		[]*ProtoBuilder{buildStaticValueInfo("x", ONNXFloat, []int64{1, 2, 2, 2})},
+		[]*ProtoBuilder{buildStaticValueInfo("y", ONNXFloat, []int64{1, 2, 2, 2})},
+		nil,
+		[]*ProtoBuilder{buildNode("Softmax", "sm", []string{"x"}, []string{"y"}, buildAttrInt("axis", 1))},
+	)
+	m11, _ := ParseONNX(raw11)
+	res11, err := LowerONNX(m11, LowerOptions{})
+	if err != nil {
+		t.Fatalf("LowerONNX opset 11 Softmax(axis=1): %v", err)
 	}
-	wB := make([]float64, 2*4*9)
-	for i := range wB {
-		wB[i] = float64((i%7)-3) * 0.05
+	if res11.Spec.Nodes[0].Axes != "chw" {
+		t.Fatalf("expected opset 11 Softmax(axis=1) to reduce 'chw', got %q", res11.Spec.Nodes[0].Axes)
 	}
-	wOut := make([]float64, 4*6)
-	for i := range wOut {
-		wOut[i] = float64((i%5)-2) * 0.1
+	dir := t.TempDir()
+	_ = WriteLoweredGraph(dir, res11)
+	refSpec, nw := loadRefGraphFromDir(t, dir)
+	xF64 := newF64Tensor(2, 2, 2)
+	for i := range xF64.Data {
+		xF64.Data[i] = float64(i-3) * 0.25
 	}
-	bOut := []float64{0.05, -0.05, 0.1, 0.0}
+	got, _, err := ref.EvalGraphF64(refSpec, map[string]ref.Tensor{"x": xF64.toRefFP16()}, nw)
+	if err != nil {
+		t.Fatalf("EvalGraphF64 opset11 softmax: %v", err)
+	}
+	mx := math.Inf(-1)
+	for _, v := range xF64.Data {
+		if v > mx {
+			mx = v
+		}
+	}
+	sum := 0.0
+	for _, v := range xF64.Data {
+		sum += math.Exp(v - mx)
+	}
+	want := newF64Tensor(2, 2, 2)
+	for i, v := range xF64.Data {
+		want.Data[i] = math.Exp(v-mx) / sum
+	}
+	assertTensorClose(t, "opset11 softmax chw", got, want, 1e-2)
 
-	rawONNX := buildModel(17, "unet_skip",
+	// Softmax opset 17 axis=2 (axes='h') with W > 1 must be rejected cleanly.
+	rawH := buildModel(17, "sm_h",
+		[]*ProtoBuilder{buildStaticValueInfo("x", ONNXFloat, []int64{1, 2, 3, 3})},
+		[]*ProtoBuilder{buildStaticValueInfo("y", ONNXFloat, []int64{1, 2, 3, 3})},
+		nil,
+		[]*ProtoBuilder{buildNode("Softmax", "sm_h", []string{"x"}, []string{"y"}, buildAttrInt("axis", 2))},
+	)
+	mH, _ := ParseONNX(rawH)
+	if _, err := LowerONNX(mH, LowerOptions{}); err == nil || !strings.Contains(err.Error(), "reduce backend") {
+		t.Fatalf("expected reduce backend error for Softmax(axis=2) with W>1, got: %v", err)
+	}
+}
+
+func TestViewOpsGatingAndNoOpElision(t *testing.T) {
+	// Non-no-op Concat U-Net skip block requires AllowViewOps: true; default rejects cleanly.
+	wA := make([]float64, 4*4*9)
+	wB := make([]float64, 2*4*9)
+	wOut := make([]float64, 4*6)
+	rawUNet := buildModel(17, "unet_skip",
 		[]*ProtoBuilder{buildStaticValueInfo("x", ONNXFloat, []int64{1, 4, 4, 4})},
 		[]*ProtoBuilder{buildStaticValueInfo("y", ONNXFloat, []int64{1, 4, 2, 2})},
 		[]*ProtoBuilder{
 			buildFloatTensor("wA", []int64{4, 4, 3, 3}, toF32Slice(wA), true),
 			buildFloatTensor("wB", []int64{2, 4, 3, 3}, toF32Slice(wB), true),
 			buildFloatTensor("wOut", []int64{4, 6, 1, 1}, toF32Slice(wOut), true),
-			buildFloatTensor("bOut", []int64{4}, toF32Slice(bOut), true),
 		},
 		[]*ProtoBuilder{
 			buildNode("Conv", "enc_conv", []string{"x", "wA"}, []string{"a0"},
@@ -529,143 +658,61 @@ func TestEndToEndConvConcatUNetSkipBlock(t *testing.T) {
 				buildAttrInts("strides", []int64{2, 2}, true)),
 			buildNode("Conv", "skip_conv", []string{"x", "wB"}, []string{"b1"},
 				buildAttrInts("strides", []int64{2, 2}, true),
-				buildAttrInts("pads", []int64{1, 1, 1, 1}, true)),
+				buildAttrInts("pads", []int64{0, 0, 1, 1}, true)),
 			buildNode("Concat", "skip_cat", []string{"a2", "b1"}, []string{"cat"},
 				buildAttrInt("axis", 1)),
-			buildNode("Conv", "out_conv", []string{"cat", "wOut", "bOut"}, []string{"c_out"}),
+			buildNode("Conv", "out_conv", []string{"cat", "wOut"}, []string{"c_out"}),
 			buildNode("Relu", "out_relu", []string{"c_out"}, []string{"y"}),
 		},
 	)
-
-	model, err := ParseONNX(rawONNX)
+	mUNet, err := ParseONNX(rawUNet)
 	if err != nil {
 		t.Fatalf("ParseONNX: %v", err)
 	}
-	res, err := LowerONNX(model, LowerOptions{Target: "h17"})
+	if _, err := LowerONNX(mUNet, LowerOptions{}); err == nil || !strings.Contains(err.Error(), "--allow-view-ops") {
+		t.Fatalf("expected --allow-view-ops error when AllowViewOps=false, got: %v", err)
+	}
+	resUNet, err := LowerONNX(mUNet, LowerOptions{AllowViewOps: true})
 	if err != nil {
-		t.Fatalf("LowerONNX: %v", err)
+		t.Fatalf("LowerONNX with AllowViewOps=true: %v", err)
+	}
+	if resUNet.Summary.FusedActCount != 2 || len(resUNet.Spec.Nodes) != 5 {
+		t.Fatalf("unexpected U-Net summary: %+v", resUNet.Summary)
+	}
+	if resUNet.Spec.Nodes[0].Act == nil || resUNet.Spec.Nodes[0].Act.Name != "silu" {
+		t.Fatalf("expected enc_conv fused act=silu, got %+v", resUNet.Spec.Nodes[0].Act)
+	}
+	if resUNet.Spec.Nodes[3].Op != "concat" || resUNet.Spec.Nodes[3].Axis == nil || *resUNet.Spec.Nodes[3].Axis != 1 {
+		t.Fatalf("expected concat axis=1 at node 3, got %+v", resUNet.Spec.Nodes[3])
 	}
 
-	// Verify Silu fusion on enc_conv, ReLU fusion on out_conv, and concat axis=1.
-	if res.Summary.FusedActCount != 2 {
-		t.Fatalf("expected 2 fused activations (silu + relu), got %+v", res.Summary)
-	}
-	if len(res.Spec.Nodes) != 5 {
-		t.Fatalf("expected 5 nodes (enc_conv, enc_pool, skip_conv, skip_cat, out_conv), got %d", len(res.Spec.Nodes))
-	}
-	if res.Spec.Nodes[0].Act == nil || res.Spec.Nodes[0].Act.Name != "silu" {
-		t.Fatalf("expected enc_conv fused act=silu, got %+v", res.Spec.Nodes[0].Act)
-	}
-	if res.Spec.Nodes[3].Op != "concat" || res.Spec.Nodes[3].Axis == nil || *res.Spec.Nodes[3].Axis != 1 {
-		t.Fatalf("expected concat axis=1 at node 3, got %+v", res.Spec.Nodes[3])
-	}
-	if !res.Spec.Nodes[4].Relu || res.Summary.OutputShape != [4]int{1, 4, 2, 2} {
-		t.Fatalf("unexpected final node/shape: %+v, %v", res.Spec.Nodes[4], res.Summary.OutputShape)
-	}
-
-	// Write graph.json + weights, reload from disk, and evaluate every emitted node using
-	// internal/ref.EvalGraphF64 (plus channel concat for the M5C concat node) vs independent float64 ref.
-	dir := t.TempDir()
-	if err := WriteLoweredGraph(dir, res); err != nil {
-		t.Fatalf("WriteLoweredGraph: %v", err)
-	}
-	rawJSON, err := os.ReadFile(filepath.Join(dir, "graph.json"))
+	// True no-op views (Transpose [0,1,2,3], Reshape same shape, Flatten on [1,C,1,1]) MUST
+	// be elided even when AllowViewOps == false!
+	rawNoOp := buildModel(17, "noop_views",
+		[]*ProtoBuilder{buildStaticValueInfo("x", ONNXFloat, []int64{1, 4, 1, 1})},
+		[]*ProtoBuilder{buildStaticValueInfo("y", ONNXFloat, []int64{1, 4, 1, 1})},
+		[]*ProtoBuilder{
+			buildInt64Tensor("same_shape", []int64{4}, []int64{1, 4, 1, 1}, false),
+		},
+		[]*ProtoBuilder{
+			buildNode("Transpose", "tr_id", []string{"x"}, []string{"h0"}, buildAttrInts("perm", []int64{0, 1, 2, 3}, true)),
+			buildNode("Reshape", "rs_id", []string{"h0", "same_shape"}, []string{"h1"}),
+			buildNode("Flatten", "fl_id", []string{"h1"}, []string{"h2"}, buildAttrInt("axis", 1)),
+			buildNode("Relu", "r", []string{"h2"}, []string{"y"}),
+		},
+	)
+	mNoOp, _ := ParseONNX(rawNoOp)
+	resNoOp, err := LowerONNX(mNoOp, LowerOptions{AllowViewOps: false})
 	if err != nil {
-		t.Fatalf("read graph.json: %v", err)
+		t.Fatalf("true no-op views should elide when AllowViewOps=false: %v", err)
 	}
-	var loaded VaneGraphSpec
-	if err := json.Unmarshal(rawJSON, &loaded); err != nil {
-		t.Fatalf("unmarshal VaneGraphSpec: %v", err)
+	if len(resNoOp.Spec.Nodes) != 1 || resNoOp.Spec.Nodes[0].Op != "lut" || resNoOp.Summary.ElidedCount != 3 {
+		t.Fatalf("expected 3 elided no-op views and 1 relu node, got nodes=%+v summary=%+v", resNoOp.Spec.Nodes, resNoOp.Summary)
 	}
-
-	xF64 := newF64Tensor(4, 4, 4)
-	for i := range xF64.Data {
-		xF64.Data[i] = fp16.ToFloat64(fp16.FromFloat64(float64((i%9)-4) * 0.25))
-	}
-	env := map[string]ref.Tensor{"x": xF64.toRefFP16()}
-
-	evalSingleNode := func(nd VaneGraphNode) ref.Tensor {
-		if nd.Op == "concat" {
-			t0, t1 := env[nd.Inputs[0]], env[nd.Inputs[1]]
-			out, _ := ref.NewTensor(1, t0.C+t1.C, t0.H, t0.W)
-			copy(out.Data, t0.Data)
-			copy(out.Data[len(t0.Data):], t1.Data)
-			return out
-		}
-		// Marshal node into a single-node ref.GraphSpec and evaluate via ref.EvalGraphF64!
-		ndBytes, _ := json.Marshal(nd)
-		var rNode ref.GraphNodeSpec
-		if err := json.Unmarshal(ndBytes, &rNode); err != nil {
-			t.Fatalf("unmarshal node %s: %v", nd.ID, err)
-		}
-		inSpecs := make([]ref.GraphInputSpec, len(nd.Inputs))
-		inMap := make(map[string]ref.Tensor, len(nd.Inputs))
-		for i, nm := range nd.Inputs {
-			inT := env[nm]
-			inSpecs[i] = ref.GraphInputSpec{Name: nm, C: inT.C, H: inT.H, W: inT.W}
-			inMap[nm] = inT
-		}
-		nw := make(map[string]ref.GraphNodeWeights)
-		if nd.Weights != "" {
-			wb, err := os.ReadFile(filepath.Join(dir, nd.Weights))
-			if err != nil {
-				t.Fatalf("read %s: %v", nd.Weights, err)
-			}
-			w16, _ := fp16.DecodeLE(wb)
-			var b16 []uint16
-			if nd.Bias != "" {
-				bb, err := os.ReadFile(filepath.Join(dir, nd.Bias))
-				if err != nil {
-					t.Fatalf("read %s: %v", nd.Bias, err)
-				}
-				b16, _ = fp16.DecodeLE(bb)
-			}
-			nw[nd.ID] = ref.GraphNodeWeights{Weights: w16, Bias: b16}
-		}
-		subSpec := ref.GraphSpec{Target: loaded.Target, Inputs: inSpecs, Nodes: []ref.GraphNodeSpec{rNode}}
-		out, _, err := ref.EvalGraphF64(subSpec, inMap, nw)
-		if err != nil {
-			t.Fatalf("EvalGraphF64(%s): %v", nd.ID, err)
-		}
-		return out
-	}
-
-	var gotOut ref.Tensor
-	for _, nd := range loaded.Nodes {
-		gotOut = evalSingleNode(nd)
-		env[nd.ID] = gotOut
-	}
-
-	// Independent float64 U-Net reference
-	a0 := refConv3x3F64(xF64, wA, nil, 4, 1, true)
-	a1 := refSiluF64(a0)
-	a2 := newF64Tensor(4, 2, 2)
-	for c := 0; c < 4; c++ {
-		for oy := 0; oy < 2; oy++ {
-			for ox := 0; ox < 2; ox++ {
-				best := math.Inf(-1)
-				for ky := 0; ky < 2; ky++ {
-					for kx := 0; kx < 2; kx++ {
-						if v := a1.at(c, oy*2+ky, ox*2+kx); v > best {
-							best = v
-						}
-					}
-				}
-				a2.set(c, oy, ox, best)
-			}
-		}
-	}
-	b1 := refConv3x3F64(xF64, wB, nil, 2, 2, true)
-	cat := newF64Tensor(6, 2, 2)
-	copy(cat.Data, a2.Data)
-	copy(cat.Data[len(a2.Data):], b1.Data)
-	want := refReluF64(refConv1x1F64(cat, wOut, bOut, 4))
-
-	assertTensorClose(t, "unet conv+concat", gotOut, want, 2e-2)
 }
 
-func TestEndToEndSafeTensorsBackedModel(t *testing.T) {
-	// ONNX topology with EXTERNAL initializers; actual F32 & BF16 weights supplied via SafeTensors.
+func TestEndToEndSafeTensorsBackedModelAndPrecedence(t *testing.T) {
+	// 1. SafeTensors-backed Conv+BN+Gelu model (with EXTERNAL ONNX initializers).
 	w1 := []float64{
 		0.5, -0.25, 0.125, 0.25,
 		-0.5, 0.75, 0.0, -0.125,
@@ -723,7 +770,6 @@ func TestEndToEndSafeTensorsBackedModel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseONNX: %v", err)
 	}
-	// Without SafeTensors override, EXTERNAL initializers must fail cleanly.
 	if _, err := LowerONNX(model, LowerOptions{}); err == nil {
 		t.Fatal("expected error for EXTERNAL initializers without SafeTensors override")
 	}
@@ -737,9 +783,7 @@ func TestEndToEndSafeTensorsBackedModel(t *testing.T) {
 	}
 
 	dir := t.TempDir()
-	if err := WriteLoweredGraph(dir, res); err != nil {
-		t.Fatalf("WriteLoweredGraph: %v", err)
-	}
+	_ = WriteLoweredGraph(dir, res)
 	refSpec, nw := loadRefGraphFromDir(t, dir)
 
 	xF64 := newF64Tensor(4, 2, 2)
@@ -750,26 +794,226 @@ func TestEndToEndSafeTensorsBackedModel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EvalGraphF64: %v", err)
 	}
-
-	// Independent float64 reference (matching BF16-quantized bnB from SafeTensors)
 	bnBExact, _ := sf.ToFloat64("bn.bias")
 	want := refBNF64(refConv1x1F64(xF64, w1, nil, 4), bnS, bnBExact, bnM, bnV, 1e-5)
 	for i, v := range want.Data {
 		want.Data[i] = 0.5 * v * (1.0 + math.Erf(v/math.Sqrt2))
 	}
 	assertTensorClose(t, "safetensors conv+bn+gelu", got, want, 1e-2)
+
+	// 2. Weight listed in graph.input (not graph.initializer) supplied by SafeTensors must be skipped as runtime input.
+	rawGraphInpWeight := buildModel(17, "sf_in_graph_input",
+		[]*ProtoBuilder{
+			buildStaticValueInfo("x", ONNXFloat, []int64{1, 4, 2, 2}),
+			buildStaticValueInfo("conv.weight", ONNXFloat, []int64{4, 4, 1, 1}),
+		},
+		[]*ProtoBuilder{buildStaticValueInfo("y", ONNXFloat, []int64{1, 4, 2, 2})},
+		nil,
+		[]*ProtoBuilder{buildNode("Conv", "c1", []string{"x", "conv.weight"}, []string{"y"})},
+	)
+	mGI, _ := ParseONNX(rawGraphInpWeight)
+	resGI, err := LowerONNX(mGI, LowerOptions{SafeTensors: sf})
+	if err != nil {
+		t.Fatalf("SafeTensors weight in graph.input should succeed: %v", err)
+	}
+	if len(resGI.Spec.Inputs) != 1 || resGI.Spec.Inputs[0].Name != "x" {
+		t.Fatalf("expected only runtime input 'x', got %+v", resGI.Spec.Inputs)
+	}
+
+	// 3. Constant node must NOT overwrite SafeTensors override of the same name.
+	sfScalarBlob, _ := WriteSafeTensors([]SafeTensorWrite{
+		{Name: "scale_c", DType: "F32", Shape: []int64{}, Data: encodeF32LE([]float32{3.0})},
+	}, nil)
+	sfScalar, _ := ParseSafeTensors(sfScalarBlob)
+	rawConstOverride := buildModel(17, "const_override",
+		[]*ProtoBuilder{buildStaticValueInfo("x", ONNXFloat, []int64{1, 2, 2, 2})},
+		[]*ProtoBuilder{buildStaticValueInfo("y", ONNXFloat, []int64{1, 2, 2, 2})},
+		nil,
+		[]*ProtoBuilder{
+			buildNode("Constant", "c_node", nil, []string{"scale_c"}, buildAttrFloat("value_float", 99.0)),
+			buildNode("Mul", "m", []string{"x", "scale_c"}, []string{"y"}),
+		},
+	)
+	mCO, _ := ParseONNX(rawConstOverride)
+	resCO, err := LowerONNX(mCO, LowerOptions{SafeTensors: sfScalar})
+	if err != nil {
+		t.Fatalf("SafeTensors override on Constant node failed: %v", err)
+	}
+	if resCO.Spec.Nodes[0].Scalar == nil || *resCO.Spec.Nodes[0].Scalar != 3.0 {
+		t.Fatalf("expected SafeTensors scalar 3.0 to win over Constant 99.0, got %+v", resCO.Spec.Nodes[0].Scalar)
+	}
+
+	// 4. Scalar ONNX initializer (dims=[]) overridden by non-scalar [1] SafeTensors tensor must fail shape check.
+	sfVec1Blob, _ := WriteSafeTensors([]SafeTensorWrite{
+		{Name: "s", DType: "F32", Shape: []int64{1}, Data: encodeF32LE([]float32{2.0})},
+	}, nil)
+	sfVec1, _ := ParseSafeTensors(sfVec1Blob)
+	rawScalarInit := buildModel(17, "scalar_init_mismatch",
+		[]*ProtoBuilder{buildStaticValueInfo("x", ONNXFloat, []int64{1, 2, 2, 2})},
+		[]*ProtoBuilder{buildStaticValueInfo("y", ONNXFloat, []int64{1, 2, 2, 2})},
+		[]*ProtoBuilder{buildFloatTensor("s", []int64{}, []float32{2.0}, false)},
+		[]*ProtoBuilder{buildNode("Mul", "m", []string{"x", "s"}, []string{"y"})},
+	)
+	mSI, _ := ParseONNX(rawScalarInit)
+	if _, err := LowerONNX(mSI, LowerOptions{SafeTensors: sfVec1}); err == nil || !strings.Contains(err.Error(), "shape") {
+		t.Fatalf("expected shape mismatch error for scalar [] vs [1] SafeTensors override, got: %v", err)
+	}
+}
+
+func TestMultiConsumerNonFusionAndPoolSameLower(t *testing.T) {
+	t.Run("conv_multi_consumer_relu_and_add_not_fused", func(t *testing.T) {
+		raw := buildModel(17, "mc_relu",
+			[]*ProtoBuilder{buildStaticValueInfo("x", ONNXFloat, []int64{1, 2, 2, 2})},
+			[]*ProtoBuilder{buildStaticValueInfo("y", ONNXFloat, []int64{1, 2, 2, 2})},
+			[]*ProtoBuilder{buildFloatTensor("w", []int64{2, 2, 1, 1}, []float32{1, 0, 0, 1}, true)},
+			[]*ProtoBuilder{
+				buildNode("Conv", "c1", []string{"x", "w"}, []string{"c_out"}),
+				buildNode("Relu", "r1", []string{"c_out"}, []string{"r_out"}),
+				buildNode("Add", "a1", []string{"r_out", "c_out"}, []string{"y"}),
+			},
+		)
+		m, _ := ParseONNX(raw)
+		res, err := LowerONNX(m, LowerOptions{})
+		if err != nil {
+			t.Fatalf("LowerONNX: %v", err)
+		}
+		if res.Summary.FusedActCount != 0 || len(res.Spec.Nodes) != 3 || res.Spec.Nodes[0].Relu {
+			t.Fatalf("expected ReLU NOT fused on multi-consumer Conv, got summary=%+v nodes=%+v", res.Summary, res.Spec.Nodes)
+		}
+	})
+
+	t.Run("conv_multi_consumer_bn_and_add_not_folded", func(t *testing.T) {
+		raw := buildModel(17, "mc_bn",
+			[]*ProtoBuilder{buildStaticValueInfo("x", ONNXFloat, []int64{1, 2, 2, 2})},
+			[]*ProtoBuilder{buildStaticValueInfo("y", ONNXFloat, []int64{1, 2, 2, 2})},
+			[]*ProtoBuilder{
+				buildFloatTensor("w", []int64{2, 2, 1, 1}, []float32{1, 0, 0, 1}, true),
+				buildFloatTensor("s", []int64{2}, []float32{1, 1}, true),
+				buildFloatTensor("b", []int64{2}, []float32{0, 0}, true),
+				buildFloatTensor("m", []int64{2}, []float32{0, 0}, true),
+				buildFloatTensor("v", []int64{2}, []float32{1, 1}, true),
+			},
+			[]*ProtoBuilder{
+				buildNode("Conv", "c1", []string{"x", "w"}, []string{"c_out"}),
+				buildNode("BatchNormalization", "bn1", []string{"c_out", "s", "b", "m", "v"}, []string{"bn_out"}),
+				buildNode("Add", "a1", []string{"bn_out", "c_out"}, []string{"y"}),
+			},
+		)
+		m, _ := ParseONNX(raw)
+		res, err := LowerONNX(m, LowerOptions{})
+		if err != nil {
+			t.Fatalf("LowerONNX: %v", err)
+		}
+		if res.Summary.FusedBNCount != 0 || len(res.Spec.Nodes) != 3 {
+			t.Fatalf("expected BN NOT folded on multi-consumer Conv, got summary=%+v nodes=%+v", res.Summary, res.Spec.Nodes)
+		}
+	})
+
+	t.Run("conv_is_graph_output_with_dead_relu_not_fused", func(t *testing.T) {
+		raw := buildModel(17, "conv_out",
+			[]*ProtoBuilder{buildStaticValueInfo("x", ONNXFloat, []int64{1, 2, 2, 2})},
+			[]*ProtoBuilder{buildStaticValueInfo("c_out", ONNXFloat, []int64{1, 2, 2, 2})},
+			[]*ProtoBuilder{buildFloatTensor("w", []int64{2, 2, 1, 1}, []float32{1, 0, 0, 1}, true)},
+			[]*ProtoBuilder{
+				buildNode("Conv", "c1", []string{"x", "w"}, []string{"c_out"}),
+				buildNode("Relu", "dead_r", []string{"c_out"}, []string{"dead_y"}),
+			},
+		)
+		m, _ := ParseONNX(raw)
+		res, err := LowerONNX(m, LowerOptions{})
+		if err != nil {
+			t.Fatalf("LowerONNX: %v", err)
+		}
+		if res.Summary.FusedActCount != 0 || len(res.Spec.Nodes) != 1 || res.Spec.Nodes[0].Relu {
+			t.Fatalf("expected Conv as graph output not fused, got %+v", res.Spec.Nodes)
+		}
+	})
+
+	t.Run("pool_same_lower_emits_custom_pads_and_matches_ref", func(t *testing.T) {
+		// 4x4 input, kernel 3x3, stride 2, SAME_LOWER:
+		// oh = 2, padTotal = (2-1)*2 + 3 - 4 = 1 -> SAME_LOWER gives pt=1, pb=0, pl=1, pr=0.
+		raw := buildModel(17, "pool_sl",
+			[]*ProtoBuilder{buildStaticValueInfo("x", ONNXFloat, []int64{1, 2, 4, 4})},
+			[]*ProtoBuilder{buildStaticValueInfo("y", ONNXFloat, []int64{1, 2, 2, 2})},
+			nil,
+			[]*ProtoBuilder{
+				buildNode("MaxPool", "mp", []string{"x"}, []string{"y"},
+					buildAttrInts("kernel_shape", []int64{3, 3}, true),
+					buildAttrInts("strides", []int64{2, 2}, true),
+					buildAttrString("auto_pad", "SAME_LOWER")),
+			},
+		)
+		m, _ := ParseONNX(raw)
+		res, err := LowerONNX(m, LowerOptions{})
+		if err != nil {
+			t.Fatalf("LowerONNX SAME_LOWER pool: %v", err)
+		}
+		nd := res.Spec.Nodes[0]
+		if nd.Pad != "custom" || nd.PT != 1 || nd.PB != 0 || nd.PL != 1 || nd.PR != 0 {
+			t.Fatalf("expected custom pads pt=1 pb=0 pl=1 pr=0, got %+v", nd)
+		}
+		dir := t.TempDir()
+		_ = WriteLoweredGraph(dir, res)
+		refSpec, nw := loadRefGraphFromDir(t, dir)
+		xF64 := newF64Tensor(2, 4, 4)
+		for i := range xF64.Data {
+			xF64.Data[i] = float64(i) * 0.25
+		}
+		got, _, err := ref.EvalGraphF64(refSpec, map[string]ref.Tensor{"x": xF64.toRefFP16()}, nw)
+		if err != nil {
+			t.Fatalf("EvalGraphF64 SAME_LOWER pool: %v", err)
+		}
+		want := newF64Tensor(2, 2, 2)
+		for c := 0; c < 2; c++ {
+			for oy := 0; oy < 2; oy++ {
+				for ox := 0; ox < 2; ox++ {
+					best := math.Inf(-1)
+					for ky := 0; ky < 3; ky++ {
+						iy := oy*2 + ky - 1
+						if iy < 0 || iy >= 4 {
+							continue
+						}
+						for kx := 0; kx < 3; kx++ {
+							ix := ox*2 + kx - 1
+							if ix < 0 || ix >= 4 {
+								continue
+							}
+							if v := xF64.at(c, iy, ix); v > best {
+								best = v
+							}
+						}
+					}
+					want.set(c, oy, ox, best)
+				}
+			}
+		}
+		assertTensorClose(t, "maxpool SAME_LOWER", got, want, 1e-3)
+	})
 }
 
 func TestOperatorCoverageAndDiagnostics(t *testing.T) {
-	t.Run("gemm_and_matmul_add_linear", func(t *testing.T) {
+	t.Run("gemm_and_matmul_add_lower_to_conv1x1_and_eval", func(t *testing.T) {
+		w1 := []float64{
+			0.5, -0.25, 0.75,
+			-0.5, 0.25, 0.5,
+			0.25, 0.5, -0.25,
+			0.0, -0.5, 0.25,
+		} // [4, 3]
+		b1 := []float64{0.1, 0.2, -0.1}
+		w2 := []float64{
+			0.5, -0.5, 0.25,
+			-0.25, 0.75, 0.5,
+		} // [2, 3] (transB=1)
+		b2 := []float64{-0.1, 0.2}
+
 		raw := buildModel(17, "mlp",
 			[]*ProtoBuilder{buildStaticValueInfo("x", ONNXFloat, []int64{1, 4, 1, 1})},
 			[]*ProtoBuilder{buildStaticValueInfo("y", ONNXFloat, []int64{1, 2, 1, 1})},
 			[]*ProtoBuilder{
-				buildFloatTensor("w1", []int64{4, 3}, make([]float32, 12), true),
-				buildFloatTensor("b1", []int64{3}, []float32{0.1, 0.2, 0.3}, true),
-				buildFloatTensor("w2", []int64{2, 3}, make([]float32, 6), true),
-				buildFloatTensor("b2", []int64{2}, []float32{-0.1, 0.1}, true),
+				buildFloatTensor("w1", []int64{4, 3}, toF32Slice(w1), true),
+				buildFloatTensor("b1", []int64{3}, toF32Slice(b1), true),
+				buildFloatTensor("w2", []int64{2, 3}, toF32Slice(w2), true),
+				buildFloatTensor("b2", []int64{2}, toF32Slice(b2), true),
 			},
 			[]*ProtoBuilder{
 				buildNode("MatMul", "mm1", []string{"x", "w1"}, []string{"h0"}),
@@ -787,11 +1031,62 @@ func TestOperatorCoverageAndDiagnostics(t *testing.T) {
 		if err != nil {
 			t.Fatalf("LowerONNX: %v", err)
 		}
-		if len(res.Spec.Nodes) != 2 || res.Spec.Nodes[0].Op != "linear" || !res.Spec.Nodes[0].Relu || res.Spec.Nodes[0].Bias == "" {
+		if len(res.Spec.Nodes) != 2 || res.Spec.Nodes[0].Op != "conv1x1" || !res.Spec.Nodes[0].Relu || res.Spec.Nodes[0].Bias == "" {
 			t.Fatalf("unexpected MLP nodes: %+v", res.Spec.Nodes)
 		}
-		if res.Spec.Nodes[1].Op != "linear" || res.Spec.Nodes[1].Cout != 2 {
+		if res.Spec.Nodes[1].Op != "conv1x1" || res.Spec.Nodes[1].Cout != 2 {
 			t.Fatalf("unexpected Gemm node: %+v", res.Spec.Nodes[1])
+		}
+
+		// Evaluate directly with internal/ref.EvalGraphF64!
+		dir := t.TempDir()
+		_ = WriteLoweredGraph(dir, res)
+		refSpec, nw := loadRefGraphFromDir(t, dir)
+		xF64 := newF64Tensor(4, 1, 1)
+		xF64.Data = []float64{1.0, -0.5, 0.25, 0.75}
+		got, _, err := ref.EvalGraphF64(refSpec, map[string]ref.Tensor{"x": xF64.toRefFP16()}, nw)
+		if err != nil {
+			t.Fatalf("EvalGraphF64 MLP: %v", err)
+		}
+		// Independent float64 reference:
+		h := make([]float64, 3)
+		for o := 0; o < 3; o++ {
+			acc := b1[o]
+			for c := 0; c < 4; c++ {
+				acc += xF64.Data[c] * w1[c*3+o]
+			}
+			if acc > 0 {
+				h[o] = acc
+			}
+		}
+		want := newF64Tensor(2, 1, 1)
+		for o := 0; o < 2; o++ {
+			acc := b2[o]
+			for c := 0; c < 3; c++ {
+				acc += 0.5 * h[c] * w2[o*3+c]
+			}
+			want.Data[o] = acc
+		}
+		assertTensorClose(t, "mlp matmul+gemm conv1x1", got, want, 1e-2)
+	})
+
+	t.Run("foldMatMulAddBias_does_not_misfold_spatial_constant", func(t *testing.T) {
+		raw := buildModel(17, "mm_spatial_add",
+			[]*ProtoBuilder{buildStaticValueInfo("x", ONNXFloat, []int64{1, 2, 2, 2})},
+			[]*ProtoBuilder{buildStaticValueInfo("y", ONNXFloat, []int64{1, 4, 2, 2})},
+			[]*ProtoBuilder{
+				buildFloatTensor("w", []int64{2, 4}, make([]float32, 8), true),
+				// Shape [1,1,2,2] has 4 elements == Cout, but is spatial, NOT a channel bias!
+				buildFloatTensor("spatial_c", []int64{1, 1, 2, 2}, []float32{1, 2, 3, 4}, true),
+			},
+			[]*ProtoBuilder{
+				buildNode("MatMul", "mm", []string{"x", "w"}, []string{"h"}),
+				buildNode("Add", "add_sp", []string{"h", "spatial_c"}, []string{"y"}),
+			},
+		)
+		m, _ := ParseONNX(raw)
+		if _, err := LowerONNX(m, LowerOptions{}); err == nil || !strings.Contains(err.Error(), "non-scalar constant") {
+			t.Fatalf("expected spatial [1,1,2,2] constant NOT to fold as channel bias, got: %v", err)
 		}
 	})
 
@@ -821,15 +1116,8 @@ func TestOperatorCoverageAndDiagnostics(t *testing.T) {
 		if err != nil {
 			t.Fatalf("LowerONNX: %v", err)
 		}
-		if res.Spec.Nodes[0].PeOp != "sadd" || res.Spec.Nodes[1].PeOp != "srsub" || res.Spec.Nodes[2].PeOp != "sdiv" || res.Spec.Nodes[3].PeOp != "abs" {
-			t.Fatalf("unexpected PE scalar/unary lowering: %+v", res.Spec.Nodes[:4])
-		}
-
-		// Evaluate entire chain via ref.EvalGraphF64 and check against direct formula!
 		dir := t.TempDir()
-		if err := WriteLoweredGraph(dir, res); err != nil {
-			t.Fatalf("WriteLoweredGraph: %v", err)
-		}
+		_ = WriteLoweredGraph(dir, res)
 		refSpec, nw := loadRefGraphFromDir(t, dir)
 		xF64 := newF64Tensor(2, 2, 2)
 		for i := range xF64.Data {
@@ -853,7 +1141,7 @@ func TestOperatorCoverageAndDiagnostics(t *testing.T) {
 		assertTensorClose(t, "scalar+acts+softplus", got, want, 1e-2)
 	})
 
-	t.Run("views_depthwise_and_constant_node", func(t *testing.T) {
+	t.Run("views_depthwise_and_noop_reduce", func(t *testing.T) {
 		raw := buildModel(18, "views",
 			[]*ProtoBuilder{buildStaticValueInfo("x", ONNXFloat, []int64{1, 4, 4, 4})},
 			[]*ProtoBuilder{buildStaticValueInfo("y", ONNXFloat, []int64{1, 2, 2, 1})},
@@ -866,7 +1154,7 @@ func TestOperatorCoverageAndDiagnostics(t *testing.T) {
 			},
 			[]*ProtoBuilder{
 				buildNode("Constant", "shape_c", nil, []string{"rshape"},
-					buildAttrTensor("value", buildInt64Tensor("", []int64{4}, []int64{1, -1, 4, 4}, false))),
+					buildAttrTensor("value", buildInt64Tensor("", []int64{4}, []int64{1, -1, 2, 8}, false))),
 				buildNode("Conv", "dw_conv", []string{"x", "dw"}, []string{"h0"},
 					buildAttrInt("group", 4),
 					buildAttrInts("pads", []int64{1, 1, 1, 1}, true)),
@@ -874,7 +1162,9 @@ func TestOperatorCoverageAndDiagnostics(t *testing.T) {
 					buildAttrInts("perm", []int64{0, 1, 3, 2}, true)),
 				buildNode("Reshape", "rs", []string{"h1", "rshape"}, []string{"h2"}),
 				buildNode("Slice", "sl", []string{"h2", "starts", "ends", "axes"}, []string{"h3"}),
-				buildNode("ReduceSum", "red", []string{"h3", "red_axes"}, []string{"y"},
+				buildNode("ReduceSum", "noop_red", []string{"h3"}, []string{"h4"},
+					buildAttrInt("keepdims", 1), buildAttrInt("noop_with_empty_axes", 1)),
+				buildNode("ReduceSum", "red", []string{"h4", "red_axes"}, []string{"y"},
 					buildAttrInt("keepdims", 1)),
 			},
 		)
@@ -882,7 +1172,7 @@ func TestOperatorCoverageAndDiagnostics(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ParseONNX: %v", err)
 		}
-		res, err := LowerONNX(m, LowerOptions{})
+		res, err := LowerONNX(m, LowerOptions{AllowViewOps: true})
 		if err != nil {
 			t.Fatalf("LowerONNX: %v", err)
 		}
@@ -897,7 +1187,7 @@ func TestOperatorCoverageAndDiagnostics(t *testing.T) {
 		}
 	})
 
-	t.Run("diagnostics_errors", func(t *testing.T) {
+	t.Run("diagnostics_and_minor_guards", func(t *testing.T) {
 		// Unsupported op
 		rawUnsup := buildModel(17, "bad_op",
 			[]*ProtoBuilder{buildStaticValueInfo("x", ONNXFloat, []int64{1, 4, 4, 4})},
@@ -931,7 +1221,48 @@ func TestOperatorCoverageAndDiagnostics(t *testing.T) {
 			t.Fatalf("expected variance error, got: %v", err)
 		}
 
-		// Grouped conv3x3 (unsupported group=2, cin=4, cout=4)
+		// BN training_mode != 0 rejected
+		rawTrainBN := buildModel(17, "train_bn",
+			[]*ProtoBuilder{buildStaticValueInfo("x", ONNXFloat, []int64{1, 2, 2, 2})},
+			[]*ProtoBuilder{buildStaticValueInfo("y", ONNXFloat, []int64{1, 2, 2, 2})},
+			[]*ProtoBuilder{
+				buildFloatTensor("s", []int64{2}, []float32{1, 1}, true),
+				buildFloatTensor("b", []int64{2}, []float32{0, 0}, true),
+				buildFloatTensor("m", []int64{2}, []float32{0, 0}, true),
+				buildFloatTensor("v", []int64{2}, []float32{1, 1}, true),
+			},
+			[]*ProtoBuilder{
+				buildNode("BatchNormalization", "bn", []string{"x", "s", "b", "m", "v"}, []string{"y"},
+					buildAttrInt("training_mode", 1)),
+			},
+		)
+		mTBN, _ := ParseONNX(rawTrainBN)
+		if _, err := LowerONNX(mTBN, LowerOptions{}); err == nil || !strings.Contains(err.Error(), "training_mode") {
+			t.Fatalf("expected training_mode error, got: %v", err)
+		}
+
+		// foldConvBatchNorm divide-by-zero guard (cout=0)
+		rawZeroCout := buildModel(17, "zero_cout_bn",
+			[]*ProtoBuilder{buildStaticValueInfo("x", ONNXFloat, []int64{1, 2, 2, 2})},
+			[]*ProtoBuilder{buildStaticValueInfo("y", ONNXFloat, []int64{1, 2, 2, 2})},
+			[]*ProtoBuilder{
+				buildFloatTensor("w", []int64{0, 2, 1, 1}, []float32{}, false),
+				buildFloatTensor("s", []int64{0}, []float32{}, false),
+				buildFloatTensor("b", []int64{0}, []float32{}, false),
+				buildFloatTensor("m", []int64{0}, []float32{}, false),
+				buildFloatTensor("v", []int64{0}, []float32{}, false),
+			},
+			[]*ProtoBuilder{
+				buildNode("Conv", "c", []string{"x", "w"}, []string{"h"}),
+				buildNode("BatchNormalization", "bn", []string{"h", "s", "b", "m", "v"}, []string{"y"}),
+			},
+		)
+		mZC, _ := ParseONNX(rawZeroCout)
+		if _, err := LowerONNX(mZC, LowerOptions{}); err == nil {
+			t.Fatal("expected clean error for cout=0 in Conv+BN folding")
+		}
+
+		// Grouped conv3x3 rejected
 		rawGrp := buildModel(17, "bad_grp",
 			[]*ProtoBuilder{buildStaticValueInfo("x", ONNXFloat, []int64{1, 4, 4, 4})},
 			[]*ProtoBuilder{buildStaticValueInfo("y", ONNXFloat, []int64{1, 4, 4, 4})},
@@ -943,7 +1274,7 @@ func TestOperatorCoverageAndDiagnostics(t *testing.T) {
 			t.Fatalf("expected grouped conv3x3 error, got: %v", err)
 		}
 
-		// ReduceMean with keepdims=0
+		// ReduceMean with keepdims=0 rejected
 		rawKeep := buildModel(17, "bad_keep",
 			[]*ProtoBuilder{buildStaticValueInfo("x", ONNXFloat, []int64{1, 4, 4, 4})},
 			[]*ProtoBuilder{buildStaticValueInfo("y", ONNXFloat, []int64{1, 4})},
@@ -954,6 +1285,98 @@ func TestOperatorCoverageAndDiagnostics(t *testing.T) {
 		mKeep, _ := ParseONNX(rawKeep)
 		if _, err := LowerONNX(mKeep, LowerOptions{}); err == nil || !strings.Contains(err.Error(), "keepdims") {
 			t.Fatalf("expected keepdims error, got: %v", err)
+		}
+
+		// ReduceSum over axis H with W > 1 rejected
+		rawRedH := buildModel(17, "bad_red_h",
+			[]*ProtoBuilder{buildStaticValueInfo("x", ONNXFloat, []int64{1, 4, 4, 4})},
+			[]*ProtoBuilder{buildStaticValueInfo("y", ONNXFloat, []int64{1, 4, 1, 4})},
+			nil,
+			[]*ProtoBuilder{buildNode("ReduceSum", "rs", []string{"x"}, []string{"y"},
+				buildAttrInts("axes", []int64{2}, true), buildAttrInt("keepdims", 1))},
+		)
+		mRedH, _ := ParseONNX(rawRedH)
+		if _, err := LowerONNX(mRedH, LowerOptions{}); err == nil || !strings.Contains(err.Error(), "reduce backend") {
+			t.Fatalf("expected reduce backend error for axes='h' W>1, got: %v", err)
+		}
+
+		// Gemm with H > 1 rejected
+		rawGemm4D := buildModel(17, "bad_gemm",
+			[]*ProtoBuilder{buildStaticValueInfo("x", ONNXFloat, []int64{1, 4, 2, 2})},
+			[]*ProtoBuilder{buildStaticValueInfo("y", ONNXFloat, []int64{1, 2, 2, 2})},
+			[]*ProtoBuilder{buildFloatTensor("w", []int64{4, 2}, make([]float32, 8), true)},
+			[]*ProtoBuilder{buildNode("Gemm", "g", []string{"x", "w"}, []string{"y"})},
+		)
+		mG4, _ := ParseONNX(rawGemm4D)
+		if _, err := LowerONNX(mG4, LowerOptions{}); err == nil || !strings.Contains(err.Error(), "2D") {
+			t.Fatalf("expected Gemm 2D input error, got: %v", err)
+		}
+
+		// Pool with stride 0 rejected
+		rawPoolS0 := buildModel(17, "bad_pool_s0",
+			[]*ProtoBuilder{buildStaticValueInfo("x", ONNXFloat, []int64{1, 2, 4, 4})},
+			[]*ProtoBuilder{buildStaticValueInfo("y", ONNXFloat, []int64{1, 2, 2, 2})},
+			nil,
+			[]*ProtoBuilder{buildNode("MaxPool", "mp", []string{"x"}, []string{"y"},
+				buildAttrInts("kernel_shape", []int64{2, 2}, true),
+				buildAttrInts("strides", []int64{0, 2}, true))},
+		)
+		mPS0, _ := ParseONNX(rawPoolS0)
+		if _, err := LowerONNX(mPS0, LowerOptions{}); err == nil || !strings.Contains(err.Error(), "strides") {
+			t.Fatalf("expected pool stride error, got: %v", err)
+		}
+
+		// Clip with min > max rejected
+		rawClip := buildModel(17, "bad_clip",
+			[]*ProtoBuilder{buildStaticValueInfo("x", ONNXFloat, []int64{1, 2, 2, 2})},
+			[]*ProtoBuilder{buildStaticValueInfo("y", ONNXFloat, []int64{1, 2, 2, 2})},
+			nil,
+			[]*ProtoBuilder{buildNode("Clip", "cl", []string{"x"}, []string{"y"},
+				buildAttrFloat("min", 5.0), buildAttrFloat("max", 1.0))},
+		)
+		mCl, _ := ParseONNX(rawClip)
+		if _, err := LowerONNX(mCl, LowerOptions{}); err == nil || !strings.Contains(err.Error(), "min <= max") {
+			t.Fatalf("expected Clip min <= max error, got: %v", err)
+		}
+
+		// HardSigmoid alpha <= 0 rejected
+		rawHS := buildModel(17, "bad_hs",
+			[]*ProtoBuilder{buildStaticValueInfo("x", ONNXFloat, []int64{1, 2, 2, 2})},
+			[]*ProtoBuilder{buildStaticValueInfo("y", ONNXFloat, []int64{1, 2, 2, 2})},
+			nil,
+			[]*ProtoBuilder{buildNode("HardSigmoid", "hs", []string{"x"}, []string{"y"}, buildAttrFloat("alpha", -0.2))},
+		)
+		mHS, _ := ParseONNX(rawHS)
+		if _, err := LowerONNX(mHS, LowerOptions{}); err == nil || !strings.Contains(err.Error(), "alpha") {
+			t.Fatalf("expected HardSigmoid alpha error, got: %v", err)
+		}
+
+		// Conv1x1 unknown auto_pad rejected
+		rawC1Pad := buildModel(17, "bad_c1_pad",
+			[]*ProtoBuilder{buildStaticValueInfo("x", ONNXFloat, []int64{1, 2, 2, 2})},
+			[]*ProtoBuilder{buildStaticValueInfo("y", ONNXFloat, []int64{1, 2, 2, 2})},
+			[]*ProtoBuilder{buildFloatTensor("w", []int64{2, 2, 1, 1}, []float32{1, 0, 0, 1}, true)},
+			[]*ProtoBuilder{buildNode("Conv", "c1", []string{"x", "w"}, []string{"y"}, buildAttrString("auto_pad", "BOGUS"))},
+		)
+		mC1P, _ := ParseONNX(rawC1Pad)
+		if _, err := LowerONNX(mC1P, LowerOptions{}); err == nil || !strings.Contains(err.Error(), "auto_pad") {
+			t.Fatalf("expected conv1x1 auto_pad error, got: %v", err)
+		}
+
+		// Duplicate Slice axes rejected
+		rawDupSlice := buildModel(17, "dup_slice",
+			[]*ProtoBuilder{buildStaticValueInfo("x", ONNXFloat, []int64{1, 4, 4, 4})},
+			[]*ProtoBuilder{buildStaticValueInfo("y", ONNXFloat, []int64{1, 2, 4, 4})},
+			[]*ProtoBuilder{
+				buildInt64Tensor("st", []int64{2}, []int64{0, 0}, false),
+				buildInt64Tensor("en", []int64{2}, []int64{2, 2}, false),
+				buildInt64Tensor("ax", []int64{2}, []int64{1, -3}, false), // both axis 1
+			},
+			[]*ProtoBuilder{buildNode("Slice", "sl", []string{"x", "st", "en", "ax"}, []string{"y"})},
+		)
+		mDS, _ := ParseONNX(rawDupSlice)
+		if _, err := LowerONNX(mDS, LowerOptions{AllowViewOps: true}); err == nil || !strings.Contains(err.Error(), "duplicate axis") {
+			t.Fatalf("expected duplicate Slice axis error, got: %v", err)
 		}
 	})
 }

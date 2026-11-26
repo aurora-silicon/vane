@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -110,9 +111,9 @@ func shapeProductChecked(shape []int64) (int64, error) {
 }
 
 type rawSafeTensorEntry struct {
-	DType       string  `json:"dtype"`
-	Shape       []int64 `json:"shape"`
-	DataOffsets []int64 `json:"data_offsets"`
+	DType       string   `json:"dtype"`
+	Shape       *[]int64 `json:"shape"`
+	DataOffsets []int64  `json:"data_offsets"`
 }
 
 // LoadSafeTensors reads and parses a .safetensors file from disk with default options.
@@ -165,10 +166,13 @@ func ParseSafeTensorsWithOptions(data []byte, opts SafeTensorsOptions) (*SafeTen
 	if top == nil {
 		return nil, fmt.Errorf("safetensors JSON header must be an object")
 	}
-	// Reject trailing non-whitespace tokens after the top-level JSON object.
+	// Reject any trailing tokens or non-JSON garbage after the top-level JSON object.
 	var trailing any
-	if err := dec.Decode(&trailing); err == nil {
-		return nil, fmt.Errorf("safetensors header contains trailing JSON data")
+	if err := dec.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return nil, fmt.Errorf("safetensors header contains trailing JSON data")
+		}
+		return nil, fmt.Errorf("safetensors header contains trailing non-JSON data: %w", err)
 	}
 
 	dataBase := int64(8 + headerLen)
@@ -226,6 +230,9 @@ func ParseSafeTensorsWithOptions(data []byte, opts SafeTensorsOptions) (*SafeTen
 		if entry.DType == "" {
 			return nil, fmt.Errorf("safetensors tensor %q: missing dtype", name)
 		}
+		if entry.Shape == nil {
+			return nil, fmt.Errorf("safetensors tensor %q: missing shape array", name)
+		}
 		elemBytes, ok := SafeTensorDTypeBytes(entry.DType)
 		if !ok {
 			return nil, fmt.Errorf("safetensors tensor %q: unsupported dtype %q", name, entry.DType)
@@ -244,7 +251,8 @@ func ParseSafeTensorsWithOptions(data []byte, opts SafeTensorsOptions) (*SafeTen
 			return nil, fmt.Errorf("safetensors tensor %q: data_offsets end %d exceeds data section size %d", name, end, dataLen)
 		}
 
-		numElems, err := shapeProductChecked(entry.Shape)
+		shape := *entry.Shape
+		numElems, err := shapeProductChecked(shape)
 		if err != nil {
 			return nil, fmt.Errorf("safetensors tensor %q: %w", name, err)
 		}
@@ -255,11 +263,11 @@ func ParseSafeTensorsWithOptions(data []byte, opts SafeTensorsOptions) (*SafeTen
 		actualBytes := end - begin
 		if actualBytes != expectedBytes {
 			return nil, fmt.Errorf("safetensors tensor %q: byte span %d != shape %v * %s (%d)",
-				name, actualBytes, entry.Shape, entry.DType, expectedBytes)
+				name, actualBytes, shape, entry.DType, expectedBytes)
 		}
 
-		shapeCopy := make([]int64, len(entry.Shape))
-		copy(shapeCopy, entry.Shape)
+		shapeCopy := make([]int64, len(shape))
+		copy(shapeCopy, shape)
 		info := SafeTensorInfo{
 			Name:        name,
 			DType:       entry.DType,

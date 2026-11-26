@@ -23,7 +23,7 @@ type VaneGraphInput struct {
 	ShortName string `json:"short_name,omitempty"`
 }
 
-// VaneGraphNode matches Vane's compile-graph JSON node descriptor (core ops + M5B/M5C ops).
+// VaneGraphNode matches Vane's compile-graph JSON node descriptor.
 type VaneGraphNode struct {
 	ID           string            `json:"id"`
 	Op           string            `json:"op"`
@@ -83,6 +83,9 @@ type LowerOptions struct {
 	SafeTensors *SafeTensorsFile
 	// NoFuse disables Conv+BN folding, Conv+Activation fusion, and Silu/MatMul+Add pattern fusion.
 	NoFuse bool
+	// AllowViewOps opts into emitting non-no-op view nodes (transpose, concat, reshape, slice).
+	// True no-op views (identity transpose, same-shape reshape/flatten) are always elided.
+	AllowViewOps bool
 }
 
 // LowerSummary reports statistics about a lowered ONNX graph.
@@ -357,7 +360,7 @@ func LowerONNX(model *ONNXModel, opts LowerOptions) (*LowerResult, error) {
 		initNames[t.Name] = true
 		if opts.SafeTensors != nil {
 			if sfInfo, ok := opts.SafeTensors.Tensors[t.Name]; ok {
-				if len(t.Dims) > 0 && !sameShape64(t.Dims, sfInfo.Shape) {
+				if !sameShape64(t.Dims, sfInfo.Shape) {
 					return nil, fmt.Errorf("safetensors override for initializer %q: shape %v != ONNX shape %v",
 						t.Name, sfInfo.Shape, t.Dims)
 				}
@@ -391,7 +394,7 @@ func LowerONNX(model *ONNXModel, opts LowerOptions) (*LowerResult, error) {
 		}
 	}
 
-	// 2. Resolve runtime graph inputs (excluding inputs that are initializers).
+	// 2. Resolve runtime graph inputs (excluding inputs supplied as initializers or SafeTensors constants).
 	var graphInputs []VaneGraphInput
 	shapes := make(map[string][4]int)
 	vaneIDOf := make(map[string]string)
@@ -399,6 +402,9 @@ func LowerONNX(model *ONNXModel, opts LowerOptions) (*LowerResult, error) {
 
 	for _, inp := range g.Inputs {
 		if initNames[inp.Name] {
+			continue
+		}
+		if _, isConst := consts[inp.Name]; isConst {
 			continue
 		}
 		var c, h, w int
@@ -462,7 +468,14 @@ func LowerONNX(model *ONNXModel, opts LowerOptions) (*LowerResult, error) {
 			if err != nil {
 				return nil, err
 			}
-			consts[cs.name] = cs
+			if existing, ok := consts[cs.name]; ok && existing.sf != nil {
+				if !sameShape64(cs.dims, existing.dims) {
+					return nil, fmt.Errorf("safetensors override for Constant %q: shape %v != ONNX Constant shape %v",
+						cs.name, existing.dims, cs.dims)
+				}
+			} else {
+				consts[cs.name] = cs
+			}
 			elidedCount++
 			continue
 		case "Identity":
@@ -687,8 +700,14 @@ func LowerONNX(model *ONNXModel, opts LowerOptions) (*LowerResult, error) {
 				if group != 1 {
 					return nil, fmt.Errorf("%s: conv1x1 requires group=1, got %d", ctx, group)
 				}
-				if autoPad == "NOTSET" && (pads[0] != 0 || pads[1] != 0 || pads[2] != 0 || pads[3] != 0) {
-					return nil, fmt.Errorf("%s: conv1x1 requires pads [0,0,0,0], got %v", ctx, pads)
+				switch autoPad {
+				case "", "NOTSET":
+					if pads[0] != 0 || pads[1] != 0 || pads[2] != 0 || pads[3] != 0 {
+						return nil, fmt.Errorf("%s: conv1x1 requires pads [0,0,0,0], got %v", ctx, pads)
+					}
+				case "VALID", "SAME_UPPER", "SAME_LOWER":
+				default:
+					return nil, fmt.Errorf("%s: conv1x1 unsupported auto_pad %q", ctx, autoPad)
 				}
 				emitNode(VaneGraphNode{
 					ID:      baseID,
@@ -716,29 +735,9 @@ func LowerONNX(model *ONNXModel, opts LowerOptions) (*LowerResult, error) {
 						ctx, group, cin, cout)
 				}
 
-				var padMode string
-				switch autoPad {
-				case "VALID":
-					padMode = "valid"
-				case "SAME_UPPER", "SAME_LOWER":
-					padMode = "same"
-				case "", "NOTSET":
-					if pads[0] == 0 && pads[1] == 0 && pads[2] == 0 && pads[3] == 0 {
-						padMode = "valid"
-					} else if pads[0] == 1 && pads[1] == 1 && pads[2] == 1 && pads[3] == 1 {
-						padMode = "same"
-					} else if sh == 2 && pads[0] == 0 && pads[1] == 0 && pads[2] == 1 && pads[3] == 1 {
-						padMode = "same"
-					} else {
-						return nil, fmt.Errorf("%s: conv3x3 unsupported pads %v (expected [0,0,0,0] or [1,1,1,1])", ctx, pads)
-					}
-				default:
-					return nil, fmt.Errorf("%s: unsupported auto_pad %q", ctx, autoPad)
-				}
-
-				ho, wo, _, _, err := ref.Conv3x3Geometry(h, w, sh, padMode)
+				padMode, ho, wo, err := resolveConv3x3Padding(h, w, sh, autoPad, pads, ctx)
 				if err != nil {
-					return nil, fmt.Errorf("%s: %w", ctx, err)
+					return nil, err
 				}
 				emitNode(VaneGraphNode{
 					ID:      baseID,
@@ -799,6 +798,9 @@ func LowerONNX(model *ONNXModel, opts LowerOptions) (*LowerResult, error) {
 			}, nd.output, [4]int{1, c, h, w})
 
 		case "Gemm", "MatMul":
+			// Gemm operates on 2D [1, Cin] (normalized to [1, Cin, 1, 1]); MatMul projects
+			// along the channel axis Cin -> Cout on [1, Cin, H, W]. Both lower to conv1x1
+			// with [Cout, Cin] row-major fp16 weights for compatibility with vane compile-graph.
 			if len(nd.inputs) < 2 {
 				return nil, fmt.Errorf("%s: expected at least 2 inputs", ctx)
 			}
@@ -807,6 +809,9 @@ func LowerONNX(model *ONNXModel, opts LowerOptions) (*LowerResult, error) {
 				return nil, err
 			}
 			cin, h, w := inSh[1], inSh[2], inSh[3]
+			if nd.opType == "Gemm" && (h != 1 || w != 1) {
+				return nil, fmt.Errorf("%s: Gemm requires 2D input [1, Cin] (normalized [1, Cin, 1, 1]), got [1, %d, %d, %d]", ctx, cin, h, w)
+			}
 			bc, ok := consts[nd.inputs[1]]
 			if !ok {
 				return nil, fmt.Errorf("%s: weight input %q must be a constant initializer", ctx, nd.inputs[1])
@@ -904,7 +909,7 @@ func LowerONNX(model *ONNXModel, opts LowerOptions) (*LowerResult, error) {
 			}
 			emitNode(VaneGraphNode{
 				ID:      baseID,
-				Op:      "linear",
+				Op:      "conv1x1",
 				Inputs:  []string{inID},
 				Cin:     cin,
 				Cout:    cout,
@@ -1110,6 +1115,21 @@ func LowerONNX(model *ONNXModel, opts LowerOptions) (*LowerResult, error) {
 			}
 			alpha := nd.orig.AttrFloat("alpha", 0.2)
 			beta := nd.orig.AttrFloat("beta", 0.5)
+			if math.IsNaN(alpha) || math.IsInf(alpha, 0) || alpha <= 0 {
+				return nil, fmt.Errorf("%s: HardSigmoid alpha must be finite and > 0 (got %g)", ctx, alpha)
+			}
+			if err := validateFiniteFP16Scalar(alpha, ctx); err != nil {
+				return nil, err
+			}
+			if err := validateFiniteFP16Scalar(beta, ctx); err != nil {
+				return nil, err
+			}
+			if err := validateFiniteFP16Scalar(alpha/0.2, ctx); err != nil {
+				return nil, err
+			}
+			if fp16.FromFloat64(alpha/0.2) == fp16.PosZero {
+				return nil, fmt.Errorf("%s: HardSigmoid alpha (%g) underflows pre-LUT scale to 0", ctx, alpha)
+			}
 			act := &ref.GraphActSpec{Name: "hard_sigmoid", Alpha: &alpha, Beta: &beta}
 			emitNode(VaneGraphNode{ID: baseID, Op: "lut", Inputs: []string{inID}, Act: act}, nd.output, inSh)
 
@@ -1131,6 +1151,15 @@ func LowerONNX(model *ONNXModel, opts LowerOptions) (*LowerResult, error) {
 			}
 			if !hasLo || !hasHi {
 				return nil, fmt.Errorf("%s: Clip requires both constant min and max bounds", ctx)
+			}
+			if err := validateFiniteFP16Scalar(lo, ctx); err != nil {
+				return nil, err
+			}
+			if err := validateFiniteFP16Scalar(hi, ctx); err != nil {
+				return nil, err
+			}
+			if lo > hi {
+				return nil, fmt.Errorf("%s: Clip requires min <= max (got min=%g, max=%g)", ctx, lo, hi)
 			}
 			var act *ref.GraphActSpec
 			if lo == 0 && hi == 6 {
@@ -1186,6 +1215,9 @@ func LowerONNX(model *ONNXModel, opts LowerOptions) (*LowerResult, error) {
 				}
 				sh, sw = int(st[0]), int(st[1])
 			}
+			if sh <= 0 || sw <= 0 {
+				return nil, fmt.Errorf("%s: pool strides must be > 0, got [%d,%d]", ctx, sh, sw)
+			}
 			autoPad := strings.ToUpper(nd.orig.AttrString("auto_pad", "NOTSET"))
 			pads := []int64{0, 0, 0, 0}
 			if ps, ok := nd.orig.AttrInts("pads"); ok {
@@ -1201,9 +1233,31 @@ func LowerONNX(model *ONNXModel, opts LowerOptions) (*LowerResult, error) {
 			case "VALID":
 				padMode = "valid"
 				pt, pl, pb, pr = 0, 0, 0, 0
-			case "SAME_UPPER", "SAME_LOWER":
+			case "SAME_UPPER":
 				padMode = "same"
 				pt, pl, pb, pr = 0, 0, 0, 0
+			case "SAME_LOWER":
+				// ONNX SAME_LOWER assigns extra padding pixel to top/left, whereas Vane's
+				// pad="same" uses SAME_UPPER. Lower SAME_LOWER with explicit custom pads.
+				ohTmp := (inSh[2] + sh - 1) / sh
+				padH := (ohTmp-1)*sh + int(kShape[0]) - inSh[2]
+				if padH < 0 {
+					padH = 0
+				}
+				owTmp := (inSh[3] + sw - 1) / sw
+				padW := (owTmp-1)*sw + int(kShape[1]) - inSh[3]
+				if padW < 0 {
+					padW = 0
+				}
+				pt = (padH + 1) / 2
+				pb = padH - pt
+				pl = (padW + 1) / 2
+				pr = padW - pl
+				if pt == 0 && pb == 0 && pl == 0 && pr == 0 {
+					padMode = "valid"
+				} else {
+					padMode = "custom"
+				}
 			case "", "NOTSET":
 				if pt == 0 && pl == 0 && pb == 0 && pr == 0 {
 					padMode = "valid"
@@ -1285,7 +1339,14 @@ func LowerONNX(model *ONNXModel, opts LowerOptions) (*LowerResult, error) {
 				if err != nil {
 					return nil, fmt.Errorf("%s: axes %q: %w", ctx, nd.inputs[1], err)
 				}
-			} else {
+			}
+			if len(rawAxes) == 0 {
+				if nd.orig.AttrInt("noop_with_empty_axes", 0) != 0 {
+					shapes[nd.output] = inSh
+					vaneIDOf[nd.output] = inID
+					elidedCount++
+					continue
+				}
 				rawAxes = []int64{1, 2, 3}
 			}
 
@@ -1294,6 +1355,9 @@ func LowerONNX(model *ONNXModel, opts LowerOptions) (*LowerResult, error) {
 				return nil, err
 			}
 			redOp := strings.ToLower(strings.TrimPrefix(nd.opType, "Reduce"))
+			if err := validateReduceBackendConstraints(redOp, axesStr, inSh, ctx); err != nil {
+				return nil, err
+			}
 			emitNode(VaneGraphNode{
 				ID:       baseID,
 				Op:       "reduce",
@@ -1310,37 +1374,67 @@ func LowerONNX(model *ONNXModel, opts LowerOptions) (*LowerResult, error) {
 			if err != nil {
 				return nil, err
 			}
-			defAxis := int64(-1)
-			if opset > 0 && opset < 13 {
-				defAxis = 1
-			}
-			axis := nd.orig.AttrInt("axis", defAxis)
-			if axis < 0 {
-				axis += 4
-			}
 			var axStr string
 			var redSh [4]int
-			switch axis {
-			case 1:
-				axStr = "c"
-				redSh = [4]int{1, 1, inSh[2], inSh[3]}
-			case 2:
-				axStr = "h"
-				redSh = [4]int{1, inSh[1], 1, inSh[3]}
-			case 3:
-				axStr = "w"
-				redSh = [4]int{1, inSh[1], inSh[2], 1}
-			default:
-				return nil, fmt.Errorf("%s: Softmax axis %d not in {1,2,3}", ctx, axis)
+			if opset > 0 && opset < 13 {
+				// ONNX opset < 13 flattens trailing axes [axis..3] (default axis=1).
+				axis := nd.orig.AttrInt("axis", 1)
+				if axis < 0 {
+					axis += 4
+				}
+				switch axis {
+				case 0, 1:
+					axStr = "chw"
+					redSh = [4]int{1, 1, 1, 1}
+				case 2:
+					axStr = "hw"
+					redSh = [4]int{1, inSh[1], 1, 1}
+				case 3:
+					axStr = "w"
+					redSh = [4]int{1, inSh[1], inSh[2], 1}
+				default:
+					return nil, fmt.Errorf("%s: Softmax (opset %d) axis %d out of range [0,3]", ctx, opset, axis)
+				}
+			} else {
+				axis := nd.orig.AttrInt("axis", -1)
+				if axis < 0 {
+					axis += 4
+				}
+				switch axis {
+				case 1:
+					axStr = "c"
+					redSh = [4]int{1, 1, inSh[2], inSh[3]}
+				case 2:
+					axStr = "h"
+					redSh = [4]int{1, inSh[1], 1, inSh[3]}
+				case 3:
+					axStr = "w"
+					redSh = [4]int{1, inSh[1], inSh[2], 1}
+				default:
+					return nil, fmt.Errorf("%s: Softmax axis %d not in {1,2,3}", ctx, axis)
+				}
+			}
+			if err := validateReduceBackendConstraints("max", axStr, inSh, ctx); err != nil {
+				return nil, err
 			}
 			maxID := sanitizeNodeID(baseID+"_max", usedIDs)
 			subID := sanitizeNodeID(baseID+"_sub", usedIDs)
 			expID := sanitizeNodeID(baseID+"_exp", usedIDs)
-			invSumID := sanitizeNodeID(baseID+"_invsum", usedIDs)
 			emitNode(VaneGraphNode{ID: maxID, Op: "reduce", Inputs: []string{inID}, ReduceOp: "max", Axes: axStr}, "", redSh)
 			emitNode(VaneGraphNode{ID: subID, Op: "pe", PeOp: "sub", Inputs: []string{inID, maxID}}, "", inSh)
 			emitNode(VaneGraphNode{ID: expID, Op: "lut", Inputs: []string{subID}, Act: &ref.GraphActSpec{Name: "exp"}}, "", inSh)
-			emitNode(VaneGraphNode{ID: invSumID, Op: "reduce", Inputs: []string{expID}, ReduceOp: "inv_sum", Axes: axStr}, "", redSh)
+
+			var invSumID string
+			if axStr == "c" && inSh[3] > 1 {
+				// Vane's NE channel reducer supports max/min/sum/mean (not inv_sum) when W > 1.
+				sumID := sanitizeNodeID(baseID+"_sum", usedIDs)
+				invSumID = sanitizeNodeID(baseID+"_invsum", usedIDs)
+				emitNode(VaneGraphNode{ID: sumID, Op: "reduce", Inputs: []string{expID}, ReduceOp: "sum", Axes: axStr}, "", redSh)
+				emitNode(VaneGraphNode{ID: invSumID, Op: "lut", Inputs: []string{sumID}, Act: &ref.GraphActSpec{Name: "inverse"}}, "", redSh)
+			} else {
+				invSumID = sanitizeNodeID(baseID+"_invsum", usedIDs)
+				emitNode(VaneGraphNode{ID: invSumID, Op: "reduce", Inputs: []string{expID}, ReduceOp: "inv_sum", Axes: axStr}, "", redSh)
+			}
 			emitNode(VaneGraphNode{ID: baseID, Op: "pe", PeOp: "mul", Inputs: []string{expID, invSumID}}, nd.output, inSh)
 
 		case "Transpose":
@@ -1371,6 +1465,15 @@ func LowerONNX(model *ONNXModel, opts LowerOptions) (*LowerResult, error) {
 			}
 			if outSh[0] != 1 {
 				return nil, fmt.Errorf("%s: Transpose output batch dimension must be 1, got %d", ctx, outSh[0])
+			}
+			if perm[0] == 0 && perm[1] == 1 && perm[2] == 2 && perm[3] == 3 {
+				shapes[nd.output] = inSh
+				vaneIDOf[nd.output] = inID
+				elidedCount++
+				continue
+			}
+			if !opts.AllowViewOps {
+				return nil, fmt.Errorf("%s: non-no-op view op Transpose (perm=%v) requires --allow-view-ops", ctx, perm)
 			}
 			emitNode(VaneGraphNode{
 				ID:     baseID,
@@ -1409,11 +1512,14 @@ func LowerONNX(model *ONNXModel, opts LowerOptions) (*LowerResult, error) {
 						if d == axis {
 							outSh[d] += sh[d]
 						} else if sh[d] != outSh[d] {
-							return nil, fmt.Errorf("%s: Concat input %d shape %v mismatches axis %d dim %d (%d vs %d)",
-								ctx, i, sh, d, outSh[d], sh[d], outSh[d])
+							return nil, fmt.Errorf("%s: Concat input %d shape %v mismatches axis %d (%d vs %d)",
+								ctx, i, sh, d, sh[d], outSh[d])
 						}
 					}
 				}
+			}
+			if !opts.AllowViewOps {
+				return nil, fmt.Errorf("%s: non-no-op view op Concat (axis=%d) requires --allow-view-ops", ctx, axis)
 			}
 			axVal := axis
 			emitNode(VaneGraphNode{
@@ -1444,6 +1550,15 @@ func LowerONNX(model *ONNXModel, opts LowerOptions) (*LowerResult, error) {
 			if err != nil {
 				return nil, err
 			}
+			if outSh == inSh {
+				shapes[nd.output] = inSh
+				vaneIDOf[nd.output] = inID
+				elidedCount++
+				continue
+			}
+			if !opts.AllowViewOps {
+				return nil, fmt.Errorf("%s: non-no-op view op Reshape (%v -> %v) requires --allow-view-ops", ctx, inSh, outSh)
+			}
 			emitNode(VaneGraphNode{
 				ID:       baseID,
 				Op:       "reshape",
@@ -1467,6 +1582,15 @@ func LowerONNX(model *ONNXModel, opts LowerOptions) (*LowerResult, error) {
 				return nil, fmt.Errorf("%s: Flatten axis %d not supported (expected axis=1)", ctx, axis)
 			}
 			outSh := [4]int{1, inSh[1] * inSh[2] * inSh[3], 1, 1}
+			if outSh == inSh {
+				shapes[nd.output] = inSh
+				vaneIDOf[nd.output] = inID
+				elidedCount++
+				continue
+			}
+			if !opts.AllowViewOps {
+				return nil, fmt.Errorf("%s: non-no-op view op Flatten (%v -> %v) requires --allow-view-ops", ctx, inSh, outSh)
+			}
 			emitNode(VaneGraphNode{
 				ID:       baseID,
 				Op:       "reshape",
@@ -1485,6 +1609,9 @@ func LowerONNX(model *ONNXModel, opts LowerOptions) (*LowerResult, error) {
 			beg, end, step, outSh, err := resolveSliceParams(nd, consts, inSh, ctx)
 			if err != nil {
 				return nil, err
+			}
+			if !opts.AllowViewOps {
+				return nil, fmt.Errorf("%s: non-no-op view op Slice (%v -> %v) requires --allow-view-ops", ctx, inSh, outSh)
 			}
 			emitNode(VaneGraphNode{
 				ID:     baseID,
@@ -1637,6 +1764,9 @@ func computeBNAffine(bn *irNode, consts map[string]*constSource, cout int, ctx s
 	if len(bn.inputs) < 5 {
 		return nil, nil, fmt.Errorf("%s: BatchNormalization requires 5 inputs", ctx)
 	}
+	if bn.orig.AttrInt("training_mode", 0) != 0 {
+		return nil, nil, fmt.Errorf("%s: BatchNormalization training_mode != 0 is not supported (inference mode only)", ctx)
+	}
 	getVec := func(idx int, label string) ([]float64, error) {
 		cs, ok := consts[bn.inputs[idx]]
 		if !ok {
@@ -1730,6 +1860,9 @@ func foldConvBatchNorm(nodes []*irNode, consts map[string]*constSource, graphOut
 			if err != nil {
 				return nil, 0, fmt.Errorf("%s: Conv weight: %w", ctx, err)
 			}
+		}
+		if cout <= 0 || len(wF64) == 0 || len(wF64)%cout != 0 {
+			return nil, 0, fmt.Errorf("%s: invalid Conv weight length %d for Cout=%d", ctx, len(wF64), cout)
 		}
 
 		var convBias []float64
@@ -1827,13 +1960,15 @@ func foldMatMulAddBias(nodes []*irNode, consts map[string]*constSource, graphOut
 		}
 		cout := int(wc.dims[1])
 		bc := consts[biasName]
-		nElems, err := shapeProductChecked(bc.dims)
-		if err != nil || int(nElems) != cout {
+		if !isChannelBiasShape(bc.dims, int64(cout)) {
 			continue
 		}
 		bVals, err := bc.float64s()
 		if err != nil {
 			return nil, err
+		}
+		if len(bVals) != cout {
+			continue
 		}
 		mm.foldedB = bVals
 		mm.hasFoldB = true
@@ -2132,6 +2267,7 @@ func resolveSliceParams(nd *irNode, consts map[string]*constSource, inSh [4]int,
 	beg = []int{0, 0, 0, 0}
 	end = []int{inSh[0], inSh[1], inSh[2], inSh[3]}
 	step = []int{1, 1, 1, 1}
+	var seenAxis [4]bool
 
 	for i := range starts {
 		ax := axes[i]
@@ -2141,6 +2277,10 @@ func resolveSliceParams(nd *irNode, consts map[string]*constSource, inSh [4]int,
 		if ax < 0 || ax >= 4 {
 			return nil, nil, nil, outSh, fmt.Errorf("%s: Slice axis %d out of range [0,3]", ctx, axes[i])
 		}
+		if seenAxis[ax] {
+			return nil, nil, nil, outSh, fmt.Errorf("%s: Slice duplicate axis %d", ctx, ax)
+		}
+		seenAxis[ax] = true
 		st := steps[i]
 		if st <= 0 {
 			return nil, nil, nil, outSh, fmt.Errorf("%s: Slice step %d must be > 0", ctx, st)
@@ -2173,10 +2313,124 @@ func resolveSliceParams(nd *irNode, consts map[string]*constSource, inSh [4]int,
 	}
 
 	for d := 0; d < 4; d++ {
-		outSh[d] = (end[d] - beg[d] + step[d] - 1) / step[d]
+		outSh[d] = 1 + (end[d]-beg[d]-1)/step[d]
 	}
 	if outSh[0] != 1 {
 		return nil, nil, nil, outSh, fmt.Errorf("%s: Slice output batch dimension must be 1, got %d", ctx, outSh[0])
 	}
 	return beg, end, step, outSh, nil
+}
+
+func isChannelBiasShape(dims []int64, cout int64) bool {
+	if cout <= 0 {
+		return false
+	}
+	switch len(dims) {
+	case 1:
+		return dims[0] == cout
+	case 2:
+		return dims[0] == 1 && dims[1] == cout
+	case 4:
+		return dims[0] == 1 && dims[1] == cout && dims[2] == 1 && dims[3] == 1
+	default:
+		return false
+	}
+}
+
+func resolveConv3x3Padding(h, w, stride int, autoPad string, pads []int64, ctx string) (padMode string, ho, wo int, err error) {
+	var onnxHo, onnxWo, pt, pl, pb, pr int
+	switch autoPad {
+	case "VALID":
+		if h < 3 || w < 3 {
+			return "", 0, 0, fmt.Errorf("%s: conv3x3 VALID requires H>=3 and W>=3, got (%d,%d)", ctx, h, w)
+		}
+		onnxHo = (h-3)/stride + 1
+		onnxWo = (w-3)/stride + 1
+	case "SAME_UPPER":
+		onnxHo = (h + stride - 1) / stride
+		onnxWo = (w + stride - 1) / stride
+		padH := (onnxHo-1)*stride + 3 - h
+		if padH < 0 {
+			padH = 0
+		}
+		padW := (onnxWo-1)*stride + 3 - w
+		if padW < 0 {
+			padW = 0
+		}
+		pt = padH / 2
+		pb = padH - pt
+		pl = padW / 2
+		pr = padW - pl
+	case "SAME_LOWER":
+		onnxHo = (h + stride - 1) / stride
+		onnxWo = (w + stride - 1) / stride
+		padH := (onnxHo-1)*stride + 3 - h
+		if padH < 0 {
+			padH = 0
+		}
+		padW := (onnxWo-1)*stride + 3 - w
+		if padW < 0 {
+			padW = 0
+		}
+		pt = (padH + 1) / 2
+		pb = padH - pt
+		pl = (padW + 1) / 2
+		pr = padW - pl
+	case "", "NOTSET":
+		pt, pl, pb, pr = int(pads[0]), int(pads[1]), int(pads[2]), int(pads[3])
+		if pt < 0 || pl < 0 || pb < 0 || pr < 0 {
+			return "", 0, 0, fmt.Errorf("%s: conv3x3 negative pads %v", ctx, pads)
+		}
+		if h+pt+pb < 3 || w+pl+pr < 3 {
+			return "", 0, 0, fmt.Errorf("%s: conv3x3 padded spatial dims (%d,%d) < 3", ctx, h+pt+pb, w+pl+pr)
+		}
+		onnxHo = (h+pt+pb-3)/stride + 1
+		onnxWo = (w+pl+pr-3)/stride + 1
+	default:
+		return "", 0, 0, fmt.Errorf("%s: unsupported auto_pad %q", ctx, autoPad)
+	}
+
+	if hoV, woV, ptV, plV, errV := ref.Conv3x3Geometry(h, w, stride, "valid"); errV == nil {
+		if onnxHo == hoV && onnxWo == woV && pt == ptV && pl == plV && pb == 0 && pr == 0 {
+			return "valid", hoV, woV, nil
+		}
+	}
+	if hoS, woS, ptS, plS, errS := ref.Conv3x3Geometry(h, w, stride, "same"); errS == nil {
+		padTotalH := (hoS-1)*stride + 3 - h
+		if padTotalH < 0 {
+			padTotalH = 0
+		}
+		padTotalW := (woS-1)*stride + 3 - w
+		if padTotalW < 0 {
+			padTotalW = 0
+		}
+		pbS := padTotalH - ptS
+		prS := padTotalW - plS
+		if onnxHo == hoS && onnxWo == woS && pt == ptS && pl == plS && pb == pbS && pr == prS {
+			return "same", hoS, woS, nil
+		}
+	}
+
+	return "", 0, 0, fmt.Errorf(
+		"%s: conv3x3 padding (auto_pad=%q, pads=[%d,%d,%d,%d], out=%dx%d) for %dx%d stride=%d does not match Vane conv3x3 'valid' or 'same' (Vane 'same' uses SAME_UPPER: [0,0,1,1] for even H/W and [1,1,1,1] for odd H/W at stride 2)",
+		ctx, autoPad, pt, pl, pb, pr, onnxHo, onnxWo, h, w, stride)
+}
+
+func validateReduceBackendConstraints(redOp, axesStr string, inSh [4]int, ctx string) error {
+	rc, rh, rw, err := ref.ParseReduceAxes(axesStr)
+	if err != nil {
+		return fmt.Errorf("%s: %w", ctx, err)
+	}
+	if rw || inSh[3] == 1 {
+		return nil
+	}
+	if rc && !rh && !rw {
+		switch strings.ToLower(redOp) {
+		case "max", "min", "sum", "mean":
+			return nil
+		default:
+			return fmt.Errorf("%s: reduce %q over axis 'c' with W=%d > 1 is unsupported by Vane reduce backend (supported: max, min, sum, mean)", ctx, redOp, inSh[3])
+		}
+	}
+	return fmt.Errorf("%s: reduce %q over axes %q with W=%d > 1 is unsupported by Vane reduce backend (requires reducing W, axes='c', or W=1)", ctx, redOp, axesStr, inSh[3])
 }
