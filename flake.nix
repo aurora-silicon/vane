@@ -32,6 +32,10 @@
               runHook preInstall
               install -Dm755 .lake/build/bin/vane "$out/bin/vane"
               install -Dm755 .lake/build/bin/vane-test "$out/bin/vane-test"
+              install -Dm755 .lake/build/bin/vane-audit "$out/bin/vane-audit"
+              # Compiled .oleans, so vane-audit can inspect them without rebuilding.
+              mkdir -p "$out/lib"
+              cp -r .lake/build/lib/lean "$out/lib/lean"
               runHook postInstall
             '';
 
@@ -107,14 +111,8 @@
       checks = forAllSystems (system: pkgs:
         let
           vanePkg = self.packages.${system}.vane;
-        in
-        {
-          lean-tests = pkgs.runCommand "vane-lean-tests" { } ''
-            ${vanePkg}/bin/vane-test
-            touch $out
-          '';
 
-          go-tests = pkgs.runCommand "vane-go-tests" {
+          goCheck = name: script: pkgs.runCommandCC name {
             nativeBuildInputs = [ pkgs.go ];
           } ''
             cp -r ${self} work
@@ -122,8 +120,62 @@
             cd work
             export HOME="$TMPDIR"
             export GOCACHE="$TMPDIR/go-cache"
-            VANE_BIN=${vanePkg}/bin/vane go test -v ./...
+            export GOPATH="$TMPDIR/go"
+            export GOPROXY=off
+            export GOTOOLCHAIN=local
+            ${script}
             touch $out
+          '';
+        in
+        {
+          lean-tests = pkgs.runCommand "vane-lean-tests" { } ''
+            ${vanePkg}/bin/vane-test
+            touch $out
+          '';
+
+          # Kernel-level audit of the compiled proofs, then a source scan for
+          # proof and trust shortcuts, then full kernel replay with leanchecker.
+          proof-audit = pkgs.runCommand "vane-proof-audit" {
+            nativeBuildInputs = [ pkgs.python3 ];
+          } ''
+            export LEAN_SYSROOT=${pkgs.lean4}
+            export LEAN_PATH=${vanePkg}/lib/lean:${pkgs.lean4}/lib/lean
+            ${vanePkg}/bin/vane-audit
+            python3 ${self}/scripts/lean-guard.py forbidden ${self}
+            ${pkgs.lean4}/bin/leanchecker Vane Vane.Proofs
+            touch $out
+          '';
+
+          # The verifier's import closure must stay inside the TCB allowlist.
+          tcb-check = pkgs.runCommand "vane-tcb-check" {
+            nativeBuildInputs = [ pkgs.python3 ];
+          } ''
+            python3 ${self}/scripts/lean-guard.py tcb ${self}
+            touch $out
+          '';
+
+          go-lint = goCheck "vane-go-lint" ''
+            unformatted="$(gofmt -l .)"
+            if [ -n "$unformatted" ]; then
+              echo "gofmt: these files need formatting (run gofmt -w .):" >&2
+              echo "$unformatted" >&2
+              gofmt -d . >&2
+              exit 1
+            fi
+            if grep -Eq '^[[:space:]]*require([[:space:]]|\(|$)' go.mod; then
+              echo "go.mod has a require directive; vane's Go code must have zero external dependencies" >&2
+              exit 1
+            fi
+            if [ -e go.sum ]; then
+              echo "go.sum exists; vane's Go code must have zero external dependencies" >&2
+              exit 1
+            fi
+            go vet ./...
+            echo "[PASS] go-lint: gofmt clean, go vet clean, zero external dependencies"
+          '';
+
+          go-tests = goCheck "vane-go-tests" ''
+            CGO_ENABLED=1 VANE_BIN=${vanePkg}/bin/vane go test -race -v ./...
           '';
         });
     };

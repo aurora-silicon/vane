@@ -1,6 +1,7 @@
 name = "vane"
 version = "0.1.0"
-defaultTargets = ["Vane", "vane", "vane-test"]
+defaultTargets = ["Vane", "vane", "vane-test", "vane-audit"]
+moreLeanArgs = ["-DwarningAsError=true"]
 
 [[lean_lib]]
 name = "Vane"
@@ -12,3 +13,7 @@ root = "Main"
 [[lean_exe]]
 name = "vane-test"
 root = "Test.Main"
+
+[[lean_exe]]
+name = "vane-audit"
+root = "Test.Audit"

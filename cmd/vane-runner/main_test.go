@@ -516,13 +516,13 @@ func TestPeEndToEndCLIAndCompare(t *testing.T) {
 	vaneBin := findVaneBin(t)
 
 	cases := []struct {
-		name      string
-		target    string
-		op        string
-		c, h, w   int
+		name       string
+		target     string
+		op         string
+		c, h, w    int
 		zc, zh, zw int
-		extraGen  []string
-		extraComp []string
+		extraGen   []string
+		extraComp  []string
 	}{
 		{"h17_abs", "h17", "abs", 4, 8, 16, 0, 0, 0, nil, nil},
 		{"h17_square_edge", "h17", "square", 1, 2, 16, 0, 0, 0, []string{"--edge-values"}, nil},
@@ -857,12 +857,12 @@ func TestMultiTaskGraphEndToEndCLI(t *testing.T) {
 	vaneBin := findVaneBin(t)
 
 	cases := []struct {
-		name           string
-		specJSON       string
-		wantTasks      int
-		wantScratch    bool
-		maxScratch     int
-		tol            string
+		name        string
+		specJSON    string
+		wantTasks   int
+		wantScratch bool
+		maxScratch  int
+		tol         string
 	}{
 		{
 			name: "h17_l2_conv_chain",

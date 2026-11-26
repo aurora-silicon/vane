@@ -4725,8 +4725,95 @@ private def runM5bTests : IO (Array TestResult) := do
 
   pure results
 
+/-- Re-validate an emitted program from its raw bytes (header, LOAD sections, static
+    verifier) and check the verified task kinds. -/
+private def matrixVerify (tgt : Target) (hwx : ByteArray) (secs : LoadSections)
+    (expected : TaskVerifySummary) : Except String Unit := do
+  let info ← validateHwx hwx
+  if info.target != tgt then
+    throw s!"HWX target {info.target.name} != {tgt.name}"
+  validateSectionsWithInfo info secs
+  validateSections hwx secs
+  let s ← verifyHwxTasksSummary hwx info (requireKnownTask := true)
+  if s != expected then
+    throw s!"verifier summary {repr s} != expected {repr expected}"
+
+/-- Cross-target smoke matrix: representative programs compiled and independently
+    verified for every target in `Target.all`, plus a tamper rejection per target. -/
+private def runTargetMatrixTests : IO (Array TestResult) := do
+  let mut results : Array TestResult := #[]
+
+  results := results.push (checkOk "matrix: Target.all is non-empty with distinct names and CPU subtypes" (do
+    if Target.all.isEmpty then
+      throw "Target.all is empty"
+    for t in Target.all do
+      if Target.parse? t.name != some t then
+        throw s!"Target.parse? does not round-trip {t.name}"
+      if Target.ofCpuSubtype? t.cpuSubtype != some t then
+        throw s!"Target.ofCpuSubtype? does not round-trip {t.name}"
+    if (Target.all.map Target.name).eraseDups.length != Target.all.length then
+      throw "duplicate target names in Target.all"
+  ))
+
+  for tgt in Target.all do
+    results := results.push (checkOk s!"matrix ({tgt.name}): conv1x1 bias+relu compiles and verifies" (do
+      let sh : Conv1x1Shape := { h := 8, w := 16, cin := 16, cout := 16 }
+      let c ← compileConv1x1 tgt sh (mkTaggedWeights 16 16) (some (mkTaggedBias 16)) true
+      matrixVerify tgt c.hwx c.sections { total := 1, neConv := 1, neAct := 0, peOp := 0 }
+    ))
+
+    results := results.push (checkOk s!"matrix ({tgt.name}): conv3x3 dense s=2 and depthwise compile and verify" (do
+      let dense : Conv3x3Shape := { mode := .dense, h := 11, w := 13, cin := 5, cout := 9, stride := 2, pad := .same }
+      let cd ← compileConv3x3 tgt dense (mkTaggedWeights3x3 9 5 (withZeros := true)) (some (mkTaggedBias 9)) true
+      matrixVerify tgt cd.hwx cd.sections { total := 1, neConv := 1, neAct := 0, peOp := 0 }
+      let dw : Conv3x3Shape := { mode := .depthwise, h := 10, w := 12, cin := 24, cout := 24, stride := 1, pad := .same }
+      let cw ← compileConv3x3 tgt dw (mkTaggedWeights3x3 24 1) (some (mkTaggedBias 24)) false
+      matrixVerify tgt cw.hwx cw.sections { total := 1, neConv := 1, neAct := 0, peOp := 0 }
+    ))
+
+    results := results.push (checkOk s!"matrix ({tgt.name}): NE LUT activations compile and verify" (do
+      for act in #[NeActSpec.lut .tanh, .lut .silu, .lut (.rsqrt 0.0625)] do
+        let c ← compileNeAct tgt act 8 16 24
+        matrixVerify tgt c.hwx c.sections { total := 1, neConv := 0, neAct := 1, peOp := 0 }
+    ))
+
+    results := results.push (checkOk s!"matrix ({tgt.name}): PE unary and binary ops compile and verify" (do
+      let d : TensorDims := { c := 4, h := 8, w := 16 }
+      for op in #[PeOp.abs, PeOp.scalarMul (floatToF16 (-0.5)), .binary .add d d false] do
+        let c ← compilePe tgt op d
+        matrixVerify tgt c.hwx c.sections { total := 1, neConv := 0, neAct := 0, peOp := 1 }
+    ))
+
+    results := results.push (checkOk s!"matrix ({tgt.name}): multi-task graph conv -> pe1 -> lut -> conv -> pe2 verifies" (do
+      let g ← Vane.Graph.compileGraph {
+        target := tgt
+        defaultPlacement := .auto
+        inputs := #[{ name := "x", shape := { c := 16, h := 8, w := 16 } }]
+        nodes := #[
+          { id := "c1", inputs := #["x"], op := .conv1x1 16 16 (mkM5aW1x1 16 16 3) (some (mkM5aBias 16)) .relu },
+          { id := "p1", inputs := #["c1"], op := .pe1 .abs },
+          { id := "l1", inputs := #["p1"], op := .lut (.lut .silu) },
+          { id := "c2", inputs := #["l1"], op := .conv1x1 16 16 (mkM5aW1x1 16 16 4) none .none },
+          { id := "add", inputs := #["c2", "c1"], op := .pe2 .add false }
+        ]
+      }
+      if g.taskCount != 5 then
+        throw s!"expected 5 tasks, got {g.taskCount}"
+      matrixVerify tgt g.hwx g.sections { total := 5, neConv := 2, neAct := 1, peOp := 2 }
+    ))
+
+    let baseConv ← match compileConv1x1 tgt { h := 8, w := 16, cin := 16, cout := 16 }
+        (mkTaggedWeights 16 16) (some (mkTaggedBias 16)) true with
+      | .ok c => pure c
+      | .error e => throw (IO.userError s!"matrix ({tgt.name}) base conv setup failed: {e}")
+    results := results.push (checkErr s!"matrix ({tgt.name}) neg: tampered L2 resBase past 2 MiB rejected by verifier" (do
+      tamperRegAndVerify baseConv regResBase 0x001fffe0
+    ) "exceeds 2 MiB")
+
+  return results
+
 def main : IO UInt32 := do
-  let results := (← runAllTests) ++ (← runM4Tests) ++ (← runM5aTests) ++ (← runM5bTests)
+  let results := (← runAllTests) ++ (← runM4Tests) ++ (← runM5aTests) ++ (← runM5bTests) ++ (← runTargetMatrixTests)
   let mut passed := 0
   let mut failed := 0
   for r in results do

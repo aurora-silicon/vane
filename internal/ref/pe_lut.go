@@ -457,7 +457,7 @@ func BuildLutTable(spec ActSpec) (tableBytes []byte, preScaleBits uint16, inputS
 			}
 		}
 		return packPwlTable(f16CanonZero(-2.5), f16CanonZero(2.5), posZero, posOne, f16CanonZero(0.5),
-			f16CanonZero(0.2), f16CanonZero(0.5), f16CanonZero(0.2), f16CanonZero(0.5), 0x0001),
+				f16CanonZero(0.2), f16CanonZero(0.5), f16CanonZero(0.2), f16CanonZero(0.5), 0x0001),
 			preScaleBits, inputShiftBits, nil
 	case "clamp_max":
 		vH, err := finiteFP16(spec.Scalar, "clamp_max.v")

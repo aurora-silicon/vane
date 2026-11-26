@@ -1897,15 +1897,15 @@ func cmdGenGraph(args []string, stdout, stderr io.Writer) int {
 	}
 
 	summary := map[string]any{
-		"target":       resolved.Target,
-		"placement":    resolved.Placement,
-		"node_count":   len(resolved.Nodes),
-		"input_files":  inFiles,
-		"out_shape":    []int{yQ.N, yQ.C, yQ.H, yQ.W},
-		"out_bytes":    len(expQBuf),
-		"seed":         *seed,
-		"resolved":     filepath.Join(*outDir, "graph_resolved.json"),
-		"out_dir":      *outDir,
+		"target":      resolved.Target,
+		"placement":   resolved.Placement,
+		"node_count":  len(resolved.Nodes),
+		"input_files": inFiles,
+		"out_shape":   []int{yQ.N, yQ.C, yQ.H, yQ.W},
+		"out_bytes":   len(expQBuf),
+		"seed":        *seed,
+		"resolved":    filepath.Join(*outDir, "graph_resolved.json"),
+		"out_dir":     *outDir,
 	}
 	if *asJSON {
 		raw, _ := json.MarshalIndent(summary, "", "  ")

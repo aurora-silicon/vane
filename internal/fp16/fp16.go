@@ -8,10 +8,10 @@ import (
 )
 
 const (
-	PosZero uint16 = 0x0000
-	NegZero uint16 = 0x8000
-	PosInf  uint16 = 0x7c00
-	NegInf  uint16 = 0xfc00
+	PosZero  uint16 = 0x0000
+	NegZero  uint16 = 0x8000
+	PosInf   uint16 = 0x7c00
+	NegInf   uint16 = 0xfc00
 	QuietNaN uint16 = 0x7e00
 )
 
