@@ -13,6 +13,7 @@ import Vane.Pe
 import Vane.Lut
 import Vane.Pool
 import Vane.Conv
+import Vane.View
 
 namespace Vane.Graph
 
@@ -31,6 +32,7 @@ open Vane.Pe
 open Vane.Lut
 open Vane.Pool
 open Vane.Conv
+open Vane.View
 
 -- ============================================================================
 -- Multi-Task DAG Graph IR
@@ -95,11 +97,16 @@ end StripMode
 inductive NodeOp where
   | conv1x1 (cin cout : Nat) (weights : ByteArray) (bias : Option ByteArray := none) (act : ConvActivation := .none)
   | conv3x3 (mode : Conv3x3Mode) (cin cout stride : Nat) (padding : PadMode) (weights : ByteArray) (bias : Option ByteArray := none) (act : ConvActivation := .none)
+  | linear (cin cout : Nat) (weights : ByteArray) (bias : Option ByteArray := none) (act : ConvActivation := .none)
   | pe1 (op : PeOp)
   | pe2 (op : PeBinOp) (rev : Bool := false)
   | lut (act : NeActSpec)
   | pool (op : PoolKind) (kh kw sh sw : Nat) (pad : PoolPad) (excludePad : Bool := true)
   | reduce (op : ReduceOp) (axes : ReduceAxes) (eps : UInt16 := 0)
+  | transpose (perm : Array Nat)
+  | slice (beginIdx endIdx step : Array Nat)
+  | concat (axis : Nat)
+  | reshape (outDims : TensorDims)
   deriving BEq
 
 instance : Inhabited NodeOp := ⟨.pe2 .add false⟩
@@ -566,16 +573,22 @@ private inductive PlannedOp where
   | nePool (op : PoolKind) (dims : TensorDims) (gh gw : PoolAxisGeom)
   | peReduce (op : ReduceOp) (axes : ReduceAxes) (eps : UInt16) (dims : TensorDims)
   | neChannelReduce (op : ReduceOp) (dims : TensorDims)
+  | neView (copy : ViewCopy)
 
 private instance : Inhabited PlannedOp := ⟨.pe2 .add false default default default default default⟩
 
 private structure ValidatedNode where
   id : String
+  logicalId : String := ""
   nodeIdx : Nat
   origNodeIdx : Nat := 0
   inputs : Array TensorRef
   op : PlannedOp
   outDims : TensorDims
+  groupOutDims : TensorDims := default
+  outByteOffset : Nat := 0
+  sharedOutGroup : Option Nat := none
+  isFinalGroup : Bool := false
   outPlacement : Option EdgePlacementMode
   engine : Engine
   isNeCompute : Bool
@@ -594,6 +607,7 @@ private inductive TaskPlanKind where
   | peReduce (p : PeReducePlan)
   | nePool (p : NeWeightlessPlan)
   | neChannelReduce (p : NeWeightlessPlan)
+  | neView (p : ViewTaskPlan)
 
 private instance : Inhabited TaskPlanKind :=
   ⟨.pe {
@@ -616,6 +630,7 @@ private def TaskPlanKind.direct : TaskPlanKind → Bool
   | .peReduce p => p.direct
   | .nePool p => p.direct
   | .neChannelReduce p => p.direct
+  | .neView p => p.direct
 
 private def TaskPlanKind.l2Peak : TaskPlanKind → Nat
   | .conv p => p.l2TaskPeak
@@ -625,6 +640,7 @@ private def TaskPlanKind.l2Peak : TaskPlanKind → Nat
   | .peReduce p => p.l2TaskPeak
   | .nePool p => p.l2TaskPeak
   | .neChannelReduce p => p.l2TaskPeak
+  | .neView p => p.l2TaskPeak
 
 private def deriveInputShortNames (inputs : Array GraphInput) : Except String (Array String) := do
   let mut names : Array String := #[]
@@ -646,10 +662,12 @@ private def deriveInputShortNames (inputs : Array GraphInput) : Except String (A
 private def nodeUsesKernel : NodeOp → Bool
   | .conv1x1 .. => true
   | .conv3x3 .. => true
+  | .linear .. => true
   | .lut (.lut _) => true
   | _ => false
 
-/-- Validate graph structure, DAG topological ordering, tensor shapes, and op contracts. -/
+/-- Validate graph structure, DAG topological ordering, tensor shapes, and op contracts,
+    expanding multi-task ops (`concat` and output-channel-split `conv1x1` / `linear`). -/
 private def validateGraph (spec : GraphSpec) :
     Except String (Array String × Array ValidatedNode × Array Nat) := do
   if spec.inputs.isEmpty || spec.inputs.size > 3 then
@@ -673,16 +691,17 @@ private def validateGraph (spec : GraphSpec) :
     m.find? (fun (k, _, _) => k == nm)
 
   let mut vNodes : Array ValidatedNode := Array.mkEmpty spec.nodes.size
-  let mut lastConsumer : Array Nat := Array.replicate spec.nodes.size 0
+  let mut lastConsumer : Array Nat := #[]
+  -- Track logical node representatives `(repIdx, endIdx, isFinal)` for unconsumed-node checking
+  let mut logicalReps : Array (Nat × Nat × Bool) := Array.mkEmpty spec.nodes.size
 
-  for i in [:spec.nodes.size] do
-    let nd := spec.nodes[i]!
+  for logIdx in [:spec.nodes.size] do
+    let nd := spec.nodes[logIdx]!
+    let isLastLogical := logIdx + 1 == spec.nodes.size
     if nd.id.isEmpty then
-      throw s!"graph node {i} has empty id"
+      throw s!"graph node {logIdx} has empty id"
     if nameMap.any (fun (nm, _, _) => nm == nd.id) then
       throw s!"duplicate graph tensor/node id '{nd.id}'"
-    if nodeUsesKernel nd.op && i >= 255 then
-      throw s!"node '{nd.id}' (taskId={i}) uses __KERN_0, which requires taskId < 255 (stage = taskId + 1 <= 255)"
 
     let mut inRefs : Array TensorRef := #[]
     let mut inDims : Array TensorDims := #[]
@@ -693,29 +712,96 @@ private def validateGraph (spec : GraphSpec) :
       | some (_, ref, dims) =>
         inRefs := inRefs.push ref
         inDims := inDims.push dims
-        match ref with
-        | .node prodIdx =>
-          lastConsumer := lastConsumer.set! prodIdx (max lastConsumer[prodIdx]! i)
-        | .input _ => pure ()
 
-    let (plannedOp, outDims, eng, isNeComp, usesKern, opKind) ← match nd.op with
+    let repIdx := vNodes.size
+
+    let pushExpandedConv1x1 := fun (opLabel : String) (cin cout : Nat) (weights : ByteArray)
+        (bias : Option ByteArray) (act : ConvActivation) (d : TensorDims) => do
+      if d.c != cin then
+        throw s!"node '{nd.id}' ({opLabel}): input C={d.c} != cin={cin}"
+      let fullSh : ConvSpec := { kernelSize := 1, mode := .dense, h := d.h, w := d.w, cin := cin, cout := cout }
+      validateConvShape fullSh
+      let lutPayload? ← match act with
+        | .lut lspec => some <$> buildLutTable lspec
+        | _ => pure none
+      let shiftBits? := lutPayload?.bind (fun lp => lp.inputShiftBits)
+      let hasEffBias := bias.isSome || shiftBits?.isSome
+      let extraLutBytes := if lutPayload?.isSome then lutTableBytes else 0
+      let slices ← chooseConv1x1OutputSlices spec.target d.h d.w cin cout extraLutBytes hasEffBias
+      let fullOutDims : TensorDims := { c := cout, h := d.h, w := d.w }
+      if slices.size == 1 then
+        let scalarBiasMode := cout == 1
+        let biasInKernel := hasEffBias && !scalarBiasMode
+        let tIdx := vNodes.size
+        if tIdx >= 255 then
+          throw s!"node '{nd.id}' (taskId={tIdx}) uses __KERN_0, which requires taskId < 255"
+        pure (#[{
+          id := nd.id
+          logicalId := nd.id
+          nodeIdx := tIdx
+          origNodeIdx := tIdx
+          inputs := inRefs
+          op := PlannedOp.conv fullSh weights bias act lutPayload? biasInKernel
+          outDims := fullOutDims
+          groupOutDims := fullOutDims
+          outByteOffset := 0
+          sharedOutGroup := none
+          isFinalGroup := isLastLogical
+          outPlacement := nd.outPlacement
+          engine := Engine.ne
+          isNeCompute := true
+          usesKernel := true
+          opKind := opLabel
+        }], fullOutDims)
+      else
+        if weights.size != 2 * cout * cin then
+          throw s!"node '{nd.id}' ({opLabel}): weights byte size {weights.size} != expected {2 * cout * cin}"
+        if let some b := bias then
+          if b.size != 2 * cout then
+            throw s!"node '{nd.id}' ({opLabel}): bias byte size {b.size} != expected {2 * cout}"
+        let starts := prefixStarts slices.toList
+        let outRowStride := alignUp (2 * d.w) dmaLineBytes
+        let outPlaneStride := d.h * outRowStride
+        let mut sliceNodes : Array ValidatedNode := Array.mkEmpty slices.size
+        for si in [:slices.size] do
+          let tIdx := repIdx + si
+          if tIdx >= 255 then
+            throw s!"node '{nd.id}' slice {si} (taskId={tIdx}) uses __KERN_0, which requires taskId < 255"
+          let c0 := starts[si]!
+          let dc := slices[si]!
+          let wSlice := weights.extract (2 * c0 * cin) (2 * (c0 + dc) * cin)
+          let bSlice? := bias.map (fun b => b.extract (2 * c0) (2 * (c0 + dc)))
+          let sh_i : ConvSpec := { kernelSize := 1, mode := .dense, h := d.h, w := d.w, cin := cin, cout := dc }
+          let biasInKernel_i := hasEffBias && dc > 1
+          sliceNodes := sliceNodes.push {
+            id := s!"{nd.id}_s{si}"
+            logicalId := nd.id
+            nodeIdx := tIdx
+            origNodeIdx := tIdx
+            inputs := inRefs
+            op := PlannedOp.conv sh_i wSlice bSlice? act lutPayload? biasInKernel_i
+            outDims := { c := dc, h := d.h, w := d.w }
+            groupOutDims := fullOutDims
+            outByteOffset := c0 * outPlaneStride
+            sharedOutGroup := some repIdx
+            isFinalGroup := isLastLogical
+            outPlacement := nd.outPlacement
+            engine := Engine.ne
+            isNeCompute := true
+            usesKernel := true
+            opKind := opLabel
+          }
+        pure (sliceNodes, fullOutDims)
+
+    let (expandedNodes, fullOutDims) : Array ValidatedNode × TensorDims ← match nd.op with
       | .conv1x1 cin cout weights bias act =>
         if inRefs.size != 1 then
           throw s!"node '{nd.id}' (conv1x1): expected 1 input, got {inRefs.size}"
-        let d := inDims[0]!
-        if d.c != cin then
-          throw s!"node '{nd.id}' (conv1x1): input C={d.c} != cin={cin}"
-        let sh : ConvSpec := { kernelSize := 1, mode := .dense, h := d.h, w := d.w, cin := cin, cout := cout }
-        validateConvShape sh
-        let lutPayload? ← match act with
-          | .lut lspec => some <$> buildLutTable lspec
-          | _ => pure none
-        let shiftBits? := lutPayload?.bind (fun lp => lp.inputShiftBits)
-        let scalarBiasMode := sh.effMode == .dense && sh.cout == 1
-        let hasEffBias := bias.isSome || shiftBits?.isSome
-        let biasInKernel := hasEffBias && !scalarBiasMode
-        let od : TensorDims := { c := cout, h := sh.outH, w := sh.outW }
-        pure (PlannedOp.conv sh weights bias act lutPayload? biasInKernel, od, Engine.ne, true, true, "conv1x1")
+        pushExpandedConv1x1 "conv1x1" cin cout weights bias act inDims[0]!
+      | .linear cin cout weights bias act =>
+        if inRefs.size != 1 then
+          throw s!"node '{nd.id}' (linear): expected 1 input, got {inRefs.size}"
+        pushExpandedConv1x1 "linear" cin cout weights bias act inDims[0]!
       | .conv3x3 mode cin cout stride padding weights bias act =>
         if inRefs.size != 1 then
           throw s!"node '{nd.id}' (conv3x3): expected 1 input, got {inRefs.size}"
@@ -735,7 +821,15 @@ private def validateGraph (spec : GraphSpec) :
         let hasEffBias := bias.isSome || shiftBits?.isSome
         let biasInKernel := hasEffBias && !scalarBiasMode
         let od : TensorDims := { c := cout, h := sh.outH, w := sh.outW }
-        pure (PlannedOp.conv sh weights bias act lutPayload? biasInKernel, od, Engine.ne, true, true, "conv3x3")
+        if repIdx >= 255 then
+          throw s!"node '{nd.id}' (taskId={repIdx}) uses __KERN_0, which requires taskId < 255"
+        pure (#[{
+          id := nd.id, logicalId := nd.id, nodeIdx := repIdx, origNodeIdx := repIdx,
+          inputs := inRefs, op := PlannedOp.conv sh weights bias act lutPayload? biasInKernel,
+          outDims := od, groupOutDims := od, outByteOffset := 0, sharedOutGroup := none,
+          isFinalGroup := isLastLogical, outPlacement := nd.outPlacement,
+          engine := Engine.ne, isNeCompute := true, usesKernel := true, opKind := "conv3x3"
+        }], od)
       | .pe1 op =>
         if inRefs.size != 1 then
           throw s!"node '{nd.id}' (pe1): expected 1 input, got {inRefs.size}"
@@ -746,7 +840,13 @@ private def validateGraph (spec : GraphSpec) :
             throw s!"node '{nd.id}' (pe1): PE chain requires at least one of inScale, bias, or scale"
         let d := inDims[0]!
         validateTensorDims d s!"node '{nd.id}'"
-        pure (PlannedOp.pe1 op d, d, Engine.pe, false, false, s!"pe_{op.opName}")
+        pure (#[{
+          id := nd.id, logicalId := nd.id, nodeIdx := repIdx, origNodeIdx := repIdx,
+          inputs := inRefs, op := PlannedOp.pe1 op d,
+          outDims := d, groupOutDims := d, outByteOffset := 0, sharedOutGroup := none,
+          isFinalGroup := isLastLogical, outPlacement := nd.outPlacement,
+          engine := Engine.pe, isNeCompute := false, usesKernel := false, opKind := s!"pe_{op.opName}"
+        }], d)
       | .pe2 binOp rev =>
         if inRefs.size != 2 then
           throw s!"node '{nd.id}' (pe2): expected 2 inputs, got {inRefs.size}"
@@ -755,7 +855,13 @@ private def validateGraph (spec : GraphSpec) :
         let od ← broadcastDims d1 d2
         let (hw1, hw2, r1, r2) := if rev then (d2, d1, inRefs[1]!, inRefs[0]!) else (d1, d2, inRefs[0]!, inRefs[1]!)
         let lbl := if rev && binOp == .sub then "pe_rsub" else s!"pe_{binOp.name}"
-        pure (PlannedOp.pe2 binOp rev od hw1 hw2 r1 r2, od, Engine.pe, false, false, lbl)
+        pure (#[{
+          id := nd.id, logicalId := nd.id, nodeIdx := repIdx, origNodeIdx := repIdx,
+          inputs := inRefs, op := PlannedOp.pe2 binOp rev od hw1 hw2 r1 r2,
+          outDims := od, groupOutDims := od, outByteOffset := 0, sharedOutGroup := none,
+          isFinalGroup := isLastLogical, outPlacement := nd.outPlacement,
+          engine := Engine.pe, isNeCompute := false, usesKernel := false, opKind := lbl
+        }], od)
       | .lut act =>
         if inRefs.size != 1 then
           throw s!"node '{nd.id}' (lut): expected 1 input, got {inRefs.size}"
@@ -765,7 +871,15 @@ private def validateGraph (spec : GraphSpec) :
           | .lut lspec => some <$> buildLutTable lspec
           | _ => pure none
         let isLut := lutPayload?.isSome
-        pure (PlannedOp.lut act d lutPayload?, d, Engine.ne, isLut, isLut, s!"lut_{act.name}")
+        if isLut && repIdx >= 255 then
+          throw s!"node '{nd.id}' (taskId={repIdx}) uses __KERN_0, which requires taskId < 255"
+        pure (#[{
+          id := nd.id, logicalId := nd.id, nodeIdx := repIdx, origNodeIdx := repIdx,
+          inputs := inRefs, op := PlannedOp.lut act d lutPayload?,
+          outDims := d, groupOutDims := d, outByteOffset := 0, sharedOutGroup := none,
+          isFinalGroup := isLastLogical, outPlacement := nd.outPlacement,
+          engine := Engine.ne, isNeCompute := isLut, usesKernel := isLut, opKind := s!"lut_{act.name}"
+        }], d)
       | .pool op kh kw sh sw pad excl =>
         if inRefs.size != 1 then
           throw s!"node '{nd.id}' ({op.opName}): expected 1 input, got {inRefs.size}"
@@ -775,15 +889,19 @@ private def validateGraph (spec : GraphSpec) :
         }
         let (backend, gh, gw) ← resolvePoolBackend pspec
         let od : TensorDims := { c := d.c, h := gh.out, w := gw.out }
-        match backend with
-        | .pePool =>
-          pure (PlannedOp.pePool op excl d gh gw, od, Engine.pe, false, false, op.opName)
-        | .nePool =>
-          pure (PlannedOp.nePool op d gh gw, od, Engine.ne, false, false, op.opName)
-        | .peReduceGlobal =>
-          let redOp : ReduceOp := match op with | .max => .max | .avg => .mean
-          let axes : ReduceAxes := { reduceH := true, reduceW := true }
-          pure (PlannedOp.peReduce redOp axes 0 d, od, Engine.pe, false, false, op.opName)
+        let (pop, eng) := match backend with
+          | .pePool => (PlannedOp.pePool op excl d gh gw, Engine.pe)
+          | .nePool => (PlannedOp.nePool op d gh gw, Engine.ne)
+          | .peReduceGlobal =>
+            let redOp : ReduceOp := match op with | .max => .max | .avg => .mean
+            (PlannedOp.peReduce redOp { reduceH := true, reduceW := true } 0 d, Engine.pe)
+        pure (#[{
+          id := nd.id, logicalId := nd.id, nodeIdx := repIdx, origNodeIdx := repIdx,
+          inputs := inRefs, op := pop,
+          outDims := od, groupOutDims := od, outByteOffset := 0, sharedOutGroup := none,
+          isFinalGroup := isLastLogical, outPlacement := nd.outPlacement,
+          engine := eng, isNeCompute := false, usesKernel := false, opKind := op.opName
+        }], od)
       | .reduce op axes eps =>
         if inRefs.size != 1 then
           throw s!"node '{nd.id}' (reduce_{op.name}): expected 1 input, got {inRefs.size}"
@@ -792,31 +910,112 @@ private def validateGraph (spec : GraphSpec) :
           target := spec.target, op := op, dims := d, axes := axes, eps := eps
         }
         let (backend, od) ← resolveReduceBackend rspec
-        match backend with
-        | .peReduce =>
-          pure (PlannedOp.peReduce op axes eps d, od, Engine.pe, false, false, s!"reduce_{op.name}")
-        | .neChannelReduce =>
-          pure (PlannedOp.neChannelReduce op d, od, Engine.ne, false, false, s!"reduce_{op.name}")
+        let (pop, eng) := match backend with
+          | .peReduce => (PlannedOp.peReduce op axes eps d, Engine.pe)
+          | .neChannelReduce => (PlannedOp.neChannelReduce op d, Engine.ne)
+        pure (#[{
+          id := nd.id, logicalId := nd.id, nodeIdx := repIdx, origNodeIdx := repIdx,
+          inputs := inRefs, op := pop,
+          outDims := od, groupOutDims := od, outByteOffset := 0, sharedOutGroup := none,
+          isFinalGroup := isLastLogical, outPlacement := nd.outPlacement,
+          engine := eng, isNeCompute := false, usesKernel := false, opKind := s!"reduce_{op.name}"
+        }], od)
+      | .transpose perm =>
+        if inRefs.size != 1 then
+          throw s!"node '{nd.id}' (transpose): expected 1 input, got {inRefs.size}"
+        let d := inDims[0]!
+        let vp ← planTranspose { n := 1, c := d.c, h := d.h, w := d.w } perm
+        if vp.outShape.n != 1 then
+          throw s!"node '{nd.id}' (transpose): graph tensors require output N=1, got N={vp.outShape.n}"
+        let od : TensorDims := { c := vp.outShape.c, h := vp.outShape.h, w := vp.outShape.w }
+        pure (#[{
+          id := nd.id, logicalId := nd.id, nodeIdx := repIdx, origNodeIdx := repIdx,
+          inputs := inRefs, op := PlannedOp.neView vp.copies[0]!,
+          outDims := od, groupOutDims := od, outByteOffset := 0, sharedOutGroup := none,
+          isFinalGroup := isLastLogical, outPlacement := nd.outPlacement,
+          engine := Engine.ne, isNeCompute := false, usesKernel := false, opKind := "transpose"
+        }], od)
+      | .slice beginIdx endIdx step =>
+        if inRefs.size != 1 then
+          throw s!"node '{nd.id}' (slice): expected 1 input, got {inRefs.size}"
+        let d := inDims[0]!
+        let vp ← planSlice { n := 1, c := d.c, h := d.h, w := d.w } beginIdx endIdx step
+        if vp.outShape.n != 1 then
+          throw s!"node '{nd.id}' (slice): graph tensors require output N=1, got N={vp.outShape.n}"
+        let od : TensorDims := { c := vp.outShape.c, h := vp.outShape.h, w := vp.outShape.w }
+        pure (#[{
+          id := nd.id, logicalId := nd.id, nodeIdx := repIdx, origNodeIdx := repIdx,
+          inputs := inRefs, op := PlannedOp.neView vp.copies[0]!,
+          outDims := od, groupOutDims := od, outByteOffset := 0, sharedOutGroup := none,
+          isFinalGroup := isLastLogical, outPlacement := nd.outPlacement,
+          engine := Engine.ne, isNeCompute := false, usesKernel := false, opKind := "slice"
+        }], od)
+      | .reshape targetDims =>
+        if inRefs.size != 1 then
+          throw s!"node '{nd.id}' (reshape): expected 1 input, got {inRefs.size}"
+        let d := inDims[0]!
+        let vp ← planReshape { n := 1, c := d.c, h := d.h, w := d.w }
+          { n := 1, c := targetDims.c, h := targetDims.h, w := targetDims.w }
+        let od : TensorDims := { c := vp.outShape.c, h := vp.outShape.h, w := vp.outShape.w }
+        pure (#[{
+          id := nd.id, logicalId := nd.id, nodeIdx := repIdx, origNodeIdx := repIdx,
+          inputs := inRefs, op := PlannedOp.neView vp.copies[0]!,
+          outDims := od, groupOutDims := od, outByteOffset := 0, sharedOutGroup := none,
+          isFinalGroup := isLastLogical, outPlacement := nd.outPlacement,
+          engine := Engine.ne, isNeCompute := false, usesKernel := false, opKind := "reshape"
+        }], od)
+      | .concat axis =>
+        if inRefs.size < 2 then
+          throw s!"node '{nd.id}' (concat): expected >= 2 inputs, got {inRefs.size}"
+        let inShapes4 : Array Shape4D := inDims.map fun d => { n := 1, c := d.c, h := d.h, w := d.w }
+        let vp ← planConcat inShapes4 axis
+        let fullOd : TensorDims := { c := vp.outShape.c, h := vp.outShape.h, w := vp.outShape.w }
+        let mut concatNodes : Array ValidatedNode := Array.mkEmpty vp.copies.size
+        for ci in [:vp.copies.size] do
+          let cp := vp.copies[ci]!
+          let tIdx := repIdx + ci
+          let sliceD := inDims[ci]!
+          concatNodes := concatNodes.push {
+            id := s!"{nd.id}_c{ci}"
+            logicalId := nd.id
+            nodeIdx := tIdx
+            origNodeIdx := tIdx
+            inputs := #[inRefs[ci]!]
+            op := PlannedOp.neView cp
+            outDims := sliceD
+            groupOutDims := fullOd
+            outByteOffset := cp.outOff
+            sharedOutGroup := some repIdx
+            isFinalGroup := isLastLogical
+            outPlacement := nd.outPlacement
+            engine := Engine.ne
+            isNeCompute := false
+            usesKernel := false
+            opKind := "concat"
+          }
+        pure (concatNodes, fullOd)
 
-    vNodes := vNodes.push {
-      id := nd.id
-      nodeIdx := i
-      origNodeIdx := i
-      inputs := inRefs
-      op := plannedOp
-      outDims := outDims
-      outPlacement := nd.outPlacement
-      engine := eng
-      isNeCompute := isNeComp
-      usesKernel := usesKern
-      opKind := opKind
-    }
-    nameMap := nameMap.push (nd.id, .node i, outDims)
+    for en in expandedNodes do
+      let tIdx := vNodes.size
+      for ref in en.inputs do
+        match ref with
+        | .node prodIdx =>
+          lastConsumer := lastConsumer.set! prodIdx (max lastConsumer[prodIdx]! tIdx)
+        | .input _ => pure ()
+      vNodes := vNodes.push en
+      lastConsumer := lastConsumer.push 0
 
-  -- Ensure every non-final intermediate node is consumed at least once
-  for i in [:spec.nodes.size - 1] do
-    if lastConsumer[i]! <= i then
-      throw s!"intermediate node '{vNodes[i]!.id}' (task {i}) is never consumed by any later node"
+    let endIdx := vNodes.size - 1
+    logicalReps := logicalReps.push (repIdx, endIdx, isLastLogical)
+    nameMap := nameMap.push (nd.id, .node repIdx, fullOutDims)
+
+  if vNodes.size > 256 then
+    throw s!"expanded graph has {vNodes.size} tasks, exceeding hardware limit 256"
+
+  -- Ensure every non-final logical node is consumed at least once
+  for (repIdx, endIdx, isFinal) in logicalReps do
+    if !isFinal && lastConsumer[repIdx]! <= endIdx then
+      throw s!"intermediate node '{vNodes[repIdx]!.logicalId}' (task {repIdx}) is never consumed by any later node"
 
   pure (shortNames, vNodes, lastConsumer)
 
@@ -826,6 +1025,10 @@ private def validateGraph (spec : GraphSpec) :
 
 private def isNodeL2Eligible (vNodes : Array ValidatedNode) (i : Nat) : Bool := Id.run do
   let nd := vNodes[i]!
+  if nd.sharedOutGroup.isSome then
+    return false
+  if let .neView _ := nd.op then
+    return false
   if l2ResidentBytes nd.outDims >= l2CapacityBytes then
     return false
   for j in [i + 1 : vNodes.size] do
@@ -837,6 +1040,9 @@ private def isNodeL2Eligible (vNodes : Array ValidatedNode) (i : Nat) : Bool := 
           return false
     | .pePool _ _ inDims gh _ | .nePool _ inDims gh _ =>
       if cons.inputs[0]! == .node i && gh.used != inDims.h then
+        return false
+    | .neView _ =>
+      if cons.inputs.any (fun r => r == .node i) then
         return false
     | _ => pure ()
   return true
@@ -887,6 +1093,8 @@ private def tryPlanAllTasks
       | .neChannelReduce _ dims =>
         let srcIsL2 := isNodeL2 nd.inputs[0]!
         TaskPlanKind.neChannelReduce <$> chooseNeChannelReduceTilingForL2 target dims srcIsL2 resIsL2 liveRanges
+      | .neView cp =>
+        TaskPlanKind.neView <$> chooseViewTaskPlan target cp liveRanges
     match planRes with
     | .ok p =>
       peakL2 := max peakL2 p.l2Peak
@@ -1093,14 +1301,16 @@ private def buildPreLoweredTasks
           else cp.tiling.tileHeight * resRowStrideConv sh cp.tiling
         l2Accs := l2Accs.push { lo := cp.resStageBase, hi := cp.resStageBase + sz, isWrite := true, role := .resStage }
         let span := dramSpanBytes nd.outDims
-        dramAccs := dramAccs.push { resource := .scratch, lo := off, hi := off + span, isWrite := true, port := .resDma }
+        let actOff := off + nd.outByteOffset
+        dramAccs := dramAccs.push { resource := .scratch, lo := actOff, hi := actOff + span, isWrite := true, port := .resDma }
       | .surface _ _ =>
         let sz :=
           if cp.direct then ((1 : Nat) <<< (cp.tiling.f + effOcgConv sh cp.tiling + cp.tiling.fat)) * 512
           else cp.tiling.tileHeight * resRowStrideConv sh cp.tiling
         l2Accs := l2Accs.push { lo := cp.resStageBase, hi := cp.resStageBase + sz, isWrite := true, role := .resStage }
         let (baseOff, _, _, ext) := surfaceDmaWindow nd.resWin nd.outDims.c nd.outDims.h nd.outDims.w
-        dramAccs := dramAccs.push { resource := .surface outSurfIdx "y", lo := baseOff, hi := baseOff + ext, isWrite := true, port := .resDma }
+        let actOff := baseOff + nd.outByteOffset
+        dramAccs := dramAccs.push { resource := .surface outSurfIdx "y", lo := actOff, hi := actOff + ext, isWrite := true, port := .resDma }
 
     | .pe1 _ dims, .pe pp =>
       let stripW := peStripWidth pp.tiling.k
@@ -1349,6 +1559,39 @@ private def buildPreLoweredTasks
         l2Accs := l2Accs.push { lo := nc.resStageBase, hi := nc.resStageBase + resSz, isWrite := true, role := .resStage }
         dramAccs := dramAccs.push { resource := .surface outSurfIdx "y", lo := 0, hi := dramSpanBytes nd.outDims, isWrite := true, port := .resDma }
 
+    | .neView cp, .neView vp =>
+      let srcSz := viewSrcL2Bytes cp vp.tiling
+      let resSz := viewResL2Bytes spec.target cp vp.tiling
+      l2Accs := l2Accs.push { lo := vp.srcStageBase, hi := vp.srcStageBase + srcSz, isWrite := true, role := .src1Stage }
+      l2Accs := l2Accs.push { lo := vp.resStageBase, hi := vp.resStageBase + resSz, isWrite := true, role := .resStage }
+      let rawInExt := 2 * cp.w + (cp.h - 1) * cp.inRowStride + (cp.c - 1) * cp.inPlaneStride +
+        (cp.d - 1) * cp.inDStride + (cp.n - 1) * cp.inNStride
+      match src1Loc with
+      | .dram off _ =>
+        let actInOff := off + cp.inOff
+        let actInEnd := alignUp (actInOff + rawInExt) dmaLineBytes
+        dramAccs := dramAccs.push { resource := .scratch, lo := actInOff, hi := actInEnd, isWrite := false, port := .src1Dma }
+      | .surface idx _ =>
+        let actInOff := cp.inOff
+        let actInEnd := alignUp (actInOff + rawInExt) dmaLineBytes
+        dramAccs := dramAccs.push { resource := .surface idx shortNames[idx]!, lo := actInOff, hi := actInEnd, isWrite := false, port := .src1Dma }
+      | .l2 _ _ =>
+        throw s!"internal error: neView node '{nd.id}' received L2-resident input"
+      let (rw, rch) := if cp.transposeCW then (cp.c, cp.w) else (cp.w, cp.c)
+      let rawOutExt := 2 * rw + (cp.h - 1) * cp.outRowStride + (rch - 1) * cp.outPlaneStride +
+        (cp.d - 1) * cp.outDStride + (cp.n - 1) * cp.outNStride
+      match resLoc with
+      | .dram off _ =>
+        let actOutOff := off + cp.outOff
+        let actOutEnd := alignUp (actOutOff + rawOutExt) dmaLineBytes
+        dramAccs := dramAccs.push { resource := .scratch, lo := actOutOff, hi := actOutEnd, isWrite := true, port := .resDma }
+      | .surface _ _ =>
+        let actOutOff := cp.outOff
+        let actOutEnd := alignUp (actOutOff + rawOutExt) dmaLineBytes
+        dramAccs := dramAccs.push { resource := .surface outSurfIdx "y", lo := actOutOff, hi := actOutEnd, isWrite := true, port := .resDma }
+      | .l2 _ _ =>
+        throw s!"internal error: neView node '{nd.id}' received L2-resident output"
+
     | _, _ =>
       throw s!"internal error: op/plan mismatch on node '{nd.id}'"
 
@@ -1389,6 +1632,7 @@ private def latestEngineBefore (pre : Array PreLoweredTask) (eng : Engine) (i : 
 private def isMultiBatchOp (op : PlannedOp) : Bool :=
   match op with
   | .peReduce _ axes _ dims => (peReduceAxes dims.c dims.h axes.reduceC axes.reduceH).sN > 1
+  | .neView cp => cp.n > 1
   | _ => false
 
 private def latestScratchWriterBefore (pre : Array PreLoweredTask) (i lo hi : Nat) : Option Nat := Id.run do
@@ -1398,6 +1642,25 @@ private def latestScratchWriterBefore (pre : Array PreLoweredTask) (i lo hi : Na
       if a.resource == .scratch && a.isWrite && intervalsOverlap a.lo a.hi lo hi then
         latestW? := some j
   return latestW?
+
+private def anyActiveMultiBatchScratchWriterBefore (pre : Array PreLoweredTask) (i lo hi : Nat) : Bool := Id.run do
+  let mut writers : Array (Nat × Nat × Nat) := #[]
+  for j in [:i] do
+    for a in pre[j]!.dramAccesses do
+      if a.resource == .scratch && a.isWrite && intervalsOverlap a.lo a.hi lo hi then
+        writers := writers.push (j, a.lo, a.hi)
+  for idx in [:writers.size] do
+    let (j, alo, ahi) := writers[idx]!
+    if isMultiBatchOp pre[j]!.node.op then
+      let ovLo := max alo lo
+      let ovHi := min ahi hi
+      let mut laterIvs : List (Nat × Nat) := []
+      for idx2 in [idx + 1 : writers.size] do
+        let (_, alo2, ahi2) := writers[idx2]!
+        laterIvs := (alo2, ahi2) :: laterIvs
+      if !intervalsCover laterIvs ovLo ovHi then
+        return true
+  return false
 
 private def computeSynchronization (pre : Array PreLoweredTask) : Array TaskSyncInfo := Id.run do
   let n := pre.size
@@ -1433,7 +1696,7 @@ private def computeSynchronization (pre : Array PreLoweredTask) : Array TaskSync
       for b in pre[i]!.dramAccesses do
         if b.resource == .scratch && !b.isWrite then
           if let some j := latestScratchWriterBefore pre i b.lo b.hi then
-            let depKind := if isMultiBatchOp pre[j]!.node.op then 1 else 2
+            let depKind := if anyActiveMultiBatchScratchWriterBefore pre i b.lo b.hi then 1 else 2
             let dist := min 15 (i - j - 1)
             if b.port == .src1Dma then
               syncs := syncs.set! i { syncs[i]! with src1DepKind := depKind, src1DepDist := dist }
@@ -1463,6 +1726,7 @@ private def computeSynchronization (pre : Array PreLoweredTask) : Array TaskSync
         | .peReduce .. => .peReduce
         | .nePool .. => .nePool
         | .neChannelReduce .. => .neChannelReduce
+        | .neView .. => .neView
         | _ => .peOp
       engine := pre[i.val]!.node.engine
       isNeCompute := pre[i.val]!.node.isNeCompute
@@ -1523,9 +1787,7 @@ private def computeSynchronization (pre : Array PreLoweredTask) : Array TaskSync
                 -- srcReadNE: set 0x4d00 depKind (1 if latest scratch writer has BatchN > 1, else 2), depDist=0 and ensure HB(k, i - 1)
                 let wantDepKind :=
                   if b.resource == .scratch then
-                    match latestScratchWriterBefore pre i b.lo b.hi with
-                    | some lw => if isMultiBatchOp pre[lw]!.node.op then 1 else 2
-                    | none => 2
+                    if anyActiveMultiBatchScratchWriterBefore pre i b.lo b.hi then 1 else 2
                   else 2
                 if syncs[i]!.src1DepKind != wantDepKind || syncs[i]!.src1DepDist != 0 then
                   syncs := syncs.set! i { syncs[i]! with src1DepKind := wantDepKind, src1DepDist := 0 }
@@ -1786,10 +2048,10 @@ private def emitTaskDesc
       let (slot, off, depCode, outRowStride, outPlaneStride) := match loc with
         | .surface _ s =>
           let (bOff, rSt, pSt, _) := surfaceDmaWindow nd.resWin sh.cout ho wo
-          (s, bOff, resDepCode target, rSt, pSt)
+          (s, bOff + nd.outByteOffset, resDepCode target, rSt, pSt)
         | .dram o _ =>
           let rSt := alignUp (2 * wo) dmaLineBytes
-          (barSlotScratch, o, resDepCode target ||| resDepScratchFlags, rSt, ho * rSt)
+          (barSlotScratch, o + nd.outByteOffset, resDepCode target ||| resDepScratchFlags, rSt, ho * rSt)
         | .l2 _ _ => (0, 0, resDepCode target, 0, 0)
       plain := plain ++ #[
         { byteAddr := regResBase, value := ← natToU32Checked cp.resStageBase "resBase" },
@@ -2350,6 +2612,18 @@ private def emitTaskDesc
     buildNeChannelReduceTaskMulti target op dims nc taskId totalTasks
       (toPortLoc pt.src1Loc) (toPortLoc pt.resLoc) sync pt.liveL2Mask
 
+  | .neView cp, .neView vp =>
+    let (inSlot, inBase) ← match pt.src1Loc with
+      | .surface _ slot => pure (slot, 0)
+      | .dram off _ => pure (barSlotScratch, off)
+      | .l2 _ _ => throw s!"internal error: neView node '{nd.id}' cannot use L2-resident input"
+    let (outSlot, outBase, outIsScratch) ← match pt.resLoc with
+      | .surface _ slot => pure (slot, 0, false)
+      | .dram off _ => pure (barSlotScratch, off, true)
+      | .l2 _ _ => throw s!"internal error: neView node '{nd.id}' cannot use L2-resident output"
+    let cp' : ViewCopy := { cp with inOff := inBase + cp.inOff, outOff := outBase + cp.outOff }
+    buildViewTaskMulti target cp' vp taskId totalTasks inSlot outSlot outIsScratch sync pt.liveL2Mask
+
   | _, _ =>
     throw s!"internal error: op/plan mismatch when lowering node '{nd.id}'"
 
@@ -2368,8 +2642,15 @@ private def solveL2Placement
   let mut autoL2 : Array Nat := #[]
   let mut dramIds : Array Nat := #[]
 
-  for i in [:n - 1] do
+  for i in [:n] do
     let nd := vNodes[i]!
+    if nd.isFinalGroup then
+      continue
+    let skipNonRep := match nd.sharedOutGroup with
+      | some rep => i != rep
+      | none => false
+    if skipNonRep then
+      continue
     let effMode := nd.outPlacement.getD defaultPlacement
     let eligible := isNodeL2Eligible vNodes i
     match effMode with
@@ -2377,7 +2658,7 @@ private def solveL2Placement
       dramIds := dramIds.push i
     | .l2 =>
       if !eligible then
-        throw s!"node '{nd.id}': forced L2 placement is ineligible (size >= 2 MiB or broadcast/cropped consumer)"
+        throw s!"node '{nd.id}': forced L2 placement is ineligible (size >= 2 MiB, view/shared-output op, or broadcast/cropped consumer)"
       pinnedL2 := pinnedL2.push i
     | .auto =>
       if eligible then
@@ -2518,6 +2799,8 @@ private def checkStripEligible
 
   let mut radii : Array Nat := Array.mkEmpty m
   for nd in vNodes do
+    if nd.sharedOutGroup.isSome then
+      throw s!"spatial strip fusion ineligible: node '{nd.logicalId}' uses multi-task shared output"
     let rad ← match nd.op with
       | .conv sh _ _ _ _ _ =>
         if sh.kernelSize == 1 then
@@ -2547,6 +2830,8 @@ private def checkStripEligible
         throw s!"spatial strip fusion ineligible: node '{nd.id}' pool operation is not supported by spatial H-strip fusion"
       | .peReduce .. | .neChannelReduce .. =>
         throw s!"spatial strip fusion ineligible: node '{nd.id}' reduce operation is not supported by spatial H-strip fusion"
+      | .neView .. =>
+        throw s!"spatial strip fusion ineligible: node '{nd.id}' view operation is not supported by spatial H-strip fusion"
     radii := radii.push rad
 
   -- Probe skip-halo exact interval match on top and interior 1-row bands
@@ -2723,7 +3008,7 @@ private def finishUnstrippedGraph
   let n := vNodes.size
   let dramLiveBufs : List LiveBuf := dramIds.toList.map fun i => {
     id := i
-    bytes := dramScratchBytes vNodes[i]!.outDims
+    bytes := dramScratchBytes vNodes[i]!.groupOutDims
     first := i
     last := lastConsumer[i]!
     priority := lastConsumer[i]! - i
@@ -2735,18 +3020,26 @@ private def finishUnstrippedGraph
   let outBarSlot : UInt8 := barSlotFirstSurface + outSurfIdx.toUInt8
   let mut nodeLocs : Array TensorLocation := Array.mkEmpty n
   for i in [:n] do
-    if i + 1 == n then
+    let nd := vNodes[i]!
+    if nd.isFinalGroup then
       nodeLocs := nodeLocs.push (.surface outSurfIdx outBarSlot)
     else
-      match lookupPlaced placedL2 i with
-      | some pb => nodeLocs := nodeLocs.push (.l2 pb.base pb.bytes)
-      | none =>
-        match lookupPlaced placedDram i with
+      match nd.sharedOutGroup with
+      | some rep =>
+        match lookupPlaced placedDram rep with
         | some pb => nodeLocs := nodeLocs.push (.dram pb.base pb.bytes)
-        | none => throw s!"internal error: node {i} missing from both L2 and DRAM allocations"
+        | none => throw s!"internal error: shared-output group node {i} (rep {rep}) missing from DRAM allocations"
+      | none =>
+        match lookupPlaced placedL2 i with
+        | some pb => nodeLocs := nodeLocs.push (.l2 pb.base pb.bytes)
+        | none =>
+          match lookupPlaced placedDram i with
+          | some pb => nodeLocs := nodeLocs.push (.dram pb.base pb.bytes)
+          | none => throw s!"internal error: node {i} missing from both L2 and DRAM allocations"
 
   let outNode := vNodes[n - 1]!
-  finalizeCompiledGraph spec shortNames outNode.outDims outNode.id vNodes plans placedL2 peakL2 nodeLocs scratchBytes 1 0
+  let outId := if outNode.logicalId.isEmpty then outNode.id else outNode.logicalId
+  finalizeCompiledGraph spec shortNames outNode.groupOutDims outId vNodes plans placedL2 peakL2 nodeLocs scratchBytes 1 0
 
 private def compileStrippedAtHeight
     (spec : GraphSpec) (shortNames : Array String)

@@ -15,6 +15,7 @@ open Vane.Pool
 open Vane.Conv
 open Vane.Conv1x1
 open Vane.Conv3x3
+open Vane.View
 open Vane.Graph
 
 private def usage : String :=
@@ -24,6 +25,8 @@ private def usage : String :=
   "  vane emit-demo --target <h16|h17> --out-dir <dir> [--with-kernel] [--with-scratch]\n" ++
   "  vane compile-conv1x1 --target <h16|h17> --h <H> --w <W> --cin <Cin> --cout <Cout>\n" ++
   "                       --weights <path> [--bias <path>] [--relu | --act <name> [act params]] --out-dir <dir>\n" ++
+  "  vane compile-linear --target <h16|h17> --m <M> --k <K> --n <N> [--batch <B>]\n" ++
+  "                      --weights <path> [--bias <path>] [--relu | --act <name> [act params]] --out-dir <dir>\n" ++
   "  vane compile-conv3x3 --target <h16|h17> --mode <dense|depthwise>\n" ++
   "                       --h <H> --w <W> --cin <Cin> --cout <Cout>\n" ++
   "                       --stride <1|2> --pad <same|valid>\n" ++
@@ -41,6 +44,7 @@ private def usage : String :=
   "                    [--pt N --pb N --pl N --pr N] [--exclude-pad <true|false>] --out-dir <dir>\n" ++
   "  vane compile-reduce --target <h16|h17> --op <sum|mean|max|min|l1|sum_square|l2|inv_sum|rsqrt_sum_square|rsqrt_mean_square>\n" ++
   "                      --h <H> --w <W> --c <C> --axes <w|h|c|hw|cw|ch|chw> [--eps F] --out-dir <dir>\n" ++
+  "  vane compile-view --target <h16|h17> --op <transpose|slice|concat|split|reshape> [op flags] --out-dir <dir>\n" ++
   "  vane compile-graph --spec <graph.json> [--strip-height <off|auto|N>] --out-dir <dir>\n"
 
 private def requireArgValue (flag : String) (rest : List String) : Except String (String × List String) :=
@@ -240,14 +244,17 @@ private def renderManifestJson (info : HwxInfo) (secs : LoadSections) : String :
   "  ]\n" ++
   "}\n"
 
-private def renderConv1x1ManifestJson (compiled : CompiledConv1x1) : String :=
+private def formatNatListJson (xs : Array Nat) : String :=
+  "[" ++ String.intercalate ", " (xs.toList.map toString) ++ "]"
+
+private def renderConv1x1ManifestJson (compiled : CompiledConv1x1) (opLabel : String := "conv1x1") : String :=
   let info := compiled.info
   let secs := compiled.sections
   let sh := compiled.shape
   let t := compiled.tiling
   let lutLine := if compiled.lutBytes.isSome then "  \"lut_file\": \"lut.bin\",\n" else ""
   "{\n" ++
-  "  \"op\": \"conv1x1\",\n" ++
+  s!"  \"op\": \"{escapeJsonString opLabel}\",\n" ++
   s!"  \"target\": \"{compiled.target.name}\",\n" ++
   "  \"hwx\": \"program.hwx\",\n" ++
   "  \"sections\": {\n" ++
@@ -262,6 +269,7 @@ private def renderConv1x1ManifestJson (compiled : CompiledConv1x1) : String :=
   s!"    \"cin\": {sh.cin},\n" ++
   s!"    \"cout\": {sh.cout}\n" ++
   "  },\n" ++
+  s!"  \"slices\": {formatNatListJson compiled.slices},\n" ++
   s!"  \"has_bias\": {if compiled.hasBias then "true" else "false"},\n" ++
   s!"  \"relu\": {if compiled.relu then "true" else "false"},\n" ++
   s!"  \"activation\": \"{escapeJsonString compiled.activation.name}\",\n" ++
@@ -281,6 +289,39 @@ private def renderConv1x1ManifestJson (compiled : CompiledConv1x1) : String :=
   s!"  \"direct\": {if compiled.direct then "true" else "false"},\n" ++
   s!"  \"l2_use_bytes\": {compiled.l2UseBytes},\n" ++
   s!"  \"kernel_bytes\": {compiled.kernelBytes},\n" ++
+  s!"  \"task_count\": {info.taskStream.taskCount},\n" ++
+  s!"  \"record_count\": {info.records},\n" ++
+  s!"  \"relocation_count\": {info.relocCount},\n" ++
+  s!"  \"has_kernel\": {if info.kernelSection.isSome then "true" else "false"},\n" ++
+  s!"  \"has_scratch\": {if info.scratchSection.isSome then "true" else "false"},\n" ++
+  "  \"surfaces\": [\n" ++
+  renderSurfacesJson info.surfaces ++ "\n" ++
+  "  ]\n" ++
+  "}\n"
+
+private def renderViewManifestJson (compiled : CompiledView) : String :=
+  let info := compiled.info
+  let secs := compiled.sections
+  let pl := compiled.plan
+  let outS := pl.outShape
+  let copyItems := pl.copies.toList.map fun cp =>
+    s!"    \{\"n\": {cp.n}, \"c\": {cp.c}, \"h\": {cp.h}, \"w\": {cp.w}, \"in_off\": {cp.inOff}, \"out_off\": {cp.outOff}, \"transpose_cw\": {if cp.transposeCW then "true" else "false"}}"
+  "{\n" ++
+  "  \"op\": \"view\",\n" ++
+  s!"  \"view_op\": \"{escapeJsonString pl.opName}\",\n" ++
+  s!"  \"target\": \"{compiled.target.name}\",\n" ++
+  "  \"hwx\": \"program.hwx\",\n" ++
+  "  \"sections\": {\n" ++
+  "    \"generic\": {\"file\": \"generic.bin\", \"size\": " ++ toString secs.generic.size ++ "},\n" ++
+  "    \"operation\": {\"file\": \"operation.bin\", \"size\": " ++ toString secs.operation.size ++ "},\n" ++
+  "    \"procedure\": {\"file\": \"procedure.bin\", \"size\": " ++ toString secs.procedure.size ++ "},\n" ++
+  "    \"text_properties\": {\"file\": \"text-properties.bin\", \"size\": " ++ toString secs.textProperties.size ++ "}\n" ++
+  "  },\n" ++
+  s!"  \"out_shape\": [{outS.n}, {outS.c}, {outS.h}, {outS.w}],\n" ++
+  "  \"copies\": [\n" ++
+  String.intercalate ",\n" copyItems ++ "\n" ++
+  "  ],\n" ++
+  s!"  \"l2_peak_bytes\": {compiled.l2PeakBytes},\n" ++
   s!"  \"task_count\": {info.taskStream.taskCount},\n" ++
   s!"  \"record_count\": {info.records},\n" ++
   s!"  \"relocation_count\": {info.relocCount},\n" ++
@@ -507,7 +548,7 @@ private def cmdValidate (args : List String) : IO UInt32 := do
   IO.println s!"surfaces ({info.surfaces.size}): {String.intercalate ", " surfDesc}"
   IO.println s!"tasks: {info.taskStream.taskCount} (records={info.records}, text={info.textSection.size}B, relocs={info.relocCount})"
   if summary.total > 0 then
-    IO.println s!"verified_tasks: {summary.total} (conv={summary.neConv}, ne_act={summary.neAct}, pe={summary.peOp}, pe_pool={summary.pePool}, pe_reduce={summary.peReduce}, ne_pool={summary.nePool}, ne_chan_reduce={summary.neChannelReduce})"
+    IO.println s!"verified_tasks: {summary.total} (conv={summary.neConv}, ne_act={summary.neAct}, pe={summary.peOp}, pe_pool={summary.pePool}, pe_reduce={summary.peReduce}, ne_pool={summary.nePool}, ne_chan_reduce={summary.neChannelReduce}, ne_view={summary.neView})"
     if summary.neConv > 0 then
       IO.println s!"verified_conv_tasks: {summary.neConv}"
   IO.println s!"bar_refs: {formatBarSlots info.taskStream.barSlots}"
@@ -808,11 +849,186 @@ private def cmdCompileConv1x1 (args : List String) : IO UInt32 := do
     return 1
 
   let t := compiled.tiling
+  let splitSuffix :=
+    if compiled.slices.size > 1 then s!" slices={formatNatListJson compiled.slices}" else ""
   IO.println (
     s!"compiled {target.name} conv1x1 ({shape.h}x{shape.w}, {shape.cin}->{shape.cout}, " ++
     s!"bias={compiled.hasBias}, act={compiled.activation.name}) to {dirStr}: " ++
     s!"hwx={compiled.hwx.size}B kernel={compiled.kernelBytes}B l2={compiled.l2UseBytes}B " ++
-    s!"direct={compiled.direct} tiling=(logNE={t.logNE},F={t.f},fat={t.fat},ocg={t.ocg},WU={t.wu},sh={t.shPref}..{t.shMax},TH={t.tileHeight})"
+    s!"direct={compiled.direct}{splitSuffix} tiling=(logNE={t.logNE},F={t.f},fat={t.fat},ocg={t.ocg},WU={t.wu},sh={t.shPref}..{t.shMax},TH={t.tileHeight})"
+  )
+  return 0
+
+private def cmdCompileLinear (args : List String) : IO UInt32 := do
+  let mut targetStr : Option String := none
+  let mut mStr : Option String := none
+  let mut kStr : Option String := none
+  let mut nStr : Option String := none
+  let mut batchStr : Option String := none
+  let mut weightsPath : Option String := none
+  let mut biasPath : Option String := none
+  let mut relu := false
+  let mut actStr : Option String := none
+  let mut actParams : ActParamFlags := {}
+  let mut outDir : Option String := none
+  let mut rest := args
+
+  while !rest.isEmpty do
+    match rest with
+    | "--target" :: tl =>
+      match requireArgValue "--target" tl with
+      | .ok (v, tl') => targetStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--m" :: tl =>
+      match requireArgValue "--m" tl with
+      | .ok (v, tl') => mStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--k" :: tl =>
+      match requireArgValue "--k" tl with
+      | .ok (v, tl') => kStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--n" :: tl =>
+      match requireArgValue "--n" tl with
+      | .ok (v, tl') => nStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--batch" :: tl =>
+      match requireArgValue "--batch" tl with
+      | .ok (v, tl') => batchStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--weights" :: tl =>
+      match requireArgValue "--weights" tl with
+      | .ok (v, tl') => weightsPath := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--bias" :: tl =>
+      match requireArgValue "--bias" tl with
+      | .ok (v, tl') => biasPath := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--relu" :: tl =>
+      relu := true; rest := tl
+    | "--act" :: tl =>
+      match requireArgValue "--act" tl with
+      | .ok (v, tl') => actStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--act-alpha" :: tl =>
+      match requireArgValue "--act-alpha" tl with
+      | .ok (v, tl') =>
+        match parseFloatArg "--act-alpha" v with
+        | .ok f => actParams := { actParams with alpha := some f }; rest := tl'
+        | .error e => IO.eprintln s!"error: {e}"; return 1
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--act-beta" :: tl =>
+      match requireArgValue "--act-beta" tl with
+      | .ok (v, tl') =>
+        match parseFloatArg "--act-beta" v with
+        | .ok f => actParams := { actParams with beta := some f }; rest := tl'
+        | .error e => IO.eprintln s!"error: {e}"; return 1
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--act-lo" :: tl =>
+      match requireArgValue "--act-lo" tl with
+      | .ok (v, tl') =>
+        match parseFloatArg "--act-lo" v with
+        | .ok f => actParams := { actParams with lo := some f }; rest := tl'
+        | .error e => IO.eprintln s!"error: {e}"; return 1
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--act-hi" :: tl =>
+      match requireArgValue "--act-hi" tl with
+      | .ok (v, tl') =>
+        match parseFloatArg "--act-hi" v with
+        | .ok f => actParams := { actParams with hi := some f }; rest := tl'
+        | .error e => IO.eprintln s!"error: {e}"; return 1
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--act-eps" :: tl =>
+      match requireArgValue "--act-eps" tl with
+      | .ok (v, tl') =>
+        match parseFloatArg "--act-eps" v with
+        | .ok f => actParams := { actParams with eps := some f }; rest := tl'
+        | .error e => IO.eprintln s!"error: {e}"; return 1
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--act-scalar" :: tl =>
+      match requireArgValue "--act-scalar" tl with
+      | .ok (v, tl') =>
+        match parseFloatArg "--act-scalar" v with
+        | .ok f => actParams := { actParams with scalar := some f }; rest := tl'
+        | .error e => IO.eprintln s!"error: {e}"; return 1
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--out-dir" :: tl =>
+      match requireArgValue "--out-dir" tl with
+      | .ok (v, tl') => outDir := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | flag :: _ =>
+      IO.eprintln s!"error: unknown argument '{flag}' for compile-linear"
+      IO.eprintln usage
+      return 1
+    | [] => break
+
+  let some tStr := targetStr
+    | do IO.eprintln "error: --target <h16|h17> is required"; return 1
+  let some target := Target.parse? tStr
+    | do IO.eprintln s!"error: unknown target '{tStr}' (expected h16 or h17)"; return 1
+  let some mRaw := mStr
+    | do IO.eprintln "error: --m <M> is required"; return 1
+  let some kRaw := kStr
+    | do IO.eprintln "error: --k <K> is required"; return 1
+  let some nRaw := nStr
+    | do IO.eprintln "error: --n <N> is required"; return 1
+  let some wPath := weightsPath
+    | do IO.eprintln "error: --weights <path> is required"; return 1
+  let some dirStr := outDir
+    | do IO.eprintln "error: --out-dir <dir> is required"; return 1
+
+  let act ← match parseConvAct relu actStr actParams with
+    | .ok a => pure a
+    | .error e => IO.eprintln s!"error: {e}"; return 1
+
+  let (m, k, n, batch) ← match (do
+      let m ← parsePosNat "--m" mRaw
+      let k ← parsePosNat "--k" kRaw
+      let n ← parsePosNat "--n" nRaw
+      let b ← match batchStr with | some s => parsePosNat "--batch" s | none => pure 1
+      pure (m, k, n, b)) with
+    | .ok v => pure v
+    | .error e => IO.eprintln s!"error: {e}"; return 1
+
+  let weightsBytes ← try
+    IO.FS.readBinFile wPath
+  catch e =>
+    IO.eprintln s!"error: failed to read weights '{wPath}': {e}"
+    return 1
+
+  let biasBytes? ← match biasPath with
+    | none => pure none
+    | some bPath =>
+      try some <$> IO.FS.readBinFile bPath
+      catch e =>
+        IO.eprintln s!"error: failed to read bias '{bPath}': {e}"
+        return 1
+
+  let compiled ← match compileLinear target m k n weightsBytes biasBytes? batch false act with
+    | .ok c => pure c
+    | .error e =>
+      IO.eprintln s!"error: compile-linear failed: {e}"
+      return 1
+
+  let manifest := renderConv1x1ManifestJson compiled "linear"
+  let dir := System.FilePath.mk dirStr
+  try
+    IO.FS.createDirAll dir
+    IO.FS.writeBinFile (dir / "program.hwx") compiled.hwx
+    IO.FS.writeBinFile (dir / "generic.bin") compiled.sections.generic
+    IO.FS.writeBinFile (dir / "operation.bin") compiled.sections.operation
+    IO.FS.writeBinFile (dir / "procedure.bin") compiled.sections.procedure
+    IO.FS.writeBinFile (dir / "text-properties.bin") compiled.sections.textProperties
+    if let some lutBs := compiled.lutBytes then
+      IO.FS.writeBinFile (dir / "lut.bin") lutBs
+    IO.FS.writeFile (dir / "manifest.json") manifest
+  catch e =>
+    IO.eprintln s!"error: failed to write compiled outputs to '{dirStr}': {e}"
+    return 1
+
+  IO.println (
+    s!"compiled {target.name} linear (batch={batch}, M={m}, K={k}, N={n}, " ++
+    s!"slices={formatNatListJson compiled.slices}, bias={compiled.hasBias}, act={compiled.activation.name}) to {dirStr}: " ++
+    s!"hwx={compiled.hwx.size}B kernel={compiled.kernelBytes}B l2={compiled.l2UseBytes}B"
   )
   return 0
 
@@ -1695,6 +1911,217 @@ private def cmdCompileReduce (args : List String) : IO UInt32 := do
   )
   return 0
 
+private def parseNatCsv (flag raw : String) (allowZero : Bool := true) : Except String (Array Nat) := do
+  let parts := raw.splitOn ","
+  if parts.isEmpty || (parts.length == 1 && parts[0]!.trimAscii.isEmpty) then
+    throw s!"{flag}: expected comma-separated integers, got '{raw}'"
+  let mut out : Array Nat := Array.mkEmpty parts.length
+  for p in parts do
+    let s := p.trimAscii.toString
+    match s.toNat? with
+    | none => throw s!"{flag}: invalid integer '{s}' in '{raw}'"
+    | some v =>
+      if !allowZero && v == 0 then
+        throw s!"{flag}: value must be >= 1 in '{raw}'"
+      out := out.push v
+  pure out
+
+private def parseViewShapeToken (tok : String) : Except String Shape4D := do
+  let parts := (tok.trimAscii.toString).splitOn "x"
+  if parts.length == 3 then
+    let h ← parsePosNat "--shapes (H)" parts[0]!
+    let w ← parsePosNat "--shapes (W)" parts[1]!
+    let c ← parsePosNat "--shapes (C)" parts[2]!
+    pure { n := 1, c := c, h := h, w := w }
+  else if parts.length == 4 then
+    let n ← parsePosNat "--shapes (N)" parts[0]!
+    let c ← parsePosNat "--shapes (C)" parts[1]!
+    let h ← parsePosNat "--shapes (H)" parts[2]!
+    let w ← parsePosNat "--shapes (W)" parts[3]!
+    pure { n := n, c := c, h := h, w := w }
+  else
+    throw s!"invalid shape '{tok}' (expected HxWxC or NxCxHxW)"
+
+private def cmdCompileView (args : List String) : IO UInt32 := do
+  let mut targetStr : Option String := none
+  let mut opStr : Option String := none
+  let mut nStr : Option String := none
+  let mut cStr : Option String := none
+  let mut hStr : Option String := none
+  let mut wStr : Option String := none
+  let mut permStr : Option String := none
+  let mut beginStr : Option String := none
+  let mut endStr : Option String := none
+  let mut stepStr : Option String := none
+  let mut axisStr : Option String := none
+  let mut shapesStr : Option String := none
+  let mut sizesStr : Option String := none
+  let mut partStr : Option String := none
+  let mut outShapeStr : Option String := none
+  let mut outDir : Option String := none
+  let mut rest := args
+
+  while !rest.isEmpty do
+    match rest with
+    | "--target" :: tl =>
+      match requireArgValue "--target" tl with
+      | .ok (v, tl') => targetStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--op" :: tl =>
+      match requireArgValue "--op" tl with
+      | .ok (v, tl') => opStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--n" :: tl =>
+      match requireArgValue "--n" tl with
+      | .ok (v, tl') => nStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--c" :: tl =>
+      match requireArgValue "--c" tl with
+      | .ok (v, tl') => cStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--h" :: tl =>
+      match requireArgValue "--h" tl with
+      | .ok (v, tl') => hStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--w" :: tl =>
+      match requireArgValue "--w" tl with
+      | .ok (v, tl') => wStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--perm" :: tl =>
+      match requireArgValue "--perm" tl with
+      | .ok (v, tl') => permStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--begin" :: tl =>
+      match requireArgValue "--begin" tl with
+      | .ok (v, tl') => beginStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--end" :: tl =>
+      match requireArgValue "--end" tl with
+      | .ok (v, tl') => endStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--step" :: tl =>
+      match requireArgValue "--step" tl with
+      | .ok (v, tl') => stepStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--axis" :: tl =>
+      match requireArgValue "--axis" tl with
+      | .ok (v, tl') => axisStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--shapes" :: tl =>
+      match requireArgValue "--shapes" tl with
+      | .ok (v, tl') => shapesStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--sizes" :: tl =>
+      match requireArgValue "--sizes" tl with
+      | .ok (v, tl') => sizesStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--part" :: tl =>
+      match requireArgValue "--part" tl with
+      | .ok (v, tl') => partStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--out-shape" :: tl =>
+      match requireArgValue "--out-shape" tl with
+      | .ok (v, tl') => outShapeStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--out-dir" :: tl =>
+      match requireArgValue "--out-dir" tl with
+      | .ok (v, tl') => outDir := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | flag :: _ =>
+      IO.eprintln s!"error: unknown argument '{flag}' for compile-view"
+      IO.eprintln usage
+      return 1
+    | [] => break
+
+  let some tStr := targetStr
+    | do IO.eprintln "error: --target <h16|h17> is required"; return 1
+  let some target := Target.parse? tStr
+    | do IO.eprintln s!"error: unknown target '{tStr}' (expected h16 or h17)"; return 1
+  let some opRaw := opStr
+    | do IO.eprintln "error: --op <transpose|slice|concat|split|reshape> is required"; return 1
+  let some dirStr := outDir
+    | do IO.eprintln "error: --out-dir <dir> is required"; return 1
+
+  let parseInShape := fun () => do
+    let some hRaw := hStr | throw "--h <H> is required"
+    let some wRaw := wStr | throw "--w <W> is required"
+    let some cRaw := cStr | throw "--c <C> is required"
+    let n ← match nStr with | some s => parsePosNat "--n" s | none => pure 1
+    let c ← parsePosNat "--c" cRaw
+    let h ← parsePosNat "--h" hRaw
+    let w ← parsePosNat "--w" wRaw
+    pure ({ n := n, c := c, h := h, w := w } : Shape4D)
+
+  let plan ← match (do
+      match opRaw.toLower with
+      | "transpose" =>
+        let sh ← parseInShape ()
+        let some pRaw := permStr | throw "transpose requires --perm p0,p1,p2,p3"
+        let perm ← parseNatCsv "--perm" pRaw true
+        planTranspose sh perm
+      | "slice" =>
+        let sh ← parseInShape ()
+        let some bRaw := beginStr | throw "slice requires --begin b0,b1,b2,b3"
+        let some eRaw := endStr | throw "slice requires --end e0,e1,e2,e3"
+        let beg ← parseNatCsv "--begin" bRaw true
+        let en ← parseNatCsv "--end" eRaw true
+        let st ← match stepStr with
+          | some sRaw => parseNatCsv "--step" sRaw false
+          | none => pure #[1, 1, 1, 1]
+        planSlice sh beg en st
+      | "concat" =>
+        let some axRaw := axisStr | throw "concat requires --axis <1|2|3>"
+        let ax ← parseNonNegNat "--axis" axRaw
+        let some shRaw := shapesStr | throw "concat requires --shapes H0xW0xC0,H1xW1xC1,..."
+        let toks := shRaw.splitOn ","
+        let mut shs : Array Shape4D := Array.mkEmpty toks.length
+        for tok in toks do
+          shs := shs.push (← parseViewShapeToken tok)
+        planConcat shs ax
+      | "split" =>
+        let sh ← parseInShape ()
+        let some axRaw := axisStr | throw "split requires --axis <1|2|3>"
+        let ax ← parseNonNegNat "--axis" axRaw
+        let some szRaw := sizesStr | throw "split requires --sizes s0,s1,..."
+        let sizes ← parseNatCsv "--sizes" szRaw false
+        let some pRaw := partStr | throw "split requires --part <idx>"
+        let part ← parseNonNegNat "--part" pRaw
+        planSplitPart sh ax sizes part
+      | "reshape" =>
+        let sh ← parseInShape ()
+        let some oRaw := outShapeStr | throw "reshape requires --out-shape No,Co,Ho,Wo"
+        let oArr ← parseNatCsv "--out-shape" oRaw false
+        let oSh ← Shape4D.ofArray oArr
+        planReshape sh oSh
+      | other => throw s!"unknown view op '{other}' (expected transpose, slice, concat, split, or reshape)") with
+    | .ok p => pure p
+    | .error e => IO.eprintln s!"error: {e}"; return 1
+
+  let compiled ← match compileView target plan with
+    | .ok c => pure c
+    | .error e => IO.eprintln s!"error: compile-view failed: {e}"; return 1
+
+  let manifest := renderViewManifestJson compiled
+  let dir := System.FilePath.mk dirStr
+  try
+    IO.FS.createDirAll dir
+    IO.FS.writeBinFile (dir / "program.hwx") compiled.hwx
+    IO.FS.writeBinFile (dir / "generic.bin") compiled.sections.generic
+    IO.FS.writeBinFile (dir / "operation.bin") compiled.sections.operation
+    IO.FS.writeBinFile (dir / "procedure.bin") compiled.sections.procedure
+    IO.FS.writeBinFile (dir / "text-properties.bin") compiled.sections.textProperties
+    IO.FS.writeFile (dir / "manifest.json") manifest
+  catch e =>
+    IO.eprintln s!"error: failed to write view outputs to '{dirStr}': {e}"
+    return 1
+
+  let os := compiled.plan.outShape
+  IO.println (
+    s!"compiled {target.name} view {compiled.plan.opName} (out={os.n}x{os.c}x{os.h}x{os.w}, " ++
+    s!"tasks={compiled.plan.copies.size}) to {dirStr}: hwx={compiled.hwx.size}B l2_peak={compiled.l2PeakBytes}B"
+  )
+  return 0
+
 private def jsonObjField? (j : Json) (key : String) : Option Json :=
   match j.getObjVal? key with
   | .ok v => if v.isNull then none else some v
@@ -1773,6 +2200,22 @@ private def jsonReqStrArray (j : Json) (key ctx : String) : Except String (Array
       | .ok s => out := out.push s
       | .error e => throw s!"{ctx}: element in '{key}' must be a string ({e})"
     pure out
+
+private def jsonReqNatArray (j : Json) (key ctx : String) : Except String (Array Nat) :=
+  match j.getObjValAs? (Array Json) key with
+  | .error e => throw s!"{ctx}: missing or invalid integer array '{key}' ({e})"
+  | .ok arr => do
+    let mut out : Array Nat := Array.mkEmpty arr.size
+    for elem in arr do
+      match elem.getNat? with
+      | .ok v => out := out.push v
+      | .error e => throw s!"{ctx}: element in '{key}' must be a non-negative integer ({e})"
+    pure out
+
+private def jsonOptNatArray (j : Json) (key ctx : String) : Except String (Option (Array Nat)) :=
+  match jsonObjField? j key with
+  | none => pure none
+  | some _ => some <$> jsonReqNatArray j key ctx
 
 private def parseJsonActField (j : Json) (ctx : String) : Except String (Option (String × ActParamFlags)) := do
   match jsonObjField? j "act" with
@@ -1969,13 +2412,19 @@ private def cmdCompileGraph (args : List String) : IO UInt32 := do
       knownShapes.find? (fun (k, _) => k == nm) |>.map Prod.snd
 
     let (nodeOp, inferredDims) ← match ndOpStr with
-      | "conv1x1" =>
+      | "conv1x1" | "linear" =>
+        let isLinear := ndOpStr == "linear"
         let parsed ← match (do
-            if ndInputs.size != 1 then throw s!"{ctx} (conv1x1): expected 1 input"
+            if ndInputs.size != 1 then throw s!"{ctx} ({ndOpStr}): expected 1 input"
             let some inDims := lookupShape ndInputs[0]!
-              | throw s!"{ctx} (conv1x1): unknown input '{ndInputs[0]!}'"
-            let cin := (← jsonOptPosNat nj "cin" ctx).getD inDims.c
-            let cout ← jsonReqPosNat nj "cout" ctx
+              | throw s!"{ctx} ({ndOpStr}): unknown input '{ndInputs[0]!}'"
+            let cin := (← jsonOptPosNat nj "cin" ctx).orElse (fun () => (jsonOptPosNat nj "k" ctx).toOption.join) |>.getD inDims.c
+            let cout ← match ← jsonOptPosNat nj "cout" ctx with
+              | some v => pure v
+              | none =>
+                match ← jsonOptPosNat nj "n" ctx with
+                | some v => pure v
+                | none => throw s!"{ctx} ({ndOpStr}): missing required field 'cout' (or 'n')"
             let wRel ← jsonReqStr nj "weights" ctx
             let bRel? ← jsonOptStr nj "bias" ctx
             let reluFlag ← jsonOptBool nj "relu" ctx
@@ -1996,7 +2445,9 @@ private def cmdCompileGraph (args : List String) : IO UInt32 := do
             let bPath := resolveSpecRelPath specDir bRel
             try some <$> IO.FS.readBinFile bPath catch e =>
               IO.eprintln s!"error: {ctx}: failed to read bias '{bPath}': {e}"; return 1
-        pure (NodeOp.conv1x1 cin cout weightsBytes biasBytes? act, outDims)
+        let op := if isLinear then NodeOp.linear cin cout weightsBytes biasBytes? act
+                  else NodeOp.conv1x1 cin cout weightsBytes biasBytes? act
+        pure (op, outDims)
 
       | "conv3x3" =>
         let parsed ← match (do
@@ -2181,8 +2632,77 @@ private def cmdCompileGraph (args : List String) : IO UInt32 := do
           | .error e => IO.eprintln s!"error: {e}"; return 1
         pure parsed
 
+      | "transpose" =>
+        let parsed ← match (do
+            if ndInputs.size != 1 then throw s!"{ctx} (transpose): expected 1 input"
+            let some inDims := lookupShape ndInputs[0]!
+              | throw s!"{ctx}: unknown input '{ndInputs[0]!}'"
+            let perm ← jsonReqNatArray nj "perm" ctx
+            let vp ← planTranspose { n := 1, c := inDims.c, h := inDims.h, w := inDims.w } perm
+            if vp.outShape.n != 1 then
+              throw s!"{ctx} (transpose): graph output requires N=1, got {vp.outShape.n}"
+            pure (NodeOp.transpose perm, { c := vp.outShape.c, h := vp.outShape.h, w := vp.outShape.w : TensorDims })) with
+          | .ok v => pure v
+          | .error e => IO.eprintln s!"error: {e}"; return 1
+        pure parsed
+
+      | "slice" =>
+        let parsed ← match (do
+            if ndInputs.size != 1 then throw s!"{ctx} (slice): expected 1 input"
+            let some inDims := lookupShape ndInputs[0]!
+              | throw s!"{ctx}: unknown input '{ndInputs[0]!}'"
+            let beg ← jsonReqNatArray nj "begin" ctx
+            let en ← jsonReqNatArray nj "end" ctx
+            let st := (← jsonOptNatArray nj "step" ctx).getD #[1, 1, 1, 1]
+            let vp ← planSlice { n := 1, c := inDims.c, h := inDims.h, w := inDims.w } beg en st
+            if vp.outShape.n != 1 then
+              throw s!"{ctx} (slice): graph output requires N=1, got {vp.outShape.n}"
+            pure (NodeOp.slice beg en st, { c := vp.outShape.c, h := vp.outShape.h, w := vp.outShape.w : TensorDims })) with
+          | .ok v => pure v
+          | .error e => IO.eprintln s!"error: {e}"; return 1
+        pure parsed
+
+      | "concat" =>
+        let parsed ← match (do
+            if ndInputs.size < 2 then throw s!"{ctx} (concat): expected >= 2 inputs"
+            let ax ← match ← jsonOptNat nj "axis" ctx with
+              | some v => pure v
+              | none => throw s!"{ctx} (concat): missing required field 'axis'"
+            let mut inShapes4 : Array Shape4D := Array.mkEmpty ndInputs.size
+            for inpNm in ndInputs do
+              let some d := lookupShape inpNm
+                | throw s!"{ctx} (concat): unknown input '{inpNm}'"
+              inShapes4 := inShapes4.push { n := 1, c := d.c, h := d.h, w := d.w }
+            let vp ← planConcat inShapes4 ax
+            pure (NodeOp.concat ax, { c := vp.outShape.c, h := vp.outShape.h, w := vp.outShape.w : TensorDims })) with
+          | .ok v => pure v
+          | .error e => IO.eprintln s!"error: {e}"; return 1
+        pure parsed
+
+      | "reshape" =>
+        let parsed ← match (do
+            if ndInputs.size != 1 then throw s!"{ctx} (reshape): expected 1 input"
+            let some inDims := lookupShape ndInputs[0]!
+              | throw s!"{ctx}: unknown input '{ndInputs[0]!}'"
+            let oArr ← jsonReqNatArray nj "out_shape" ctx
+            let targetDims : TensorDims ←
+              if oArr.size == 4 then
+                if oArr[0]! != 1 then
+                  throw s!"{ctx} (reshape): graph output requires N=1, got {oArr[0]!}"
+                pure { c := oArr[1]!, h := oArr[2]!, w := oArr[3]! }
+              else if oArr.size == 3 then
+                pure { c := oArr[0]!, h := oArr[1]!, w := oArr[2]! }
+              else
+                throw s!"{ctx} (reshape): out_shape must have length 4 ([1,C,H,W]) or 3 ([C,H,W]), got {oArr.size}"
+            let vp ← planReshape { n := 1, c := inDims.c, h := inDims.h, w := inDims.w }
+              { n := 1, c := targetDims.c, h := targetDims.h, w := targetDims.w }
+            pure (NodeOp.reshape targetDims, { c := vp.outShape.c, h := vp.outShape.h, w := vp.outShape.w : TensorDims })) with
+          | .ok v => pure v
+          | .error e => IO.eprintln s!"error: {e}"; return 1
+        pure parsed
+
       | other =>
-        IO.eprintln s!"error: {ctx}: unsupported node op '{other}' (expected conv1x1, conv3x3, pe, lut, max_pool, avg_pool, or reduce)"
+        IO.eprintln s!"error: {ctx}: unsupported node op '{other}' (expected conv1x1, linear, conv3x3, pe, lut, max_pool, avg_pool, reduce, transpose, slice, concat, or reshape)"
         return 1
 
     graphNodes := graphNodes.push {
@@ -2236,11 +2756,13 @@ def main (args : List String) : IO UInt32 := do
   | "sections" :: rest => cmdSections rest
   | "emit-demo" :: rest => cmdEmitDemo rest
   | "compile-conv1x1" :: rest => cmdCompileConv1x1 rest
+  | "compile-linear" :: rest => cmdCompileLinear rest
   | "compile-conv3x3" :: rest => cmdCompileConv3x3 rest
   | "compile-pe" :: rest => cmdCompilePe rest
   | "compile-lut" :: rest => cmdCompileLut rest
   | "compile-pool" :: rest => cmdCompilePool rest
   | "compile-reduce" :: rest => cmdCompileReduce rest
+  | "compile-view" :: rest => cmdCompileView rest
   | "compile-graph" :: rest => cmdCompileGraph rest
   | "--help" :: _ | "-h" :: _ | [] =>
     IO.println usage
