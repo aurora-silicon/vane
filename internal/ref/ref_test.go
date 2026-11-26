@@ -290,11 +290,11 @@ func TestElementwiseAffineAndRelu(t *testing.T) {
 func TestConv2d3x3PadAndQ1516(t *testing.T) {
 	// Verify Conv3x3Geometry for same (even & odd dims, stride 1 & 2) and valid (stride 1 & 2)
 	geoCases := []struct {
-		h, w, s  int
-		pad      string
-		ho, wo   int
-		pt, pl   int
-		wantErr  bool
+		h, w, s int
+		pad     string
+		ho, wo  int
+		pt, pl  int
+		wantErr bool
 	}{
 		{5, 5, 1, "same", 5, 5, 1, 1, false},
 		{4, 6, 2, "same", 2, 3, 0, 0, false}, // even dims -> pt=0, pl=0 (bottom/right pad=1)
