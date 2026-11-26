@@ -2321,6 +2321,18 @@ func cmdGenGraph(args []string, stdout, stderr io.Writer) int {
 				fmt.Fprintf(stderr, "error: node %q (transpose): perm must have length 4\n", nd.ID)
 				return 1
 			}
+			var seen [4]bool
+			for idx, p := range nd.Perm {
+				if p < 0 || p > 3 {
+					fmt.Fprintf(stderr, "error: node %q (transpose): perm[%d]=%d out of range 0..3\n", nd.ID, idx, p)
+					return 1
+				}
+				if seen[p] {
+					fmt.Fprintf(stderr, "error: node %q (transpose): duplicate axis %d in perm\n", nd.ID, p)
+					return 1
+				}
+				seen[p] = true
+			}
 			in4 := [4]int{1, inD.c, inD.h, inD.w}
 			out4 := [4]int{in4[nd.Perm[0]], in4[nd.Perm[1]], in4[nd.Perm[2]], in4[nd.Perm[3]]}
 			if out4[0] != 1 {

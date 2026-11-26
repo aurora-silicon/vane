@@ -1872,4 +1872,35 @@ func TestM5cViewLinearAndGraphCLI(t *testing.T) {
 	if out := runVane(t, vaneBin, "validate", "--hwx", filepath.Join(ffnComp, "program.hwx"), "--sections", ffnComp, "--check-tasks"); !strings.Contains(out, "status: ok") {
 		t.Fatalf("validate ffn graph failed:\n%s", out)
 	}
+
+	// 5. Negative CLI tests: gen-graph rejects out-of-range and duplicate transpose perm without panicking
+	badPerms := []struct {
+		name string
+		perm string
+		want string
+	}{
+		{"perm_gt3", "[0, 1, 2, 4]", "out of range"},
+		{"perm_neg", "[-1, 1, 2, 3]", "out of range"},
+		{"perm_dup", "[0, 1, 1, 1]", "duplicate axis"},
+	}
+	for _, tc := range badPerms {
+		specFile := filepath.Join(tmp, tc.name+".json")
+		specBody := fmt.Sprintf(`{
+			"target": "h17",
+			"inputs": [{"name": "x", "c": 4, "h": 4, "w": 32}],
+			"nodes": [{"id": "tr", "op": "transpose", "perm": %s, "inputs": ["x"]}]
+		}`, tc.perm)
+		if err := os.WriteFile(specFile, []byte(specBody), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		stdout.Reset()
+		stderr.Reset()
+		rc := runCLI([]string{"gen-graph", "--spec", specFile, "--out-dir", filepath.Join(tmp, "out_"+tc.name)}, nil, &stdout, &stderr)
+		if rc == 0 {
+			t.Fatalf("gen-graph %s unexpectedly succeeded", tc.name)
+		}
+		if !strings.Contains(stderr.String(), tc.want) {
+			t.Fatalf("gen-graph %s stderr=%q, want %q", tc.name, stderr.String(), tc.want)
+		}
+	}
 }
