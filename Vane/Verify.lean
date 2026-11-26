@@ -105,6 +105,27 @@ private def vVerifyPoolAxisGeom
 private def vNeActDirectResBytes (f fat : Nat) : Nat :=
   ((1 : Nat) <<< (f + fat)) * 512
 
+private def vGroupCode (c : Nat) : Nat :=
+  if c <= 16 then 1
+  else if c <= 32 then 2
+  else if c <= 64 then 4
+  else 8
+
+private def vGroupCodeLog2 (c : Nat) : Nat :=
+  if c <= 16 then 0
+  else if c <= 32 then 1
+  else if c <= 64 then 2
+  else 3
+
+/-- Explicitly reject unmodelled Linux `accel/ane` DMA registers (`0x4d84`, `0x5150`, `0x5104`)
+    that are rejected with `-ENOEXEC` by `ane_hx_dma_modelled`. -/
+private def vCheckNoUnmodelledDmaRegs (writes : Array DecodedWrite) (prefixMsg : String) :
+    Except String Unit := do
+  for w in writes do
+    if w.byteAddr == regSrc1DmaCrop || w.byteAddr == regResDmaViewOff || w.byteAddr == regResDmaWarWait then
+      throw s!"{prefixMsg}: forbidden unmodelled DMA register {toHex w.byteAddr} (rejected by ane_hx_dma_modelled)"
+  pure ()
+
 private def vL2ResidentGeometry (c h w : Nat) : Nat × Nat × Nat :=
   let chs := 2 * alignUp w 8
   let row := c * chs
@@ -314,6 +335,7 @@ private def vVerifySparseChunkBytes
 inductive TaskKind where
   | neConv
   | neAct
+  | neView
   | peOp
   | pePool
   | peReduce
@@ -432,6 +454,7 @@ structure TaskVerifySummary where
   peReduce : Nat := 0
   nePool : Nat := 0
   neChannelReduce : Nat := 0
+  neView : Nat := 0
   deriving Repr, BEq, Inhabited
 
 /-- Resolved resource target referenced by a BAR slot in the HWX program descriptor. -/
@@ -474,17 +497,39 @@ def classifyTask (task : DecodedTask) : TaskKind :=
       .nePool
   else if (findDecodedWrite task.writes regDwGroups).isSome || hasNeTile ||
           (peCommon?.isSome && hasNeOp) then
-    let dwLowZero := match findDecodedWrite task.writes regDwGroups with
-      | some w => (w.value &&& 0xffff) == 0
+    let isViewCopyOp := match findDecodedWrite task.writes regNeOp with
+      | some w => w.value == neOpViewCopy
       | none => false
-    let isOcg3 := match findDecodedWrite task.writes regNeTile with
-      | some w => (w.value &&& 7) == 3
-      | none => false
-    if dwLowZero ||
-       (isOcg3 && (findDecodedWrite task.writes regLutCfg).isNone && (findDecodedWrite task.writes regNeCfg).isNone) then
-      .neChannelReduce
+    let noKernNeCfg := (findDecodedWrite task.writes regLutCfg).isNone &&
+      (findDecodedWrite task.writes regNeCfg).isNone
+    if isViewCopyOp && noKernNeCfg then
+      let hasTransposeBits := match findDecodedWrite task.writes regNeCommon with
+        | some w => (w.value &&& ((3 : UInt32) <<< 28)) != 0
+        | none => false
+      let has4dViewRegs :=
+        (findDecodedWrite task.writes regDin).isSome ||
+        (findDecodedWrite task.writes regDout).isSome ||
+        (findDecodedWrite task.writes regSrc1DmaDStride).isSome ||
+        (findDecodedWrite task.writes regSrc1DmaNStride).isSome ||
+        (findDecodedWrite task.writes regResDmaDStride).isSome ||
+        (findDecodedWrite task.writes regResDmaNStride).isSome ||
+        (match findDecodedWrite task.writes regBatchN with
+          | some w => w.value != 1
+          | none => false)
+      let isLegacyCopy :=
+        task.header.getD 4 0 == taskHeaderWord4CopyConst && !hasTransposeBits && !has4dViewRegs
+      if isLegacyCopy then .neAct else .neView
     else
-      .neAct
+      let dwLowZero := match findDecodedWrite task.writes regDwGroups with
+        | some w => (w.value &&& 0xffff) == 0
+        | none => false
+      let isOcg3 := match findDecodedWrite task.writes regNeTile with
+        | some w => (w.value &&& 7) == 3
+        | none => false
+      if dwLowZero || (isOcg3 && noKernNeCfg) then
+        .neChannelReduce
+      else
+        .neAct
   else
     .unknown
 
@@ -768,8 +813,8 @@ private def vVerifyDmaStridesAndBounds
   let extent := if c == 0 || h == 0 then 0 else (c - 1) * planeStride + h * rowStride
   if extent == 0 || baseOff + extent > cap then
     throw s!"{prefixMsg}: {dirLabel} range [{toHex baseOff}, {toHex (baseOff + extent)}) exceeds {targetLabel} capacity {cap}"
-  if isSurface && c > 1 && baseOff + h * rowStride > planeStride then
-    throw s!"{prefixMsg}: {dirLabel} {targetLabel} plane bleed: baseOff ({toHex baseOff}) + H * rowStride ({h * rowStride}) > planeStride ({planeStride})"
+  if isSurface && c > 1 && planeStride > 0 && (baseOff % planeStride) + h * rowStride > planeStride then
+    throw s!"{prefixMsg}: {dirLabel} {targetLabel} plane bleed: (baseOff % planeStride) ({toHex (baseOff % planeStride)}) + H * rowStride ({h * rowStride}) > planeStride ({planeStride})"
   pure extent
 
 /-- Verify that a set of register addresses are all absent (omitted). -/
@@ -887,8 +932,9 @@ def verifyConvTaskMulti
   let (taskId, ene, h7) ← vVerifyTaskHeader9 target task taskCount false false prefixMsg
   let logNE := ene - 1
 
-  -- 2. Reject duplicate register writes
+  -- 2. Reject duplicate register writes and unmodelled DMA registers
   vCheckNoDuplicateWrites task.writes prefixMsg
+  vCheckNoUnmodelledDmaRegs task.writes prefixMsg
 
   -- 3. Decode common shape & control registers
   let wWin ← requireDecodedWrite task.writes regWin "Win"
@@ -996,8 +1042,9 @@ def verifyConvTaskMulti
           throw s!"{prefixMsg}: src1Base BAR slot {inBarSlot} bound to non-input surface '{s.shortName}'"
         if s.n != 1 then
           throw s!"{prefixMsg}: single-batch input surface required (got n={s.n})"
-        if s.channels.toNat != cin then
-          throw s!"{prefixMsg}: Cin={cin} != bound input surface channels {s.channels}"
+        let inChanOk := if kw == 1 && kh == 1 then cin <= s.channels.toNat else s.channels.toNat == cin
+        if !inChanOk then
+          throw s!"{prefixMsg}: Cin={cin} incompatible with bound input surface channels {s.channels}"
         let sfh := s.height.toNat
         let sfw := s.width.toNat
         if sfh == 0 || sfh > 65535 || sfw == 0 || sfw > 65535 then
@@ -1039,7 +1086,8 @@ def verifyConvTaskMulti
         let outHeightOk :=
           if kw == 3 && sx == 2 then s.height.toNat == hout
           else hout <= s.height.toNat
-        if s.channels.toNat != cout || !outHeightOk || s.width.toNat != wout then
+        let outChanOk := if kw == 1 && kh == 1 then cout <= s.channels.toNat else s.channels.toNat == cout
+        if !outChanOk || !outHeightOk || s.width.toNat != wout then
           throw s!"{prefixMsg}: output dims ({cout}x{hout}x{wout}) incompatible with bound output surface ({s.channels}x{s.height}x{s.width})"
         pure (some (outBarSlot, outTarget, resBaseOff))
       | .scratch _ =>
@@ -1489,8 +1537,9 @@ def verifyPeTaskMulti
   -- 1. Verify 9-word header with ene == 0
   let (taskId, _, h7) ← vVerifyTaskHeader9 target task taskCount true false prefixMsg
 
-  -- 2. Reject duplicate register writes
+  -- 2. Reject duplicate register writes and unmodelled DMA registers
   vCheckNoDuplicateWrites task.writes prefixMsg
+  vCheckNoUnmodelledDmaRegs task.writes prefixMsg
 
   -- 3. Common block & PE control registers
   vCheckOmitted task.writes #[
@@ -3793,12 +3842,432 @@ def verifyNeChannelReduceTaskMulti
     sync := sync
   }
 
+/-- Independent static safety verifier for Weightless NE Copy / View tasks (`neView`:
+    `transpose`, `slice`, `concat`, `split`, `reshape`).
+    Enforces strict `ane_hx_dma_modelled` compliance (forbidding `0x4d84`, `0x5150`, `0x5104`),
+    64-byte alignment, exact `ane_hx_dma_tile` bounds on both input and output BAR slots,
+    `groupCode`/`ocg`/`transposeOut`/`transposeWideGroup` consistency, and `<= 2 MiB` L2 bounds. -/
+def verifyNeViewTaskMulti
+    (taskCount : Nat) (hasPriorNe hasPriorPe : Bool)
+    (info : HwxInfo) (task : DecodedTask) : Except String VerifiedTaskFootprint := do
+  let target := info.target
+  let prefixMsg := s!"task {task.taskIndex} (NE view)"
+  let isFirst := task.taskIndex == 0
+  let isLast := task.taskIndex + 1 == taskCount
+
+  -- 1. Verify 9-word header, no duplicate writes, no unmodelled DMA registers
+  let (taskId, ene, h7) ← vVerifyTaskHeader9 target task taskCount false false prefixMsg
+  let logNE := ene - 1
+  vCheckNoDuplicateWrites task.writes prefixMsg
+  vCheckNoUnmodelledDmaRegs task.writes prefixMsg
+
+  vCheckOmitted task.writes #[
+    (regConvCfg, "convCfg"), (regNeCfg, "neCfg"),
+    (regKernelBaseLo, "kernelBaseLo"), (regKernelBaseHi, "kernelBaseHi"),
+    (regLutCfg, "lutCfg"), (regLutSize, "lutSize"), (regLutBaseLo, "lutBaseLo"), (regLutBaseHi, "lutBaseHi")
+  ] "weightless NE view" prefixMsg
+
+  -- 2. Common block dims, groupCode, neViewCommon, neTile, targetCfg
+  let wWin ← requireDecodedWrite task.writes regWin "Win"
+  let wHin ← requireDecodedWrite task.writes regHin "Hin"
+  let wCin ← requireDecodedWrite task.writes regCin "Cin"
+  let wWout ← requireDecodedWrite task.writes regWout "Wout"
+  let wHout ← requireDecodedWrite task.writes regHout "Hout"
+  let wCout ← requireDecodedWrite task.writes regCout "Cout"
+  let wDw ← requireDecodedWrite task.writes regDwGroups "dwGroups"
+  let wTH ← requireDecodedWrite task.writes regTH "TH"
+  let wNeCommon ← requireDecodedWrite task.writes regNeCommon "neCommon"
+  let wNeTile ← requireDecodedWrite task.writes regNeTile "neTile"
+  let wTargetCfg ← requireDecodedWrite task.writes regTargetCfg "targetCfg"
+
+  let w := (← decodeFieldChecked (dim16Layout "Win") wWin.value "val").toNat
+  let h := (← decodeFieldChecked (dim16Layout "Hin") wHin.value "val").toNat
+  let c := wCin.value.toNat
+  let wout := (← decodeFieldChecked (dim16Layout "Wout") wWout.value "val").toNat
+  let hout := (← decodeFieldChecked (dim16Layout "Hout") wHout.value "val").toNat
+  let cout := wCout.value.toNat
+  let dIn ← match findDecodedWrite task.writes regDin with
+    | some wd => pure (← decodeFieldChecked (dim16Layout "Din") wd.value "val").toNat
+    | none => pure 1
+  let dOut ← match findDecodedWrite task.writes regDout with
+    | some wd => pure (← decodeFieldChecked (dim16Layout "Dout") wd.value "val").toNat
+    | none => pure 1
+  let batchN ← match findDecodedWrite task.writes regBatchN with
+    | some wn => pure (← decodeFieldChecked (dim16Layout "BatchN") wn.value "val").toNat
+    | none => pure 1
+  let th := (← decodeFieldChecked (dim16Layout "TH") wTH.value "val").toNat
+
+  if w == 0 || h == 0 || c == 0 || dIn == 0 || batchN == 0 then
+    throw s!"{prefixMsg}: invalid view dims (N={batchN}, C={c}, H={h}, D={dIn}, W={w})"
+  if wout != w || hout != h || cout != c || dOut != dIn then
+    throw s!"{prefixMsg}: view output dims ({cout}x{hout}x{dOut}x{wout}) != input dims ({c}x{h}x{dIn}x{w})"
+  if th == 0 || th > h then
+    throw s!"{prefixMsg}: tileHeight={th} out of range 1..{h}"
+  if wTargetCfg.value != targetCfgValue target then
+    throw s!"{prefixMsg}: targetCfg {toHex wTargetCfg.value.toNat} != expected {toHex (targetCfgValue target).toNat}"
+
+  let kind := (← decodeFieldChecked neViewCommonLayout wNeCommon.value "kind").toNat
+  let shPref := (← decodeFieldChecked neViewCommonLayout wNeCommon.value "shPref").toNat
+  let shMin := (← decodeFieldChecked neViewCommonLayout wNeCommon.value "shMin").toNat
+  let shMax := (← decodeFieldChecked neViewCommonLayout wNeCommon.value "shMax").toNat
+  let f := (← decodeFieldChecked neViewCommonLayout wNeCommon.value "F").toNat
+  let tOutBit := (← decodeFieldChecked neViewCommonLayout wNeCommon.value "transposeOut").toNat
+  let tWideBit := (← decodeFieldChecked neViewCommonLayout wNeCommon.value "transposeWideGroup").toNat
+  if kind != 0 then
+    throw s!"{prefixMsg}: neViewCommon kind={kind} != 0"
+  if shPref > shMin || shMin > shMax || shMax > 4 then
+    throw s!"{prefixMsg}: invalid shifts shPref={shPref}, shMin={shMin}, shMax={shMax}"
+
+  let transposeCW := tOutBit == 1
+  let expCode := if transposeCW then vGroupCode c else 1
+  let expOcg := if transposeCW then vGroupCodeLog2 c else 0
+  let expWide : Nat := if transposeCW && expCode >= 2 then 1 else 0
+
+  let gotCode := (← decodeFieldChecked dwGroupsLayout wDw.value "perGroupIn").toNat
+  if gotCode != expCode then
+    throw s!"{prefixMsg}: dwGroups (0x0030) groupCode={gotCode} != expected {expCode} (transposeCW={transposeCW}, C={c})"
+  if tWideBit != expWide then
+    throw s!"{prefixMsg}: neViewCommon transposeWideGroup={tWideBit} != expected {expWide} (transposeCW={transposeCW}, groupCode={expCode})"
+
+  let ocg := (← decodeFieldChecked neTileLayout wNeTile.value "ocg").toNat
+  let fat := (← decodeFieldChecked neTileLayout wNeTile.value "fat").toNat
+  let wu := (← decodeFieldChecked neTileLayout wNeTile.value "WU").toNat
+  if ocg != expOcg then
+    throw s!"{prefixMsg}: neTile ocg={ocg} != expected {expOcg} (transposeCW={transposeCW}, C={c})"
+  if fat > 1 || wu > 3 || wu + f + fat != logNE then
+    throw s!"{prefixMsg}: invalid neTile (WU={wu}, F={f}, fat={fat}, logNE={logNE})"
+
+  let stripW := vStripW fat shPref
+  let tmin := vStripW fat shMin
+  if stripW < 8 || stripW > 256 || tmin < 8 || tmin > 256 then
+    throw s!"{prefixMsg}: strip width T={stripW}, tmin={tmin} outside [8, 256]"
+
+  -- 3. NE copy op & scale
+  let wNeOp ← requireDecodedWrite task.writes regNeOp "neOp"
+  if wNeOp.value != neOpViewCopy then
+    throw s!"{prefixMsg}: neOp {toHex wNeOp.value.toNat} != expected neOpViewCopy ({toHex neOpViewCopy.toNat})"
+  let wNeScale ← requireDecodedWrite task.writes regNeScale "neScale"
+  if wNeScale.value != neScaleOne then
+    throw s!"{prefixMsg}: neScale {toHex wNeScale.value.toNat} != expected neScaleOne ({toHex neScaleOne.toNat})"
+
+  -- 4. Port configs
+  let wSrc1Cfg ← requireDecodedWrite task.writes regSrc1Cfg "src1Cfg"
+  let src1Cfg ← vDecodeSrcPortCfg "src1Cfg" wSrc1Cfg.value isFirst hasPriorNe hasPriorPe prefixMsg
+  if isFirst then
+    let wSrc2Cfg ← requireDecodedWrite task.writes regSrc2Cfg "src2Cfg"
+    if wSrc2Cfg.value != src2CfgValue then
+      throw s!"{prefixMsg}: src2Cfg {toHex wSrc2Cfg.value.toNat} != {toHex src2CfgValue.toNat}"
+  else
+    vCheckOmitted task.writes #[(regSrc2Cfg, "src2Cfg")] "NE view taskId > 0" prefixMsg
+
+  let wResCfg ← requireDecodedWrite task.writes regResCfg "resCfg"
+  let (resIsL2, direct) ← vDecodeResPortCfg wResCfg.value isFirst isLast prefixMsg
+
+  -- 5. Resolve DMA endpoints
+  let mut dramAccs : Array VerifiedDramAccess := #[]
+  let mut sync : TaskSyncInfo := {
+    src1WaitNe5 := src1Cfg.waitNe5
+    src1WaitPe22 := src1Cfg.waitPe22
+    src1HandoffNe := src1Cfg.handoffNe
+    src1HandoffPe := src1Cfg.handoffPe
+    hasSrc1Dma := !src1Cfg.isL2
+  }
+
+  let src1DmaTarget? ←
+    if src1Cfg.isL2 then
+      if batchN != 1 || dIn != 1 then
+        throw s!"{prefixMsg}: L2-resident view src1 requires BatchN=1 and Din=1"
+      vCheckOmitted task.writes #[
+        (regSrc1Dep, "src1Dep"), (regSrc1DmaCfg, "src1DmaCfg"),
+        (regSrc1BaseLo, "src1BaseLo"), (regSrc1BaseHi, "src1BaseHi"),
+        (regSrc1DmaRowStride, "src1DmaRowStride"), (regSrc1DmaPlaneStride, "src1DmaPlaneStride"),
+        (regSrc1DmaDStride, "src1DmaDStride"), (regSrc1DmaNStride, "src1DmaNStride"),
+        (regSrc1Fmt, "src1Fmt")
+      ] "L2-resident NE view src1" prefixMsg
+      pure none
+    else
+      let (slot, tgt, off, _) ← resolveBasePair info task.writes regSrc1BaseLo regSrc1BaseHi "src1BaseLo" "src1BaseHi" prefixMsg
+      match tgt with
+      | .surface s =>
+        if s.direction != .input then
+          throw s!"{prefixMsg}: src1Base BAR slot {slot} bound to non-input surface '{s.shortName}'"
+        pure (some (slot, tgt, off))
+      | .scratch _ =>
+        if slot != barSlotScratch then
+          throw s!"{prefixMsg}: scratch src1Base must use BAR slot {barSlotScratch}, got {slot}"
+        if isFirst then
+          throw s!"{prefixMsg}: first task cannot read uninitialized DRAM scratch"
+        pure (some (slot, tgt, off))
+      | _ => throw s!"{prefixMsg}: src1Base BAR slot {slot} does not reference an input surface or scratch"
+
+  let resDmaTarget? ←
+    if resIsL2 then
+      if transposeCW || batchN != 1 || dIn != 1 then
+        throw s!"{prefixMsg}: L2-resident view res requires !transposeCW, BatchN=1, and Din=1"
+      vCheckOmitted task.writes #[
+        (regResDep, "resDep"), (regResBaseLo, "resBaseLo"), (regResBaseHi, "resBaseHi"),
+        (regResDmaRowStride, "resDmaRowStride"), (regResDmaPlaneStride, "resDmaPlaneStride"),
+        (regResDmaDStride, "resDmaDStride"), (regResDmaNStride, "resDmaNStride"),
+        (regResFmt, "resFmt")
+      ] "L2-resident NE view res" prefixMsg
+      pure none
+    else
+      let (slot, tgt, off, _) ← resolveBasePair info task.writes regResBaseLo regResBaseHi "resBaseLo" "resBaseHi" prefixMsg
+      match tgt with
+      | .surface s =>
+        if s.direction != .output then
+          throw s!"{prefixMsg}: resBase BAR slot {slot} bound to non-output surface '{s.shortName}'"
+        if let some (s1Slot, .surface _, _) := src1DmaTarget? then
+          if slot == s1Slot then
+            throw s!"{prefixMsg}: output BAR slot {slot} aliases src1 BAR slot"
+        pure (some (slot, tgt, off))
+      | .scratch _ =>
+        if slot != barSlotScratch then
+          throw s!"{prefixMsg}: scratch resBase must use BAR slot {barSlotScratch}, got {slot}"
+        if isLast then
+          throw s!"{prefixMsg}: final task cannot write to DRAM scratch"
+        pure (some (slot, tgt, off))
+      | _ => throw s!"{prefixMsg}: resBase BAR slot {slot} does not reference an output surface or scratch"
+
+  -- 6. L2 staging geometry & <= 2 MiB capacity check
+  let mut l2Accs : Array VerifiedL2Access := #[]
+  let wSrc1Base ← requireDecodedWrite task.writes regSrc1Base "src1Base"
+  let wSrc1Chs ← requireDecodedWrite task.writes regSrc1ChanStride "src1ChanStride"
+  let wSrc1Row ← requireDecodedWrite task.writes regSrc1RowStride "src1RowStride"
+  let srcL2Base := wSrc1Base.value.toNat
+  if src1Cfg.isL2 then
+    vCheckOmitted task.writes #[
+      (regSrc1RowBytesA, "src1RowBytesA"), (regSrc1RowBytesB, "src1RowBytesB")
+    ] "L2-resident NE view src1" prefixMsg
+    let (expChs, expRow, l2Bytes) := vL2ResidentGeometry c h w
+    if wSrc1Chs.value.toNat != expChs then
+      throw s!"{prefixMsg}: L2 src1ChanStride {wSrc1Chs.value} != expected {expChs}"
+    if wSrc1Row.value.toNat != expRow then
+      throw s!"{prefixMsg}: L2 src1RowStride {wSrc1Row.value} != expected {expRow}"
+    l2Accs := l2Accs.push { lo := srcL2Base, hi := srcL2Base + l2Bytes, isWrite := false, role := .src1L2 }
+  else
+    let wSrc1RowA ← requireDecodedWrite task.writes regSrc1RowBytesA "src1RowBytesA"
+    let wSrc1RowB ← requireDecodedWrite task.writes regSrc1RowBytesB "src1RowBytesB"
+    let effT := if transposeCW then tmin else stripW
+    let expPx := min (alignUp w 8) (max effT 32)
+    let expChs := 2 * expPx
+    if wSrc1Chs.value.toNat != expChs then
+      throw s!"{prefixMsg}: src1ChanStride {wSrc1Chs.value} != expected {expChs}"
+    let expU := c * expChs
+    let expDU := dIn * expU
+    let src1Row := wSrc1Row.value.toNat
+    if src1Row < expDU || (src1Row - expDU) % 16 != 0 then
+      throw s!"{prefixMsg}: src1RowStride {src1Row} incompatible with D*C*chs={expDU} + 16*srcSkew"
+    if wSrc1RowA.value.toNat != expU || wSrc1RowB.value.toNat != expDU then
+      throw s!"{prefixMsg}: src1RowBytesA/B ({wSrc1RowA.value}, {wSrc1RowB.value}) != ({expU}, {expDU})"
+    l2Accs := l2Accs.push { lo := srcL2Base, hi := srcL2Base + th * src1Row, isWrite := true, role := .src1Stage }
+
+  let wResBase ← requireDecodedWrite task.writes regResBase "resBase"
+  let resL2Base := wResBase.value.toNat
+  if resIsL2 then
+    vCheckOmitted task.writes #[
+      (regResRowBytesA, "resRowBytesA"), (regResRowBytesB, "resRowBytesB")
+    ] "L2-resident NE view res" prefixMsg
+    let wResChs ← requireDecodedWrite task.writes regResChanStride "resChanStride"
+    let wResRow ← requireDecodedWrite task.writes regResRowStride "resRowStride"
+    let (expChs, expRow, l2Bytes) := vL2ResidentGeometry c h w
+    if wResChs.value.toNat != expChs then
+      throw s!"{prefixMsg}: L2 resChanStride {wResChs.value} != expected {expChs}"
+    if wResRow.value.toNat != expRow then
+      throw s!"{prefixMsg}: L2 resRowStride {wResRow.value} != expected {expRow}"
+    l2Accs := l2Accs.push { lo := resL2Base, hi := resL2Base + l2Bytes, isWrite := true, role := .resL2 }
+  else
+    let expDirect :=
+      if transposeCW then
+        !(9 <= c && c <= 16 && shMin == 0 && w < 32)
+      else
+        vIsDirect target fat shMax w
+    if direct != expDirect then
+      throw s!"{prefixMsg}: resCfg direct={direct} disagrees with expected direct={expDirect} (transposeCW={transposeCW})"
+    if direct then
+      vCheckOmitted task.writes #[
+        (regResChanStride, "resChanStride"), (regResRowStride, "resRowStride"),
+        (regResRowBytesA, "resRowBytesA"), (regResRowBytesB, "resRowBytesB")
+      ] "direct mode" prefixMsg
+      let resDirectBytes := ((1 : Nat) <<< (f + ocg + fat)) * 512
+      l2Accs := l2Accs.push { lo := resL2Base, hi := resL2Base + resDirectBytes, isWrite := true, role := .resStage }
+    else
+      let wResChs ← requireDecodedWrite task.writes regResChanStride "resChanStride"
+      let wResRow ← requireDecodedWrite task.writes regResRowStride "resRowStride"
+      let wResRowA ← requireDecodedWrite task.writes regResRowBytesA "resRowBytesA"
+      let wResRowB ← requireDecodedWrite task.writes regResRowBytesB "resRowBytesB"
+      let (rw, rch) := if transposeCW then (c, w) else (w, c)
+      let expResChs := 2 * min (alignUp rw 8) (max stripW 32)
+      if wResChs.value.toNat != expResChs then
+        throw s!"{prefixMsg}: staged resChanStride {wResChs.value} != expected {expResChs}"
+      let expResRowBytes := rch * expResChs
+      let resRow := wResRow.value.toNat
+      if resRow < expResRowBytes || (resRow - expResRowBytes) % 16 != 0 then
+        throw s!"{prefixMsg}: staged resRowStride {resRow} incompatible with rch*resChs={expResRowBytes} + 16*resSkew"
+      if wResRowA.value.toNat != expResRowBytes || wResRowB.value.toNat != expResRowBytes then
+        throw s!"{prefixMsg}: staged resRowBytesA/B ({wResRowA.value}, {wResRowB.value}) != {expResRowBytes}"
+      l2Accs := l2Accs.push { lo := resL2Base, hi := resL2Base + th * resRow, isWrite := true, role := .resStage }
+
+  vCheckTaskL2Accesses l2Accs prefixMsg
+
+  -- 7. Verify DMA deps, formats, 64B alignment, and exact ane_hx_dma_tile bounds
+  let checkViewStride := fun (dim : Nat) (addr : Nat) (nm dirLbl : String) => do
+    match findDecodedWrite task.writes addr with
+    | some wr =>
+      let sv := wr.value.toNat
+      if sv % vDmaLineBytes != 0 then
+        throw s!"{prefixMsg}: {dirLbl} {nm} ({sv}) is not {vDmaLineBytes}-byte aligned"
+      if dim > 1 && sv == 0 then
+        throw s!"{prefixMsg}: {dirLbl} {nm} must be > 0 for dim={dim} > 1"
+      pure sv
+    | none =>
+      if dim > 1 then
+        throw s!"{prefixMsg}: {dirLbl} missing required stride {nm} ({toHex addr}) for dim={dim} > 1"
+      pure 0
+
+  if let some (_, tgt, off) := src1DmaTarget? then
+    let (dk, dd) ← vDecodeSrcDep info task.writes regSrc1Dep regSrc1DmaCfg "src1Dep" "src1DmaCfg" taskId isFirst prefixMsg
+    sync := { sync with src1DepKind := dk, src1DepDist := dd }
+    let wFmt ← requireDecodedWrite task.writes regSrc1Fmt "src1Fmt"
+    if wFmt.value != srcFmtWordP1 then
+      throw s!"{prefixMsg}: src1Fmt {toHex wFmt.value.toNat} != {toHex srcFmtWordP1.toNat}"
+    let (resId, cap, lbl) := match tgt with
+      | .surface s => (BarResource.surface (findSurfaceIndex info s) s.shortName, min s.span.toNat s.sect.size.toNat, s!"surface '{s.shortName}'")
+      | .scratch sc => (BarResource.scratch, sc.size.toNat, "scratch (__DATA,__bss)")
+      | _ => (BarResource.scratch, 0, "invalid")
+    if off % vDmaLineBytes != 0 then
+      throw s!"{prefixMsg}: input DMA {lbl} base offset {toHex off} is not {vDmaLineBytes}-byte aligned"
+    let inRowSt ← checkViewStride h regSrc1DmaRowStride "src1DmaRowStride" "input DMA"
+    let inPlaneSt ← checkViewStride c regSrc1DmaPlaneStride "src1DmaPlaneStride" "input DMA"
+    let inDSt ← checkViewStride dIn regSrc1DmaDStride "src1DmaDStride" "input DMA"
+    let inNSt ← checkViewStride batchN regSrc1DmaNStride "src1DmaNStride" "input DMA"
+    let rawInExt := 2 * w + (h - 1) * inRowSt + (c - 1) * inPlaneSt + (dIn - 1) * inDSt + (batchN - 1) * inNSt
+    let alignedInEnd := alignUp (off + rawInExt) vDmaLineBytes
+    if alignedInEnd > cap then
+      throw s!"{prefixMsg}: input DMA ane_hx_dma_tile bound [{toHex off}, {toHex alignedInEnd}) exceeds {lbl} capacity {cap}"
+    dramAccs := dramAccs.push { resource := resId, lo := off, hi := alignedInEnd, isWrite := false, port := .src1Dma }
+
+  if let some (_, tgt, off) := resDmaTarget? then
+    match ← resolveBarTarget info barSlotConfigZero with
+    | .configZero => pure ()
+    | _ => throw s!"{prefixMsg}: BAR slot {barSlotConfigZero} must have VM base 0"
+    let wResDep ← requireDecodedWrite task.writes regResDep "resDep"
+    if wResDep.barSlot != some barSlotConfigZero then
+      throw s!"{prefixMsg}: resDep must use BAR slot {barSlotConfigZero}"
+    let expCode := match tgt with
+      | .scratch _ => resDepCode target ||| resDepScratchFlags
+      | _ => resDepCode target
+    if (← decodeFieldChecked resDepLayout wResDep.value "code") != expCode then
+      throw s!"{prefixMsg}: resDep code mismatch"
+    if (← decodeFieldChecked resDepLayout wResDep.value "task").toNat != taskId then
+      throw s!"{prefixMsg}: resDep task != header taskId={taskId}"
+    if ((← decodeFieldChecked resDepLayout wResDep.value "direct") == 1) != direct then
+      throw s!"{prefixMsg}: resDep direct bit != resCfg direct={direct}"
+    let wResFmt ← requireDecodedWrite task.writes regResFmt "resFmt"
+    if wResFmt.value != resFmtWordP1 then
+      throw s!"{prefixMsg}: resFmt {toHex wResFmt.value.toNat} != {toHex resFmtWordP1.toNat}"
+    let (resId, cap, lbl) := match tgt with
+      | .surface s => (BarResource.surface (findSurfaceIndex info s) s.shortName, min s.span.toNat s.sect.size.toNat, s!"surface '{s.shortName}'")
+      | .scratch sc => (BarResource.scratch, sc.size.toNat, "scratch (__DATA,__bss)")
+      | _ => (BarResource.scratch, 0, "invalid")
+    if off % vDmaLineBytes != 0 then
+      throw s!"{prefixMsg}: output DMA {lbl} base offset {toHex off} is not {vDmaLineBytes}-byte aligned"
+    let resPlaneDim := if transposeCW then w else c
+    let outRowSt ← checkViewStride h regResDmaRowStride "resDmaRowStride" "output DMA"
+    let outPlaneSt ← checkViewStride resPlaneDim regResDmaPlaneStride "resDmaPlaneStride" "output DMA"
+    let outDSt ← checkViewStride dOut regResDmaDStride "resDmaDStride" "output DMA"
+    let outNSt ← checkViewStride batchN regResDmaNStride "resDmaNStride" "output DMA"
+    -- Exact kernel ane_hx_dma_tile bound (evaluates using 0x14=Wout, 0x18=Hout, 0x1c=Cout, 0x20=Dout, 0x24=BatchN)
+    let rawKernelOutExt := 2 * w + (h - 1) * outRowSt + (c - 1) * outPlaneSt + (dOut - 1) * outDSt + (batchN - 1) * outNSt
+    let alignedKernelOutEnd := alignUp (off + rawKernelOutExt) vDmaLineBytes
+    if alignedKernelOutEnd > cap then
+      throw s!"{prefixMsg}: output DMA ane_hx_dma_tile bound [{toHex off}, {toHex alignedKernelOutEnd}) exceeds {lbl} capacity {cap}"
+    -- Actual hardware write bound (exchanges C and W when transposeCW == true)
+    let (rw, rch) := if transposeCW then (c, w) else (w, c)
+    let rawActualOutExt := 2 * rw + (h - 1) * outRowSt + (rch - 1) * outPlaneSt + (dOut - 1) * outDSt + (batchN - 1) * outNSt
+    let alignedActualOutEnd := alignUp (off + rawActualOutExt) vDmaLineBytes
+    if alignedActualOutEnd > cap then
+      throw s!"{prefixMsg}: output DMA write range [{toHex off}, {toHex alignedActualOutEnd}) exceeds {lbl} capacity {cap}"
+    dramAccs := dramAccs.push { resource := resId, lo := off, hi := alignedActualOutEnd, isWrite := true, port := .resDma }
+
+  -- 8. Kernel stage, output stage, and strict mode-conditional register allowlist
+  vVerifyKernelStageMulti task.writes taskId isLast false false prefixMsg
+  vVerifyOutputStageMulti task.writes taskId isLast prefixMsg
+
+  let mut allowed : Array Nat := #[
+    regWin, regHin, regCin, regDin, regWout, regHout, regCout, regDout, regBatchN,
+    regDwGroups, regTH, regNeCommon, regNeTile, regTargetCfg,
+    regSrc1Cfg, regSrc1Base, regSrc1ChanStride, regSrc1RowStride,
+    regResCfg, regResBase, regNeOp, regNeScale
+  ]
+  if isFirst then allowed := allowed.push regSrc2Cfg
+  if !src1Cfg.isL2 then
+    allowed := allowed ++ #[
+      regSrc1RowBytesA, regSrc1RowBytesB,
+      regSrc1Dep, regSrc1DmaCfg, regSrc1BaseLo, regSrc1BaseHi,
+      regSrc1DmaRowStride, regSrc1DmaPlaneStride, regSrc1DmaDStride, regSrc1DmaNStride,
+      regSrc1Fmt
+    ]
+  if resIsL2 then
+    allowed := allowed ++ #[regResChanStride, regResRowStride]
+  else
+    allowed := allowed ++ #[
+      regResDep, regResBaseLo, regResBaseHi,
+      regResDmaRowStride, regResDmaPlaneStride, regResDmaDStride, regResDmaNStride,
+      regResFmt
+    ]
+    if !direct then
+      allowed := allowed ++ #[
+        regResChanStride, regResRowStride, regResRowBytesA, regResRowBytesB
+      ]
+  if isLast then
+    allowed := allowed ++ #[regKernelStage, regOut0, regOut1, regOut2, regOut3, regOut4, regOut5]
+  vCheckAllowedRegs task.writes allowed prefixMsg
+
+  pure {
+    taskIndex := task.taskIndex
+    kind := .neView
+    engine := .ne
+    isNeCompute := false
+    isMultiBatch := batchN > 1
+    liveL2Mask := h7
+    l2Accesses := l2Accs
+    dramAccesses := dramAccs
+    sync := sync
+  }
+
 -- ============================================================================
 -- S5: Independent Whole-Program Multi-Task Happens-Before & Hazard Checker
 -- ============================================================================
 
 private def vIntervalsOverlap (lo1 hi1 lo2 hi2 : Nat) : Bool :=
   lo1 < hi2 && lo2 < hi1
+
+/-- Insert a half-open interval `(lo, hi)` into a list sorted ascending by `lo`. -/
+def insertInterval (iv : Nat × Nat) : List (Nat × Nat) → List (Nat × Nat)
+  | [] => [iv]
+  | hd :: tl =>
+    if iv.1 <= hd.1 then iv :: hd :: tl
+    else hd :: insertInterval iv tl
+
+/-- Insertion-sort a list of half-open intervals ascending by start address `lo`. -/
+def sortIntervals : List (Nat × Nat) → List (Nat × Nat)
+  | [] => []
+  | hd :: tl => insertInterval hd (sortIntervals tl)
+
+/-- Sweep contiguous coverage frontier starting from `cur` across intervals `ivs`. -/
+def sweepCover : List (Nat × Nat) → Nat → Nat
+  | [], cur => cur
+  | (a, b) :: rest, cur =>
+    if a <= cur then
+      sweepCover rest (max cur b)
+    else
+      cur
+
+/-- Return `true` iff the union of half-open intervals `ivs` covers `[lo, hi)` completely. -/
+def intervalsCover (ivs : List (Nat × Nat)) (lo hi : Nat) : Bool :=
+  if lo >= hi then true
+  else sweepCover (sortIntervals ivs) lo >= hi
 
 private def vLatestEngBefore (fps : Array VerifiedTaskFootprint) (eng : Engine) (i : Nat) : Option Nat := Id.run do
   let mut best : Option Nat := none
@@ -4071,8 +4540,9 @@ def verifyProgramHazards (fps : Array VerifiedTaskFootprint) : Except String Uni
 
   -- 3. BAR 3 DRAM-scratch read integrity (Clause S5):
   --    Every task reading BAR 3 scratch must (a) unconditionally set depKind in {1, 2} on its reading
-  --    port (even with no prior overlapping write), and (b) have a latest prior overlapping resDma
-  --    write on scratch that fully covers [b.lo, b.hi) (rejecting uninitialized or partial reads).
+  --    port (even with no prior overlapping write), and (b) have prior ordered overlapping resDma
+  --    writes whose union covers [b.lo, b.hi) completely (rejecting uninitialized or gap reads),
+  --    and set depKind == 1 whenever any active (non-superseded) contributing writer has BatchN > 1.
   for i in [:n] do
     let ti := fps[i]!
     for b in ti.dramAccesses do
@@ -4081,22 +4551,32 @@ def verifyProgramHazards (fps : Array VerifiedTaskFootprint) : Except String Uni
           throw s!"S5 DRAM scratch coherence: task {i} src1Dma reading scratch [{toHex b.lo}, {toHex b.hi}) must set 0x4d00 depKind to 1 or 2 (got {ti.sync.src1DepKind})"
         if b.port == .src2Dma && !(ti.sync.src2DepKind == 1 || ti.sync.src2DepKind == 2) then
           throw s!"S5 DRAM scratch coherence: task {i} src2Dma reading scratch [{toHex b.lo}, {toHex b.hi}) must set 0x4d04 depKind to 1 or 2 (got {ti.sync.src2DepKind})"
-        let mut latestScratchWriter? : Option (Nat × VerifiedDramAccess) := none
+        let mut priorWriters : Array (Nat × VerifiedDramAccess) := #[]
         for k in [:i] do
           for a in fps[k]!.dramAccesses do
             if a.resource == .scratch && a.port == .resDma && a.isWrite && vIntervalsOverlap a.lo a.hi b.lo b.hi then
-              latestScratchWriter? := some (k, a)
-        match latestScratchWriter? with
-        | none =>
+              priorWriters := priorWriters.push (k, a)
+        if priorWriters.isEmpty then
           throw s!"S5 DRAM scratch integrity: task {i} {b.port.name} reads uninitialized scratch [{toHex b.lo}, {toHex b.hi}) with no prior overlapping resDma write"
-        | some (p, a) =>
-          if !(a.lo <= b.lo && b.hi <= a.hi) then
-            throw s!"S5 DRAM scratch integrity: task {i} {b.port.name} scratch read [{toHex b.lo}, {toHex b.hi}) is only partially covered by latest writer task {p} resDma [{toHex a.lo}, {toHex a.hi})"
+        let writerIvs : List (Nat × Nat) := priorWriters.toList.map (fun (_, a) => (a.lo, a.hi))
+        if !intervalsCover writerIvs b.lo b.hi then
+          throw s!"S5 DRAM scratch integrity: task {i} {b.port.name} scratch read [{toHex b.lo}, {toHex b.hi}) is only partially covered by prior resDma writers (uninitialized gap)"
+        -- Check [multiBatchRaw] on every active (not completely superseded by later writers) multi-batch writer
+        for idx in [:priorWriters.size] do
+          let (p, a) := priorWriters[idx]!
           if fps[p]!.isMultiBatch then
-            if b.port == .src1Dma && ti.sync.src1DepKind != 1 then
-              throw s!"S5 DRAM scratch coherence [multiBatchRaw]: task {i} src1Dma reading multi-batch (BatchN > 1) scratch [{toHex b.lo}, {toHex b.hi}) written by task {p} must set 0x4d00 depKind to 1 (got {ti.sync.src1DepKind})"
-            if b.port == .src2Dma && ti.sync.src2DepKind != 1 then
-              throw s!"S5 DRAM scratch coherence [multiBatchRaw]: task {i} src2Dma reading multi-batch (BatchN > 1) scratch [{toHex b.lo}, {toHex b.hi}) written by task {p} must set 0x4d04 depKind to 1 (got {ti.sync.src2DepKind})"
+            let mut laterIvs : List (Nat × Nat) := []
+            for idx2 in [idx + 1 : priorWriters.size] do
+              let (p2, a2) := priorWriters[idx2]!
+              if p2 > p then
+                laterIvs := (a2.lo, a2.hi) :: laterIvs
+            let clipLo := max a.lo b.lo
+            let clipHi := min a.hi b.hi
+            if !intervalsCover laterIvs clipLo clipHi then
+              if b.port == .src1Dma && ti.sync.src1DepKind != 1 then
+                throw s!"S5 DRAM scratch coherence [multiBatchRaw]: task {i} src1Dma reading multi-batch (BatchN > 1) scratch [{toHex b.lo}, {toHex b.hi}) written by task {p} must set 0x4d00 depKind to 1 (got {ti.sync.src1DepKind})"
+              if b.port == .src2Dma && ti.sync.src2DepKind != 1 then
+                throw s!"S5 DRAM scratch coherence [multiBatchRaw]: task {i} src2Dma reading multi-batch (BatchN > 1) scratch [{toHex b.lo}, {toHex b.hi}) written by task {p} must set 0x4d04 depKind to 1 (got {ti.sync.src2DepKind})"
 
   pure ()
 
@@ -4118,6 +4598,7 @@ def verifyHwxTasksSummary (hwxBytes : ByteArray) (info : HwxInfo) (requireKnownT
     | none => pure none
   let mut nConv := 0
   let mut nAct := 0
+  let mut nView := 0
   let mut nPe := 0
   let mut nPePool := 0
   let mut nPeReduce := 0
@@ -4138,6 +4619,11 @@ def verifyHwxTasksSummary (hwxBytes : ByteArray) (info : HwxInfo) (requireKnownT
       footprints := footprints.push fp
       hasPriorNe := true
       nAct := nAct + 1
+    | .neView =>
+      let fp ← verifyNeViewTaskMulti tasks.size hasPriorNe hasPriorPe info task
+      footprints := footprints.push fp
+      hasPriorNe := true
+      nView := nView + 1
     | .peOp =>
       let fp ← verifyPeTaskMulti tasks.size hasPriorNe hasPriorPe info task
       footprints := footprints.push fp
@@ -4165,8 +4651,8 @@ def verifyHwxTasksSummary (hwxBytes : ByteArray) (info : HwxInfo) (requireKnownT
       nNeChanRed := nNeChanRed + 1
     | .unknown =>
       if requireKnownTask then
-        throw s!"task {task.taskIndex}: unrecognized task kind (missing conv, NE activation, pooling/reduction, and PE configuration registers)"
-  let total := nConv + nAct + nPe + nPePool + nPeReduce + nNePool + nNeChanRed
+        throw s!"task {task.taskIndex}: unrecognized task kind (missing conv, NE activation, view, pooling/reduction, and PE configuration registers)"
+  let total := nConv + nAct + nView + nPe + nPePool + nPeReduce + nNePool + nNeChanRed
   if requireKnownTask && total == 0 then
     throw "HWX contains no recognized tasks"
   if footprints.size == tasks.size && footprints.size > 1 then
@@ -4180,6 +4666,7 @@ def verifyHwxTasksSummary (hwxBytes : ByteArray) (info : HwxInfo) (requireKnownT
     peReduce := nPeReduce
     nePool := nNePool
     neChannelReduce := nNeChanRed
+    neView := nView
   }
 
 /-- Verify all recognized tasks (`neConv`, `neAct`, `peOp`) decoded from a validated HWX binary. -/
