@@ -30,7 +30,7 @@ CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o vane-runner ./cmd/vane-runner
 nix build .#vane
 nix build .#vane-runner
 nix build .#vane-runner-arm64
-nix flake check
+nix flake check   # Lean tests, proof/axiom audit, verifier TCB gate, gofmt/vet, go test -race
 ```
 
 ## CLI Quick Reference

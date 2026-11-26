@@ -31,6 +31,13 @@ def parse? (s : String) : Option Target :=
   | "h17" => some .h17
   | _ => none
 
+/-- Every supported target, in a fixed order. Tests iterate this list, so a new
+    constructor is exercised by CI once it is added here. -/
+def all : List Target := [.h16, .h17]
+
+theorem mem_all (t : Target) : t ∈ all := by
+  cases t <;> simp [all]
+
 end Target
 
 /-- Byte size of the task-stream opening prologue frame. -/
