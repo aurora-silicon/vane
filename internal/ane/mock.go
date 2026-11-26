@@ -2,6 +2,7 @@ package ane
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -31,6 +32,18 @@ type mockBO struct {
 	mappedCount int
 }
 
+type mockV2Prog struct {
+	id           uint32
+	sections     map[uint32][]byte
+	genericBinds []GenericBindV2
+}
+
+// MockExecV2Buffer exposes one resolved I/O buffer slice to MockTransport.OnExecV2.
+type MockExecV2Buffer struct {
+	IO   ExecIOV2
+	Data []byte
+}
+
 type mockFDState struct {
 	path         string
 	spec         MockDeviceSpec
@@ -39,17 +52,26 @@ type mockFDState struct {
 	nextBOHandle uint32
 	bos          map[uint32]*mockBO
 	boByOffset   map[uint64]*mockBO
+	nextProgID   uint32
+	progs        map[uint32]*mockV2Prog
+	progByDigest map[[32]byte]uint32
+	nextProcID   uint32
+	procs        map[uint32]uint32 // procID -> progID
 }
 
 // MockTransport implements Transport in memory against Linux accel/ane ABI v1/v2/v3 contracts.
 type MockTransport struct {
 	Devices                map[string]MockDeviceSpec
 	ComputeFn              func(inputs [][]byte, call int) []byte
+	OnExecV2               func(args ExecV2, sections map[uint32][]byte, bufs []MockExecV2Buffer, call int) error
 	HostPageSize           int
 	SubmitDstCount         int
 	BoInitFailAt           int // If > 0, fail the Nth BoInit call with ENOMEM (for leak testing).
 	MmapFailAt             int // If > 0, fail the Nth Mmap call with ENOMEM (for leak testing).
 	SubmitErr              error
+	ProgLoadErr            error
+	ProcCreateErr          error
+	ExecV2Err              error
 	nextFD                 int
 	openFDs                map[int]*mockFDState
 	mappedBOs              map[uintptr]*mockBO
@@ -57,8 +79,16 @@ type MockTransport struct {
 	LoadedSections         map[uint32][]byte
 	ExecCalls              int
 	SubmitCalls            int
+	ProgLoadCalls          int
+	ProcCreateCalls        int
+	ExecV2Calls            int
 	LastSubmitArgs         *SubmitArgs
 	LastBtspData           []byte
+	LastProgLoadArgs       *ProgLoadV2
+	LastProgLoadSections   []SectionV2
+	LastProgLoadBinds      []GenericBindV2
+	LastExecV2Args         *ExecV2
+	LastExecV2IOs          []ExecIOV2
 	TotalAllocatedBOs      int
 	TotalFreedBOs          int
 	FreedBOHandles         []uint32
@@ -113,10 +143,13 @@ func (m *MockTransport) Open(path string) (int, error) {
 	fd := m.nextFD
 	m.nextFD++
 	m.openFDs[fd] = &mockFDState{
-		path:       path,
-		spec:       spec,
-		bos:        map[uint32]*mockBO{},
-		boByOffset: map[uint64]*mockBO{},
+		path:         path,
+		spec:         spec,
+		bos:          map[uint32]*mockBO{},
+		boByOffset:   map[uint64]*mockBO{},
+		progs:        map[uint32]*mockV2Prog{},
+		progByDigest: map[[32]byte]uint32{},
+		procs:        map[uint32]uint32{},
 	}
 	return fd, nil
 }
@@ -410,6 +443,232 @@ func (m *MockTransport) Submit(fd int, args SubmitArgs) error {
 		outData := m.runCompute(inputs, outSz)
 		copy(tileBOs[4].data[:outSz], outData)
 	}
+	return nil
+}
+
+func (m *MockTransport) ProgLoad(fd int, args ProgLoadV2, sections []SectionV2, genericBinds []GenericBindV2) (ProgLoadV2, error) {
+	st, ok := m.openFDs[fd]
+	if !ok {
+		return ProgLoadV2{}, syscall.EBADF
+	}
+	if st.spec.ABIVersion != ABIV2 {
+		return ProgLoadV2{}, syscall.EOPNOTSUPP
+	}
+	if m.ProgLoadErr != nil {
+		return ProgLoadV2{}, m.ProgLoadErr
+	}
+	if args.Pad != 0 {
+		return ProgLoadV2{}, syscall.EINVAL
+	}
+	if len(sections) < 1 || len(sections) > MaxSectionsV2 {
+		return ProgLoadV2{}, syscall.EINVAL
+	}
+	if args.SectionCount != 0 && int(args.SectionCount) != len(sections) {
+		return ProgLoadV2{}, syscall.EINVAL
+	}
+	if len(genericBinds) > MaxBindsV2 {
+		return ProgLoadV2{}, syscall.EINVAL
+	}
+	if args.GenericCount != 0 && int(args.GenericCount) != len(genericBinds) {
+		return ProgLoadV2{}, syscall.EINVAL
+	}
+	for _, g := range genericBinds {
+		if g.Pad != 0 {
+			return ProgLoadV2{}, syscall.EINVAL
+		}
+	}
+
+	secBytes := make(map[uint32][]byte, len(sections))
+	sortedIDs := make([]int, 0, len(sections))
+	for _, s := range sections {
+		if s.ID < 1 || s.ID > MaxSectionsV2 {
+			return ProgLoadV2{}, syscall.EINVAL
+		}
+		if _, dup := secBytes[s.ID]; dup {
+			return ProgLoadV2{}, syscall.EINVAL
+		}
+		if s.Size == 0 {
+			return ProgLoadV2{}, syscall.EINVAL
+		}
+		bo, exists := st.bos[s.BoHandle]
+		if !exists {
+			return ProgLoadV2{}, syscall.EINVAL
+		}
+		if s.Offset > bo.size || s.Size > bo.size-s.Offset {
+			return ProgLoadV2{}, syscall.EINVAL
+		}
+		cp := make([]byte, s.Size)
+		copy(cp, bo.data[s.Offset:s.Offset+s.Size])
+		secBytes[s.ID] = cp
+		sortedIDs = append(sortedIDs, int(s.ID))
+	}
+	sort.Ints(sortedIDs)
+
+	// Identical section payloads in one firmware generation yield the same prog_id.
+	h := sha256.New()
+	var tmp8 [8]byte
+	for _, id := range sortedIDs {
+		binary.LittleEndian.PutUint32(tmp8[0:4], uint32(id))
+		h.Write(tmp8[0:4])
+		payload := secBytes[uint32(id)]
+		binary.LittleEndian.PutUint64(tmp8[0:8], uint64(len(payload)))
+		h.Write(tmp8[0:8])
+		h.Write(payload)
+	}
+	var digest [32]byte
+	copy(digest[:], h.Sum(nil))
+
+	progID, exists := st.progByDigest[digest]
+	if !exists {
+		st.nextProgID++
+		progID = st.nextProgID
+		st.progByDigest[digest] = progID
+		st.progs[progID] = &mockV2Prog{
+			id:           progID,
+			sections:     secBytes,
+			genericBinds: append([]GenericBindV2(nil), genericBinds...),
+		}
+	}
+
+	out := args
+	out.SectionCount = uint32(len(sections))
+	out.GenericCount = uint32(len(genericBinds))
+	out.ProgIDOut = progID
+
+	m.ProgLoadCalls++
+	cpArgs := out
+	m.LastProgLoadArgs = &cpArgs
+	m.LastProgLoadSections = append([]SectionV2(nil), sections...)
+	m.LastProgLoadBinds = append([]GenericBindV2(nil), genericBinds...)
+	return out, nil
+}
+
+func (m *MockTransport) ProcCreate(fd int, args ProcCreateV2) (ProcCreateV2, error) {
+	st, ok := m.openFDs[fd]
+	if !ok {
+		return ProcCreateV2{}, syscall.EBADF
+	}
+	if st.spec.ABIVersion != ABIV2 {
+		return ProcCreateV2{}, syscall.EOPNOTSUPP
+	}
+	if m.ProcCreateErr != nil {
+		return ProcCreateV2{}, m.ProcCreateErr
+	}
+	if args.ProgID == 0 {
+		return ProcCreateV2{}, syscall.EINVAL
+	}
+	if _, exists := st.progs[args.ProgID]; !exists {
+		return ProcCreateV2{}, syscall.EINVAL
+	}
+
+	st.nextProcID++
+	procID := st.nextProcID
+	st.procs[procID] = args.ProgID
+	m.ProcCreateCalls++
+	return ProcCreateV2{
+		ProgID:    args.ProgID,
+		ProcIDOut: procID,
+	}, nil
+}
+
+func (m *MockTransport) ExecV2(fd int, args ExecV2, ios []ExecIOV2) error {
+	st, ok := m.openFDs[fd]
+	if !ok {
+		return syscall.EBADF
+	}
+	if st.spec.ABIVersion != ABIV2 {
+		return syscall.EOPNOTSUPP
+	}
+	if m.ExecV2Err != nil {
+		return m.ExecV2Err
+	}
+	if args.Pad != 0 {
+		return syscall.EINVAL
+	}
+	if len(ios) < 1 || len(ios) > MaxBindsV2 {
+		return syscall.EINVAL
+	}
+	if args.Count != 0 && int(args.Count) != len(ios) {
+		return syscall.EINVAL
+	}
+	if args.Priority < MinPriorityV2 || args.Priority > MaxPriorityV2 {
+		return syscall.EINVAL
+	}
+	if args.TimeoutMS > MaxTimeoutMSV2 {
+		return syscall.EINVAL
+	}
+	prog, exists := st.progs[args.ProgID]
+	if !exists {
+		return syscall.EINVAL
+	}
+	boundProgID, exists := st.procs[args.ProcID]
+	if !exists || boundProgID != args.ProgID {
+		return syscall.EINVAL
+	}
+
+	bufs := make([]MockExecV2Buffer, len(ios))
+	for i, ioSpec := range ios {
+		if ioSpec.Flags != 0 || ioSpec.Reserved != 0 {
+			return syscall.EINVAL
+		}
+		if ioSpec.Size == 0 {
+			return syscall.EINVAL
+		}
+		bo, ok := st.bos[ioSpec.BoHandle]
+		if !ok {
+			return syscall.EINVAL
+		}
+		if ioSpec.Size > bo.size {
+			return syscall.EINVAL
+		}
+		bufs[i] = MockExecV2Buffer{
+			IO:   ioSpec,
+			Data: bo.data[:ioSpec.Size],
+		}
+	}
+
+	m.ExecCalls++
+	m.ExecV2Calls++
+	cpArgs := args
+	cpArgs.Count = uint32(len(ios))
+	m.LastExecV2Args = &cpArgs
+	m.LastExecV2IOs = append([]ExecIOV2(nil), ios...)
+
+	if m.OnExecV2 != nil {
+		return m.OnExecV2(cpArgs, prog.sections, bufs, m.ExecV2Calls)
+	}
+
+	// Default mock behavior when OnExecV2 is nil: treat type==1 (or last buffer) as output,
+	// check 0xff pre-poisoning, and invoke ComputeFn.
+	outIdx := -1
+	for i, b := range bufs {
+		if b.IO.Type == 1 {
+			outIdx = i
+			break
+		}
+	}
+	if outIdx < 0 {
+		outIdx = len(bufs) - 1
+	}
+	var inputs [][]byte
+	for i, b := range bufs {
+		if i == outIdx {
+			continue
+		}
+		cp := make([]byte, len(b.Data))
+		copy(cp, b.Data)
+		inputs = append(inputs, cp)
+	}
+	poisonOK := true
+	for _, v := range bufs[outIdx].Data {
+		if v != 0xff {
+			poisonOK = false
+			break
+		}
+	}
+	m.ObservedOutputPoisonOK = append(m.ObservedOutputPoisonOK, poisonOK)
+	outData := m.runCompute(inputs, len(bufs[outIdx].Data))
+	copy(bufs[outIdx].Data, outData)
 	return nil
 }
 
