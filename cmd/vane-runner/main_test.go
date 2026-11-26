@@ -1721,3 +1721,155 @@ func TestMultiABIProbeAndRunAnecCLI(t *testing.T) {
 		t.Fatalf("run-anec on empty device set rc=%d, want %d", rc, ane.ExitSkip)
 	}
 }
+
+func TestM5cViewLinearAndGraphCLI(t *testing.T) {
+	vaneBin := findVaneBin(t)
+	tmp := t.TempDir()
+	var stdout, stderr bytes.Buffer
+
+	// 1. All 5 view ops via gen-view + vane compile-view + vane validate --check-tasks
+	viewCases := []struct {
+		name        string
+		genArgs     []string
+		compileArgs []string
+	}{
+		{
+			name:        "transpose_ch",
+			genArgs:     []string{"--op", "transpose", "--h", "8", "--w", "32", "--c", "16", "--perm", "0,2,1,3"},
+			compileArgs: []string{"--target", "h17", "--op", "transpose", "--h", "8", "--w", "32", "--c", "16", "--perm", "0,2,1,3"},
+		},
+		{
+			name:        "transpose_cw_tmode",
+			genArgs:     []string{"--op", "transpose", "--n", "2", "--h", "4", "--w", "32", "--c", "16", "--perm", "0,3,2,1"},
+			compileArgs: []string{"--target", "h16", "--op", "transpose", "--n", "2", "--h", "4", "--w", "32", "--c", "16", "--perm", "0,3,2,1"},
+		},
+		{
+			name:        "slice_w32",
+			genArgs:     []string{"--op", "slice", "--h", "8", "--w", "96", "--c", "8", "--begin", "0,0,0,32", "--end", "1,8,8,64"},
+			compileArgs: []string{"--target", "h17", "--op", "slice", "--h", "8", "--w", "96", "--c", "8", "--begin", "0,0,0,32", "--end", "1,8,8,64"},
+		},
+		{
+			name:        "concat_c",
+			genArgs:     []string{"--op", "concat", "--axis", "1", "--shapes", "8x32x16,8x32x24"},
+			compileArgs: []string{"--target", "h17", "--op", "concat", "--axis", "1", "--shapes", "8x32x16,8x32x24"},
+		},
+		{
+			name:        "split_c",
+			genArgs:     []string{"--op", "split", "--h", "8", "--w", "32", "--c", "24", "--axis", "1", "--sizes", "8,16", "--part", "1"},
+			compileArgs: []string{"--target", "h16", "--op", "split", "--h", "8", "--w", "32", "--c", "24", "--axis", "1", "--sizes", "8,16", "--part", "1"},
+		},
+		{
+			name:        "reshape",
+			genArgs:     []string{"--op", "reshape", "--h", "8", "--w", "32", "--c", "16", "--out-shape", "1,32,4,32"},
+			compileArgs: []string{"--target", "h17", "--op", "reshape", "--h", "8", "--w", "32", "--c", "16", "--out-shape", "1,32,4,32"},
+		},
+	}
+
+	for _, tc := range viewCases {
+		vecDir := filepath.Join(tmp, "vec_"+tc.name)
+		compDir := filepath.Join(tmp, "comp_"+tc.name)
+		stdout.Reset()
+		stderr.Reset()
+		gArgs := append([]string{"gen-view"}, tc.genArgs...)
+		gArgs = append(gArgs, "--out-dir", vecDir, "--json")
+		if rc := runCLI(gArgs, nil, &stdout, &stderr); rc != 0 {
+			t.Fatalf("gen-view %s failed rc=%d stderr=%s", tc.name, rc, stderr.String())
+		}
+		expF64, err := os.ReadFile(filepath.Join(vecDir, "expected_f64.bin"))
+		if err != nil || len(expF64) == 0 {
+			t.Fatalf("gen-view %s missing expected_f64.bin: %v", tc.name, err)
+		}
+		expQ, err := os.ReadFile(filepath.Join(vecDir, "expected_q1516.bin"))
+		if err != nil || !bytes.Equal(expF64, expQ) {
+			t.Fatalf("gen-view %s expected_f64 != expected_q1516", tc.name)
+		}
+
+		cArgs := append([]string{"compile-view"}, tc.compileArgs...)
+		cArgs = append(cArgs, "--out-dir", compDir)
+		runVane(t, vaneBin, cArgs...)
+		valOut := runVane(t, vaneBin, "validate", "--hwx", filepath.Join(compDir, "program.hwx"), "--sections", compDir, "--check-tasks")
+		if !strings.Contains(valOut, "status: ok") || !strings.Contains(valOut, "ne_view=") {
+			t.Fatalf("validate view %s failed:\n%s", tc.name, valOut)
+		}
+	}
+
+	// 2. Large-channel auto-split compile-linear CLI (H16 256->512)
+	linDir := filepath.Join(tmp, "lin_split")
+	wBytes := make([]byte, 512*256*2)
+	bBytes := make([]byte, 512*2)
+	wPath := filepath.Join(tmp, "lin_w.bin")
+	bPath := filepath.Join(tmp, "lin_b.bin")
+	if err := os.WriteFile(wPath, wBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bPath, bBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	linOut := runVane(t, vaneBin, "compile-linear", "--target", "h16", "--m", "16", "--k", "256", "--n", "512", "--batch", "2", "--weights", wPath, "--bias", bPath, "--act", "gelu", "--out-dir", linDir)
+	if !strings.Contains(linOut, "slices=[256, 256]") {
+		t.Fatalf("expected split slices=[256, 256] on H16 linear 256->512, got: %s", linOut)
+	}
+	if valOut := runVane(t, vaneBin, "validate", "--hwx", filepath.Join(linDir, "program.hwx"), "--sections", linDir, "--check-tasks"); !strings.Contains(valOut, "status: ok") {
+		t.Fatalf("validate compile-linear failed:\n%s", valOut)
+	}
+
+	// 3. U-Net skip-concat graph via gen-graph + compile-graph + validate
+	unetSpec := filepath.Join(tmp, "unet.json")
+	unetVec := filepath.Join(tmp, "unet_vec")
+	unetComp := filepath.Join(tmp, "unet_comp")
+	unetJSON := `{
+		"target": "h17",
+		"placement": "auto",
+		"inputs": [{"name": "x", "c": 16, "h": 8, "w": 32}],
+		"nodes": [
+			{"id": "enc", "op": "conv3x3", "mode": "dense", "cout": 16, "stride": 1, "pad": "same", "relu": true, "inputs": ["x"]},
+			{"id": "mid", "op": "conv1x1", "cout": 16, "relu": true, "inputs": ["enc"]},
+			{"id": "cat", "op": "concat", "axis": 1, "inputs": ["mid", "enc"]},
+			{"id": "dec", "op": "conv1x1", "cout": 16, "has_bias": true, "inputs": ["cat"]}
+		]
+	}`
+	if err := os.WriteFile(unetSpec, []byte(unetJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if rc := runCLI([]string{"gen-graph", "--spec", unetSpec, "--out-dir", unetVec, "--json"}, nil, &stdout, &stderr); rc != 0 {
+		t.Fatalf("gen-graph unet failed rc=%d stderr=%s", rc, stderr.String())
+	}
+	runVane(t, vaneBin, "compile-graph", "--spec", filepath.Join(unetVec, "graph_resolved.json"), "--out-dir", unetComp)
+	if out := runVane(t, vaneBin, "validate", "--hwx", filepath.Join(unetComp, "program.hwx"), "--sections", unetComp, "--check-tasks"); !strings.Contains(out, "status: ok") {
+		t.Fatalf("validate unet graph failed:\n%s", out)
+	}
+
+	// 4. Large-hidden Transformer FFN graph (auto-split linear 256->1024 GELU -> linear 1024->256 + residual)
+	ffnSpec := filepath.Join(tmp, "ffn.json")
+	ffnVec := filepath.Join(tmp, "ffn_vec")
+	ffnComp := filepath.Join(tmp, "ffn_comp")
+	ffnJSON := `{
+		"target": "h17",
+		"placement": "auto",
+		"inputs": [{"name": "x", "c": 256, "h": 1, "w": 32}],
+		"nodes": [
+			{"id": "sq", "op": "pe", "pe_op": "square", "inputs": ["x"]},
+			{"id": "ms", "op": "reduce", "reduce_op": "mean", "axes": "c", "inputs": ["sq"]},
+			{"id": "ms_eps", "op": "pe", "pe_op": "sadd", "scalar": 0.001, "inputs": ["ms"]},
+			{"id": "inv_rms", "op": "lut", "act": "rsqrt", "inputs": ["ms_eps"]},
+			{"id": "norm", "op": "pe", "pe_op": "mul", "inputs": ["x", "inv_rms"]},
+			{"id": "up", "op": "linear", "k": 256, "n": 1024, "has_bias": true, "act": "gelu", "inputs": ["norm"]},
+			{"id": "down", "op": "linear", "k": 1024, "n": 256, "has_bias": true, "inputs": ["up"]},
+			{"id": "out", "op": "pe", "pe_op": "add", "inputs": ["down", "x"]}
+		]
+	}`
+	if err := os.WriteFile(ffnSpec, []byte(ffnJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if rc := runCLI([]string{"gen-graph", "--spec", ffnSpec, "--out-dir", ffnVec, "--json"}, nil, &stdout, &stderr); rc != 0 {
+		t.Fatalf("gen-graph ffn failed rc=%d stderr=%s", rc, stderr.String())
+	}
+	runVane(t, vaneBin, "compile-graph", "--spec", filepath.Join(ffnVec, "graph_resolved.json"), "--out-dir", ffnComp)
+	if out := runVane(t, vaneBin, "validate", "--hwx", filepath.Join(ffnComp, "program.hwx"), "--sections", ffnComp, "--check-tasks"); !strings.Contains(out, "status: ok") {
+		t.Fatalf("validate ffn graph failed:\n%s", out)
+	}
+}
