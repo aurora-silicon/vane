@@ -24,10 +24,11 @@ type MockDeviceSpec struct {
 }
 
 type mockBO struct {
-	handle uint32
-	size   uint64
-	offset uint64
-	data   []byte
+	handle      uint32
+	size        uint64
+	offset      uint64
+	data        []byte
+	mappedCount int
 }
 
 type mockFDState struct {
@@ -47,9 +48,11 @@ type MockTransport struct {
 	HostPageSize           int
 	SubmitDstCount         int
 	BoInitFailAt           int // If > 0, fail the Nth BoInit call with ENOMEM (for leak testing).
+	MmapFailAt             int // If > 0, fail the Nth Mmap call with ENOMEM (for leak testing).
 	SubmitErr              error
 	nextFD                 int
 	openFDs                map[int]*mockFDState
+	mappedBOs              map[uintptr]*mockBO
 	ObservedOutputPoisonOK []bool
 	LoadedSections         map[uint32][]byte
 	ExecCalls              int
@@ -60,6 +63,7 @@ type MockTransport struct {
 	TotalFreedBOs          int
 	FreedBOHandles         []uint32
 	boInitCount            int
+	mmapCount              int
 }
 
 // NewMockTransport creates an in-memory accel/ane transport with 16 KiB default pages.
@@ -70,6 +74,7 @@ func NewMockTransport(devices map[string]MockDeviceSpec, compute func([][]byte, 
 		HostPageSize:   PageSize16K,
 		nextFD:         100,
 		openFDs:        map[int]*mockFDState{},
+		mappedBOs:      map[uintptr]*mockBO{},
 		LoadedSections: map[uint32][]byte{},
 	}
 }
@@ -81,6 +86,11 @@ func (m *MockTransport) ActiveBOCount() int {
 		n += len(st.bos)
 	}
 	return n
+}
+
+// ActiveMappedBOCount returns the number of currently mapped ABI v1/v2 BOs.
+func (m *MockTransport) ActiveMappedBOCount() int {
+	return len(m.mappedBOs)
 }
 
 func (m *MockTransport) ListDevices() ([]string, error) {
@@ -125,11 +135,20 @@ func (m *MockTransport) Mmap(fd int, offset int64, length int, prot int, _ int) 
 	if !ok {
 		return nil, syscall.EINVAL
 	}
-	if st.spec.ABIVersion == ABIV1 {
+	m.mmapCount++
+	if m.MmapFailAt > 0 && m.mmapCount == m.MmapFailAt {
+		return nil, syscall.ENOMEM
+	}
+	if st.spec.ABIVersion == ABIV1 || st.spec.ABIVersion == ABIV2 {
 		bo, ok := st.boByOffset[uint64(offset)]
 		if !ok || length <= 0 || length > len(bo.data) {
 			return nil, syscall.EINVAL
 		}
+		if m.mappedBOs == nil {
+			m.mappedBOs = map[uintptr]*mockBO{}
+		}
+		bo.mappedCount++
+		m.mappedBOs[uintptr(unsafe.Pointer(&bo.data[0]))] = bo
 		return bo.data[:length], nil
 	}
 	if st.loaded == nil {
@@ -148,7 +167,17 @@ func (m *MockTransport) Mmap(fd int, offset int64, length int, prot int, _ int) 
 	return st.surfaces[idx][:length], nil
 }
 
-func (m *MockTransport) Munmap(_ []byte) error {
+func (m *MockTransport) Munmap(b []byte) error {
+	if len(b) > 0 && m.mappedBOs != nil {
+		ptr := uintptr(unsafe.Pointer(&b[0]))
+		if bo, ok := m.mappedBOs[ptr]; ok {
+			bo.mappedCount--
+			if bo.mappedCount <= 0 {
+				bo.mappedCount = 0
+				delete(m.mappedBOs, ptr)
+			}
+		}
+	}
 	return nil
 }
 
@@ -270,6 +299,9 @@ func (m *MockTransport) BoFree(fd int, handle uint32) error {
 	bo, ok := st.bos[handle]
 	if !ok {
 		return syscall.EINVAL
+	}
+	if bo.mappedCount > 0 {
+		return syscall.EBUSY
 	}
 	delete(st.bos, handle)
 	delete(st.boByOffset, bo.offset)

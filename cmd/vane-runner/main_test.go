@@ -1692,8 +1692,9 @@ func TestMultiABIProbeAndRunAnecCLI(t *testing.T) {
 	if rep.Comparison == nil || !rep.Comparison.Passed {
 		t.Fatalf("expected comparison passed, got %+v", rep.Comparison)
 	}
-	if h13Tr.SubmitCalls != 4 || h13Tr.ActiveBOCount() != 0 {
-		t.Fatalf("expected 4 submits and 0 leaked BOs, got submits=%d activeBOs=%d", h13Tr.SubmitCalls, h13Tr.ActiveBOCount())
+	if h13Tr.SubmitCalls != 4 || h13Tr.ActiveBOCount() != 0 || h13Tr.TotalAllocatedBOs == 0 || h13Tr.TotalAllocatedBOs != h13Tr.TotalFreedBOs {
+		t.Fatalf("expected 4 submits and leak-free BO lifecycle, got submits=%d activeBOs=%d alloc=%d freed=%d",
+			h13Tr.SubmitCalls, h13Tr.ActiveBOCount(), h13Tr.TotalAllocatedBOs, h13Tr.TotalFreedBOs)
 	}
 	gotOut, err := os.ReadFile(outPath)
 	if err != nil || !bytes.Equal(gotOut, fp16.EncodeLE(expVals)) {

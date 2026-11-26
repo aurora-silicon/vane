@@ -165,13 +165,8 @@ def taskHeader8MultiLayout : WordLayout := {
 
 /-- Named constants for 9-word task header words 2 and 4. -/
 def taskHeader2FirstFlags : UInt32 := 0x68
-def taskHeader4H17Base : UInt32 := 0x00fff800
-def taskHeader4H16Base : UInt32 := 0x00fff820
 def taskHeader4FirstBit : UInt32 := 0x00000008
-def taskHeader4H17EdgeBits : UInt32 := 0x00000060
-def taskHeader4H16EdgeBits : UInt32 := 0x00000040
 def taskHeaderWord2Const : UInt32 := ((1 : UInt32) <<< 26) ||| taskHeader2FirstFlags
-def taskHeaderWord4Const : UInt32 := taskHeader4H17Base ||| taskHeader4FirstBit ||| taskHeader4H17EdgeBits
 def taskHeaderWord4CopyConst : UInt32 := taskHeader2FirstFlags
 
 /-- Target- and position-specific `header[4]` word for multi-task streams. -/
@@ -180,6 +175,8 @@ def taskHeaderWord4Multi (target : Target) (isFirst isLast : Bool) : UInt32 :=
   let firstBit := if isFirst then taskHeader4FirstBit else 0
   let edgeBits := if isFirst || isLast then prof.taskHeader4EdgeBits else 0
   prof.taskHeader4Base ||| firstBit ||| edgeBits
+
+def taskHeaderWord4Const : UInt32 := taskHeaderWord4Multi .h17 true true
 
 /-- 64 KiB L2 block size for `header[7]` live-L2 bitmasks (32 blocks cover 2 MiB). -/
 def l2MaskBlockBytes : Nat := 0x10000

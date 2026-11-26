@@ -131,6 +131,78 @@ func alignUpU64(n, align uint64) (uint64, bool) {
 	return n + add, true
 }
 
+func validateAnecHeaderAndPayload(h AnecHeader, payloadLen int) error {
+	if h.Size == 0 {
+		return errors.New("anec header size must be > 0")
+	}
+	if uint64(payloadLen) != h.Size {
+		return fmt.Errorf("anec payload size mismatch: payload has %d bytes, header declares %d",
+			payloadLen, h.Size)
+	}
+	if h.TDCount == 0 || h.TDCount > MaxTDCount {
+		return fmt.Errorf("anec td_count %d out of range [1, %d]", h.TDCount, MaxTDCount)
+	}
+	if h.TDSize < MinTDSize || h.TDSize > MaxTDSize || h.TDSize%4 != 0 {
+		return fmt.Errorf("anec td_size %d must be in [%d, %d] and 4-byte aligned",
+			h.TDSize, MinTDSize, MaxTDSize)
+	}
+	if uint64(h.TDSize) > h.Size {
+		return fmt.Errorf("anec td_size %d exceeds payload size %d", h.TDSize, h.Size)
+	}
+	if h.TskSize == 0 {
+		return errors.New("anec tsk_size must be > 0")
+	}
+	if h.TskSize > h.Size {
+		return fmt.Errorf("anec tsk_size %d exceeds payload size %d", h.TskSize, h.Size)
+	}
+	hi, tdBytes := bits.Mul64(uint64(h.TDCount), uint64(h.TDSize))
+	if hi != 0 || tdBytes > h.TskSize {
+		return fmt.Errorf("anec td_count(%d)*td_size(%d) exceeds tsk_size(%d)",
+			h.TDCount, h.TDSize, h.TskSize)
+	}
+	if h.Tiles[0] == 0 {
+		return errors.New("anec tiles[0] must be > 0")
+	}
+	if h.Tiles[1] != 0 {
+		return fmt.Errorf("anec tiles[1] must be 0 (derived by kernel), got %d", h.Tiles[1])
+	}
+	tile0Bytes := h.TileBytes(0)
+	if h.Size > tile0Bytes {
+		return fmt.Errorf("anec payload size %d exceeds tiles[0] allocation %d", h.Size, tile0Bytes)
+	}
+	if h.TskSize >= tile0Bytes {
+		return fmt.Errorf("anec tsk_size %d must be strictly smaller than tiles[0] allocation %d",
+			h.TskSize, tile0Bytes)
+	}
+	if h.KrnSize > 0 {
+		tskAligned, ok := alignUpU64(h.TskSize, CmdGran)
+		if !ok || tskAligned > h.Size || h.KrnSize > h.Size-tskAligned {
+			return fmt.Errorf("anec round_up(tsk_size=%d, 0x10) + krn_size(%d) exceeds payload size %d",
+				h.TskSize, h.KrnSize, h.Size)
+		}
+	}
+	if h.DstCount < 1 {
+		return errors.New("anec dst_count must be >= 1")
+	}
+	if uint64(4)+uint64(h.DstCount)+uint64(h.SrcCount) > TileCount {
+		return fmt.Errorf("anec surface slots 4 + dst_count(%d) + src_count(%d) exceed %d",
+			h.DstCount, h.SrcCount, TileCount)
+	}
+	for i := 0; i < int(h.DstCount); i++ {
+		bdx := h.DstSlot(i)
+		if h.Tiles[bdx] == 0 {
+			return fmt.Errorf("anec output slot %d has zero tile allocation", bdx)
+		}
+	}
+	for i := 0; i < int(h.SrcCount); i++ {
+		bdx := h.SrcSlot(i)
+		if h.Tiles[bdx] == 0 {
+			return fmt.Errorf("anec input slot %d has zero tile allocation", bdx)
+		}
+	}
+	return nil
+}
+
 // ParseAnec parses and validates an ABI v1 .anec binary container.
 func ParseAnec(data []byte) (*AnecProgram, error) {
 	if len(data) < AnecHeaderSize {
@@ -157,70 +229,8 @@ func ParseAnec(data []byte) (*AnecProgram, error) {
 		}
 	}
 
-	if h.Size == 0 {
-		return nil, errors.New("anec header size must be > 0")
-	}
-	if uint64(len(data)-AnecHeaderSize) != h.Size {
-		return nil, fmt.Errorf("anec payload size mismatch: file has %d payload bytes, header declares %d",
-			len(data)-AnecHeaderSize, h.Size)
-	}
-	if h.TDCount == 0 || h.TDCount > MaxTDCount {
-		return nil, fmt.Errorf("anec td_count %d out of range [1, %d]", h.TDCount, MaxTDCount)
-	}
-	if h.TDSize < MinTDSize || h.TDSize > MaxTDSize || h.TDSize%4 != 0 {
-		return nil, fmt.Errorf("anec td_size %d must be in [%d, %d] and 4-byte aligned",
-			h.TDSize, MinTDSize, MaxTDSize)
-	}
-	if uint64(h.TDSize) > h.Size {
-		return nil, fmt.Errorf("anec td_size %d exceeds payload size %d", h.TDSize, h.Size)
-	}
-	if h.TskSize == 0 {
-		return nil, errors.New("anec tsk_size must be > 0")
-	}
-	hi, tdBytes := bits.Mul64(uint64(h.TDCount), uint64(h.TDSize))
-	if hi != 0 || tdBytes > h.TskSize {
-		return nil, fmt.Errorf("anec td_count(%d)*td_size(%d) exceeds tsk_size(%d)",
-			h.TDCount, h.TDSize, h.TskSize)
-	}
-	if h.Tiles[0] == 0 {
-		return nil, errors.New("anec tiles[0] must be > 0")
-	}
-	if h.Tiles[1] != 0 {
-		return nil, fmt.Errorf("anec tiles[1] must be 0 (derived by kernel), got %d", h.Tiles[1])
-	}
-	tile0Bytes := h.TileBytes(0)
-	if h.Size > tile0Bytes {
-		return nil, fmt.Errorf("anec payload size %d exceeds tiles[0] allocation %d", h.Size, tile0Bytes)
-	}
-	if h.TskSize >= tile0Bytes {
-		return nil, fmt.Errorf("anec tsk_size %d must be strictly smaller than tiles[0] allocation %d",
-			h.TskSize, tile0Bytes)
-	}
-	if h.KrnSize > 0 {
-		tskAligned, ok := alignUpU64(h.TskSize, CmdGran)
-		if !ok || tskAligned > h.Size || h.KrnSize > h.Size-tskAligned {
-			return nil, fmt.Errorf("anec round_up(tsk_size=%d, 0x10) + krn_size(%d) exceeds payload size %d",
-				h.TskSize, h.KrnSize, h.Size)
-		}
-	}
-	if h.DstCount < 1 {
-		return nil, errors.New("anec dst_count must be >= 1")
-	}
-	if uint64(4)+uint64(h.DstCount)+uint64(h.SrcCount) > TileCount {
-		return nil, fmt.Errorf("anec surface slots 4 + dst_count(%d) + src_count(%d) exceed %d",
-			h.DstCount, h.SrcCount, TileCount)
-	}
-	for i := 0; i < int(h.DstCount); i++ {
-		bdx := h.DstSlot(i)
-		if h.Tiles[bdx] == 0 {
-			return nil, fmt.Errorf("anec output slot %d has zero tile allocation", bdx)
-		}
-	}
-	for i := 0; i < int(h.SrcCount); i++ {
-		bdx := h.SrcSlot(i)
-		if h.Tiles[bdx] == 0 {
-			return nil, fmt.Errorf("anec input slot %d has zero tile allocation", bdx)
-		}
+	if err := validateAnecHeaderAndPayload(h, len(data)-AnecHeaderSize); err != nil {
+		return nil, err
 	}
 
 	payload := make([]byte, len(data)-AnecHeaderSize)
@@ -254,6 +264,9 @@ func ExecuteAnec(
 ) ([]byte, RunReport, error) {
 	if prog == nil {
 		return nil, RunReport{}, errors.New("nil AnecProgram")
+	}
+	if err := validateAnecHeaderAndPayload(prog.Header, len(prog.Payload)); err != nil {
+		return nil, RunReport{}, fmt.Errorf("invalid AnecProgram: %w", err)
 	}
 	if opts.InPlace {
 		return nil, RunReport{}, errors.New("--in-place is not supported for ABI v1 execution (BOs are always mmap-backed)")

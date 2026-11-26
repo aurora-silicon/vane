@@ -409,6 +409,15 @@ func TestParseAnecValidation(t *testing.T) {
 		{"td_size_too_large", func(h *AnecHeader, _ *[]byte) { h.TDSize = MaxTDSize + 4 }},
 		{"td_size_gt_payload", func(h *AnecHeader, _ *[]byte) { h.TDSize = 0x300; h.TskSize = 0x300 }},
 		{"tsk_size_zero", func(h *AnecHeader, _ *[]byte) { h.TskSize = 0 }},
+		{"tsk_size_gt_payload_krn_zero", func(h *AnecHeader, p *[]byte) {
+			*p = make([]byte, 0x100)
+			h.Size = 0x100
+			h.TDCount = 2
+			h.TDSize = 0x100
+			h.TskSize = 0x200
+			h.KrnSize = 0
+			h.Tiles[0] = 2
+		}},
 		{"td_bytes_gt_tsk_size", func(h *AnecHeader, _ *[]byte) { h.TDCount = 2; h.TskSize = 0x100 }},
 		{"tiles0_zero", func(h *AnecHeader, _ *[]byte) { h.Tiles[0] = 0 }},
 		{"tiles1_nonzero", func(h *AnecHeader, _ *[]byte) { h.Tiles[1] = 1 }},
@@ -570,5 +579,123 @@ func TestExecuteAnecLifecycleAndCleanup(t *testing.T) {
 	if trSubErr.ActiveBOCount() != 0 || trSubErr.TotalAllocatedBOs != trSubErr.TotalFreedBOs {
 		t.Fatalf("BO leak after SUBMIT error: active=%d alloc=%d freed=%d",
 			trSubErr.ActiveBOCount(), trSubErr.TotalAllocatedBOs, trSubErr.TotalFreedBOs)
+	}
+
+	// Mid-setup Mmap failure must unmap prior BOs and free every allocated BO (including the unmapped one)
+	trMmapFail := NewMockTransport(map[string]MockDeviceSpec{
+		"/dev/accel/accel0": {ABIVersion: ABIV1, ChipFamily: ChipH13},
+	}, nil)
+	trMmapFail.MmapFailAt = 3
+	fdMm, capsMm, err := DiscoverDeviceABI(trMmapFail, "", ABIV1, ChipH13)
+	if err != nil {
+		t.Fatalf("DiscoverDeviceABI: %v", err)
+	}
+	defer trMmapFail.Close(fdMm)
+	if _, _, err := ExecuteAnec(trMmapFail, fdMm, capsMm, prog, [][]byte{in1}, ExecOptions{Runs: 1}); err == nil {
+		t.Fatalf("expected mid-setup Mmap ENOMEM failure")
+	}
+	if trMmapFail.ActiveBOCount() != 0 || trMmapFail.ActiveMappedBOCount() != 0 ||
+		trMmapFail.TotalAllocatedBOs != 3 || trMmapFail.TotalFreedBOs != 3 {
+		t.Fatalf("BO/mmap leak after mid-setup Mmap failure: active=%d mapped=%d alloc=%d freed=%d",
+			trMmapFail.ActiveBOCount(), trMmapFail.ActiveMappedBOCount(), trMmapFail.TotalAllocatedBOs, trMmapFail.TotalFreedBOs)
+	}
+
+	// Direct check: BoFree rejects still-mapped BO with EBUSY, then succeeds after Munmap (and ABI v2 Mmap works)
+	for _, spec := range []MockDeviceSpec{
+		{ABIVersion: ABIV1, ChipFamily: ChipH13},
+		{ABIVersion: ABIV2, ChipFamily: ChipH14},
+	} {
+		trMap := NewMockTransport(map[string]MockDeviceSpec{"/dev/accel/accel0": spec}, nil)
+		mfd, _, err := DiscoverDeviceABI(trMap, "", spec.ABIVersion, spec.ChipFamily)
+		if err != nil {
+			t.Fatalf("DiscoverDeviceABI(v%d): %v", spec.ABIVersion, err)
+		}
+		bo, err := trMap.BoInit(mfd, PageSize16K)
+		if err != nil {
+			t.Fatalf("BoInit(v%d): %v", spec.ABIVersion, err)
+		}
+		mm, err := trMap.Mmap(mfd, int64(bo.Offset), PageSize16K, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+		if err != nil {
+			t.Fatalf("Mmap(v%d): %v", spec.ABIVersion, err)
+		}
+		if err := trMap.BoFree(mfd, bo.Handle); !errors.Is(err, syscall.EBUSY) {
+			t.Fatalf("BoFree while mapped (v%d): got %v, want EBUSY", spec.ABIVersion, err)
+		}
+		if err := trMap.Munmap(mm); err != nil {
+			t.Fatalf("Munmap(v%d): %v", spec.ABIVersion, err)
+		}
+		if err := trMap.BoFree(mfd, bo.Handle); err != nil {
+			t.Fatalf("BoFree after Munmap (v%d): %v", spec.ABIVersion, err)
+		}
+		_ = trMap.Close(mfd)
+	}
+
+	// Manually constructed malformed AnecProgram structs must be rejected cleanly without panicking or allocating BOs
+	malformedProgs := []struct {
+		name string
+		prog *AnecProgram
+	}{
+		{"empty_struct", &AnecProgram{}},
+		{"dst_count_zero", func() *AnecProgram {
+			h, p := validSyntheticAnecHeader()
+			h.DstCount = 0
+			return &AnecProgram{Header: h, Payload: p}
+		}()},
+		{"slots_overflow", func() *AnecProgram {
+			h, p := validSyntheticAnecHeader()
+			h.DstCount = 20
+			h.SrcCount = 10
+			return &AnecProgram{Header: h, Payload: p}
+		}()},
+		{"tiles0_zero", func() *AnecProgram {
+			h, p := validSyntheticAnecHeader()
+			h.Tiles[0] = 0
+			return &AnecProgram{Header: h, Payload: p}
+		}()},
+		{"tiles1_nonzero", func() *AnecProgram {
+			h, p := validSyntheticAnecHeader()
+			h.Tiles[1] = 1
+			return &AnecProgram{Header: h, Payload: p}
+		}()},
+		{"td_size_gt_payload", func() *AnecProgram {
+			h, p := validSyntheticAnecHeader()
+			h.TDSize = 0x400
+			h.TskSize = 0x400
+			return &AnecProgram{Header: h, Payload: p}
+		}()},
+		{"tsk_size_gt_payload", func() *AnecProgram {
+			h, p := validSyntheticAnecHeader()
+			h.KrnSize = 0
+			h.TskSize = uint64(len(p)) + 0x100
+			return &AnecProgram{Header: h, Payload: p}
+		}()},
+		{"dst_slot_zero_tile", func() *AnecProgram {
+			h, p := validSyntheticAnecHeader()
+			h.Tiles[4] = 0
+			return &AnecProgram{Header: h, Payload: p}
+		}()},
+		{"src_slot_zero_tile", func() *AnecProgram {
+			h, p := validSyntheticAnecHeader()
+			h.Tiles[5] = 0
+			return &AnecProgram{Header: h, Payload: p}
+		}()},
+	}
+	for _, tc := range malformedProgs {
+		t.Run("manual_malformed_"+tc.name, func(t *testing.T) {
+			trBad := NewMockTransport(map[string]MockDeviceSpec{
+				"/dev/accel/accel0": {ABIVersion: ABIV1, ChipFamily: ChipH13},
+			}, nil)
+			bfd, bcaps, err := DiscoverDeviceABI(trBad, "", ABIV1, ChipH13)
+			if err != nil {
+				t.Fatalf("DiscoverDeviceABI: %v", err)
+			}
+			defer trBad.Close(bfd)
+			if _, _, err := ExecuteAnec(trBad, bfd, bcaps, tc.prog, nil, ExecOptions{Runs: 1}); err == nil {
+				t.Fatalf("ExecuteAnec unexpectedly accepted malformed program %s", tc.name)
+			}
+			if trBad.TotalAllocatedBOs != 0 || trBad.ActiveBOCount() != 0 {
+				t.Fatalf("malformed program %s allocated BOs: alloc=%d active=%d", tc.name, trBad.TotalAllocatedBOs, trBad.ActiveBOCount())
+			}
+		})
 	}
 }

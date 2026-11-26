@@ -1926,4 +1926,18 @@ theorem target_profile_header4_disjoint_firstBit (t : Target) :
     (t.profile.taskHeader4EdgeBits &&& taskHeader4FirstBit) = 0 := by
   cases t <;> decide
 
+theorem target_profile_isValidPrologue_binary (t : Target) (p : UInt32)
+    (h : t.profile.isValidPrologue p = true) : p = 0 ∨ p = 1 := by
+  cases t <;> simp [Target.profile, TargetProfile.isValidPrologue] at h
+  · right; exact h
+  · rcases h with h1 | h0
+    · right; exact h1
+    · left; exact h0
+
+theorem target_profile_conv1x1MaxCout_pos (t : Target) (f ocg : Nat) :
+    t.profile.conv1x1MaxCout f ocg > 0 := by
+  unfold TargetProfile.conv1x1MaxCout
+  rw [Nat.shiftLeft_eq, Nat.one_mul]
+  exact Nat.two_pow_pos _
+
 end Vane.Proofs
