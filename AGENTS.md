@@ -20,7 +20,7 @@ nix build .#vane .#vane-runner .#vane-runner-arm64
 `nix flake check` runs:
 
 - `lean-tests`: `vane-test`, including the cross-target smoke matrix over `Target.all`.
-- `proof-audit`: `vane-audit` loads the compiled `.olean`s and checks that every `Vane.*` constant uses only `propext`, `Classical.choice` and `Quot.sound`, declares no `axiom`, `unsafe`, `implemented_by` or `extern`, and that `Vane.Proofs` still has at least 189 theorems; `cmd/lean-guard` runs `selftest` and `forbidden` to reject `sorry`, `admit`, `native_decide`, `implemented_by`, `bv_decide`, `unsafe`, `skipKernelTC` and `extern` in Lean code; and `leanchecker Vane Vane.Proofs` replays every declaration through the Lean kernel.
+- `proof-audit`: `vane-audit` loads the compiled `.olean`s and checks that every `Vane.*` constant uses only `propext`, `Classical.choice` and `Quot.sound`, declares no `axiom`, `unsafe`, `implemented_by` or `extern`, and that `Vane.Proofs` still has at least 320 theorems; `cmd/lean-guard` runs `selftest` and `forbidden` to reject `sorry`, `admit`, `native_decide`, `implemented_by`, `bv_decide`, `unsafe`, `skipKernelTC` and `extern` in Lean code; and `leanchecker Vane Vane.Proofs` replays every declaration through the Lean kernel.
 - `tcb-check`: `cmd/lean-guard` (`tcb`) keeps the import closure of `Vane/Verify.lean` inside `Vane.Binary`, `Vane.TaskStream`, `Vane.Hwx`, `Vane.Register` and `Vane.Reach`.
 - `go-lint`: `gofmt`, `go vet`, and no `require` in `go.mod` / no `go.sum`.
 - `go-tests`: `go test -race -v ./...` against the built `vane`.

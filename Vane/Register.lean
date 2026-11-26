@@ -989,6 +989,91 @@ structure DecodedTask where
   writes : Array DecodedWrite
   deriving Repr, BEq, Inhabited
 
+/-- Push a list of little-endian 32-bit words onto `bs`. -/
+def pushU32LEs (bs : ByteArray) : List UInt32 → ByteArray
+  | [] => bs
+  | v :: rest => pushU32LEs (pushU32LE bs v) rest
+
+/-- Decode the set-bit register byte addresses `(base + i + 1) * 4` for `i < k` in ascending order. -/
+def decodeBitmaskAddrsAux (base mask : Nat) : Nat → List Nat → List Nat
+  | 0, acc => acc
+  | i + 1, acc =>
+    let acc' := if ((mask >>> i) &&& 1) == 1 then ((base + i + 1) * 4) :: acc else acc
+    decodeBitmaskAddrsAux base mask i acc'
+
+/-- Decode all register byte addresses targeted by a bitmask record header `(base, mask)`. -/
+def decodeBitmaskAddrs (base mask : Nat) : List Nat :=
+  (base * 4) :: decodeBitmaskAddrsAux base mask 16 []
+
+/-- Decode payload words for a bitmask register record into `acc`. -/
+def decodeBitmaskWrites (bs : ByteArray) (recPos recLen : Nat) :
+    Nat → List Nat → Array DecodedWrite → Except String (Array DecodedWrite)
+  | _, [], acc => .ok acc
+  | i, addr :: rest, acc => do
+    let pOff := recPos + 4 * i
+    let v ← readU32LE bs pOff
+    decodeBitmaskWrites bs recPos recLen (i + 1) rest (acc.push {
+      byteAddr := addr
+      value := v
+      barSlot := none
+      payloadOffset := pOff
+      recordLen := recLen
+    })
+
+/-- Decode `rem` payload words (starting at index `i`) for a sequential register record into `acc`. -/
+def decodeSequentialWrites (bs : ByteArray) (recPos base cnt : Nat) (slot? : Option UInt8) :
+    Nat → Nat → Array DecodedWrite → Except String (Array DecodedWrite)
+  | _, 0, acc => .ok acc
+  | i, rem + 1, acc => do
+    let pOff := recPos + 4 * i
+    let v ← readU32LE bs pOff
+    decodeSequentialWrites bs recPos base cnt slot? (i + 1) rem (acc.push {
+      byteAddr := (base + i) * 4
+      value := v
+      barSlot := slot?
+      payloadOffset := pOff
+      recordLen := cnt
+    })
+
+/-- Decode one register record starting at byte offset `recPos` in `bs`, appending its
+    `DecodedWrite`s to `acc` and returning `(acc', nextRecPos)`. -/
+def decodeRegRecordAt (bs : ByteArray) (recPos : Nat) (acc : Array DecodedWrite) :
+    Except String (Array DecodedWrite × Nat) := do
+  let h ← readU32LE bs recPos
+  let payloadStart := recPos + 4
+  let base := (h &&& 0x7fff).toNat
+  let isBitmask := ((h >>> 31) &&& 1) == 1
+  if isBitmask then
+    let mask := ((h >>> 15) &&& 0xffff).toNat
+    let addrs := decodeBitmaskAddrs base mask
+    let recLen := addrs.length
+    let acc' ← decodeBitmaskWrites bs payloadStart recLen 0 addrs acc
+    pure (acc', payloadStart + 4 * recLen)
+  else
+    let cnt := (((h >>> 15) &&& 0x3f).toNat) + 1
+    let slot? : Option UInt8 :=
+      if ((h >>> 29) &&& 1) == 1 then
+        some ((h >>> 23) &&& 0x3f).toUInt8
+      else
+        none
+    let acc' ← decodeSequentialWrites bs payloadStart base cnt slot? 0 cnt acc
+    pure (acc', payloadStart + 4 * cnt)
+
+/-- Decode all register records in `[recPos, taskEnd)` of `bs` into `acc`. -/
+def decodeTaskRecords (bs : ByteArray) (recPos taskEnd : Nat) (acc : Array DecodedWrite) :
+    Except String (Array DecodedWrite) :=
+  if _ : recPos < taskEnd then
+    match decodeRegRecordAt bs recPos acc with
+    | .error e => .error e
+    | .ok (acc', nextPos) =>
+      if _ : recPos < nextPos then
+        decodeTaskRecords bs nextPos taskEnd acc'
+      else
+        .error s!"decoder internal error: non-advancing register record at {toHex recPos}"
+  else
+    .ok acc
+termination_by taskEnd - recPos
+
 /-- Decode all tasks and register writes from raw `__TEXT,__text` bytes.
     Runs full structural `validateTaskStream` before extracting headers and writes. -/
 def decodeTaskStream (target : Target) (bs : ByteArray) : Except String (Array DecodedTask) := do
@@ -1010,48 +1095,7 @@ def decodeTaskStream (target : Target) (bs : ByteArray) : Except String (Array D
       for hi in [:headerWords] do
         hdr := hdr.push (← readU32LE bs (cursor + 4 * hi))
 
-      let mut writes : Array DecodedWrite := #[]
-      let mut recPos := cursor + 4 * headerWords
-      while recPos < taskEnd do
-        let h ← readU32LE bs recPos
-        recPos := recPos + 4
-        let base := (h &&& 0x7fff).toNat
-        let isBitmask := ((h >>> 31) &&& 1) == 1
-        if isBitmask then
-          let mask := ((h >>> 15) &&& 0xffff).toNat
-          let mut addrs : Array Nat := #[base * 4]
-          for i in [:16] do
-            if ((mask >>> i) &&& 1) == 1 then
-              addrs := addrs.push ((base + i + 1) * 4)
-          for i in [:addrs.size] do
-            let pOff := recPos + 4 * i
-            let v ← readU32LE bs pOff
-            writes := writes.push {
-              byteAddr := addrs[i]!
-              value := v
-              barSlot := none
-              payloadOffset := pOff
-              recordLen := addrs.size
-            }
-          recPos := recPos + 4 * addrs.size
-        else
-          let cnt := (((h >>> 15) &&& 0x3f).toNat) + 1
-          let slot? : Option UInt8 :=
-            if ((h >>> 29) &&& 1) == 1 then
-              some ((h >>> 23) &&& 0x3f).toUInt8
-            else
-              none
-          for i in [:cnt] do
-            let pOff := recPos + 4 * i
-            let v ← readU32LE bs pOff
-            writes := writes.push {
-              byteAddr := (base + i) * 4
-              value := v
-              barSlot := slot?
-              payloadOffset := pOff
-              recordLen := cnt
-            }
-          recPos := recPos + 4 * cnt
+      let writes ← decodeTaskRecords bs (cursor + 4 * headerWords) taskEnd #[]
 
       tasks := tasks.push {
         taskIndex := taskIdx

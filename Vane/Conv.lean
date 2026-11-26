@@ -699,15 +699,17 @@ def chooseConv1x1OutputSlices
           none
 
   -- Prefer multiples of 32, then 16, then 8, then any 1 <= s <= maxSingle
-  for alignStep in #[32, 16, 8, 1] do
-    let top := (maxSingle / alignStep) * alignStep
-    let count := top / alignStep
-    for i in [:count] do
-      let s := top - i * alignStep
-      if let some slices := tryWidth s then
-        return slices
+  let chosen? : Option (Array Nat) :=
+    findFirstSome [32, 16, 8, 1] fun alignStep =>
+      let top := (maxSingle / alignStep) * alignStep
+      let count := top / alignStep
+      findFirstSome (natRange 0 count) fun i =>
+        let s := top - i * alignStep
+        tryWidth s
 
-  throw s!"no legal {target.name} output-channel split for conv1x1 ({h}x{w}, {cin}->{cout})"
+  match chosen? with
+  | some slices => pure slices
+  | none => throw s!"no legal {target.name} output-channel split for conv1x1 ({h}x{w}, {cin}->{cout})"
 
 /-- Lower one slice of a multi-task output-channel-split `conv1x1` into a `TaskDesc`. -/
 private def lowerConv1x1SliceTask

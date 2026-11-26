@@ -10,6 +10,8 @@ import Vane.Pool
 import Vane.Verify
 import Vane.View
 import Vane.Matmul
+import Vane.Conv
+import Vane.Conv3x3
 
 namespace Vane.Proofs
 
@@ -25,6 +27,8 @@ open Vane.Pool
 open Vane.Verify
 open Vane.View
 open Vane.Matmul
+open Vane.Conv
+open Vane.Conv3x3
 
 -- ============================================================================
 -- 1. Alignment soundness (alignUp_ge, alignUp_dvd)
@@ -2527,5 +2531,3434 @@ theorem matmulRowSlice_disjoint (ba bb m0a ma m0b mb totalM row : Nat)
       have h1 : bb * (totalM * row) + m0b * row + mb * row ≤ ba * (totalM * row) :=
         matmulRowSlice_end_le_total bb ba m0b mb totalM row hgt hb
       omega
+
+-- ============================================================================
+-- 16. Binary Codec & Little-Endian Round-Trip Soundness (Vane.Binary)
+-- ============================================================================
+
+private theorem byteArray_get!_eq_getElem {bs : ByteArray} {i : Nat} (hi : i < bs.size) :
+    bs.get! i = bs.data[i] := by
+  cases bs with
+  | mk data =>
+    change data[i]! = data[i]
+    exact getElem!_pos data i hi
+
+private theorem byteArray_get!_push_lt (bs : ByteArray) (b : UInt8) (i : Nat) (hi : i < bs.size) :
+    (bs.push b).get! i = bs.get! i := by
+  have hi' : i < (bs.push b).size := by rw [ByteArray.size_push]; omega
+  rw [byteArray_get!_eq_getElem hi', byteArray_get!_eq_getElem hi]
+  cases bs with
+  | mk data =>
+    exact Array.getElem_push_lt hi
+
+private theorem byteArray_get!_push_eq (bs : ByteArray) (b : UInt8) :
+    (bs.push b).get! bs.size = b := by
+  have hi' : bs.size < (bs.push b).size := by rw [ByteArray.size_push]; omega
+  rw [byteArray_get!_eq_getElem hi']
+  cases bs with
+  | mk data =>
+    exact Array.getElem_push_eq
+
+private theorem byteArray_get!_append_left (a b : ByteArray) (i : Nat) (hi : i < a.size) :
+    (a ++ b).get! i = a.get! i := by
+  have hi' : i < (a ++ b).size := by rw [ByteArray.size_append]; omega
+  rw [byteArray_get!_eq_getElem hi', byteArray_get!_eq_getElem hi]
+  exact ByteArray.getElem_append_left hi
+
+private theorem byteArray_get!_append_right (a b : ByteArray) (i : Nat)
+    (hlo : a.size ≤ i) (hhi : i < a.size + b.size) :
+    (a ++ b).get! i = b.get! (i - a.size) := by
+  have hi' : i < (a ++ b).size := by rw [ByteArray.size_append]; exact hhi
+  have hsub : i - a.size < b.size := by omega
+  rw [byteArray_get!_eq_getElem hi', byteArray_get!_eq_getElem hsub]
+  exact ByteArray.getElem_append_right hlo
+
+private theorem zeroBytes_size (n : Nat) : (zeroBytes n).size = n := by
+  simp [zeroBytes, ByteArray.size]
+
+private theorem zeroBytes_get! (n i : Nat) (hi : i < n) : (zeroBytes n).get! i = 0 := by
+  have hi' : i < (zeroBytes n).size := by rw [zeroBytes_size]; exact hi
+  rw [byteArray_get!_eq_getElem hi']
+  simp [zeroBytes]
+
+/-- `pushU16LE` appends exactly 2 bytes. -/
+theorem pushU16LE_size (bs : ByteArray) (v : UInt16) :
+    (pushU16LE bs v).size = bs.size + 2 := by
+  simp [pushU16LE, ByteArray.size_push]
+
+/-- `pushU32LE` appends exactly 4 bytes. -/
+theorem pushU32LE_size (bs : ByteArray) (v : UInt32) :
+    (pushU32LE bs v).size = bs.size + 4 := by
+  simp [pushU32LE, ByteArray.size_push]
+
+/-- `pushU64LE` appends exactly 8 bytes. -/
+theorem pushU64LE_size (bs : ByteArray) (v : UInt64) :
+    (pushU64LE bs v).size = bs.size + 8 := by
+  simp [pushU64LE, pushU32LE_size]
+
+/-- `pushU16LE` preserves all prefix bytes before `bs.size`. -/
+theorem pushU16LE_get_prefix (bs : ByteArray) (v : UInt16) (i : Nat) (hi : i < bs.size) :
+    (pushU16LE bs v).get! i = bs.get! i := by
+  unfold pushU16LE
+  rw [byteArray_get!_push_lt _ _ i (by rw [ByteArray.size_push]; omega),
+      byteArray_get!_push_lt _ _ i hi]
+
+/-- `pushU32LE` preserves all prefix bytes before `bs.size`. -/
+theorem pushU32LE_get_prefix (bs : ByteArray) (v : UInt32) (i : Nat) (hi : i < bs.size) :
+    (pushU32LE bs v).get! i = bs.get! i := by
+  unfold pushU32LE
+  dsimp only
+  rw [byteArray_get!_push_lt _ _ i (by simp [ByteArray.size_push]; omega),
+      byteArray_get!_push_lt _ _ i (by simp [ByteArray.size_push]; omega),
+      byteArray_get!_push_lt _ _ i (by simp [ByteArray.size_push]; omega),
+      byteArray_get!_push_lt _ _ i hi]
+
+/-- `pushU64LE` preserves all prefix bytes before `bs.size`. -/
+theorem pushU64LE_get_prefix (bs : ByteArray) (v : UInt64) (i : Nat) (hi : i < bs.size) :
+    (pushU64LE bs v).get! i = bs.get! i := by
+  unfold pushU64LE
+  dsimp only
+  rw [pushU32LE_get_prefix _ _ i (by rw [pushU32LE_size]; omega),
+      pushU32LE_get_prefix _ _ i hi]
+
+private theorem testBit_ff (i : Nat) : (255 : Nat).testBit i = decide (i < 8) := by
+  have h : (255 : Nat) = 2 ^ 8 - 1 := rfl
+  rw [h, Nat.testBit_two_pow_sub_one]
+
+private theorem testBit_ffffffff (i : Nat) : (4294967295 : Nat).testBit i = decide (i < 32) := by
+  have h : (4294967295 : Nat) = 2 ^ 32 - 1 := rfl
+  rw [h, Nat.testBit_two_pow_sub_one]
+
+/-- Exact little-endian round-trip for `pushU16LE` followed by `readU16LE` at arbitrary prefix `bs`. -/
+theorem readU16LE_pushU16LE (bs : ByteArray) (v : UInt16) :
+    readU16LE (pushU16LE bs v) bs.size = .ok v := by
+  unfold readU16LE
+  have hsz : (pushU16LE bs v).size = bs.size + 2 := pushU16LE_size bs v
+  have hnot : ¬ (bs.size + 2 > (pushU16LE bs v).size) := by omega
+  simp only [hnot, ↓reduceIte, pure, Except.pure, Except.ok.injEq]
+  have hb0 : (pushU16LE bs v).get! bs.size = (v &&& 0xff).toUInt8 := by
+    unfold pushU16LE
+    rw [byteArray_get!_push_lt _ _ bs.size (by rw [ByteArray.size_push]; omega),
+        byteArray_get!_push_eq]
+  have hb1 : (pushU16LE bs v).get! (bs.size + 1) = ((v >>> 8) &&& 0xff).toUInt8 := by
+    unfold pushU16LE
+    have heq : bs.size + 1 = (bs.push (v &&& 0xff).toUInt8).size := by rw [ByteArray.size_push]
+    rw [heq, byteArray_get!_push_eq]
+  rw [hb0, hb1]
+  apply UInt16.toNat_inj.mp
+  apply Nat.eq_of_testBit_eq
+  intro i
+  rw [UInt16.toNat_or, UInt16.toNat_shiftLeft, Nat.testBit_or]
+  have hmod16 : ∀ x : Nat, (x % 65536).testBit i = (decide (i < 16) && x.testBit i) := by
+    intro x
+    change (x % 2 ^ 16).testBit i = _
+    exact Nat.testBit_mod_two_pow x 16 i
+  have h0toNat : (v &&& 0xff).toUInt8.toUInt16.toNat = v.toNat % 256 := by
+    simp [UInt16.toNat_and]
+    rw [show (255 : Nat) = 2 ^ 8 - 1 from rfl, Nat.and_two_pow_sub_one_eq_mod, Nat.mod_mod]
+  have h1toNat : ((v >>> 8) &&& 0xff).toUInt8.toUInt16.toNat = (v.toNat >>> 8) % 256 := by
+    simp [UInt16.toNat_and, UInt16.toNat_shiftRight]
+    rw [show (255 : Nat) = 2 ^ 8 - 1 from rfl, Nat.and_two_pow_sub_one_eq_mod, Nat.mod_mod]
+  have h8 : (8 : UInt16).toNat % 16 = 8 := rfl
+  rw [h0toNat, h1toNat, h8, hmod16, Nat.testBit_shiftLeft]
+  have h256 : ∀ x k : Nat, (x % 256).testBit k = (decide (k < 8) && x.testBit k) := by
+    intro x k
+    change (x % 2 ^ 8).testBit k = _
+    exact Nat.testBit_mod_two_pow x 8 k
+  by_cases hi8 : i < 8
+  · have hi16 : i < 16 := by omega
+    have hge8 : ¬ (8 ≤ i) := by omega
+    simp [h256, hi8, hi16, hge8]
+  · by_cases hi16 : i < 16
+    · have hge8 : 8 ≤ i := by omega
+      have hsub8 : i - 8 < 8 := by omega
+      have hadd : 8 + (i - 8) = i := by omega
+      simp [h256, hi8, hi16, hge8, hsub8, Nat.testBit_shiftRight, hadd]
+    · simp [h256, hi8, hi16]
+      exact testBit_eq_false_of_lt_two_pow v.toNat_lt (Nat.le_of_not_lt hi16)
+
+/-- Exact little-endian round-trip for `pushU32LE` followed by `readU32LE` at arbitrary prefix `bs`. -/
+theorem readU32LE_pushU32LE (bs : ByteArray) (v : UInt32) :
+    readU32LE (pushU32LE bs v) bs.size = .ok v := by
+  unfold readU32LE
+  have hsz : (pushU32LE bs v).size = bs.size + 4 := pushU32LE_size bs v
+  have hnot : ¬ (bs.size + 4 > (pushU32LE bs v).size) := by omega
+  simp only [hnot, ↓reduceIte, pure, Except.pure, Except.ok.injEq]
+  have hb0 : (pushU32LE bs v).get! bs.size = (v &&& 0xff).toUInt8 := by
+    unfold pushU32LE; dsimp only
+    rw [byteArray_get!_push_lt _ _ bs.size (by rw [ByteArray.size_push, ByteArray.size_push, ByteArray.size_push]; omega),
+        byteArray_get!_push_lt _ _ bs.size (by rw [ByteArray.size_push, ByteArray.size_push]; omega),
+        byteArray_get!_push_lt _ _ bs.size (by rw [ByteArray.size_push]; omega),
+        byteArray_get!_push_eq]
+  have hb1 : (pushU32LE bs v).get! (bs.size + 1) = ((v >>> 8) &&& 0xff).toUInt8 := by
+    unfold pushU32LE; dsimp only
+    rw [byteArray_get!_push_lt _ _ (bs.size + 1) (by rw [ByteArray.size_push, ByteArray.size_push, ByteArray.size_push]; omega),
+        byteArray_get!_push_lt _ _ (bs.size + 1) (by rw [ByteArray.size_push, ByteArray.size_push]; omega)]
+    have heq : bs.size + 1 = (bs.push (v &&& 0xff).toUInt8).size := by rw [ByteArray.size_push]
+    rw [heq, byteArray_get!_push_eq]
+  have hb2 : (pushU32LE bs v).get! (bs.size + 2) = ((v >>> 16) &&& 0xff).toUInt8 := by
+    unfold pushU32LE; dsimp only
+    rw [byteArray_get!_push_lt _ _ (bs.size + 2) (by rw [ByteArray.size_push, ByteArray.size_push, ByteArray.size_push]; omega)]
+    have heq : bs.size + 2 = ((bs.push (v &&& 0xff).toUInt8).push ((v >>> 8) &&& 0xff).toUInt8).size := by
+      rw [ByteArray.size_push, ByteArray.size_push]
+    rw [heq, byteArray_get!_push_eq]
+  have hb3 : (pushU32LE bs v).get! (bs.size + 3) = ((v >>> 24) &&& 0xff).toUInt8 := by
+    unfold pushU32LE; dsimp only
+    have heq : bs.size + 3 =
+        (((bs.push (v &&& 0xff).toUInt8).push ((v >>> 8) &&& 0xff).toUInt8).push
+          ((v >>> 16) &&& 0xff).toUInt8).size := by
+      rw [ByteArray.size_push, ByteArray.size_push, ByteArray.size_push]
+    rw [heq, byteArray_get!_push_eq]
+  rw [hb0, hb1, hb2, hb3]
+  apply UInt32.toNat_inj.mp
+  apply Nat.eq_of_testBit_eq
+  intro i
+  rw [UInt32.toNat_or, UInt32.toNat_or, UInt32.toNat_or,
+      UInt32.toNat_shiftLeft, UInt32.toNat_shiftLeft, UInt32.toNat_shiftLeft,
+      Nat.testBit_or, Nat.testBit_or, Nat.testBit_or]
+  have hmod32 : ∀ x : Nat, (x % 4294967296).testBit i = (decide (i < 32) && x.testBit i) := by
+    intro x
+    change (x % 2 ^ 32).testBit i = _
+    exact Nat.testBit_mod_two_pow x 32 i
+  have h256 : ∀ x k : Nat, (x % 256).testBit k = (decide (k < 8) && x.testBit k) := by
+    intro x k
+    change (x % 2 ^ 8).testBit k = _
+    exact Nat.testBit_mod_two_pow x 8 k
+  have h0n : (v &&& 0xff).toUInt8.toUInt32.toNat = v.toNat % 256 := by
+    simp [UInt32.toNat_and]
+    rw [show (255 : Nat) = 2 ^ 8 - 1 from rfl, Nat.and_two_pow_sub_one_eq_mod, Nat.mod_mod]
+  have h1n : ((v >>> 8) &&& 0xff).toUInt8.toUInt32.toNat = (v.toNat >>> 8) % 256 := by
+    simp [UInt32.toNat_and, UInt32.toNat_shiftRight]
+    rw [show (255 : Nat) = 2 ^ 8 - 1 from rfl, Nat.and_two_pow_sub_one_eq_mod, Nat.mod_mod]
+  have h2n : ((v >>> 16) &&& 0xff).toUInt8.toUInt32.toNat = (v.toNat >>> 16) % 256 := by
+    simp [UInt32.toNat_and, UInt32.toNat_shiftRight]
+    rw [show (255 : Nat) = 2 ^ 8 - 1 from rfl, Nat.and_two_pow_sub_one_eq_mod, Nat.mod_mod]
+  have h3n : ((v >>> 24) &&& 0xff).toUInt8.toUInt32.toNat = (v.toNat >>> 24) % 256 := by
+    simp [UInt32.toNat_and, UInt32.toNat_shiftRight]
+    rw [show (255 : Nat) = 2 ^ 8 - 1 from rfl, Nat.and_two_pow_sub_one_eq_mod, Nat.mod_mod]
+  have s8 : (8 : UInt32).toNat % 32 = 8 := rfl
+  have s16 : (16 : UInt32).toNat % 32 = 16 := rfl
+  have s24 : (24 : UInt32).toNat % 32 = 24 := rfl
+  rw [h0n, h1n, h2n, h3n, s8, s16, s24, hmod32, hmod32, hmod32,
+      Nat.testBit_shiftLeft, Nat.testBit_shiftLeft, Nat.testBit_shiftLeft]
+  by_cases hi8 : i < 8
+  · have hi32 : i < 32 := by omega
+    have hge8 : ¬ (8 ≤ i) := by omega
+    have hge16 : ¬ (16 ≤ i) := by omega
+    have hge24 : ¬ (24 ≤ i) := by omega
+    simp [h256, hi8, hi32, hge8, hge16, hge24]
+  · by_cases hi16 : i < 16
+    · have hi32 : i < 32 := by omega
+      have hge8 : 8 ≤ i := by omega
+      have hge16 : ¬ (16 ≤ i) := by omega
+      have hge24 : ¬ (24 ≤ i) := by omega
+      have hsub8 : i - 8 < 8 := by omega
+      have hadd : 8 + (i - 8) = i := by omega
+      simp [h256, hi8, hi32, hge8, hge16, hge24, hsub8, Nat.testBit_shiftRight, hadd]
+    · by_cases hi24 : i < 24
+      · have hi32 : i < 32 := by omega
+        have hge8 : 8 ≤ i := by omega
+        have hge16 : 16 ≤ i := by omega
+        have hge24 : ¬ (24 ≤ i) := by omega
+        have hsub8 : ¬ (i - 8 < 8) := by omega
+        have hsub16 : i - 16 < 8 := by omega
+        have hadd : 16 + (i - 16) = i := by omega
+        simp [h256, hi8, hi32, hge8, hge16, hge24, hsub8, hsub16, Nat.testBit_shiftRight, hadd]
+      · by_cases hi32 : i < 32
+        · have hge8 : 8 ≤ i := by omega
+          have hge16 : 16 ≤ i := by omega
+          have hge24 : 24 ≤ i := by omega
+          have hsub8 : ¬ (i - 8 < 8) := by omega
+          have hsub16 : ¬ (i - 16 < 8) := by omega
+          have hsub24 : i - 24 < 8 := by omega
+          have hadd : 24 + (i - 24) = i := by omega
+          simp [h256, hi8, hi32, hge8, hge16, hge24, hsub8, hsub16, hsub24,
+                Nat.testBit_shiftRight, hadd]
+        · simp [h256, hi8, hi32]
+          exact testBit_eq_false_of_lt_two_pow v.toNat_lt (Nat.le_of_not_lt hi32)
+
+/-- `readU16LE` is preserved when any suffix `tail` is appended after `[off, off + 2)`. -/
+theorem readU16LE_append_prefix (bs tail : ByteArray) (off : Nat) (h : off + 2 ≤ bs.size) :
+    readU16LE (bs ++ tail) off = readU16LE bs off := by
+  unfold readU16LE
+  have h1 : ¬ (off + 2 > (bs ++ tail).size) := by rw [ByteArray.size_append]; omega
+  have h2 : ¬ (off + 2 > bs.size) := by omega
+  simp only [h1, h2, ↓reduceIte]
+  rw [byteArray_get!_append_left bs tail off (by omega),
+      byteArray_get!_append_left bs tail (off + 1) (by omega)]
+
+/-- `readU32LE` is preserved when any suffix `tail` is appended after `[off, off + 4)`. -/
+theorem readU32LE_append_prefix (bs tail : ByteArray) (off : Nat) (h : off + 4 ≤ bs.size) :
+    readU32LE (bs ++ tail) off = readU32LE bs off := by
+  unfold readU32LE
+  have h1 : ¬ (off + 4 > (bs ++ tail).size) := by rw [ByteArray.size_append]; omega
+  have h2 : ¬ (off + 4 > bs.size) := by omega
+  simp only [h1, h2, ↓reduceIte]
+  rw [byteArray_get!_append_left bs tail off (by omega),
+      byteArray_get!_append_left bs tail (off + 1) (by omega),
+      byteArray_get!_append_left bs tail (off + 2) (by omega),
+      byteArray_get!_append_left bs tail (off + 3) (by omega)]
+
+/-- `readU64LE` is preserved when any suffix `tail` is appended after `[off, off + 8)`. -/
+theorem readU64LE_append_prefix (bs tail : ByteArray) (off : Nat) (h : off + 8 ≤ bs.size) :
+    readU64LE (bs ++ tail) off = readU64LE bs off := by
+  unfold readU64LE
+  have h1 : ¬ (off + 8 > (bs ++ tail).size) := by rw [ByteArray.size_append]; omega
+  have h2 : ¬ (off + 8 > bs.size) := by omega
+  simp only [h1, h2, ↓reduceIte]
+  rw [readU32LE_append_prefix bs tail off (by omega),
+      readU32LE_append_prefix bs tail (off + 4) (by omega)]
+
+private theorem readU32LE_pushU32LE_prefix (bs : ByteArray) (v : UInt32) (off : Nat)
+    (h : off + 4 ≤ bs.size) :
+    readU32LE (pushU32LE bs v) off = readU32LE bs off := by
+  unfold readU32LE
+  have h1 : ¬ (off + 4 > (pushU32LE bs v).size) := by rw [pushU32LE_size]; omega
+  have h2 : ¬ (off + 4 > bs.size) := by omega
+  simp only [h1, h2, ↓reduceIte]
+  rw [pushU32LE_get_prefix bs v off (by omega),
+      pushU32LE_get_prefix bs v (off + 1) (by omega),
+      pushU32LE_get_prefix bs v (off + 2) (by omega),
+      pushU32LE_get_prefix bs v (off + 3) (by omega)]
+
+/-- Exact little-endian round-trip for `pushU64LE` followed by `readU64LE` at arbitrary prefix `bs`. -/
+theorem readU64LE_pushU64LE (bs : ByteArray) (v : UInt64) :
+    readU64LE (pushU64LE bs v) bs.size = .ok v := by
+  unfold readU64LE pushU64LE
+  dsimp only
+  have hsz : (pushU32LE (pushU32LE bs (v &&& 0xffffffff).toUInt32)
+      ((v >>> 32) &&& 0xffffffff).toUInt32).size = bs.size + 8 := by
+    simp [pushU32LE_size]
+  have hnot : ¬ (bs.size + 8 > (pushU32LE (pushU32LE bs (v &&& 0xffffffff).toUInt32)
+      ((v >>> 32) &&& 0xffffffff).toUInt32).size) := by omega
+  simp only [hnot, ↓reduceIte]
+  have hlo : readU32LE (pushU32LE (pushU32LE bs (v &&& 0xffffffff).toUInt32)
+      ((v >>> 32) &&& 0xffffffff).toUInt32) bs.size = .ok (v &&& 0xffffffff).toUInt32 := by
+    rw [readU32LE_pushU32LE_prefix _ _ bs.size (by rw [pushU32LE_size]; omega)]
+    exact readU32LE_pushU32LE bs _
+  have hhi : readU32LE (pushU32LE (pushU32LE bs (v &&& 0xffffffff).toUInt32)
+      ((v >>> 32) &&& 0xffffffff).toUInt32) (bs.size + 4) =
+      .ok ((v >>> 32) &&& 0xffffffff).toUInt32 := by
+    have heq : bs.size + 4 = (pushU32LE bs (v &&& 0xffffffff).toUInt32).size := by
+      rw [pushU32LE_size]
+    rw [heq]
+    exact readU32LE_pushU32LE _ _
+  rw [hlo, hhi]
+  simp only [bind, Except.bind, pure, Except.pure, Except.ok.injEq]
+  apply UInt64.toNat_inj.mp
+  apply Nat.eq_of_testBit_eq
+  intro i
+  rw [UInt64.toNat_or, UInt64.toNat_shiftLeft, Nat.testBit_or]
+  have hmod64 : ∀ x : Nat, (x % 18446744073709551616).testBit i = (decide (i < 64) && x.testBit i) := by
+    intro x
+    change (x % 2 ^ 64).testBit i = _
+    exact Nat.testBit_mod_two_pow x 64 i
+  have hmod32 : ∀ x k : Nat, (x % 4294967296).testBit k = (decide (k < 32) && x.testBit k) := by
+    intro x k
+    change (x % 2 ^ 32).testBit k = _
+    exact Nat.testBit_mod_two_pow x 32 k
+  have hlon : (v &&& 0xffffffff).toUInt32.toUInt64.toNat = v.toNat % 4294967296 := by
+    simp [UInt64.toNat_and]
+    rw [show (4294967295 : Nat) = 2 ^ 32 - 1 from rfl, Nat.and_two_pow_sub_one_eq_mod, Nat.mod_mod]
+  have hhin : ((v >>> 32) &&& 0xffffffff).toUInt32.toUInt64.toNat =
+      (v.toNat >>> 32) % 4294967296 := by
+    simp [UInt64.toNat_and, UInt64.toNat_shiftRight]
+    rw [show (4294967295 : Nat) = 2 ^ 32 - 1 from rfl, Nat.and_two_pow_sub_one_eq_mod, Nat.mod_mod]
+  have s32 : (32 : UInt64).toNat % 64 = 32 := rfl
+  rw [hlon, hhin, s32, hmod64, Nat.testBit_shiftLeft]
+  by_cases hi32 : i < 32
+  · have hi64 : i < 64 := by omega
+    have hge32 : ¬ (32 ≤ i) := by omega
+    simp [hmod32, hi32, hi64, hge32]
+  · by_cases hi64 : i < 64
+    · have hge32 : 32 ≤ i := by omega
+      have hsub32 : i - 32 < 32 := by omega
+      have hadd : 32 + (i - 32) = i := by omega
+      simp [hmod32, hi32, hi64, hge32, hsub32, Nat.testBit_shiftRight, hadd]
+    · simp [hmod32, hi32, hi64]
+      exact testBit_eq_false_of_lt_two_pow v.toNat_lt (Nat.le_of_not_lt hi64)
+
+/-- `pushZeros` increases length by exactly `count`. -/
+theorem pushZeros_size (bs : ByteArray) (count : Nat) :
+    (pushZeros bs count).size = bs.size + count := by
+  unfold pushZeros
+  split
+  · rename_i h
+    have hc : count = 0 := by simpa using h
+    subst hc; omega
+  · rw [ByteArray.size_append, zeroBytes_size]
+
+/-- `pushZeros` preserves all prefix bytes before `bs.size`. -/
+theorem pushZeros_get_prefix (bs : ByteArray) (count i : Nat) (hi : i < bs.size) :
+    (pushZeros bs count).get! i = bs.get! i := by
+  unfold pushZeros
+  split
+  · rfl
+  · exact byteArray_get!_append_left bs (zeroBytes count) i hi
+
+/-- Every byte appended by `pushZeros` is `0`. -/
+theorem pushZeros_get_zero (bs : ByteArray) (count i : Nat)
+    (hlo : bs.size ≤ i) (hhi : i < bs.size + count) :
+    (pushZeros bs count).get! i = 0 := by
+  unfold pushZeros
+  split
+  · rename_i h
+    have hc : count = 0 := by simpa using h
+    omega
+  · rw [byteArray_get!_append_right bs (zeroBytes count) i hlo (by rw [zeroBytes_size]; exact hhi)]
+    exact zeroBytes_get! count (i - bs.size) (by omega)
+
+/-- `padToAlign` produces a `ByteArray` of exact length `alignUp bs.size align`. -/
+theorem padToAlign_size (bs : ByteArray) (align : Nat) :
+    (padToAlign bs align).size = alignUp bs.size align := by
+  unfold padToAlign
+  dsimp only
+  rw [pushZeros_size]
+  have hge := alignUp_ge bs.size align
+  omega
+
+/-- For any positive `align > 0`, `(padToAlign bs align).size` is divisible by `align`. -/
+theorem padToAlign_dvd (bs : ByteArray) (align : Nat) (halign : align > 0) :
+    (padToAlign bs align).size % align = 0 := by
+  rw [padToAlign_size]
+  exact alignUp_dvd bs.size align halign
+
+/-- `padToAlign` preserves all original prefix bytes before `bs.size`. -/
+theorem padToAlign_get_prefix (bs : ByteArray) (align i : Nat) (hi : i < bs.size) :
+    (padToAlign bs align).get! i = bs.get! i := by
+  unfold padToAlign
+  exact pushZeros_get_prefix bs _ i hi
+
+/-- Every padding byte added by `padToAlign` in `[bs.size, (padToAlign bs align).size)` is `0`. -/
+theorem padToAlign_get_pad (bs : ByteArray) (align i : Nat)
+    (hlo : bs.size ≤ i) (hhi : i < (padToAlign bs align).size) :
+    (padToAlign bs align).get! i = 0 := by
+  rw [padToAlign_size] at hhi
+  unfold padToAlign
+  have hge := alignUp_ge bs.size align
+  exact pushZeros_get_zero bs (alignUp bs.size align - bs.size) i hlo (by omega)
+
+-- ============================================================================
+-- 17. Task-Stream Record Codec Round-Trip Soundness (Vane.TaskStream / Vane.Register)
+-- ============================================================================
+
+private theorem pushU32LEs_size (bs : ByteArray) (vals : List UInt32) :
+    (pushU32LEs bs vals).size = bs.size + 4 * vals.length := by
+  induction vals generalizing bs with
+  | nil => simp [pushU32LEs]
+  | cons v rest ih =>
+    simp only [pushU32LEs, List.length_cons]
+    rw [ih (pushU32LE bs v), pushU32LE_size]
+    omega
+
+private theorem readU32LE_pushU32LEs_prefix (bs : ByteArray) (vals : List UInt32) (off : Nat)
+    (h : off + 4 ≤ bs.size) :
+    readU32LE (pushU32LEs bs vals) off = readU32LE bs off := by
+  induction vals generalizing bs with
+  | nil => rfl
+  | cons v rest ih =>
+    simp only [pushU32LEs]
+    rw [ih (pushU32LE bs v) (by rw [pushU32LE_size]; omega)]
+    exact readU32LE_pushU32LE_prefix bs v off h
+
+private theorem readU32LE_pushU32LEs_at (bs : ByteArray) (vals : List UInt32) (i : Nat)
+    (hi : i < vals.length) :
+    readU32LE (pushU32LEs bs vals) (bs.size + 4 * i) = .ok vals[i] := by
+  induction vals generalizing bs i with
+  | nil => simp at hi
+  | cons v rest ih =>
+    cases i with
+    | zero =>
+      simp only [pushU32LEs, Nat.mul_zero, Nat.add_zero, List.getElem_cons_zero]
+      rw [readU32LE_pushU32LEs_prefix (pushU32LE bs v) rest bs.size (by rw [pushU32LE_size]; omega)]
+      exact readU32LE_pushU32LE bs v
+    | succ k =>
+      simp only [pushU32LEs, List.getElem_cons_succ]
+      have hk : k < rest.length := by simp at hi; omega
+      have hoff : bs.size + 4 * (k + 1) = (pushU32LE bs v).size + 4 * k := by
+        rw [pushU32LE_size]; omega
+      rw [hoff]
+      exact ih (pushU32LE bs v) k hk
+
+/-- Encoding a valid sequential register record recovers exact `isBitmask = false`, `base`,
+    `count = values.size`, `barSlot`, and `values` from the encoded 32-bit record header. -/
+theorem encodeRegRecord_sequential_header
+    (base : UInt16) (barSlot : Option UInt8) (values : Array UInt32)
+    (hdr : UInt32) (vals : Array UInt32)
+    (henc : encodeRegRecord (.sequential base barSlot values) = .ok (hdr, vals)) :
+    vals = values ∧
+    1 ≤ values.size ∧ values.size ≤ 64 ∧
+    ((hdr >>> 31) &&& 1) = 0 ∧
+    (hdr &&& 0x7fff).toNat = base.toNat ∧
+    (((hdr >>> 15) &&& 0x3f).toNat) + 1 = values.size ∧
+    (if ((hdr >>> 29) &&& 1) == 1 then some ((hdr >>> 23) &&& 0x3f).toUInt8 else none) = barSlot := by
+  unfold encodeRegRecord at henc
+  dsimp only at henc
+  obtain ⟨hbase, henc⟩ := except_if_err_ok henc
+  obtain ⟨hsz, henc⟩ := except_if_err_ok henc
+  obtain ⟨⟨⟩, _, henc⟩ := except_bind_ok henc
+  have hbaseLe : base.toNat ≤ 0x7fff := by omega
+  have hszBounds : 1 ≤ values.size ∧ values.size ≤ 64 := by
+    simp only [Bool.or_eq_true, decide_eq_true_eq, not_or] at hsz
+    have hnot1 : values.isEmpty = false := by cases h : values.isEmpty <;> simp_all
+    have hne0 : values.size ≠ 0 := by
+      unfold Array.isEmpty at hnot1
+      simpa using hnot1
+    have hle64 : values.size ≤ 64 := by omega
+    omega
+  have hbarExtract : ∃ barBits : UInt32,
+      ((barSlot = none ∧ barBits = 0) ∨
+       (∃ slot : UInt8, barSlot = some slot ∧ slot.toNat ≤ 63 ∧
+         barBits = (((1 : UInt32) <<< 29) ||| (slot.toUInt32 <<< 23)))) ∧
+      hdr = (barBits ||| (((values.size - 1).toUInt32 &&& 0x3f) <<< 15) |||
+             (base.toUInt32 &&& 0x7fff)) ∧
+      vals = values := by
+    cases barSlot with
+    | none =>
+      simp only [bind, Except.bind, pure, Except.pure, Except.ok.injEq, Prod.mk.injEq] at henc
+      exact ⟨0, Or.inl ⟨rfl, rfl⟩, henc.1.symm, henc.2.symm⟩
+    | some slot =>
+      dsimp only at henc
+      obtain ⟨hslot, henc⟩ := except_if_err_ok henc
+      simp only [bind, Except.bind, pure, Except.pure, Except.ok.injEq, Prod.mk.injEq] at henc
+      exact ⟨(((1 : UInt32) <<< 29) ||| (slot.toUInt32 <<< 23)),
+             Or.inr ⟨slot, rfl, by omega, rfl⟩, henc.1.symm, henc.2.symm⟩
+  obtain ⟨barBits, hbarSpec, hhdrEq, hvalsEq⟩ := hbarExtract
+  subst hdr
+  subst vals
+  have hbit31 : (((barBits ||| (((values.size - 1).toUInt32 &&& 0x3f) <<< 15) |||
+      (base.toUInt32 &&& 0x7fff)) >>> 31) &&& 1) = 0 := by
+    apply UInt32.toNat_inj.mp
+    apply Nat.eq_of_testBit_eq; intro i
+    rw [UInt32.toNat_and, UInt32.toNat_shiftRight, UInt32.toNat_or, UInt32.toNat_or,
+        UInt32.toNat_shiftLeft, UInt32.toNat_and, UInt32.toNat_and]
+    simp only [UInt32.toNat_zero, Nat.zero_testBit, Nat.testBit_and, Nat.testBit_shiftRight,
+               Nat.testBit_or]
+    have s31 : (31 : UInt32).toNat % 32 = 31 := rfl
+    have s15 : (15 : UInt32).toNat % 32 = 15 := rfl
+    rw [s31, s15]
+    by_cases hi0 : i = 0
+    · subst hi0
+      simp only [Nat.add_zero]
+      have h1 : (1 : UInt32).toNat.testBit 0 = true := by decide
+      have hcnt : (((values.size - 1).toUInt32.toNat &&& (0x3f : UInt32).toNat) <<< 15 % 2 ^ 32).testBit 31 = false := by
+        rw [Nat.testBit_mod_two_pow, Nat.testBit_shiftLeft, Nat.testBit_and]
+        have : (0x3f : UInt32).toNat.testBit (31 - 15) = false := by decide
+        rw [this]; simp
+      have hbase0 : (0x7fff : UInt32).toNat.testBit 31 = false := by decide
+      have hbar31 : barBits.toNat.testBit 31 = false := by
+        rcases hbarSpec with ⟨_, rfl⟩ | ⟨slot, _, hslot, rfl⟩
+        · simp
+        · rw [UInt32.toNat_or, UInt32.toNat_shiftLeft, UInt32.toNat_shiftLeft, Nat.testBit_or]
+          have hs23 : (23 : UInt32).toNat % 32 = 23 := rfl
+          have hs29 : (29 : UInt32).toNat % 32 = 29 := rfl
+          rw [hs23, hs29]
+          have hslotLt : slot.toUInt32.toNat < 2 ^ 6 := by
+            have : slot.toUInt32.toNat = slot.toNat := by simp
+            omega
+          have hslot31 : (slot.toUInt32.toNat <<< 23 % 2 ^ 32).testBit 31 = false := by
+            rw [Nat.testBit_mod_two_pow, Nat.testBit_shiftLeft]
+            have hlt : slot.toUInt32.toNat.testBit (31 - 23) = false :=
+              testBit_eq_false_of_lt_two_pow hslotLt (by omega)
+            rw [hlt]; simp
+          have h29' : ((1 : UInt32).toNat <<< 29 % 2 ^ 32).testBit 31 = false := by decide
+          rw [h29', hslot31]; rfl
+      rw [h1, hcnt, hbase0, hbar31]; simp
+    · have h1 : (1 : UInt32).toNat.testBit i = false :=
+        testBit_eq_false_of_lt_two_pow (w := 1) (by decide) (by omega)
+      rw [h1, Bool.and_false]
+  have hbaseRec : ((barBits ||| (((values.size - 1).toUInt32 &&& 0x3f) <<< 15) |||
+      (base.toUInt32 &&& 0x7fff)) &&& 0x7fff).toNat = base.toNat := by
+    apply Nat.eq_of_testBit_eq; intro i
+    rw [UInt32.toNat_and, UInt32.toNat_or, UInt32.toNat_or, UInt32.toNat_shiftLeft,
+        UInt32.toNat_and, UInt32.toNat_and,
+        Nat.testBit_and, Nat.testBit_or, Nat.testBit_or, Nat.testBit_and]
+    have hmask : (0x7fff : UInt32).toNat.testBit i = decide (i < 15) := by
+      change (2 ^ 15 - 1 : Nat).testBit i = _
+      exact Nat.testBit_two_pow_sub_one 15 i
+    have s15 : (15 : UInt32).toNat % 32 = 15 := rfl
+    rw [hmask, s15]
+    by_cases hi15 : i < 15
+    · have hcnt0 : (((values.size - 1).toUInt32.toNat &&& (0x3f : UInt32).toNat) <<< 15 % 2 ^ 32).testBit i = false := by
+        rw [Nat.testBit_mod_two_pow, Nat.testBit_shiftLeft]
+        have : ¬ (15 ≤ i) := by omega
+        simp [this]
+      have hbar0 : barBits.toNat.testBit i = false := by
+        rcases hbarSpec with ⟨_, rfl⟩ | ⟨slot, _, _, rfl⟩
+        · simp
+        · rw [UInt32.toNat_or, UInt32.toNat_shiftLeft, UInt32.toNat_shiftLeft, Nat.testBit_or]
+          have hs29 : (29 : UInt32).toNat % 32 = 29 := rfl
+          have hs23 : (23 : UInt32).toNat % 32 = 23 := rfl
+          rw [hs29, hs23]
+          have h29 : ((1 : UInt32).toNat <<< 29 % 2 ^ 32).testBit i = false := by
+            rw [Nat.testBit_mod_two_pow, Nat.testBit_shiftLeft]
+            have : ¬ (29 ≤ i) := by omega
+            simp [this]
+          have h23 : (slot.toUInt32.toNat <<< 23 % 2 ^ 32).testBit i = false := by
+            rw [Nat.testBit_mod_two_pow, Nat.testBit_shiftLeft]
+            have : ¬ (23 ≤ i) := by omega
+            simp [this]
+          rw [h29, h23]; rfl
+      have hbEq : base.toUInt32.toNat = base.toNat := by simp
+      rw [hcnt0, hbar0, hbEq]
+      simp [hi15]
+    · simp only [hi15, decide_false, Bool.and_false]
+      exact (testBit_eq_false_of_lt_two_pow (w := 15) (by omega) (Nat.le_of_not_lt hi15)).symm
+  have hcntRec : ((((barBits ||| (((values.size - 1).toUInt32 &&& 0x3f) <<< 15) |||
+      (base.toUInt32 &&& 0x7fff)) >>> 15) &&& 0x3f).toNat) + 1 = values.size := by
+    have hsub : ((((barBits ||| (((values.size - 1).toUInt32 &&& 0x3f) <<< 15) |||
+        (base.toUInt32 &&& 0x7fff)) >>> 15) &&& 0x3f).toNat) = values.size - 1 := by
+      apply Nat.eq_of_testBit_eq; intro i
+      rw [UInt32.toNat_and, UInt32.toNat_shiftRight, UInt32.toNat_or, UInt32.toNat_or,
+          UInt32.toNat_shiftLeft, UInt32.toNat_and, UInt32.toNat_and,
+          Nat.testBit_and, Nat.testBit_shiftRight, Nat.testBit_or, Nat.testBit_or, Nat.testBit_and]
+      have hmask : (0x3f : UInt32).toNat.testBit i = decide (i < 6) := by
+        change (2 ^ 6 - 1 : Nat).testBit i = _
+        exact Nat.testBit_two_pow_sub_one 6 i
+      have s15 : (15 : UInt32).toNat % 32 = 15 := rfl
+      rw [hmask, s15]
+      by_cases hi6 : i < 6
+      · have hbar0 : barBits.toNat.testBit (15 + i) = false := by
+          rcases hbarSpec with ⟨_, rfl⟩ | ⟨slot, _, _, rfl⟩
+          · simp
+          · rw [UInt32.toNat_or, UInt32.toNat_shiftLeft, UInt32.toNat_shiftLeft, Nat.testBit_or]
+            have hs29 : (29 : UInt32).toNat % 32 = 29 := rfl
+            have hs23 : (23 : UInt32).toNat % 32 = 23 := rfl
+            rw [hs29, hs23]
+            have h29 : ((1 : UInt32).toNat <<< 29 % 2 ^ 32).testBit (15 + i) = false := by
+              rw [Nat.testBit_mod_two_pow, Nat.testBit_shiftLeft]
+              have : ¬ (29 ≤ 15 + i) := by omega
+              simp [this]
+            have h23 : (slot.toUInt32.toNat <<< 23 % 2 ^ 32).testBit (15 + i) = false := by
+              rw [Nat.testBit_mod_two_pow, Nat.testBit_shiftLeft]
+              have : ¬ (23 ≤ 15 + i) := by omega
+              simp [this]
+            rw [h29, h23]; rfl
+        have hbase0 : (0x7fff : UInt32).toNat.testBit (15 + i) = false := by
+          change (2 ^ 15 - 1 : Nat).testBit (15 + i) = false
+          rw [Nat.testBit_two_pow_sub_one]
+          have : ¬ (15 + i < 15) := by omega
+          simp [this]
+        have hcntBit : (((values.size - 1).toUInt32.toNat &&& (0x3f : UInt32).toNat) <<< 15 % 2 ^ 32).testBit (15 + i) =
+            (values.size - 1).testBit i := by
+          rw [Nat.testBit_mod_two_pow, Nat.testBit_shiftLeft, Nat.testBit_and]
+          have hlt32 : 15 + i < 32 := by omega
+          have hge15 : 15 ≤ 15 + i := by omega
+          have hsub15 : 15 + i - 15 = i := by omega
+          have hm6 : (0x3f : UInt32).toNat.testBit i = true := by
+            change (2 ^ 6 - 1 : Nat).testBit i = true
+            rw [Nat.testBit_two_pow_sub_one]; simp [hi6]
+          have htoNat : (values.size - 1).toUInt32.toNat = values.size - 1 := by
+            change (values.size - 1) % 2 ^ 32 = values.size - 1
+            exact Nat.mod_eq_of_lt (by omega)
+          rw [hsub15, hm6, htoNat]
+          simp [hlt32, hge15]
+        rw [hbar0, hbase0, hcntBit]
+        simp [hi6]
+      · simp only [hi6, decide_false, Bool.and_false]
+        exact (testBit_eq_false_of_lt_two_pow (w := 6) (by omega) (Nat.le_of_not_lt hi6)).symm
+    omega
+  have hbarRec : (if (((barBits ||| (((values.size - 1).toUInt32 &&& 0x3f) <<< 15) |||
+      (base.toUInt32 &&& 0x7fff)) >>> 29) &&& 1) == 1 then
+      some (((barBits ||| (((values.size - 1).toUInt32 &&& 0x3f) <<< 15) |||
+        (base.toUInt32 &&& 0x7fff)) >>> 23) &&& 0x3f).toUInt8 else none) = barSlot := by
+    have hbit29 : (((barBits ||| (((values.size - 1).toUInt32 &&& 0x3f) <<< 15) |||
+        (base.toUInt32 &&& 0x7fff)) >>> 29) &&& 1) = (if barSlot.isSome then 1 else 0) := by
+      apply UInt32.toNat_inj.mp
+      apply Nat.eq_of_testBit_eq; intro i
+      rw [UInt32.toNat_and, UInt32.toNat_shiftRight, UInt32.toNat_or, UInt32.toNat_or,
+          UInt32.toNat_shiftLeft, UInt32.toNat_and, UInt32.toNat_and,
+          Nat.testBit_and, Nat.testBit_shiftRight, Nat.testBit_or, Nat.testBit_or, Nat.testBit_and]
+      have s29 : (29 : UInt32).toNat % 32 = 29 := rfl
+      have s15 : (15 : UInt32).toNat % 32 = 15 := rfl
+      rw [s29, s15]
+      by_cases hi0 : i = 0
+      · subst hi0
+        simp only [Nat.add_zero]
+        have hcnt0 : (((values.size - 1).toUInt32.toNat &&& (0x3f : UInt32).toNat) <<< 15 % 2 ^ 32).testBit 29 = false := by
+          rw [Nat.testBit_mod_two_pow, Nat.testBit_shiftLeft, Nat.testBit_and]
+          have : (0x3f : UInt32).toNat.testBit (29 - 15) = false := by decide
+          rw [this]; simp
+        have hbase0 : (0x7fff : UInt32).toNat.testBit 29 = false := by decide
+        have h1 : (1 : UInt32).toNat.testBit 0 = true := by decide
+        rcases hbarSpec with ⟨rfl, rfl⟩ | ⟨slot, rfl, hslot, rfl⟩
+        · rw [hcnt0, hbase0]; simp
+        · have hbar29 : (((1 : UInt32) <<< 29) ||| (slot.toUInt32 <<< 23)).toNat.testBit 29 = true := by
+            rw [UInt32.toNat_or, Nat.testBit_or]
+            have : ((1 : UInt32) <<< 29).toNat.testBit 29 = true := by decide
+            rw [this]; rfl
+          rw [hcnt0, hbase0, hbar29, h1]; simp
+      · have h1 : (1 : UInt32).toNat.testBit i = false :=
+          testBit_eq_false_of_lt_two_pow (w := 1) (by decide) (by omega)
+        rcases hbarSpec with ⟨rfl, rfl⟩ | ⟨slot, rfl, _, rfl⟩
+        · rw [h1, Bool.and_false]; simp
+        · rw [h1, Bool.and_false]
+          change false = (1 : UInt32).toNat.testBit i
+          exact h1.symm
+    rw [hbit29]
+    rcases hbarSpec with ⟨rfl, rfl⟩ | ⟨slot, rfl, hslot, rfl⟩
+    · simp
+    · simp only [Option.isSome_some, ↓reduceIte, beq_self_eq_true, Option.some.injEq]
+      apply UInt8.toNat_inj.mp
+      apply Nat.eq_of_testBit_eq; intro i
+      have htoU8 : ∀ x : UInt32, x.toUInt8.toNat = x.toNat % 256 := fun _ => rfl
+      rw [htoU8]
+      change (((((1 : UInt32) <<< 29 ||| slot.toUInt32 <<< 23 |||
+          ((values.size - 1).toUInt32 &&& 0x3f) <<< 15 |||
+          (base.toUInt32 &&& 0x7fff)) >>> 23) &&& 0x3f).toNat % 2 ^ 8).testBit i = _
+      rw [Nat.testBit_mod_two_pow, UInt32.toNat_and, UInt32.toNat_shiftRight,
+          UInt32.toNat_or, UInt32.toNat_or, UInt32.toNat_or,
+          UInt32.toNat_shiftLeft, UInt32.toNat_shiftLeft, UInt32.toNat_shiftLeft,
+          UInt32.toNat_and, UInt32.toNat_and,
+          Nat.testBit_and, Nat.testBit_shiftRight, Nat.testBit_or, Nat.testBit_or, Nat.testBit_or,
+          Nat.testBit_and]
+      have hmask : (0x3f : UInt32).toNat.testBit i = decide (i < 6) := by
+        change (2 ^ 6 - 1 : Nat).testBit i = _
+        exact Nat.testBit_two_pow_sub_one 6 i
+      have s29 : (29 : UInt32).toNat % 32 = 29 := rfl
+      have s23 : (23 : UInt32).toNat % 32 = 23 := rfl
+      have s15 : (15 : UInt32).toNat % 32 = 15 := rfl
+      rw [hmask, s29, s23, s15]
+      by_cases hi6 : i < 6
+      · have hi8 : i < 8 := by omega
+        have h29 : ((1 : UInt32).toNat <<< 29 % 2 ^ 32).testBit (23 + i) = false := by
+          rw [Nat.testBit_mod_two_pow, Nat.testBit_shiftLeft]
+          have : ¬ (29 ≤ 23 + i) := by omega
+          simp [this]
+        have hcnt0 : (((values.size - 1).toUInt32.toNat &&& (0x3f : UInt32).toNat) <<< 15 % 2 ^ 32).testBit (23 + i) = false := by
+          rw [Nat.testBit_mod_two_pow, Nat.testBit_shiftLeft, Nat.testBit_and]
+          have hm6 : (0x3f : UInt32).toNat.testBit (23 + i - 15) = false :=
+            testBit_eq_false_of_lt_two_pow (w := 6) (by decide) (by omega)
+          rw [hm6]; simp
+        have hbase0 : (0x7fff : UInt32).toNat.testBit (23 + i) = false := by
+          change (2 ^ 15 - 1 : Nat).testBit (23 + i) = false
+          rw [Nat.testBit_two_pow_sub_one]
+          have : ¬ (23 + i < 15) := by omega
+          simp [this]
+        have hslotBit : (slot.toUInt32.toNat <<< 23 % 2 ^ 32).testBit (23 + i) = slot.toNat.testBit i := by
+          rw [Nat.testBit_mod_two_pow, Nat.testBit_shiftLeft]
+          have hlt32 : 23 + i < 32 := by omega
+          have hge23 : 23 ≤ 23 + i := by omega
+          have hsub23 : 23 + i - 23 = i := by omega
+          have hsn : slot.toUInt32.toNat = slot.toNat := by simp
+          simp [hlt32, hge23, hsub23, hsn]
+        rw [h29, hcnt0, hbase0, hslotBit]
+        simp [hi6, hi8]
+      · simp only [hi6, decide_false, Bool.and_false]
+        exact (testBit_eq_false_of_lt_two_pow (w := 6) (by omega) (Nat.le_of_not_lt hi6)).symm
+  exact ⟨rfl, hszBounds.1, hszBounds.2, hbit31, hbaseRec, hcntRec, hbarRec⟩
+
+/-- Encoding a valid bitmask register record recovers exact `isBitmask = true`, `base`, `mask`,
+    and `values.size = 1 + popcount16 mask` from the encoded 32-bit record header. -/
+theorem encodeRegRecord_bitmask_header
+    (base mask : UInt16) (values : Array UInt32)
+    (hdr : UInt32) (vals : Array UInt32)
+    (henc : encodeRegRecord (.bitmask base mask values) = .ok (hdr, vals)) :
+    vals = values ∧
+    values.size = 1 + popcount16 mask ∧
+    ((hdr >>> 31) &&& 1) = 1 ∧
+    (hdr &&& 0x7fff).toNat = base.toNat ∧
+    ((hdr >>> 15) &&& 0xffff).toNat = mask.toNat := by
+  unfold encodeRegRecord at henc
+  dsimp only at henc
+  obtain ⟨hbase, henc⟩ := except_if_err_ok henc
+  obtain ⟨hsz, henc⟩ := except_if_err_ok henc
+  obtain ⟨_, henc⟩ := except_if_err_ok henc
+  obtain ⟨⟨⟩, _, henc⟩ := except_bind_ok henc
+  simp only [pure, Except.pure, Except.ok.injEq, Prod.mk.injEq] at henc
+  rcases henc with ⟨rfl, rfl⟩
+  have hbaseLe : base.toNat ≤ 0x7fff := by omega
+  have hszEq : values.size = 1 + popcount16 mask := by simpa using hsz
+  have hbit31 : ((((1 : UInt32) <<< 31 ||| (mask.toUInt32 <<< 15) |||
+      (base.toUInt32 &&& 0x7fff)) >>> 31) &&& 1) = 1 := by
+    apply UInt32.toNat_inj.mp
+    apply Nat.eq_of_testBit_eq; intro i
+    rw [UInt32.toNat_and, UInt32.toNat_shiftRight, UInt32.toNat_or, UInt32.toNat_or,
+        Nat.testBit_and, Nat.testBit_shiftRight, Nat.testBit_or, Nat.testBit_or]
+    have s31 : (31 : UInt32).toNat % 32 = 31 := rfl
+    rw [s31]
+    by_cases hi0 : i = 0
+    · subst hi0
+      have h31 : ((1 : UInt32) <<< 31).toNat.testBit (31 + 0) = true := by decide
+      have h1 : (1 : UInt32).toNat.testBit 0 = true := by decide
+      rw [h31, h1]; rfl
+    · have h1 : (1 : UInt32).toNat.testBit i = false :=
+        testBit_eq_false_of_lt_two_pow (w := 1) (by decide) (by omega)
+      rw [h1, Bool.and_false]
+  have hbaseRec : (((1 : UInt32) <<< 31 ||| (mask.toUInt32 <<< 15) |||
+      (base.toUInt32 &&& 0x7fff)) &&& 0x7fff).toNat = base.toNat := by
+    apply Nat.eq_of_testBit_eq; intro i
+    rw [UInt32.toNat_and, UInt32.toNat_or, UInt32.toNat_or, UInt32.toNat_shiftLeft,
+        UInt32.toNat_shiftLeft, UInt32.toNat_and,
+        Nat.testBit_and, Nat.testBit_or, Nat.testBit_or, Nat.testBit_and]
+    have hmask : (0x7fff : UInt32).toNat.testBit i = decide (i < 15) := by
+      change (2 ^ 15 - 1 : Nat).testBit i = _
+      exact Nat.testBit_two_pow_sub_one 15 i
+    have s15 : (15 : UInt32).toNat % 32 = 15 := rfl
+    have s31 : (31 : UInt32).toNat % 32 = 31 := rfl
+    rw [hmask, s15, s31]
+    by_cases hi15 : i < 15
+    · have h31 : ((1 : UInt32).toNat <<< 31 % 2 ^ 32).testBit i = false := by
+        rw [Nat.testBit_mod_two_pow, Nat.testBit_shiftLeft]
+        have : ¬ (31 ≤ i) := by omega
+        simp [this]
+      have hm0 : (mask.toUInt32.toNat <<< 15 % 2 ^ 32).testBit i = false := by
+        rw [Nat.testBit_mod_two_pow, Nat.testBit_shiftLeft]
+        have : ¬ (15 ≤ i) := by omega
+        simp [this]
+      have hbEq : base.toUInt32.toNat = base.toNat := by simp
+      rw [h31, hm0, hbEq]
+      simp [hi15]
+    · simp only [hi15, decide_false, Bool.and_false]
+      symm
+      exact testBit_eq_false_of_lt_two_pow (w := 15) (by omega) (by omega)
+  have hmaskRec : ((((1 : UInt32) <<< 31 ||| (mask.toUInt32 <<< 15) |||
+      (base.toUInt32 &&& 0x7fff)) >>> 15) &&& 0xffff).toNat = mask.toNat := by
+    apply Nat.eq_of_testBit_eq; intro i
+    rw [UInt32.toNat_and, UInt32.toNat_shiftRight, UInt32.toNat_or, UInt32.toNat_or,
+        UInt32.toNat_shiftLeft, UInt32.toNat_shiftLeft, UInt32.toNat_and,
+        Nat.testBit_and, Nat.testBit_shiftRight, Nat.testBit_or, Nat.testBit_or, Nat.testBit_and]
+    have hmask : (0xffff : UInt32).toNat.testBit i = decide (i < 16) := by
+      change (2 ^ 16 - 1 : Nat).testBit i = _
+      exact Nat.testBit_two_pow_sub_one 16 i
+    have s15 : (15 : UInt32).toNat % 32 = 15 := rfl
+    have s31 : (31 : UInt32).toNat % 32 = 31 := rfl
+    rw [hmask, s15, s31]
+    by_cases hi16 : i < 16
+    · have h31 : ((1 : UInt32).toNat <<< 31 % 2 ^ 32).testBit (15 + i) = false := by
+        rw [Nat.testBit_mod_two_pow, Nat.testBit_shiftLeft]
+        have : ¬ (31 ≤ 15 + i) := by omega
+        simp [this]
+      have hbase0 : (0x7fff : UInt32).toNat.testBit (15 + i) = false := by
+        change (2 ^ 15 - 1 : Nat).testBit (15 + i) = false
+        rw [Nat.testBit_two_pow_sub_one]
+        have : ¬ (15 + i < 15) := by omega
+        simp [this]
+      have hmBit : (mask.toUInt32.toNat <<< 15 % 2 ^ 32).testBit (15 + i) = mask.toNat.testBit i := by
+        rw [Nat.testBit_mod_two_pow, Nat.testBit_shiftLeft]
+        have hlt32 : 15 + i < 32 := by omega
+        have hge15 : 15 ≤ 15 + i := by omega
+        have hsub15 : 15 + i - 15 = i := by omega
+        have hmEq : mask.toUInt32.toNat = mask.toNat := by simp
+        simp [hlt32, hge15, hsub15, hmEq]
+      rw [h31, hmBit, hbase0]
+      simp [hi16]
+    · simp only [hi16, decide_false, Bool.and_false]
+      exact (testBit_eq_false_of_lt_two_pow mask.toNat_lt (Nat.le_of_not_lt hi16)).symm
+  exact ⟨rfl, hszEq, hbit31, hbaseRec, hmaskRec⟩
+
+private theorem decodeBitmaskAddrsAux_length (base mask k : Nat) (acc : List Nat) :
+    (decodeBitmaskAddrsAux base mask k acc).length = acc.length + popcountBits mask k := by
+  induction k generalizing acc with
+  | zero => simp [decodeBitmaskAddrsAux, popcountBits]
+  | succ i ih =>
+    simp only [decodeBitmaskAddrsAux, popcountBits]
+    split
+    · rw [ih]; simp; omega
+    · rw [ih]; omega
+
+/-- The number of register addresses decoded by `decodeBitmaskAddrs` equals `1 + popcount16 mask`. -/
+theorem decodeBitmaskAddrs_length (base : Nat) (mask : UInt16) :
+    (decodeBitmaskAddrs base mask.toNat).length = 1 + popcount16 mask := by
+  unfold decodeBitmaskAddrs popcount16
+  simp only [List.length_cons, decodeBitmaskAddrsAux_length, List.length_nil]
+  omega
+
+/-- The first address of `decodeBitmaskAddrs base mask` is always `base * 4`. -/
+theorem decodeBitmaskAddrs_head (base mask : Nat) :
+    (decodeBitmaskAddrs base mask)[0]? = some (base * 4) := rfl
+
+private theorem mem_decodeBitmaskAddrsAux_iff (base mask k : Nat) (acc : List Nat) (addr : Nat) :
+    addr ∈ decodeBitmaskAddrsAux base mask k acc ↔
+      addr ∈ acc ∨ ∃ i < k, ((mask >>> i) &&& 1) = 1 ∧ addr = (base + i + 1) * 4 := by
+  induction k generalizing acc with
+  | zero =>
+    simp [decodeBitmaskAddrsAux]
+  | succ j ih =>
+    simp only [decodeBitmaskAddrsAux]
+    split
+    · rename_i hbit
+      have hbitEq : ((mask >>> j) &&& 1) = 1 := by simpa using hbit
+      rw [ih]
+      simp only [List.mem_cons]
+      constructor
+      · rintro ((rfl | hacc) | ⟨i, hi, hb, rfl⟩)
+        · right; exact ⟨j, by omega, hbitEq, rfl⟩
+        · left; exact hacc
+        · right; exact ⟨i, by omega, hb, rfl⟩
+      · rintro (hacc | ⟨i, hi, hb, rfl⟩)
+        · left; right; exact hacc
+        · by_cases hij : i = j
+          · subst hij; left; left; rfl
+          · right; exact ⟨i, by omega, hb, rfl⟩
+    · rename_i hbit
+      have hbitNe : ((mask >>> j) &&& 1) ≠ 1 := by simpa using hbit
+      rw [ih]
+      constructor
+      · rintro (hacc | ⟨i, hi, hb, rfl⟩)
+        · left; exact hacc
+        · right; exact ⟨i, by omega, hb, rfl⟩
+      · rintro (hacc | ⟨i, hi, hb, rfl⟩)
+        · left; exact hacc
+        · by_cases hij : i = j
+          · subst hij; exact absurd hb hbitNe
+          · right; exact ⟨i, by omega, hb, rfl⟩
+
+/-- Exact membership characterization for `decodeBitmaskAddrs`: an address is targeted iff it is
+    `base * 4` or `(base + i + 1) * 4` for a set bit `i < 16` of `mask`. -/
+theorem mem_decodeBitmaskAddrs_iff (base mask addr : Nat) :
+    addr ∈ decodeBitmaskAddrs base mask ↔
+      addr = base * 4 ∨ ∃ i < 16, ((mask >>> i) &&& 1) = 1 ∧ addr = (base + i + 1) * 4 := by
+  unfold decodeBitmaskAddrs
+  simp only [List.mem_cons, mem_decodeBitmaskAddrsAux_iff, List.not_mem_nil, false_or]
+
+private theorem decodeSequentialWrites_spec
+    (bs : ByteArray) (recPos base cnt : Nat) (slot? : Option UInt8)
+    (vals : List UInt32) (i : Nat) (acc : Array DecodedWrite)
+    (hread : ∀ k (hk : k < vals.length), readU32LE bs (recPos + 4 * (i + k)) = .ok vals[k]) :
+    decodeSequentialWrites bs recPos base cnt slot? i vals.length acc =
+      .ok (acc ++ (List.ofFn (n := vals.length) fun j => {
+        byteAddr := (base + (i + j.val)) * 4
+        value := vals[j.val]
+        barSlot := slot?
+        payloadOffset := recPos + 4 * (i + j.val)
+        recordLen := cnt
+      }).toArray) := by
+  induction vals generalizing i acc with
+  | nil =>
+    simp [decodeSequentialWrites]
+  | cons v rest ih =>
+    simp only [List.length_cons, decodeSequentialWrites]
+    have h0 : readU32LE bs (recPos + 4 * i) = .ok v := by
+      have h := hread 0 (by simp)
+      simp only [Nat.add_zero] at h
+      exact h
+    rw [h0]
+    simp only [bind, Except.bind]
+    have hrest : ∀ k (hk : k < rest.length), readU32LE bs (recPos + 4 * (i + 1 + k)) = .ok rest[k] := by
+      intro k hk
+      have h' := hread (k + 1) (by simp; omega)
+      have hidx : i + (k + 1) = i + 1 + k := by omega
+      rw [hidx] at h'
+      simpa using h'
+    rw [ih (i + 1) _ hrest]
+    congr 1
+    apply Array.ext'
+    simp only [Array.toList_append, Array.toList_push, List.ofFn_succ]
+    simp only [List.append_assoc, List.singleton_append]
+    congr 2
+    apply List.ext_getElem (by simp)
+    intro j h1 h2
+    simp only [List.getElem_ofFn, Fin.val_succ, List.getElem_cons_succ]
+    have hadd : i + 1 + j = i + (j + 1) := by omega
+    simp [hadd]
+
+private theorem decodeBitmaskWrites_spec
+    (bs : ByteArray) (recPos recLen : Nat)
+    (addrs : List Nat) (vals : List UInt32) (i : Nat) (acc : Array DecodedWrite)
+    (hlen : addrs.length = vals.length)
+    (hread : ∀ k (hk : k < vals.length), readU32LE bs (recPos + 4 * (i + k)) = .ok vals[k]) :
+    decodeBitmaskWrites bs recPos recLen i addrs acc =
+      .ok (acc ++ (List.ofFn (n := vals.length) fun j => {
+        byteAddr := addrs[j.val]'(by omega)
+        value := vals[j.val]
+        barSlot := none
+        payloadOffset := recPos + 4 * (i + j.val)
+        recordLen := recLen
+      }).toArray) := by
+  induction addrs generalizing vals i acc with
+  | nil =>
+    cases vals with
+    | nil => simp [decodeBitmaskWrites]
+    | cons _ _ => simp at hlen
+  | cons a restA ih =>
+    cases vals with
+    | nil => simp at hlen
+    | cons v restV =>
+      simp only [decodeBitmaskWrites]
+      have h0 : readU32LE bs (recPos + 4 * i) = .ok v := by
+        have h := hread 0 (by simp)
+        simp only [Nat.add_zero] at h
+        exact h
+      rw [h0]
+      simp only [bind, Except.bind]
+      have hlen' : restA.length = restV.length := by simp at hlen; omega
+      have hrest : ∀ k (hk : k < restV.length), readU32LE bs (recPos + 4 * (i + 1 + k)) = .ok restV[k] := by
+        intro k hk
+        have h' := hread (k + 1) (by simp; omega)
+        have hidx : i + (k + 1) = i + 1 + k := by omega
+        rw [hidx] at h'
+        simpa using h'
+      rw [ih restV (i + 1) _ hlen' hrest]
+      congr 1
+      apply Array.ext'
+      simp only [Array.toList_append, Array.toList_push, List.length_cons,
+                 List.ofFn_succ, List.append_assoc, List.singleton_append]
+      congr 2
+      apply List.ext_getElem (by simp)
+      intro j h1 h2
+      simp only [List.getElem_ofFn, Fin.val_succ, List.getElem_cons_succ]
+      have hadd : i + 1 + j = i + (j + 1) := by omega
+      simp [hadd]
+
+/-- Full byte-level round-trip soundness for production `encodeRegRecord` + `decodeRegRecordAt`
+    on any valid single-word or multi-word sequential register record (plain or BAR-tagged) at
+    arbitrary prefix `bs` and trailing bytes `suffix`. -/
+theorem decodeRegRecordAt_sequential_roundTrip
+    (bs suffix : ByteArray) (acc : Array DecodedWrite)
+    (base : UInt16) (barSlot : Option UInt8) (values : Array UInt32)
+    (hdr : UInt32) (vals : Array UInt32)
+    (henc : encodeRegRecord (.sequential base barSlot values) = .ok (hdr, vals)) :
+    let encoded := pushU32LEs (pushU32LE bs hdr) vals.toList ++ suffix
+    decodeRegRecordAt encoded bs.size acc =
+      .ok (acc ++ (List.ofFn (n := values.size) fun j => {
+        byteAddr := (base.toNat + j.val) * 4
+        value := values[j.val]
+        barSlot := barSlot
+        payloadOffset := bs.size + 4 + 4 * j.val
+        recordLen := values.size
+      }).toArray, bs.size + 4 + 4 * values.size) := by
+  obtain ⟨hvalsEq, hsz1, hsz64, hbit31, hbase, hcnt, hslot⟩ :=
+    encodeRegRecord_sequential_header base barSlot values hdr vals henc
+  subst vals
+  dsimp only
+  unfold decodeRegRecordAt
+  let pre := pushU32LEs (pushU32LE bs hdr) values.toList
+  have hpreSz : pre.size = bs.size + 4 + 4 * values.size := by
+    simp [pre, pushU32LEs_size, pushU32LE_size]
+  have hhdrRead : readU32LE (pre ++ suffix) bs.size = .ok hdr := by
+    rw [readU32LE_append_prefix pre suffix bs.size (by omega)]
+    rw [readU32LE_pushU32LEs_prefix (pushU32LE bs hdr) values.toList bs.size (by rw [pushU32LE_size]; omega)]
+    exact readU32LE_pushU32LE bs hdr
+  rw [show readU32LE (pushU32LEs (pushU32LE bs hdr) values.toList ++ suffix) bs.size = .ok hdr from hhdrRead]
+  simp only [bind, Except.bind, hbit31, hbase, hcnt, hslot]
+  have hnotBm : ((0 : UInt32) == 1) = false := rfl
+  simp only [hnotBm, Bool.false_eq_true, ↓reduceIte]
+  have hread : ∀ k (hk : k < values.toList.length),
+      readU32LE (pre ++ suffix) (bs.size + 4 + 4 * (0 + k)) = .ok values.toList[k] := by
+    intro k hk
+    have hk' : k < values.size := by simpa using hk
+    rw [readU32LE_append_prefix pre suffix (bs.size + 4 + 4 * (0 + k)) (by omega)]
+    have hoff : bs.size + 4 + 4 * (0 + k) = (pushU32LE bs hdr).size + 4 * k := by
+      rw [pushU32LE_size]; omega
+    rw [hoff]
+    exact readU32LE_pushU32LEs_at (pushU32LE bs hdr) values.toList k hk
+  have hseq := decodeSequentialWrites_spec (pre ++ suffix) (bs.size + 4) base.toNat values.size barSlot
+        values.toList 0 acc hread
+  simp only [Array.length_toList] at hseq
+  rw [hseq]
+  simp only [Nat.zero_add, pure, Except.pure, Array.getElem_toList]
+
+/-- Specialized single-word sequential register record round-trip: encoding `(base, barSlot, #[val])`
+    and decoding via `decodeRegRecordAt` recovers exact `byteAddr = base * 4`, `value = val`,
+    `barSlot`, `payloadOffset = bs.size + 4`, and `recordLen = 1`. -/
+theorem decodeRegRecordAt_single_roundTrip
+    (bs suffix : ByteArray) (acc : Array DecodedWrite)
+    (base : UInt16) (barSlot : Option UInt8) (val : UInt32)
+    (hdr : UInt32) (vals : Array UInt32)
+    (henc : encodeRegRecord (.sequential base barSlot #[val]) = .ok (hdr, vals)) :
+    let encoded := pushU32LEs (pushU32LE bs hdr) vals.toList ++ suffix
+    decodeRegRecordAt encoded bs.size acc =
+      .ok (acc.push {
+        byteAddr := base.toNat * 4
+        value := val
+        barSlot := barSlot
+        payloadOffset := bs.size + 4
+        recordLen := 1
+      }, bs.size + 8) := by
+  have h := decodeRegRecordAt_sequential_roundTrip bs suffix acc base barSlot #[val] hdr vals henc
+  simpa using h
+
+/-- Full byte-level round-trip soundness for production `encodeRegRecord` + `decodeRegRecordAt`
+    on any valid bitmask register record at arbitrary prefix `bs` and trailing bytes `suffix`. -/
+theorem decodeRegRecordAt_bitmask_roundTrip
+    (bs suffix : ByteArray) (acc : Array DecodedWrite)
+    (base mask : UInt16) (values : Array UInt32)
+    (hdr : UInt32) (vals : Array UInt32)
+    (henc : encodeRegRecord (.bitmask base mask values) = .ok (hdr, vals)) :
+    let encoded := pushU32LEs (pushU32LE bs hdr) vals.toList ++ suffix
+    let addrs := decodeBitmaskAddrs base.toNat mask.toNat
+    decodeRegRecordAt encoded bs.size acc =
+      .ok (acc ++ (List.ofFn (n := values.size) fun j => {
+        byteAddr := addrs[j.val]'(by
+          have h1 := (encodeRegRecord_bitmask_header base mask values hdr vals henc).2.1
+          have h2 := decodeBitmaskAddrs_length base.toNat mask
+          show j.val < (decodeBitmaskAddrs base.toNat mask.toNat).length
+          rw [h2, ← h1]; exact j.isLt)
+        value := values[j.val]
+        barSlot := none
+        payloadOffset := bs.size + 4 + 4 * j.val
+        recordLen := values.size
+      }).toArray, bs.size + 4 + 4 * values.size) := by
+  obtain ⟨hvalsEq, hsz, hbit31, hbase, hmask⟩ :=
+    encodeRegRecord_bitmask_header base mask values hdr vals henc
+  subst vals
+  dsimp only
+  unfold decodeRegRecordAt
+  let pre := pushU32LEs (pushU32LE bs hdr) values.toList
+  have hpreSz : pre.size = bs.size + 4 + 4 * values.size := by
+    simp [pre, pushU32LEs_size, pushU32LE_size]
+  have hhdrRead : readU32LE (pre ++ suffix) bs.size = .ok hdr := by
+    rw [readU32LE_append_prefix pre suffix bs.size (by omega)]
+    rw [readU32LE_pushU32LEs_prefix (pushU32LE bs hdr) values.toList bs.size (by rw [pushU32LE_size]; omega)]
+    exact readU32LE_pushU32LE bs hdr
+  rw [show readU32LE (pushU32LEs (pushU32LE bs hdr) values.toList ++ suffix) bs.size = .ok hdr from hhdrRead]
+  simp only [bind, Except.bind, hbit31, hbase, hmask, beq_self_eq_true, ↓reduceIte]
+  have haddrsLen : (decodeBitmaskAddrs base.toNat mask.toNat).length = values.toList.length := by
+    rw [decodeBitmaskAddrs_length base.toNat mask]
+    simp [hsz]
+  have hread : ∀ k (hk : k < values.toList.length),
+      readU32LE (pre ++ suffix) (bs.size + 4 + 4 * (0 + k)) = .ok values.toList[k] := by
+    intro k hk
+    have hk' : k < values.size := by simpa using hk
+    rw [readU32LE_append_prefix pre suffix (bs.size + 4 + 4 * (0 + k)) (by omega)]
+    have hoff : bs.size + 4 + 4 * (0 + k) = (pushU32LE bs hdr).size + 4 * k := by
+      rw [pushU32LE_size]; omega
+    rw [hoff]
+    exact readU32LE_pushU32LEs_at (pushU32LE bs hdr) values.toList k hk
+  rw [decodeBitmaskWrites_spec (pre ++ suffix) (bs.size + 4)
+        (decodeBitmaskAddrs base.toNat mask.toNat).length
+        (decodeBitmaskAddrs base.toNat mask.toNat) values.toList 0 acc haddrsLen hread]
+  have hlenVal : (decodeBitmaskAddrs base.toNat mask.toNat).length = values.size := by
+    simpa using haddrsLen
+  simp only [Nat.zero_add, pure, Except.pure, Except.ok.injEq, Prod.mk.injEq, hlenVal,
+             Array.getElem_toList, and_true]
+  congr 1
+
+/-- Expected `DecodedWrite` list produced by encoding a single `RegRecord` starting at byte offset `off`. -/
+def expectedRecordWrites (off : Nat) : RegRecord → List DecodedWrite
+  | .sequential base barSlot values =>
+    List.ofFn (n := values.size) fun j => {
+      byteAddr := (base.toNat + j.val) * 4
+      value := values[j.val]
+      barSlot := barSlot
+      payloadOffset := off + 4 + 4 * j.val
+      recordLen := values.size
+    }
+  | .bitmask base mask values =>
+    let addrs := decodeBitmaskAddrs base.toNat mask.toNat
+    List.ofFn (n := values.size) fun j => {
+      byteAddr := addrs.getD j.val 0
+      value := values[j.val]
+      barSlot := none
+      payloadOffset := off + 4 + 4 * j.val
+      recordLen := values.size
+    }
+
+/-- Encode a list of `RegRecord`s into bytes (appending onto `bs`) and compute the exact expected
+    sequence of `DecodedWrite`s. -/
+def encodeRecordList (bs : ByteArray) : List RegRecord → Except String (ByteArray × List DecodedWrite)
+  | [] => .ok (bs, [])
+  | r :: rest =>
+    encodeRegRecord r >>= fun (hdr, vals) =>
+    let ws := expectedRecordWrites bs.size r
+    let bs' := pushU32LEs (pushU32LE bs hdr) vals.toList
+    encodeRecordList bs' rest >>= fun (outBs, restWs) =>
+    .ok (outBs, ws ++ restWs)
+
+private theorem byteArray_append_empty (a : ByteArray) : a ++ ByteArray.empty = a := by
+  cases a with
+  | mk da =>
+    cases da with
+    | mk la =>
+      change ByteArray.mk (Array.mk (la ++ [])) = ByteArray.mk (Array.mk la)
+      simp
+
+private theorem byteArray_append_assoc (a b c : ByteArray) : (a ++ b) ++ c = a ++ (b ++ c) := by
+  cases a with
+  | mk da =>
+    cases da with
+    | mk la =>
+      cases b with
+      | mk db =>
+        cases db with
+        | mk lb =>
+          cases c with
+          | mk dc =>
+            cases dc with
+            | mk lc =>
+              change ByteArray.mk (Array.mk ((la ++ lb) ++ lc)) = ByteArray.mk (Array.mk (la ++ (lb ++ lc)))
+              simp [List.append_assoc]
+
+private theorem encodeRecordList_append_split (bs : ByteArray) (recs : List RegRecord)
+    (outBs : ByteArray) (ws : List DecodedWrite)
+    (h : encodeRecordList bs recs = .ok (outBs, ws)) :
+    ∃ tail : ByteArray, outBs = bs ++ tail := by
+  induction recs generalizing bs outBs ws with
+  | nil =>
+    simp only [encodeRecordList, Except.ok.injEq, Prod.mk.injEq] at h
+    rcases h with ⟨rfl, _⟩
+    exact ⟨ByteArray.empty, (byteArray_append_empty bs).symm⟩
+  | cons r rest ih =>
+    unfold encodeRecordList at h
+    obtain ⟨⟨hdr, vals⟩, henc, h⟩ := except_bind_ok h
+    obtain ⟨⟨outBs', restWs⟩, hrest, h⟩ := except_bind_ok h
+    simp only [Except.ok.injEq, Prod.mk.injEq] at h
+    rcases h with ⟨rfl, rfl⟩
+    obtain ⟨tail2, hout⟩ := ih _ _ _ hrest
+    have hpush : ∀ (a : ByteArray) (b : UInt8), ∃ t, a.push b = a ++ t := by
+      intro a b
+      refine ⟨ByteArray.mk #[b], ?_⟩
+      cases a with
+      | mk da =>
+        cases da with
+        | mk la =>
+          change ByteArray.mk (Array.push (Array.mk la) b) = ByteArray.mk (Array.mk (la ++ [b]))
+          congr 1
+          apply Array.ext'
+          simp
+    have hpush32 : ∀ (a : ByteArray) (v : UInt32), ∃ t, pushU32LE a v = a ++ t := by
+      intro a v
+      unfold pushU32LE; dsimp only
+      obtain ⟨t1, h1⟩ := hpush a _
+      obtain ⟨t2, h2⟩ := hpush _ _
+      obtain ⟨t3, h3⟩ := hpush _ _
+      obtain ⟨t4, h4⟩ := hpush _ _
+      refine ⟨t1 ++ (t2 ++ (t3 ++ t4)), ?_⟩
+      rw [h4, h3, h2, h1, byteArray_append_assoc, byteArray_append_assoc, byteArray_append_assoc]
+    have hpush32s : ∀ (a : ByteArray) (vs : List UInt32), ∃ t, pushU32LEs a vs = a ++ t := by
+      intro a vs
+      induction vs generalizing a with
+      | nil =>
+        exact ⟨ByteArray.empty, (byteArray_append_empty a).symm⟩
+      | cons v vs' ihv =>
+        obtain ⟨t1, h1⟩ := hpush32 a v
+        obtain ⟨t2, h2⟩ := ihv (pushU32LE a v)
+        refine ⟨t1 ++ t2, ?_⟩
+        simp only [pushU32LEs]
+        rw [h2, h1, byteArray_append_assoc]
+    obtain ⟨tHdr, hHdr⟩ := hpush32 bs hdr
+    obtain ⟨tVals, hVals⟩ := hpush32s (pushU32LE bs hdr) vals.toList
+    refine ⟨tHdr ++ (tVals ++ tail2), ?_⟩
+    rw [hout, hVals, hHdr, byteArray_append_assoc, byteArray_append_assoc]
+
+/-- Whole-task record-sequence round-trip soundness: encoding ANY list of valid `RegRecord`s
+    via `encodeRegRecord` + `pushU32LE` and decoding `[bs.size, outBs.size)` via production
+    `decodeTaskRecords` (called by `decodeTaskStream`) succeeds and recovers EVERY encoded write
+    in exact order, proving the decoder/verifier can never silently drop an emitted register write. -/
+theorem decodeTaskRecords_roundTrip
+    (bs suffix : ByteArray) (recs : List RegRecord)
+    (outBs : ByteArray) (ws : List DecodedWrite) (acc : Array DecodedWrite)
+    (henc : encodeRecordList bs recs = .ok (outBs, ws)) :
+    decodeTaskRecords (outBs ++ suffix) bs.size outBs.size acc = .ok (acc ++ ws.toArray) := by
+  induction recs generalizing bs outBs ws acc with
+  | nil =>
+    simp only [encodeRecordList, Except.ok.injEq, Prod.mk.injEq] at henc
+    rcases henc with ⟨rfl, rfl⟩
+    unfold decodeTaskRecords
+    simp
+  | cons r rest ih =>
+    unfold encodeRecordList at henc
+    obtain ⟨⟨hdr, vals⟩, hr, henc⟩ := except_bind_ok henc
+    obtain ⟨⟨outBs', restWs⟩, hrest, henc⟩ := except_bind_ok henc
+    simp only [Except.ok.injEq, Prod.mk.injEq] at henc
+    rcases henc with ⟨rfl, rfl⟩
+    let bs' := pushU32LEs (pushU32LE bs hdr) vals.toList
+    obtain ⟨tailRest, houtEq⟩ := encodeRecordList_append_split bs' rest outBs' restWs hrest
+    have hrecLenPos : 1 ≤ vals.size := by
+      cases r with
+      | sequential base barSlot values =>
+        obtain ⟨hveq, h1, _⟩ := encodeRegRecord_sequential_header base barSlot values hdr vals hr
+        rw [hveq]; exact h1
+      | bitmask base mask values =>
+        obtain ⟨hveq, hsz, _⟩ := encodeRegRecord_bitmask_header base mask values hdr vals hr
+        rw [hveq, hsz]; omega
+    have hbs'Sz : bs'.size = bs.size + 4 + 4 * vals.size := by
+      simp [bs', pushU32LEs_size, pushU32LE_size]
+    have houtSz : outBs'.size = bs'.size + tailRest.size := by
+      rw [houtEq, ByteArray.size_append]
+    have hlt : bs.size < outBs'.size := by omega
+    have hstep : decodeRegRecordAt (outBs' ++ suffix) bs.size acc =
+        .ok (acc ++ (expectedRecordWrites bs.size r).toArray, bs'.size) := by
+      have happAssoc : outBs' ++ suffix = bs' ++ (tailRest ++ suffix) := by
+        rw [houtEq, byteArray_append_assoc]
+      rw [happAssoc]
+      cases r with
+      | sequential base barSlot values =>
+        have hseq := decodeRegRecordAt_sequential_roundTrip bs (tailRest ++ suffix) acc
+          base barSlot values hdr vals hr
+        obtain ⟨hveq, _⟩ := encodeRegRecord_sequential_header base barSlot values hdr vals hr
+        rw [hbs'Sz, hveq]
+        simpa [bs', hveq, expectedRecordWrites] using hseq
+      | bitmask base mask values =>
+        have hbm := decodeRegRecordAt_bitmask_roundTrip bs (tailRest ++ suffix) acc
+          base mask values hdr vals hr
+        obtain ⟨hveq, hsz, _⟩ := encodeRegRecord_bitmask_header base mask values hdr vals hr
+        have hlenAddrs : (decodeBitmaskAddrs base.toNat mask.toNat).length = values.size := by
+          rw [decodeBitmaskAddrs_length, ← hsz]
+        have hlistEq :
+            (List.ofFn (n := values.size) fun j => {
+              byteAddr := (decodeBitmaskAddrs base.toNat mask.toNat)[j.val]'(by omega)
+              value := values[j.val]
+              barSlot := none
+              payloadOffset := bs.size + 4 + 4 * j.val
+              recordLen := values.size
+            }) = expectedRecordWrites bs.size (.bitmask base mask values) := by
+          unfold expectedRecordWrites
+          apply List.ext_getElem (by simp)
+          intro j hj1 hj2
+          simp only [List.getElem_ofFn]
+          have hjLt : j < (decodeBitmaskAddrs base.toNat mask.toNat).length := by simp at hj1; omega
+          have hgetD : (decodeBitmaskAddrs base.toNat mask.toNat).getD j 0 =
+              (decodeBitmaskAddrs base.toNat mask.toNat)[j]'hjLt := by
+            rw [List.getD_eq_getElem?_getD, List.getElem?_eq_getElem hjLt]; rfl
+          rw [hgetD]
+        rw [hbs'Sz, hveq]
+        simpa [bs', hveq, hlistEq] using hbm
+    unfold decodeTaskRecords
+    simp only [hlt, ↓reduceDIte, hstep]
+    have hgt : bs.size < bs'.size := by omega
+    simp only [hgt, ↓reduceDIte]
+    rw [ih bs' outBs' restWs (acc ++ (expectedRecordWrites bs.size r).toArray) hrest]
+    congr 1
+    apply Array.ext'
+    simp
+
+-- ============================================================================
+-- 18. Production WordLayout Completeness (remaining 16/37 layouts -> 100% coverage)
+-- ============================================================================
+
+theorem dim16_roundTrip (name : String) (val : UInt32) (hv : val < 65536) :
+    ∃ w, encodeWord (dim16Layout name) #[("val", val)] = .ok w ∧
+         decodeFieldChecked (dim16Layout name) w "val" = .ok val := by
+  have h1 : ¬ val.toNat ≥ 65536 := u32_not_ge_of_lt hv
+  have hlay : validateWordLayout (dim16Layout name) = .ok 0x0000ffff := by
+    simp [validateWordLayout, dim16Layout, validateWordLayoutFields, BitField.mask, BitField.maskNat]
+  have hval : validateEncodeValues name (dim16Layout name).fields.toList [("val", val)] [] = .ok () := by
+    simp [dim16Layout, validateEncodeValues]
+  have henc : encodeWord (dim16Layout name) #[("val", val)] = .ok ((0 : UInt32) ||| (val <<< 0)) := by
+    unfold encodeWord
+    rw [hlay]; simp only [bind, Except.bind]
+    have hval' : validateEncodeValues (dim16Layout name).name (dim16Layout name).fields.toList
+        #[("val", val)].toList [] = .ok () := hval
+    rw [hval']
+    simp [dim16Layout, encodeWordFields, List.find?]
+    omega
+  exact ⟨_, henc, encodeWord_decodeFieldChecked _ _ _ "val" val henc rfl⟩
+
+theorem u32_roundTrip (name : String) (val : UInt32) :
+    ∃ w, encodeWord (u32Layout name) #[("val", val)] = .ok w ∧
+         decodeFieldChecked (u32Layout name) w "val" = .ok val := by
+  have hlay : validateWordLayout (u32Layout name) = .ok 0xffffffff := by
+    simp [validateWordLayout, u32Layout, validateWordLayoutFields, BitField.mask, BitField.maskNat]
+  have hval : validateEncodeValues name (u32Layout name).fields.toList [("val", val)] [] = .ok () := by
+    simp [u32Layout, validateEncodeValues]
+  have henc : encodeWord (u32Layout name) #[("val", val)] = .ok ((0 : UInt32) ||| (val <<< 0)) := by
+    unfold encodeWord
+    rw [hlay]; simp only [bind, Except.bind]
+    have hval' : validateEncodeValues (u32Layout name).name (u32Layout name).fields.toList
+        #[("val", val)].toList [] = .ok () := hval
+    rw [hval']
+    simp [u32Layout, encodeWordFields, List.find?]
+    exact Nat.lt_of_lt_of_eq val.toNat_lt rfl
+  exact ⟨_, henc, encodeWord_decodeFieldChecked _ _ _ "val" val henc rfl⟩
+
+theorem dwGroups_roundTrip (perGroupIn : UInt32) (h : perGroupIn < 65536) :
+    ∃ w, encodeWord dwGroupsLayout #[("perGroupIn", perGroupIn)] = .ok w ∧
+         decodeFieldChecked dwGroupsLayout w "perGroupIn" = .ok perGroupIn := by
+  have h1 : ¬ perGroupIn.toNat ≥ 65536 := u32_not_ge_of_lt h
+  have henc : encodeWord dwGroupsLayout #[("perGroupIn", perGroupIn)] =
+      .ok ((0x00004000 : UInt32) ||| (perGroupIn <<< 16)) := by
+    change (if perGroupIn.toNat ≥ 65536 then _ else _) = _
+    simp only [h1, ↓reduceIte]; rfl
+  exact ⟨_, henc, encodeWord_decodeFieldChecked _ _ _ "perGroupIn" perGroupIn henc rfl⟩
+
+theorem peCommon_roundTrip (mode : UInt32) (hm : mode < 256) :
+    ∃ w, encodeWord peCommonLayout #[("mode", mode)] = .ok w ∧
+         decodeFieldChecked peCommonLayout w "mode" = .ok mode := by
+  have h1 : ¬ mode.toNat ≥ 256 := u32_not_ge_of_lt hm
+  have henc : encodeWord peCommonLayout #[("mode", mode)] =
+      .ok ((0 : UInt32) ||| (mode <<< 0)) := by
+    change (if mode.toNat ≥ 256 then _ else _) = _
+    simp only [h1, ↓reduceIte]; rfl
+  exact ⟨_, henc, encodeWord_decodeFieldChecked _ _ _ "mode" mode henc rfl⟩
+
+theorem neActShiftEn_roundTrip (enable : UInt32) (he : enable < 2) :
+    ∃ w, encodeWord neActShiftEnLayout #[("enable", enable)] = .ok w ∧
+         decodeFieldChecked neActShiftEnLayout w "enable" = .ok enable := by
+  have h1 : ¬ enable.toNat ≥ 2 := u32_not_ge_of_lt he
+  have henc : encodeWord neActShiftEnLayout #[("enable", enable)] =
+      .ok ((0 : UInt32) ||| (enable <<< 0)) := by
+    change (if enable.toNat ≥ 2 then _ else _) = _
+    simp only [h1, ↓reduceIte]; rfl
+  exact ⟨_, henc, encodeWord_decodeFieldChecked _ _ _ "enable" enable henc rfl⟩
+
+theorem src1Cfg_roundTrip (mode p : UInt32) (hmode : mode < 4) (hp : p < 16) :
+    ∃ w, encodeWord src1CfgLayout #[("mode", mode), ("P", p)] = .ok w ∧
+         decodeFieldChecked src1CfgLayout w "mode" = .ok mode ∧
+         decodeFieldChecked src1CfgLayout w "P" = .ok p := by
+  have h1 : ¬ mode.toNat ≥ 4 := u32_not_ge_of_lt hmode
+  have h2 : ¬ p.toNat ≥ 16 := u32_not_ge_of_lt hp
+  have henc : encodeWord src1CfgLayout #[("mode", mode), ("P", p)] =
+      .ok (((0x00500070 : UInt32) ||| (mode <<< 0)) ||| (p <<< 8)) := by
+    change (if mode.toNat ≥ 4 then _ else if p.toNat ≥ 16 then _ else _) = _
+    simp only [h1, h2, ↓reduceIte]; rfl
+  exact ⟨_, henc,
+    encodeWord_decodeFieldChecked _ _ _ "mode" mode henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "P" p henc rfl⟩
+
+theorem portCfgMulti_roundTrip (name : String)
+    (mode handoffNe handoffPe waitNe4 waitNe5 dmaFlag p waitPe20 waitPe22 : UInt32)
+    (hmode : mode < 4) (hhn : handoffNe < 2) (hhp : handoffPe < 2)
+    (hwn4 : waitNe4 < 2) (hwn5 : waitNe5 < 2) (hdf : dmaFlag < 2)
+    (hp : p < 16) (hwp20 : waitPe20 < 2) (hwp22 : waitPe22 < 2) :
+    ∃ w, encodeWord (portCfgMultiLayout name) #[
+            ("mode", mode), ("handoffNe", handoffNe), ("handoffPe", handoffPe),
+            ("waitNe4", waitNe4), ("waitNe5", waitNe5), ("dmaFlag", dmaFlag),
+            ("P", p), ("waitPe20", waitPe20), ("waitPe22", waitPe22)
+          ] = .ok w ∧
+         decodeFieldChecked (portCfgMultiLayout name) w "mode" = .ok mode ∧
+         decodeFieldChecked (portCfgMultiLayout name) w "handoffNe" = .ok handoffNe ∧
+         decodeFieldChecked (portCfgMultiLayout name) w "handoffPe" = .ok handoffPe ∧
+         decodeFieldChecked (portCfgMultiLayout name) w "waitNe4" = .ok waitNe4 ∧
+         decodeFieldChecked (portCfgMultiLayout name) w "waitNe5" = .ok waitNe5 ∧
+         decodeFieldChecked (portCfgMultiLayout name) w "dmaFlag" = .ok dmaFlag ∧
+         decodeFieldChecked (portCfgMultiLayout name) w "P" = .ok p ∧
+         decodeFieldChecked (portCfgMultiLayout name) w "waitPe20" = .ok waitPe20 ∧
+         decodeFieldChecked (portCfgMultiLayout name) w "waitPe22" = .ok waitPe22 := by
+  have c1 : ¬ 4 ≤ mode.toNat := u32_not_ge_of_lt hmode
+  have c2 : ¬ 2 ≤ handoffNe.toNat := u32_not_ge_of_lt hhn
+  have c3 : ¬ 2 ≤ handoffPe.toNat := u32_not_ge_of_lt hhp
+  have c4 : ¬ 2 ≤ waitNe4.toNat := u32_not_ge_of_lt hwn4
+  have c5 : ¬ 2 ≤ waitNe5.toNat := u32_not_ge_of_lt hwn5
+  have c6 : ¬ 2 ≤ dmaFlag.toNat := u32_not_ge_of_lt hdf
+  have c7 : ¬ 16 ≤ p.toNat := u32_not_ge_of_lt hp
+  have c8 : ¬ 2 ≤ waitPe20.toNat := u32_not_ge_of_lt hwp20
+  have c9 : ¬ 2 ≤ waitPe22.toNat := u32_not_ge_of_lt hwp22
+  have hlay : validateWordLayout (portCfgMultiLayout name) = .ok 0x00500f7f := by
+    simp [validateWordLayout, portCfgMultiLayout, validateWordLayoutFields, BitField.mask, BitField.maskNat]
+    rfl
+  have hval : validateEncodeValues name (portCfgMultiLayout name).fields.toList
+      [("mode", mode), ("handoffNe", handoffNe), ("handoffPe", handoffPe),
+       ("waitNe4", waitNe4), ("waitNe5", waitNe5), ("dmaFlag", dmaFlag),
+       ("P", p), ("waitPe20", waitPe20), ("waitPe22", waitPe22)] [] = .ok () := by
+    simp [portCfgMultiLayout, validateEncodeValues]
+  have henc : encodeWord (portCfgMultiLayout name) #[
+      ("mode", mode), ("handoffNe", handoffNe), ("handoffPe", handoffPe),
+      ("waitNe4", waitNe4), ("waitNe5", waitNe5), ("dmaFlag", dmaFlag),
+      ("P", p), ("waitPe20", waitPe20), ("waitPe22", waitPe22)
+    ] = .ok ((((((((((0 : UInt32) ||| (mode <<< 0)) ||| (handoffNe <<< 2)) ||| (handoffPe <<< 3)) |||
+      (waitNe4 <<< 4)) ||| (waitNe5 <<< 5)) ||| (dmaFlag <<< 6)) ||| (p <<< 8)) |||
+      (waitPe20 <<< 20)) ||| (waitPe22 <<< 22)) := by
+    unfold encodeWord
+    rw [hlay]; simp only [bind, Except.bind]
+    have hval' : validateEncodeValues (portCfgMultiLayout name).name (portCfgMultiLayout name).fields.toList
+        #[("mode", mode), ("handoffNe", handoffNe), ("handoffPe", handoffPe),
+          ("waitNe4", waitNe4), ("waitNe5", waitNe5), ("dmaFlag", dmaFlag),
+          ("P", p), ("waitPe20", waitPe20), ("waitPe22", waitPe22)].toList [] = .ok () := hval
+    rw [hval']
+    simp [portCfgMultiLayout, encodeWordFields, List.find?, c1, c2, c3, c4, c5, c6, c7, c8, c9]
+  exact ⟨_, henc,
+    encodeWord_decodeFieldChecked _ _ _ "mode" mode henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "handoffNe" handoffNe henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "handoffPe" handoffPe henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "waitNe4" waitNe4 henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "waitNe5" waitNe5 henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "dmaFlag" dmaFlag henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "P" p henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "waitPe20" waitPe20 henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "waitPe22" waitPe22 henc rfl⟩
+
+theorem resCfgMulti_roundTrip
+    (mode direct waitNe4 waitNe5 dmaFlag p waitPe20 waitPe22 : UInt32)
+    (hmode : mode < 4) (hdir : direct < 2) (hwn4 : waitNe4 < 2) (hwn5 : waitNe5 < 2)
+    (hdf : dmaFlag < 2) (hp : p < 16) (hwp20 : waitPe20 < 2) (hwp22 : waitPe22 < 2) :
+    ∃ w, encodeWord resCfgMultiLayout #[
+            ("mode", mode), ("direct", direct), ("waitNe4", waitNe4), ("waitNe5", waitNe5),
+            ("dmaFlag", dmaFlag), ("P", p), ("waitPe20", waitPe20), ("waitPe22", waitPe22)
+          ] = .ok w ∧
+         decodeFieldChecked resCfgMultiLayout w "mode" = .ok mode ∧
+         decodeFieldChecked resCfgMultiLayout w "direct" = .ok direct ∧
+         decodeFieldChecked resCfgMultiLayout w "waitNe4" = .ok waitNe4 ∧
+         decodeFieldChecked resCfgMultiLayout w "waitNe5" = .ok waitNe5 ∧
+         decodeFieldChecked resCfgMultiLayout w "dmaFlag" = .ok dmaFlag ∧
+         decodeFieldChecked resCfgMultiLayout w "P" = .ok p ∧
+         decodeFieldChecked resCfgMultiLayout w "waitPe20" = .ok waitPe20 ∧
+         decodeFieldChecked resCfgMultiLayout w "waitPe22" = .ok waitPe22 := by
+  have c1 : ¬ mode.toNat ≥ 4 := u32_not_ge_of_lt hmode
+  have c2 : ¬ direct.toNat ≥ 2 := u32_not_ge_of_lt hdir
+  have c3 : ¬ waitNe4.toNat ≥ 2 := u32_not_ge_of_lt hwn4
+  have c4 : ¬ waitNe5.toNat ≥ 2 := u32_not_ge_of_lt hwn5
+  have c5 : ¬ dmaFlag.toNat ≥ 2 := u32_not_ge_of_lt hdf
+  have c6 : ¬ p.toNat ≥ 16 := u32_not_ge_of_lt hp
+  have c7 : ¬ waitPe20.toNat ≥ 2 := u32_not_ge_of_lt hwp20
+  have c8 : ¬ waitPe22.toNat ≥ 2 := u32_not_ge_of_lt hwp22
+  have henc : encodeWord resCfgMultiLayout #[
+      ("mode", mode), ("direct", direct), ("waitNe4", waitNe4), ("waitNe5", waitNe5),
+      ("dmaFlag", dmaFlag), ("P", p), ("waitPe20", waitPe20), ("waitPe22", waitPe22)
+    ] = .ok (((((((((0 : UInt32) ||| (mode <<< 0)) ||| (direct <<< 3)) ||| (waitNe4 <<< 4)) |||
+      (waitNe5 <<< 5)) ||| (dmaFlag <<< 6)) ||| (p <<< 8)) |||
+      (waitPe20 <<< 20)) ||| (waitPe22 <<< 22)) := by
+    change (if mode.toNat ≥ 4 then _ else if direct.toNat ≥ 2 then _ else
+            if waitNe4.toNat ≥ 2 then _ else if waitNe5.toNat ≥ 2 then _ else
+            if dmaFlag.toNat ≥ 2 then _ else if p.toNat ≥ 16 then _ else
+            if waitPe20.toNat ≥ 2 then _ else if waitPe22.toNat ≥ 2 then _ else _) = _
+    simp only [c1, c2, c3, c4, c5, c6, c7, c8, ↓reduceIte]; rfl
+  exact ⟨_, henc,
+    encodeWord_decodeFieldChecked _ _ _ "mode" mode henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "direct" direct henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "waitNe4" waitNe4 henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "waitNe5" waitNe5 henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "dmaFlag" dmaFlag henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "P" p henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "waitPe20" waitPe20 henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "waitPe22" waitPe22 henc rfl⟩
+
+theorem scalarBias_roundTrip (val : UInt32) (hv : val < 65536) :
+    ∃ w, encodeWord scalarBiasLayout #[("val", val)] = .ok w ∧
+         decodeFieldChecked scalarBiasLayout w "val" = .ok val :=
+  dim16_roundTrip "scalarBias" val hv
+
+theorem neScale_roundTrip (val : UInt32) (hv : val < 65536) :
+    ∃ w, encodeWord neScaleLayout #[("val", val)] = .ok w ∧
+         decodeFieldChecked neScaleLayout w "val" = .ok val :=
+  dim16_roundTrip "neScale" val hv
+
+theorem src1Dep_roundTrip (code task : UInt32) (hc : code < 256) (ht : task < 256) :
+    ∃ w, encodeWord src1DepLayout #[("code", code), ("task", task)] = .ok w ∧
+         decodeFieldChecked src1DepLayout w "code" = .ok code ∧
+         decodeFieldChecked src1DepLayout w "task" = .ok task := by
+  have h1 : ¬ code.toNat ≥ 256 := u32_not_ge_of_lt hc
+  have h2 : ¬ task.toNat ≥ 256 := u32_not_ge_of_lt ht
+  have henc : encodeWord src1DepLayout #[("code", code), ("task", task)] =
+      .ok (((0 : UInt32) ||| (code <<< 0)) ||| (task <<< 16)) := by
+    change (if code.toNat ≥ 256 then _ else if task.toNat ≥ 256 then _ else _) = _
+    simp only [h1, h2, ↓reduceIte]; rfl
+  exact ⟨_, henc,
+    encodeWord_decodeFieldChecked _ _ _ "code" code henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "task" task henc rfl⟩
+
+theorem dmaFmt_roundTrip (name : String) (fmt p : UInt32)
+    (hf : fmt < 16777216) (hp : p < 256) :
+    ∃ w, encodeWord (dmaFmtLayout name) #[("format", fmt), ("P", p)] = .ok w ∧
+         decodeFieldChecked (dmaFmtLayout name) w "format" = .ok fmt ∧
+         decodeFieldChecked (dmaFmtLayout name) w "P" = .ok p := by
+  have c1 : ¬ 16777216 ≤ fmt.toNat := u32_not_ge_of_lt hf
+  have c2 : ¬ 256 ≤ p.toNat := u32_not_ge_of_lt hp
+  have hlay : validateWordLayout (dmaFmtLayout name) = .ok 0xffffffff := by
+    simp [validateWordLayout, dmaFmtLayout, validateWordLayoutFields, BitField.mask, BitField.maskNat]
+    have h0 : ((4278190080 : UInt32) &&& (16777215 : UInt32)) = 0 := by decide
+    simp [h0]; rfl
+  have hval : validateEncodeValues name (dmaFmtLayout name).fields.toList
+      [("format", fmt), ("P", p)] [] = .ok () := by
+    simp [dmaFmtLayout, validateEncodeValues]
+  have henc : encodeWord (dmaFmtLayout name) #[("format", fmt), ("P", p)] =
+      .ok (((0 : UInt32) ||| (fmt <<< 0)) ||| (p <<< 24)) := by
+    unfold encodeWord
+    rw [hlay]; simp only [bind, Except.bind]
+    have hval' : validateEncodeValues (dmaFmtLayout name).name (dmaFmtLayout name).fields.toList
+        #[("format", fmt), ("P", p)].toList [] = .ok () := hval
+    rw [hval']
+    simp [dmaFmtLayout, encodeWordFields, List.find?, c1, c2]
+  exact ⟨_, henc,
+    encodeWord_decodeFieldChecked _ _ _ "format" fmt henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "P" p henc rfl⟩
+
+theorem resDep_roundTrip (code task direct : UInt32)
+    (hc : code < 256) (ht : task < 256) (hd : direct < 2) :
+    ∃ w, encodeWord resDepLayout #[("code", code), ("task", task), ("direct", direct)] = .ok w ∧
+         decodeFieldChecked resDepLayout w "code" = .ok code ∧
+         decodeFieldChecked resDepLayout w "task" = .ok task ∧
+         decodeFieldChecked resDepLayout w "direct" = .ok direct := by
+  have h1 : ¬ code.toNat ≥ 256 := u32_not_ge_of_lt hc
+  have h2 : ¬ task.toNat ≥ 256 := u32_not_ge_of_lt ht
+  have h3 : ¬ direct.toNat ≥ 2 := u32_not_ge_of_lt hd
+  have henc : encodeWord resDepLayout #[("code", code), ("task", task), ("direct", direct)] =
+      .ok ((((0 : UInt32) ||| (code <<< 0)) ||| (task <<< 16)) ||| (direct <<< 24)) := by
+    change (if code.toNat ≥ 256 then _ else if task.toNat ≥ 256 then _ else if direct.toNat ≥ 2 then _ else _) = _
+    simp only [h1, h2, h3, ↓reduceIte]; rfl
+  exact ⟨_, henc,
+    encodeWord_decodeFieldChecked _ _ _ "code" code henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "task" task henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "direct" direct henc rfl⟩
+
+theorem chunkSlot_roundTrip (en on20 task : UInt32)
+    (he : en < 2) (ho : on20 < 2) (ht : task < 256) :
+    ∃ w, encodeWord chunkSlotLayout #[("enable", en), ("on20", on20), ("task", task)] = .ok w ∧
+         decodeFieldChecked chunkSlotLayout w "enable" = .ok en ∧
+         decodeFieldChecked chunkSlotLayout w "on20" = .ok on20 ∧
+         decodeFieldChecked chunkSlotLayout w "task" = .ok task := by
+  have h1 : ¬ en.toNat ≥ 2 := u32_not_ge_of_lt he
+  have h2 : ¬ on20.toNat ≥ 2 := u32_not_ge_of_lt ho
+  have h3 : ¬ task.toNat ≥ 256 := u32_not_ge_of_lt ht
+  have henc : encodeWord chunkSlotLayout #[("enable", en), ("on20", on20), ("task", task)] =
+      .ok ((((0 : UInt32) ||| (en <<< 0)) ||| (on20 <<< 5)) ||| (task <<< 16)) := by
+    change (if en.toNat ≥ 2 then _ else if on20.toNat ≥ 2 then _ else if task.toNat ≥ 256 then _ else _) = _
+    simp only [h1, h2, h3, ↓reduceIte]; rfl
+  exact ⟨_, henc,
+    encodeWord_decodeFieldChecked _ _ _ "enable" en henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "on20" on20 henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "task" task henc rfl⟩
+
+theorem out2_roundTrip (form task : UInt32) (hf : form < 65536) (ht : task < 256) :
+    ∃ w, encodeWord out2Layout #[("form", form), ("task", task)] = .ok w ∧
+         decodeFieldChecked out2Layout w "form" = .ok form ∧
+         decodeFieldChecked out2Layout w "task" = .ok task := by
+  have h1 : ¬ form.toNat ≥ 65536 := u32_not_ge_of_lt hf
+  have h2 : ¬ task.toNat ≥ 256 := u32_not_ge_of_lt ht
+  have henc : encodeWord out2Layout #[("form", form), ("task", task)] =
+      .ok (((0 : UInt32) ||| (form <<< 0)) ||| (task <<< 16)) := by
+    change (if form.toNat ≥ 65536 then _ else if task.toNat ≥ 256 then _ else _) = _
+    simp only [h1, h2, ↓reduceIte]; rfl
+  exact ⟨_, henc,
+    encodeWord_decodeFieldChecked _ _ _ "form" form henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "task" task henc rfl⟩
+
+theorem neCfg_roundTrip (target : Target) (sparse : UInt32) (hs : sparse < 2) :
+    ∃ w, encodeWord (neCfgLayout target) #[("sparse", sparse)] = .ok w ∧
+         decodeFieldChecked (neCfgLayout target) w "sparse" = .ok sparse := by
+  have h1 : ¬ sparse.toNat ≥ 2 := u32_not_ge_of_lt hs
+  cases target with
+  | h16 =>
+    have henc : encodeWord (neCfgLayout .h16) #[("sparse", sparse)] =
+        .ok ((neCfgValue .h16) ||| (sparse <<< 8)) := by
+      change (if sparse.toNat ≥ 2 then _ else _) = _
+      simp only [h1, ↓reduceIte]; rfl
+    exact ⟨_, henc, encodeWord_decodeFieldChecked _ _ _ "sparse" sparse henc rfl⟩
+  | h17 =>
+    have henc : encodeWord (neCfgLayout .h17) #[("sparse", sparse)] =
+        .ok ((neCfgValue .h17) ||| (sparse <<< 8)) := by
+      change (if sparse.toNat ≥ 2 then _ else _) = _
+      simp only [h1, ↓reduceIte]; rfl
+    exact ⟨_, henc, encodeWord_decodeFieldChecked _ _ _ "sparse" sparse henc rfl⟩
+
+-- ============================================================================
+-- 19. Whole-Program S1–S5 Hazard Verifier Soundness (Vane.Verify + Vane.Reach)
+-- ============================================================================
+
+/-- `vIntervalsOverlap` is symmetric. -/
+theorem vIntervalsOverlap_symm (lo1 hi1 lo2 hi2 : Nat) :
+    vIntervalsOverlap lo1 hi1 lo2 hi2 = vIntervalsOverlap lo2 hi2 lo1 hi1 := by
+  unfold vIntervalsOverlap
+  exact Bool.and_comm _ _
+
+/-- `vIntervalsOverlap` is irreflexive on empty intervals (`hi ≤ lo`). -/
+theorem vIntervalsOverlap_irrefl_empty (lo hi : Nat) (hempty : hi ≤ lo) :
+    vIntervalsOverlap lo hi lo hi = false := by
+  unfold vIntervalsOverlap
+  have h : ¬ (lo < hi) := by omega
+  simp [h]
+
+/-- Whenever two half-open intervals `[lo1, hi1)` and `[lo2, hi2)` share any byte address `a`,
+    `vIntervalsOverlap lo1 hi1 lo2 hi2 = true` unconditionally. -/
+theorem vIntervalsOverlap_of_witness (lo1 hi1 lo2 hi2 : Nat)
+    (hw : ∃ a, lo1 ≤ a ∧ a < hi1 ∧ lo2 ≤ a ∧ a < hi2) :
+    vIntervalsOverlap lo1 hi1 lo2 hi2 = true := by
+  rcases hw with ⟨a, h1, h2, h3, h4⟩
+  unfold vIntervalsOverlap
+  simp only [Bool.and_eq_true, decide_eq_true_eq]
+  omega
+
+/-- Exact witness characterization for non-empty intervals: `vIntervalsOverlap lo1 hi1 lo2 hi2 = true`
+    iff there exists a byte address `a` belonging to both `[lo1, hi1)` and `[lo2, hi2)`. -/
+theorem vIntervalsOverlap_iff_witness (lo1 hi1 lo2 hi2 : Nat)
+    (hne1 : lo1 < hi1) (hne2 : lo2 < hi2) :
+    vIntervalsOverlap lo1 hi1 lo2 hi2 = true ↔
+      ∃ a, lo1 ≤ a ∧ a < hi1 ∧ lo2 ≤ a ∧ a < hi2 := by
+  constructor
+  · intro h
+    unfold vIntervalsOverlap at h
+    simp only [Bool.and_eq_true, decide_eq_true_eq] at h
+    exact ⟨max lo1 lo2, by omega, by omega, by omega, by omega⟩
+  · exact vIntervalsOverlap_of_witness lo1 hi1 lo2 hi2
+
+/-- Contrapositive soundness: if `vIntervalsOverlap` returns `false`, no byte address `a`
+    lies inside both `[lo1, hi1)` and `[lo2, hi2)`. -/
+theorem no_shared_byte_of_not_vIntervalsOverlap (lo1 hi1 lo2 hi2 : Nat)
+    (h : vIntervalsOverlap lo1 hi1 lo2 hi2 = false) :
+    ∀ a, ¬ (lo1 ≤ a ∧ a < hi1 ∧ lo2 ≤ a ∧ a < hi2) := by
+  intro a ha
+  have ht := vIntervalsOverlap_of_witness lo1 hi1 lo2 hi2 ⟨a, ha⟩
+  rw [h] at ht
+  cases ht
+
+/-- Every direct whole-task happens-before edge `stepHB fps j i` is strictly forward (`j < i`). -/
+theorem stepHB_fwd (fps : Array VerifiedTaskFootprint) (j i : Nat)
+    (h : stepHB fps j i = true) : j < i := by
+  unfold stepHB at h
+  split at h
+  · cases h
+  · rename_i hc
+    simp only [Bool.not_eq_true', Bool.and_eq_false_iff, decide_eq_false_iff_not, not_or,
+               Classical.not_not] at hc
+    exact hc.1
+
+/-- Every direct L2 happens-before edge `stepHBL fps j i` is strictly forward (`j < i`). -/
+theorem stepHBL_fwd (fps : Array VerifiedTaskFootprint) (j i : Nat)
+    (h : stepHBL fps j i = true) : j < i := by
+  unfold stepHBL at h
+  split at h
+  · cases h
+  · rename_i hc
+    simp only [Bool.not_eq_true', Bool.and_eq_false_iff, decide_eq_false_iff_not, not_or,
+               Classical.not_not] at hc
+    exact hc.1
+
+/-- Every direct whole-task HB edge implies an L2 HBL edge. -/
+theorem stepHB_imp_stepHBL (fps : Array VerifiedTaskFootprint) (j i : Nat)
+    (h : stepHB fps j i = true) : stepHBL fps j i = true := by
+  have hlt : j < i ∧ i < fps.size := by
+    unfold stepHB at h
+    split at h
+    · cases h
+    · rename_i hc
+      simp only [Bool.not_eq_true', Bool.and_eq_false_iff, decide_eq_false_iff_not, not_or,
+                 Classical.not_not] at hc
+      exact hc
+  unfold stepHBL
+  have hnot : (!(decide (j < i) && decide (i < fps.size))) = false := by simp [hlt.1, hlt.2]
+  rw [hnot]
+  simp [h]
+
+/-- Formal whole-task happens-before relation on task indices: transitive closure of `stepHB`. -/
+def HappensBefore (fps : Array VerifiedTaskFootprint) (k i : Nat) : Prop :=
+  Relation.TransGen (fun a b => stepHB fps a b = true) k i
+
+/-- Formal L2-level happens-before relation on task indices: transitive closure of `stepHBL`. -/
+def HappensBeforeL2 (fps : Array VerifiedTaskFootprint) (k i : Nat) : Prop :=
+  Relation.TransGen (fun a b => stepHBL fps a b = true) k i
+
+/-- Reflexive-transitive whole-task happens-before (`k = i ∨ HappensBefore fps k i`). -/
+def HappensBeforeEq (fps : Array VerifiedTaskFootprint) (k i : Nat) : Prop :=
+  k = i ∨ HappensBefore fps k i
+
+/-- Reflexive-transitive L2-level happens-before (`k = i ∨ HappensBeforeL2 fps k i`). -/
+def HappensBeforeL2Eq (fps : Array VerifiedTaskFootprint) (k i : Nat) : Prop :=
+  k = i ∨ HappensBeforeL2 fps k i
+
+/-- `HappensBefore` strictly respects program order (`k < i`). -/
+theorem happensBefore_lt (fps : Array VerifiedTaskFootprint) {k i : Nat}
+    (h : HappensBefore fps k i) : k < i :=
+  transGen_lt_of_fwd (stepHB_fwd fps) h
+
+/-- `HappensBefore` is irreflexive. -/
+theorem happensBefore_irrefl (fps : Array VerifiedTaskFootprint) (i : Nat) :
+    ¬ HappensBefore fps i i := fun h =>
+  Nat.lt_irrefl i (happensBefore_lt fps h)
+
+/-- `HappensBefore` is asymmetric. -/
+theorem happensBefore_asymm (fps : Array VerifiedTaskFootprint) {a b : Nat}
+    (hab : HappensBefore fps a b) : ¬ HappensBefore fps b a := fun hba =>
+  Nat.lt_asymm (happensBefore_lt fps hab) (happensBefore_lt fps hba)
+
+/-- `HappensBefore` is transitive. -/
+theorem happensBefore_trans (fps : Array VerifiedTaskFootprint) {a b c : Nat}
+    (hab : HappensBefore fps a b) (hbc : HappensBefore fps b c) :
+    HappensBefore fps a c :=
+  Relation.TransGen.trans hab hbc
+
+/-- Whole-task `HappensBefore` implies L2-level `HappensBeforeL2`. -/
+theorem happensBefore_imp_l2 (fps : Array VerifiedTaskFootprint) {k i : Nat}
+    (h : HappensBefore fps k i) : HappensBeforeL2 fps k i := by
+  induction h with
+  | single hstep => exact Relation.TransGen.single (stepHB_imp_stepHBL fps _ _ hstep)
+  | tail _ hstep ih => exact Relation.TransGen.tail ih (stepHB_imp_stepHBL fps _ _ hstep)
+
+private theorem vLatestEngArraysAux_spec
+    (fps : Array VerifiedTaskFootprint) (n : Nat) :
+    ∀ rem i lastNe lastPe neArr peArr,
+      rem = n - i →
+      i ≤ n →
+      neArr.size = i →
+      peArr.size = i →
+      lastNe = vLatestEngBefore fps .ne i →
+      lastPe = vLatestEngBefore fps .pe i →
+      (∀ j < i, neArr[j]! = vLatestEngBefore fps .ne j) →
+      (∀ j < i, peArr[j]! = vLatestEngBefore fps .pe j) →
+      let res := vLatestEngArraysAux fps n i lastNe lastPe neArr peArr
+      res.1.size = n ∧ res.2.size = n ∧
+      (∀ j < n, res.1[j]! = vLatestEngBefore fps .ne j) ∧
+      (∀ j < n, res.2[j]! = vLatestEngBefore fps .pe j) := by
+  intro rem
+  induction rem with
+  | zero =>
+    intro i lastNe lastPe neArr peArr hrem hiLe hneSz hpeSz _ _ hnePre hpePre
+    have hiEq : i = n := by omega
+    subst hiEq
+    unfold vLatestEngArraysAux
+    simp only [Nat.lt_irrefl, ↓reduceDIte]
+    exact ⟨hneSz, hpeSz, hnePre, hpePre⟩
+  | succ r ih =>
+    intro i lastNe lastPe neArr peArr hrem hiLe hneSz hpeSz hlastNe hlastPe hnePre hpePre
+    have hlt : i < n := by omega
+    unfold vLatestEngArraysAux
+    simp only [hlt, ↓reduceDIte]
+    have hnePre' : ∀ j < i + 1, (neArr.push lastNe)[j]! = vLatestEngBefore fps .ne j := by
+      intro j hj
+      by_cases hji : j < i
+      · have h1 : j < (neArr.push lastNe).size := by rw [Array.size_push]; omega
+        have h2 : j < neArr.size := by omega
+        rw [getElem!_pos (neArr.push lastNe) j h1, Array.getElem_push_lt h2,
+            ← getElem!_pos neArr j h2]
+        exact hnePre j hji
+      · have hjEq : j = i := by omega
+        subst j
+        have h1 : i < (neArr.push lastNe).size := by rw [Array.size_push]; omega
+        rw [getElem!_pos (neArr.push lastNe) i h1]
+        have hgetPush : (neArr.push lastNe)[i] = lastNe := by
+          simp [Array.getElem_push, hneSz]
+        rw [hgetPush, hlastNe]
+    have hpePre' : ∀ j < i + 1, (peArr.push lastPe)[j]! = vLatestEngBefore fps .pe j := by
+      intro j hj
+      by_cases hji : j < i
+      · have h1 : j < (peArr.push lastPe).size := by rw [Array.size_push]; omega
+        have h2 : j < peArr.size := by omega
+        rw [getElem!_pos (peArr.push lastPe) j h1, Array.getElem_push_lt h2,
+            ← getElem!_pos peArr j h2]
+        exact hpePre j hji
+      · have hjEq : j = i := by omega
+        subst j
+        have h1 : i < (peArr.push lastPe).size := by rw [Array.size_push]; omega
+        rw [getElem!_pos (peArr.push lastPe) i h1]
+        have hgetPush : (peArr.push lastPe)[i] = lastPe := by
+          simp [Array.getElem_push, hpeSz]
+        rw [hgetPush, hlastPe]
+    have hnextEq :
+        (match fps[i]? with
+         | some fp => match fp.engine with | .ne => (some i, lastPe) | .pe => (lastNe, some i)
+         | none => (lastNe, lastPe)) =
+        (vLatestEngBefore fps .ne (i + 1), vLatestEngBefore fps .pe (i + 1)) := by
+      unfold vLatestEngBefore
+      cases hget : fps[i]? with
+      | none => simp [hlastNe, hlastPe]
+      | some fp =>
+        cases heng : fp.engine with
+        | ne =>
+          simp [heng, hlastPe, show (Engine.ne == Engine.ne) = true from rfl,
+                show (Engine.ne == Engine.pe) = false from rfl]
+        | pe =>
+          simp [heng, hlastNe, show (Engine.pe == Engine.pe) = true from rfl,
+                show (Engine.pe == Engine.ne) = false from rfl]
+    have hneNext :
+        (match fps[i]? with
+         | some fp => match fp.engine with | .ne => (some i, lastPe) | .pe => (lastNe, some i)
+         | none => (lastNe, lastPe)).1 = vLatestEngBefore fps .ne (i + 1) :=
+      congrArg Prod.fst hnextEq
+    have hpeNext :
+        (match fps[i]? with
+         | some fp => match fp.engine with | .ne => (some i, lastPe) | .pe => (lastNe, some i)
+         | none => (lastNe, lastPe)).2 = vLatestEngBefore fps .pe (i + 1) :=
+      congrArg Prod.snd hnextEq
+    exact ih (i + 1) _ _ (neArr.push lastNe) (peArr.push lastPe)
+      (by omega) (by omega) (by rw [Array.size_push]; omega) (by rw [Array.size_push]; omega)
+      hneNext hpeNext hnePre' hpePre'
+
+private theorem vLatestEngArrays_eq (fps : Array VerifiedTaskFootprint) :
+    (vLatestEngArrays fps).1.size = fps.size ∧
+    (vLatestEngArrays fps).2.size = fps.size ∧
+    (∀ i < fps.size, (vLatestEngArrays fps).1[i]! = vLatestEngBefore fps .ne i) ∧
+    (∀ i < fps.size, (vLatestEngArrays fps).2[i]! = vLatestEngBefore fps .pe i) := by
+  unfold vLatestEngArrays
+  exact vLatestEngArraysAux_spec fps fps.size fps.size 0 none none
+    (Array.mkEmpty fps.size) (Array.mkEmpty fps.size)
+    (by omega) (by omega) (by simp) (by simp) rfl rfl
+    (fun j hj => by omega) (fun j hj => by omega)
+
+/-- Soundness and completeness of the production HB reachability table in `buildHBReachTables`:
+    for every `i < fps.size`, `reachB (buildHBReachTables fps).1 k i = true` iff `HappensBefore fps k i`. -/
+theorem buildHBReachTables_hb_iff (fps : Array VerifiedTaskFootprint) (k i : Nat) (hi : i < fps.size) :
+    reachB (buildHBReachTables fps).1 k i = true ↔ HappensBefore fps k i := by
+  obtain ⟨_, _, hneArr, hpeArr⟩ := vLatestEngArrays_eq fps
+  unfold buildHBReachTables
+  dsimp only
+  have hstepEq :
+      (fun j i =>
+        if j < i && i < fps.size then
+          ((Array.ofFn (n := fps.size) fun iFin =>
+            let i := iFin.val
+            let ti := fps[i]!
+            let latestPe := (vLatestEngArrays fps).2[i]!
+            let latestNe := (vLatestEngArrays fps).1[i]!
+            Array.ofFn (n := i) fun jFin =>
+              let j := jFin.val
+              let tj := fps[j]!
+              let poPe := ti.engine == .pe && latestPe == some j
+              let poNeComp := ti.engine == .ne && tj.engine == .ne && latestNe == some j && tj.isNeCompute && ti.isNeCompute
+              let w5 := tj.engine == .ne && (ti.sync.src1WaitNe5 || (ti.engine == .pe && ti.sync.src2WaitNe5))
+              let wPe := tj.engine == .pe && latestPe == some j && (ti.sync.src1WaitPe22 || (ti.engine == .pe && ti.sync.src2WaitPe22))
+              let depNonRaw :=
+                j + 1 == i && ti.sync.hasSrc1Dma &&
+                (ti.sync.src1DepKind == 1 || ti.sync.src1DepKind == 2) &&
+                ti.sync.src1DepDist == 0 &&
+                !vSrc1DramReadsFromWrite tj ti
+              poPe || poNeComp || w5 || wPe || depNonRaw)[i]!)[j]!
+        else false) = stepHB fps := by
+    funext a b
+    unfold stepHB
+    by_cases hab : a < b ∧ b < fps.size
+    · have hcond : (decide (a < b) && decide (b < fps.size)) = true := by simp [hab.1, hab.2]
+      simp only [hcond, ↓reduceIte, Bool.not_true, Bool.false_eq_true]
+      have hbSz : b < (Array.ofFn (n := fps.size) fun iFin : Fin fps.size =>
+          let i := iFin.val
+          let ti := fps[i]!
+          let latestPe := (vLatestEngArrays fps).2[i]!
+          let latestNe := (vLatestEngArrays fps).1[i]!
+          Array.ofFn (n := i) fun jFin : Fin i =>
+            let j := jFin.val
+            let tj := fps[j]!
+            let poPe := ti.engine == .pe && latestPe == some j
+            let poNeComp := ti.engine == .ne && tj.engine == .ne && latestNe == some j && tj.isNeCompute && ti.isNeCompute
+            let w5 := tj.engine == .ne && (ti.sync.src1WaitNe5 || (ti.engine == .pe && ti.sync.src2WaitNe5))
+            let wPe := tj.engine == .pe && latestPe == some j && (ti.sync.src1WaitPe22 || (ti.engine == .pe && ti.sync.src2WaitPe22))
+            let depNonRaw :=
+              j + 1 == i && ti.sync.hasSrc1Dma &&
+              (ti.sync.src1DepKind == 1 || ti.sync.src1DepKind == 2) &&
+              ti.sync.src1DepDist == 0 &&
+              !vSrc1DramReadsFromWrite tj ti
+            poPe || poNeComp || w5 || wPe || depNonRaw).size := by
+        rw [Array.size_ofFn]; exact hab.2
+      rw [getElem!_pos _ b hbSz, Array.getElem_ofFn]
+      have haSz : a < (Array.ofFn (n := b) fun jFin : Fin b =>
+          let j := jFin.val
+          let tj := fps[j]!
+          let poPe := fps[b]!.engine == .pe && (vLatestEngArrays fps).2[b]! == some j
+          let poNeComp := fps[b]!.engine == .ne && tj.engine == .ne && (vLatestEngArrays fps).1[b]! == some j && tj.isNeCompute && fps[b]!.isNeCompute
+          let w5 := tj.engine == .ne && (fps[b]!.sync.src1WaitNe5 || (fps[b]!.engine == .pe && fps[b]!.sync.src2WaitNe5))
+          let wPe := tj.engine == .pe && (vLatestEngArrays fps).2[b]! == some j && (fps[b]!.sync.src1WaitPe22 || (fps[b]!.engine == .pe && fps[b]!.sync.src2WaitPe22))
+          let depNonRaw :=
+            j + 1 == b && fps[b]!.sync.hasSrc1Dma &&
+            (fps[b]!.sync.src1DepKind == 1 || fps[b]!.sync.src1DepKind == 2) &&
+            fps[b]!.sync.src1DepDist == 0 &&
+            !vSrc1DramReadsFromWrite tj fps[b]!
+          poPe || poNeComp || w5 || wPe || depNonRaw).size := by
+        rw [Array.size_ofFn]; exact hab.1
+      rw [getElem!_pos _ a haSz, Array.getElem_ofFn]
+      simp only [hneArr b hab.2, hpeArr b hab.2]
+    · have hcond : (decide (a < b) && decide (b < fps.size)) = false := by
+        simp only [Bool.and_eq_false_iff, decide_eq_false_iff_not]
+        by_cases h1 : a < b
+        · right; intro h2; exact hab ⟨h1, h2⟩
+        · left; exact h1
+      simp [hcond]
+  rw [hstepEq]
+  exact reachB_iff (stepHB fps) (stepHB_fwd fps) fps.size k i hi
+
+/-- Soundness and completeness of the production L2 HBL reachability table in `buildHBReachTables`:
+    for every `i < fps.size`, `reachB (buildHBReachTables fps).2 k i = true` iff `HappensBeforeL2 fps k i`. -/
+theorem buildHBReachTables_hbl_iff (fps : Array VerifiedTaskFootprint) (k i : Nat) (hi : i < fps.size) :
+    reachB (buildHBReachTables fps).2 k i = true ↔ HappensBeforeL2 fps k i := by
+  obtain ⟨_, _, hneArr, hpeArr⟩ := vLatestEngArrays_eq fps
+  unfold buildHBReachTables
+  dsimp only
+  have hstepEq :
+      (fun j i =>
+        if j < i && i < fps.size then
+          ((Array.ofFn (n := fps.size) fun iFin =>
+            let i := iFin.val
+            let ti := fps[i]!
+            let latestNe := (vLatestEngArrays fps).1[i]!
+            let hbRow := (Array.ofFn (n := fps.size) fun iFin =>
+              let i := iFin.val
+              let ti := fps[i]!
+              let latestPe := (vLatestEngArrays fps).2[i]!
+              let latestNe := (vLatestEngArrays fps).1[i]!
+              Array.ofFn (n := i) fun jFin =>
+                let j := jFin.val
+                let tj := fps[j]!
+                let poPe := ti.engine == .pe && latestPe == some j
+                let poNeComp := ti.engine == .ne && tj.engine == .ne && latestNe == some j && tj.isNeCompute && ti.isNeCompute
+                let w5 := tj.engine == .ne && (ti.sync.src1WaitNe5 || (ti.engine == .pe && ti.sync.src2WaitNe5))
+                let wPe := tj.engine == .pe && latestPe == some j && (ti.sync.src1WaitPe22 || (ti.engine == .pe && ti.sync.src2WaitPe22))
+                let depNonRaw :=
+                  j + 1 == i && ti.sync.hasSrc1Dma &&
+                  (ti.sync.src1DepKind == 1 || ti.sync.src1DepKind == 2) &&
+                  ti.sync.src1DepDist == 0 &&
+                  !vSrc1DramReadsFromWrite tj ti
+                poPe || poNeComp || w5 || wPe || depNonRaw)[i]!
+            Array.ofFn (n := i) fun jFin =>
+              let j := jFin.val
+              hbRow[j]! || (ti.engine == .ne && latestNe == some j))[i]!)[j]!
+        else false) = stepHBL fps := by
+    funext a b
+    unfold stepHBL stepHB
+    by_cases hab : a < b ∧ b < fps.size
+    · have hcond : (decide (a < b) && decide (b < fps.size)) = true := by simp [hab.1, hab.2]
+      simp only [hcond, ↓reduceIte, Bool.not_true, Bool.false_eq_true]
+      rw [getElem!_pos _ b (by rw [Array.size_ofFn]; exact hab.2), Array.getElem_ofFn,
+          getElem!_pos _ a (by rw [Array.size_ofFn]; exact hab.1), Array.getElem_ofFn,
+          getElem!_pos _ b (by rw [Array.size_ofFn]; exact hab.2), Array.getElem_ofFn,
+          getElem!_pos _ a (by rw [Array.size_ofFn]; exact hab.1), Array.getElem_ofFn]
+      simp only [hneArr b hab.2, hpeArr b hab.2]
+    · have hcond : (decide (a < b) && decide (b < fps.size)) = false := by
+        simp only [Bool.and_eq_false_iff, decide_eq_false_iff_not]
+        by_cases h1 : a < b
+        · right; intro h2; exact hab ⟨h1, h2⟩
+        · left; exact h1
+      simp [hcond]
+  rw [hstepEq]
+  exact reachB_iff (stepHBL fps) (stepHBL_fwd fps) fps.size k i hi
+
+private theorem checkRange_ok {lo hi : Nat} {f : Nat → Except String Unit}
+    (h : checkRange lo hi f = .ok ()) :
+    ∀ i, lo ≤ i → i < hi → f i = .ok () := by
+  intro i hlo hhi
+  have haux : ∀ d lo, d = hi - lo → checkRange lo hi f = .ok () → lo ≤ i → i < hi → f i = .ok () := by
+    intro d
+    induction d with
+    | zero => intro lo hd _ _ _; omega
+    | succ r ih =>
+      intro lo hd hchk hlo' hhi'
+      have hlt : lo < hi := by omega
+      unfold checkRange at hchk
+      simp only [hlt, ↓reduceDIte] at hchk
+      cases hflo : f lo with
+      | error e => simp [hflo] at hchk
+      | ok u =>
+        cases u
+        simp only [hflo] at hchk
+        by_cases hEq : i = lo
+        · subst hEq; exact hflo
+        · exact ih (lo + 1) (by omega) hchk (by omega) hhi'
+  exact haux (hi - lo) lo rfl h hlo hhi
+
+private theorem barResource_beq_eq {a b : BarResource} (h : (a == b) = true) : a = b := by
+  cases a with
+  | surface i1 s1 =>
+    cases b with
+    | surface i2 s2 =>
+      change ((i1 == i2) && (s1 == s2)) = true at h
+      simp only [Bool.and_eq_true, beq_iff_eq] at h
+      rw [h.1, h.2]
+    | scratch => cases h
+    | kernel => cases h
+  | scratch => cases b <;> first | rfl | cases h
+  | kernel => cases b <;> first | rfl | cases h
+
+private theorem dramAccessPort_beq_eq {a b : DramAccessPort} (h : (a == b) = true) : a = b := by
+  cases a <;> cases b <;> first | rfl | cases h
+
+private theorem l2AccessRole_beq_eq {a b : L2AccessRole} (h : (a == b) = true) : a = b := by
+  cases a <;> cases b <;> first | rfl | cases h
+
+private theorem engine_beq_eq {a b : Engine} (h : (a == b) = true) : a = b := by
+  cases a <;> cases b <;> first | rfl | cases h
+
+private theorem barResource_beq_self (a : BarResource) : (a == a) = true := by
+  cases a with
+  | surface i s => change ((i == i) && (s == s)) = true; simp
+  | scratch => rfl
+  | kernel => rfl
+
+private theorem dramAccessPort_beq_self (a : DramAccessPort) : (a == a) = true := by
+  cases a <;> rfl
+
+private theorem l2AccessRole_beq_self (a : L2AccessRole) : (a == a) = true := by
+  cases a <;> rfl
+
+private theorem engine_beq_self (a : Engine) : (a == a) = true := by
+  cases a <;> rfl
+
+private theorem reachB_lt_size (tbl : Array (Array Bool)) (k p : Nat)
+    (h : reachB tbl k p = true) : p < tbl.size := by
+  unfold reachB at h
+  cases hget : tbl[p]? with
+  | none => simp [hget] at h
+  | some _ =>
+    cases Nat.lt_or_ge p tbl.size with
+    | inl hlt => exact hlt
+    | inr hge =>
+      have hnone : tbl[p]? = none := Array.getElem?_eq_none hge
+      rw [hnone] at hget
+      cases hget
+
+private theorem except_if_throw_bind_ok {α : Type} {c : Prop} [Decidable c] {e : String}
+    {k : Unit → Except String α} {v : α}
+    (h : ((if c then throw e else pure ()) >>= k) = .ok v) : ¬ c ∧ k () = .ok v := by
+  by_cases hc : c
+  · simp [hc, throw, throwThe, MonadExceptOf.throw, bind, Except.bind] at h
+  · simp [hc, pure, Except.pure, bind, Except.bind] at h
+    exact ⟨hc, h⟩
+
+private theorem except_if_do_throw_ok {α β : Type} {c : Prop} [Decidable c] {e : String}
+    {t : β → Except String α} {k : Except String α} {v : α}
+    (h : (if c then (throw e >>= t) else k) = .ok v) : ¬ c ∧ k = .ok v := by
+  by_cases hc : c
+  · simp [hc, throw, throwThe, MonadExceptOf.throw, bind, Except.bind] at h
+  · simp [hc] at h
+    exact ⟨hc, h⟩
+
+/-- Intra-task BAR 3 scratch non-overlap soundness: whenever production `verifyProgramHazards`
+    accepts a program `fps`, no two distinct BAR 3 scratch accesses in the same task (where at
+    least one is a write) share any byte address `x`. -/
+theorem verifyProgramHazards_intraTask_scratch_disjoint
+    (fps : Array VerifiedTaskFootprint)
+    (hok : verifyProgramHazards fps = .ok ())
+    (i : Nat) (hi : i < fps.size)
+    (idx1 idx2 : Nat) (h1 : idx1 < fps[i]!.dramAccesses.size)
+    (h2 : idx2 < fps[i]!.dramAccesses.size) (hne : idx1 ≠ idx2) :
+    let a := fps[i]!.dramAccesses[idx1]!
+    let b := fps[i]!.dramAccesses[idx2]!
+    a.resource = .scratch → b.resource = .scratch → (a.isWrite = true ∨ b.isWrite = true) →
+    ∀ x, ¬ (a.lo ≤ x ∧ x < a.hi ∧ b.lo ≤ x ∧ x < b.hi) := by
+  unfold verifyProgramHazards at hok
+  dsimp only at hok
+  obtain ⟨⟨⟩, _, hok⟩ := except_bind_ok hok
+  obtain ⟨⟨⟩, _, hok⟩ := except_bind_ok hok
+  obtain ⟨⟨⟩, _, h4⟩ := except_bind_ok hok
+  unfold verifyIntraTaskScratch at h4
+  intro a b haRes hbRes hwr x hx
+  have checkPair : ∀ p q, p < q → q < fps[i]!.dramAccesses.size →
+      let ap := fps[i]!.dramAccesses[p]!
+      let bq := fps[i]!.dramAccesses[q]!
+      ap.resource = .scratch → bq.resource = .scratch → (ap.isWrite = true ∨ bq.isWrite = true) →
+      vIntervalsOverlap ap.lo ap.hi bq.lo bq.hi = false := by
+    intro p q hpq hq ap bq hpRes hqRes hpWr
+    have hiOk := checkRange_ok h4 i (Nat.zero_le i) hi
+    have hpOk := checkRange_ok hiOk p (Nat.zero_le p) (by omega)
+    have hqOk := checkRange_ok hpOk q (by omega) hq
+    cases hov : vIntervalsOverlap ap.lo ap.hi bq.lo bq.hi with
+    | false => rfl
+    | true =>
+      have hwrB : (ap.isWrite || bq.isWrite) = true := by
+        rcases hpWr with h | h <;> simp [h]
+      have hprB : (ap.resource == .scratch) = true := by rw [hpRes]; rfl
+      have hqrB : (bq.resource == .scratch) = true := by rw [hqRes]; rfl
+      dsimp only at hqOk
+      change (if (ap.resource == .scratch && bq.resource == .scratch && (ap.isWrite || bq.isWrite) &&
+          vIntervalsOverlap ap.lo ap.hi bq.lo bq.hi) = true then _ else _) = Except.ok () at hqOk
+      rw [hprB, hqrB, hwrB, hov] at hqOk
+      cases hqOk
+  by_cases hlt : idx1 < idx2
+  · have hno := checkPair idx1 idx2 hlt h2 haRes hbRes hwr
+    exact no_shared_byte_of_not_vIntervalsOverlap _ _ _ _ hno x hx
+  · have hgt : idx2 < idx1 := by omega
+    have hno := checkPair idx2 idx1 hgt h1 hbRes haRes hwr.symm
+    exact no_shared_byte_of_not_vIntervalsOverlap _ _ _ _ hno x ⟨hx.2.2.1, hx.2.2.2, hx.1, hx.2.1⟩
+
+/-- Formal access-level `src1Dma` `depKind` RAW barrier predicate (in terms of `HappensBeforeEq`). -/
+def DramRawBarrier (fps : Array VerifiedTaskFootprint) (k i : Nat) : Prop :=
+  let ti := fps[i]!
+  ti.sync.hasSrc1Dma = true ∧
+  (ti.sync.src1DepKind = 1 ∨ ti.sync.src1DepKind = 2) ∧
+  ti.sync.src1DepDist = 0 ∧
+  HappensBeforeEq fps k (i - 1)
+
+/-- Formal access-level PE `src2Dma` `depKind` barrier predicate (in terms of `HappensBeforeEq`). -/
+def Src2KindBarrier (fps : Array VerifiedTaskFootprint) (k i : Nat) : Prop :=
+  let ti := fps[i]!
+  fps[i - 1]!.engine = .pe ∧
+  ti.sync.hasSrc2Dma = true ∧
+  (ti.sync.src2DepKind = 1 ∨ ti.sync.src2DepKind = 2) ∧
+  ti.sync.src2DepDist = 0 ∧
+  HappensBeforeEq fps k (i - 1)
+
+/-- Formal PE wait-bit-22 barrier predicate (in terms of `HappensBeforeEq`). -/
+def WaitPe22Barrier (fps : Array VerifiedTaskFootprint) (k i : Nat) : Prop :=
+  let ti := fps[i]!
+  (ti.sync.src1WaitPe22 = true ∨ ti.sync.src2WaitPe22 = true) ∧
+  ∃ j, vLatestEngBefore fps .pe i = some j ∧ HappensBeforeEq fps k j
+
+/-- Formal NE wait-bit-5 barrier predicate (in terms of `HappensBeforeEq`). -/
+def WaitNe5Barrier (fps : Array VerifiedTaskFootprint) (k i : Nat) : Prop :=
+  let ti := fps[i]!
+  (ti.sync.src1WaitNe5 = true ∨ ti.sync.src2WaitNe5 = true) ∧
+  (fps[k]!.engine = .ne ∨ ∃ j < i, fps[j]!.engine = .ne ∧ HappensBeforeEq fps k j)
+
+/-- Formal DRAM ordering relation established by the S5 hazard verifier for conflicting accesses
+    `(a, b)` on tasks `(k, i)` (`k < i`). Every branch strictly orders `k` before `i` via
+    whole-task `HappensBefore` or a hardware DMA/sync/extended-header barrier anchored in
+    `HappensBeforeEq`. -/
+def DramOrdered (fps : Array VerifiedTaskFootprint) (k i : Nat)
+    (a b : VerifiedDramAccess) : Prop :=
+  let ti := fps[i]!
+  if b.port = .kernel then
+    a.isWrite = true ∧ ∃ p, ti.extProducerTask = some p ∧ HappensBeforeEq fps k p
+  else if ti.engine = .ne ∧ b.port = .src1Dma then
+    a.isWrite = true ∧ DramRawBarrier fps k i
+  else if ti.engine = .pe ∧ b.port = .src2Dma then
+    Src2KindBarrier fps k i ∨ WaitPe22Barrier fps k i ∨ WaitNe5Barrier fps k i ∨ DramRawBarrier fps k i
+  else if a.isWrite = true ∧ b.isWrite = false then
+    HappensBefore fps k i ∨ DramRawBarrier fps k i
+  else
+    HappensBefore fps k i
+
+/-- Formal L2 ordering relation established by the S5 hazard verifier for conflicting L2 accesses
+    `(a, b)` on tasks `(k, i)` (`k < i`). -/
+def L2Ordered (fps : Array VerifiedTaskFootprint) (k i : Nat)
+    (a b : VerifiedL2Access) : Prop :=
+  let ti := fps[i]!
+  let handoff2 : Prop :=
+    a.isWrite = true ∧
+    ((b.role = .src1L2 ∧ ti.sync.src1HandoffNe = true) ∨
+     (b.role = .src2L2 ∧ ti.sync.src2HandoffNe = true)) ∧
+    ∃ j, vLatestEngBefore fps .ne i = some j ∧ HappensBeforeL2Eq fps k j
+  let handoff3 : Prop :=
+    a.isWrite = true ∧
+    b.role = .src1L2 ∧
+    ti.sync.src1HandoffPe = true ∧
+    ∃ j, vLatestEngBefore fps .pe i = some j ∧ HappensBeforeL2Eq fps k j
+  if ti.engine = .pe ∧ (b.role = .src2Stage ∨ b.role = .src2L2) then
+    WaitPe22Barrier fps k i ∨ WaitNe5Barrier fps k i ∨ Src2KindBarrier fps k i ∨
+      (b.role = .src2L2 ∧ handoff2)
+  else if b.role = .src1Stage ∧ a.role = .resStage then
+    WaitNe5Barrier fps k i ∨ WaitPe22Barrier fps k i
+  else
+    HappensBeforeL2 fps k i ∨ handoff2 ∨ handoff3
+
+private theorem vLatestEngBefore_lt (fps : Array VerifiedTaskFootprint) (eng : Engine) :
+    ∀ n j, vLatestEngBefore fps eng n = some j → j < n := by
+  intro n
+  induction n with
+  | zero => intro j h; simp [vLatestEngBefore] at h
+  | succ m ih =>
+    intro j h
+    unfold vLatestEngBefore at h
+    cases hget : fps[m]? with
+    | none => simp [hget] at h; have := ih j h; omega
+    | some fp =>
+      simp only [hget] at h
+      split at h
+      · simp at h; omega
+      · have := ih j h; omega
+
+private theorem hbEq_of_bool (fps : Array VerifiedTaskFootprint) (k j : Nat) (hj : j < fps.size)
+    (h : (k == j || reachB (buildHBReachTables fps).1 k j) = true) :
+    HappensBeforeEq fps k j := by
+  simp only [Bool.or_eq_true, beq_iff_eq] at h
+  rcases h with rfl | hhb
+  · exact Or.inl rfl
+  · exact Or.inr ((buildHBReachTables_hb_iff fps k j hj).mp hhb)
+
+private theorem hblEq_of_bool (fps : Array VerifiedTaskFootprint) (k j : Nat) (hj : j < fps.size)
+    (h : (k == j || reachB (buildHBReachTables fps).2 k j) = true) :
+    HappensBeforeL2Eq fps k j := by
+  simp only [Bool.or_eq_true, beq_iff_eq] at h
+  rcases h with rfl | hhbl
+  · exact Or.inl rfl
+  · exact Or.inr ((buildHBReachTables_hbl_iff fps k j hj).mp hhbl)
+
+private theorem vDramRawKind_sound (fps : Array VerifiedTaskFootprint) (k i : Nat) (hi : i < fps.size)
+    (h : vDramRawKind fps (fun x y => x == y || reachB (buildHBReachTables fps).1 x y) k i = true) :
+    DramRawBarrier fps k i := by
+  unfold vDramRawKind at h
+  simp only [Bool.and_eq_true, Bool.or_eq_true, beq_iff_eq] at h
+  rcases h with ⟨⟨⟨hhas, hkind⟩, hdist⟩, hhb⟩
+  refine ⟨hhas, hkind, hdist, ?_⟩
+  rcases hhb with rfl | hhb
+  · exact Or.inl rfl
+  · exact Or.inr ((buildHBReachTables_hb_iff fps k (i - 1) (by omega)).mp hhb)
+
+private theorem vSrc2Kind_sound (fps : Array VerifiedTaskFootprint) (k i : Nat) (hi : i < fps.size)
+    (h : vSrc2Kind fps (fun x y => x == y || reachB (buildHBReachTables fps).1 x y) k i = true) :
+    Src2KindBarrier fps k i := by
+  unfold vSrc2Kind at h
+  simp only [Bool.and_eq_true, Bool.or_eq_true, beq_iff_eq] at h
+  rcases h with ⟨⟨⟨⟨heng, hhas⟩, hkind⟩, hdist⟩, hhb⟩
+  refine ⟨engine_beq_eq heng, hhas, hkind, hdist, ?_⟩
+  rcases hhb with rfl | hhb
+  · exact Or.inl rfl
+  · exact Or.inr ((buildHBReachTables_hb_iff fps k (i - 1) (by omega)).mp hhb)
+
+private theorem vSrc2Wait22_sound (fps : Array VerifiedTaskFootprint) (k i : Nat) (hi : i < fps.size)
+    (h : vSrc2Wait22 fps[i]! (fun x y => x == y || reachB (buildHBReachTables fps).1 x y)
+          (vLatestEngBefore fps .pe i) k = true) :
+    WaitPe22Barrier fps k i := by
+  unfold vSrc2Wait22 at h
+  simp only [Bool.and_eq_true, Bool.or_eq_true] at h
+  rcases h with ⟨hw, hmatch⟩
+  cases hlat : vLatestEngBefore fps .pe i with
+  | none => simp [hlat] at hmatch
+  | some j =>
+    simp only [hlat] at hmatch
+    have hjLt : j < i := vLatestEngBefore_lt fps .pe i j hlat
+    exact ⟨hw, j, hlat, hbEq_of_bool fps k j (by omega) hmatch⟩
+
+private theorem vSrc2Wait5_sound (fps : Array VerifiedTaskFootprint) (k i : Nat) (hi : i < fps.size)
+    (h : vSrc2Wait5 fps (fun x y => x == y || reachB (buildHBReachTables fps).1 x y) k i = true) :
+    WaitNe5Barrier fps k i := by
+  unfold vSrc2Wait5 at h
+  simp only [Bool.and_eq_true, Bool.or_eq_true] at h
+  rcases h with ⟨hw, heng | hany⟩
+  · exact ⟨hw, Or.inl (engine_beq_eq heng)⟩
+  · rw [anyLt_iff] at hany
+    obtain ⟨j, hjLt, hcond⟩ := hany
+    simp only [Bool.and_eq_true] at hcond
+    exact ⟨hw, Or.inr ⟨j, hjLt, engine_beq_eq hcond.1, hbEq_of_bool fps k j (by omega) hcond.2⟩⟩
+
+private theorem vDramPairOrdered_sound (fps : Array VerifiedTaskFootprint)
+    (k i : Nat) (hi : i < fps.size) (a b : VerifiedDramAccess)
+    (h : vDramPairOrdered fps (buildHBReachTables fps).1 (vLatestEngBefore fps .pe i) k i a b = true) :
+    DramOrdered fps k i a b := by
+  unfold vDramPairOrdered at h
+  unfold DramOrdered
+  dsimp only at h ⊢
+  by_cases hkern : b.port = .kernel
+  · have hkernB : (b.port == .kernel) = true := by rw [hkern]; rfl
+    simp only [hkern, ↓reduceIte]
+    simp only [hkernB, ↓reduceIte] at h
+    simp only [Bool.and_eq_true] at h
+    rcases h with ⟨haw, hmatch⟩
+    cases hp : fps[i]!.extProducerTask with
+    | none => simp [hp] at hmatch
+    | some p =>
+      simp only [hp, Bool.or_eq_true, beq_iff_eq] at hmatch
+      rcases hmatch with hkp | hhb
+      · exact ⟨haw, p, rfl, Or.inl hkp⟩
+      · have hsz : (buildHBReachTables fps).1.size = fps.size := by
+          unfold buildHBReachTables reachTable; exact reachTableAux_size _ _ _
+        have hpLt : p < fps.size := hsz ▸ reachB_lt_size (buildHBReachTables fps).1 k p hhb
+        exact ⟨haw, p, rfl, Or.inr ((buildHBReachTables_hb_iff fps k p hpLt).mp hhb)⟩
+  · have hkernB : (b.port == .kernel) = false := by
+      cases hc : (b.port == .kernel) with
+      | false => rfl
+      | true => exact absurd (dramAccessPort_beq_eq hc) hkern
+    simp only [hkern, ↓reduceIte]
+    simp only [hkernB, Bool.false_eq_true, ↓reduceIte] at h
+    by_cases hne1 : fps[i]!.engine = .ne ∧ b.port = .src1Dma
+    · have hne1B : (fps[i]!.engine == .ne && b.port == .src1Dma) = true := by
+        rw [hne1.1, hne1.2]; rfl
+      simp only [hne1]
+      simp only [hne1B, ↓reduceIte] at h
+      simp only [Bool.and_eq_true] at h
+      exact ⟨h.1, vDramRawKind_sound fps k i hi h.2⟩
+    · have hne1B : (fps[i]!.engine == .ne && b.port == .src1Dma) = false := by
+        cases hc : (fps[i]!.engine == .ne && b.port == .src1Dma) with
+        | false => rfl
+        | true =>
+          simp only [Bool.and_eq_true] at hc
+          exact absurd ⟨engine_beq_eq hc.1, dramAccessPort_beq_eq hc.2⟩ hne1
+      simp only [hne1]
+      simp only [hne1B, Bool.false_eq_true, ↓reduceIte] at h
+      by_cases hpe2 : fps[i]!.engine = .pe ∧ b.port = .src2Dma
+      · have hpe2B : (fps[i]!.engine == .pe && b.port == .src2Dma) = true := by
+          rw [hpe2.1, hpe2.2]; rfl
+        simp only [hpe2, ↓reduceIte]
+        simp only [hpe2B, ↓reduceIte] at h
+        simp only [Bool.or_eq_true] at h
+        rcases h with ((hs2k | hw22) | hw5) | hdr
+        · exact Or.inl (vSrc2Kind_sound fps k i hi hs2k)
+        · exact Or.inr (Or.inl (vSrc2Wait22_sound fps k i hi hw22))
+        · exact Or.inr (Or.inr (Or.inl (vSrc2Wait5_sound fps k i hi hw5)))
+        · exact Or.inr (Or.inr (Or.inr (vDramRawKind_sound fps k i hi hdr)))
+      · have hpe2B : (fps[i]!.engine == .pe && b.port == .src2Dma) = false := by
+          cases hc : (fps[i]!.engine == .pe && b.port == .src2Dma) with
+          | false => rfl
+          | true =>
+            simp only [Bool.and_eq_true] at hc
+            exact absurd ⟨engine_beq_eq hc.1, dramAccessPort_beq_eq hc.2⟩ hpe2
+        simp only [hpe2]
+        simp only [hpe2B, Bool.false_eq_true, ↓reduceIte] at h
+        by_cases hraw : a.isWrite = true ∧ b.isWrite = false
+        · have hrawB : (a.isWrite && !b.isWrite) = true := by rw [hraw.1, hraw.2]; rfl
+          simp only [hraw, ↓reduceIte]
+          simp only [hrawB, ↓reduceIte] at h
+          simp only [Bool.or_eq_true] at h
+          rcases h with hhb | hdr
+          · exact Or.inl ((buildHBReachTables_hb_iff fps k i hi).mp hhb)
+          · exact Or.inr (vDramRawKind_sound fps k i hi hdr)
+        · have hrawB : (a.isWrite && !b.isWrite) = false := by
+            cases ha : a.isWrite <;> cases hb : b.isWrite <;> simp_all
+          simp only [hraw]
+          simp only [hrawB, Bool.false_eq_true, ↓reduceIte] at h
+          exact (buildHBReachTables_hb_iff fps k i hi).mp h
+
+private theorem vL2PairOrdered_sound (fps : Array VerifiedTaskFootprint)
+    (k i : Nat) (hi : i < fps.size) (a b : VerifiedL2Access)
+    (h : vL2PairOrdered fps (buildHBReachTables fps).1 (buildHBReachTables fps).2
+          (vLatestEngBefore fps .ne i) (vLatestEngBefore fps .pe i) k i a b = true) :
+    L2Ordered fps k i a b := by
+  unfold vL2PairOrdered at h
+  unfold L2Ordered
+  dsimp only at h ⊢
+  have hHO2 :
+      (a.isWrite &&
+       ((b.role == .src1L2 && fps[i]!.sync.src1HandoffNe) ||
+        (b.role == .src2L2 && fps[i]!.sync.src2HandoffNe)) &&
+       match vLatestEngBefore fps .ne i with
+       | some j => k == j || reachB (buildHBReachTables fps).2 k j
+       | none => false) = true →
+      a.isWrite = true ∧
+      ((b.role = .src1L2 ∧ fps[i]!.sync.src1HandoffNe = true) ∨
+       (b.role = .src2L2 ∧ fps[i]!.sync.src2HandoffNe = true)) ∧
+      ∃ j, vLatestEngBefore fps .ne i = some j ∧ HappensBeforeL2Eq fps k j := by
+    intro h2
+    simp only [Bool.and_eq_true, Bool.or_eq_true] at h2
+    rcases h2 with ⟨⟨haw, ⟨hr1, h1⟩ | ⟨hr2, h2'⟩⟩, hmatch⟩
+    · cases hlat : vLatestEngBefore fps .ne i with
+      | none => simp [hlat] at hmatch
+      | some j =>
+        simp only [hlat] at hmatch
+        have hjLt := vLatestEngBefore_lt fps .ne i j hlat
+        exact ⟨haw, Or.inl ⟨l2AccessRole_beq_eq hr1, h1⟩, j, rfl, hblEq_of_bool fps k j (by omega) hmatch⟩
+    · cases hlat : vLatestEngBefore fps .ne i with
+      | none => simp [hlat] at hmatch
+      | some j =>
+        simp only [hlat] at hmatch
+        have hjLt := vLatestEngBefore_lt fps .ne i j hlat
+        exact ⟨haw, Or.inr ⟨l2AccessRole_beq_eq hr2, h2'⟩, j, rfl, hblEq_of_bool fps k j (by omega) hmatch⟩
+  have hHO3 :
+      (a.isWrite && (b.role == .src1L2) && fps[i]!.sync.src1HandoffPe &&
+       match vLatestEngBefore fps .pe i with
+       | some j => k == j || reachB (buildHBReachTables fps).2 k j
+       | none => false) = true →
+      a.isWrite = true ∧ b.role = .src1L2 ∧ fps[i]!.sync.src1HandoffPe = true ∧
+      ∃ j, vLatestEngBefore fps .pe i = some j ∧ HappensBeforeL2Eq fps k j := by
+    intro h3
+    simp only [Bool.and_eq_true] at h3
+    rcases h3 with ⟨⟨⟨haw, hrole⟩, hpe⟩, hmatch⟩
+    cases hlat : vLatestEngBefore fps .pe i with
+    | none => simp [hlat] at hmatch
+    | some j =>
+      simp only [hlat] at hmatch
+      have hjLt := vLatestEngBefore_lt fps .pe i j hlat
+      exact ⟨haw, l2AccessRole_beq_eq hrole, hpe, j, rfl, hblEq_of_bool fps k j (by omega) hmatch⟩
+  by_cases hs2 : fps[i]!.engine = .pe ∧ (b.role = .src2Stage ∨ b.role = .src2L2)
+  · have hs2B : (fps[i]!.engine == .pe && (b.role == .src2Stage || b.role == .src2L2)) = true := by
+      rcases hs2 with ⟨he, hr | hr⟩ <;> rw [he, hr] <;> rfl
+    simp only [hs2]
+    simp only [hs2B, ↓reduceIte] at h
+    simp only [Bool.or_eq_true] at h
+    rcases h with ((hw22 | hw5) | hs2k) | hbo2
+    · exact Or.inl (vSrc2Wait22_sound fps k i hi hw22)
+    · exact Or.inr (Or.inl (vSrc2Wait5_sound fps k i hi hw5))
+    · exact Or.inr (Or.inr (Or.inl (vSrc2Kind_sound fps k i hi hs2k)))
+    · rw [Bool.and_eq_true] at hbo2
+      exact Or.inr (Or.inr (Or.inr ⟨l2AccessRole_beq_eq hbo2.1, hHO2 hbo2.2⟩))
+  · have hs2B : (fps[i]!.engine == .pe && (b.role == .src2Stage || b.role == .src2L2)) = false := by
+      cases hc : (fps[i]!.engine == .pe && (b.role == .src2Stage || b.role == .src2L2)) with
+      | false => rfl
+      | true =>
+        simp only [Bool.and_eq_true, Bool.or_eq_true] at hc
+        rcases hc with ⟨he, h1 | h2⟩
+        · exact absurd ⟨engine_beq_eq he, Or.inl (l2AccessRole_beq_eq h1)⟩ hs2
+        · exact absurd ⟨engine_beq_eq he, Or.inr (l2AccessRole_beq_eq h2)⟩ hs2
+    simp only [hs2]
+    simp only [hs2B, Bool.false_eq_true, ↓reduceIte] at h
+    by_cases hst : b.role = .src1Stage ∧ a.role = .resStage
+    · have hstB : (b.role == .src1Stage && a.role == .resStage) = true := by
+        rw [hst.1, hst.2]; rfl
+      simp only [hst, ↓reduceIte]
+      simp only [hstB, ↓reduceIte] at h
+      simp only [Bool.or_eq_true] at h
+      rcases h with hw5 | hw22
+      · exact Or.inl (vSrc2Wait5_sound fps k i hi hw5)
+      · exact Or.inr (vSrc2Wait22_sound fps k i hi hw22)
+    · have hstB : (b.role == .src1Stage && a.role == .resStage) = false := by
+        cases hc : (b.role == .src1Stage && a.role == .resStage) with
+        | false => rfl
+        | true =>
+          simp only [Bool.and_eq_true] at hc
+          exact absurd ⟨l2AccessRole_beq_eq hc.1, l2AccessRole_beq_eq hc.2⟩ hst
+      simp only [hst]
+      simp only [hstB, Bool.false_eq_true, ↓reduceIte] at h
+      simp only [Bool.or_eq_true] at h
+      rcases h with (hhbl | ho2) | ho3
+      · exact Or.inl ((buildHBReachTables_hbl_iff fps k i hi).mp hhbl)
+      · exact Or.inr (Or.inl (hHO2 ho2))
+      · exact Or.inr (Or.inr (hHO3 ho3))
+
+/-- Inter-task DRAM race-freedom soundness: whenever production `verifyProgramHazards` accepts
+    a program `fps`, every pair of tasks `k < i < fps.size` with conflicting DRAM accesses
+    `(a, b)` on the same resource (at least one write) sharing any byte `x` is strictly ordered
+    by `DramOrdered fps k i a b`. -/
+theorem verifyProgramHazards_dram_ordered
+    (fps : Array VerifiedTaskFootprint)
+    (hok : verifyProgramHazards fps = .ok ())
+    (k i : Nat) (hki : k < i) (hi : i < fps.size)
+    (ia ib : Nat) (hia : ia < fps[k]!.dramAccesses.size) (hib : ib < fps[i]!.dramAccesses.size) :
+    let a := fps[k]!.dramAccesses[ia]!
+    let b := fps[i]!.dramAccesses[ib]!
+    a.resource = b.resource → (a.isWrite = true ∨ b.isWrite = true) →
+    (∃ x, a.lo ≤ x ∧ x < a.hi ∧ b.lo ≤ x ∧ x < b.hi) →
+    DramOrdered fps k i a b := by
+  unfold verifyProgramHazards at hok
+  dsimp only at hok
+  obtain ⟨⟨⟩, _, hok⟩ := except_bind_ok hok
+  obtain ⟨⟨⟩, h2, _⟩ := except_bind_ok hok
+  unfold verifyPairwiseHazards at h2
+  intro a b hres hwr hwit
+  have hiOk := checkRange_ok h2 i (by omega) hi
+  have hkOk := checkRange_ok hiOk k (Nat.zero_le k) hki
+  obtain ⟨⟨⟩, _, hdramOk⟩ := except_bind_ok hkOk
+  have hiaOk := checkRange_ok hdramOk ia (Nat.zero_le ia) hia
+  have hibOk := checkRange_ok hiaOk ib (Nat.zero_le ib) hib
+  have hov : vIntervalsOverlap a.lo a.hi b.lo b.hi = true :=
+    vIntervalsOverlap_of_witness a.lo a.hi b.lo b.hi hwit
+  have hwrB : (a.isWrite || b.isWrite) = true := by
+    rcases hwr with h | h <;> simp [h]
+  have hresB : (a.resource == b.resource) = true := by rw [hres]; exact barResource_beq_self _
+  obtain ⟨_, _, _, hpeArr⟩ := vLatestEngArrays_eq fps
+  have hord : vDramPairOrdered fps (buildHBReachTables fps).1 (vLatestEngBefore fps .pe i) k i a b = true := by
+    cases hbo : vDramPairOrdered fps (buildHBReachTables fps).1 (vLatestEngBefore fps .pe i) k i a b with
+    | true => rfl
+    | false =>
+      dsimp only at hibOk
+      rw [hpeArr i hi] at hibOk
+      change (if (a.resource == b.resource && (a.isWrite || b.isWrite) &&
+          vIntervalsOverlap a.lo a.hi b.lo b.hi) = true then
+        if (!vDramPairOrdered fps (buildHBReachTables fps).1 (vLatestEngBefore fps .pe i) k i a b) = true then _
+        else _ else _) = Except.ok () at hibOk
+      rw [hresB, hwrB, hov, hbo] at hibOk
+      cases hibOk
+  exact vDramPairOrdered_sound fps k i hi a b hord
+
+/-- Inter-task DRAM WAR & WAW strict `HappensBefore` soundness: whenever `verifyProgramHazards`
+    accepts `fps` and task `k < i` has any DRAM access `a` conflicting with a `resDma` write `b`
+    in task `i` on the same resource (sharing any byte `x`), strict whole-task `HappensBefore fps k i`
+    holds. -/
+theorem verifyProgramHazards_dram_war_waw_hb
+    (fps : Array VerifiedTaskFootprint)
+    (hok : verifyProgramHazards fps = .ok ())
+    (k i : Nat) (hki : k < i) (hi : i < fps.size)
+    (ia ib : Nat) (hia : ia < fps[k]!.dramAccesses.size) (hib : ib < fps[i]!.dramAccesses.size) :
+    let a := fps[k]!.dramAccesses[ia]!
+    let b := fps[i]!.dramAccesses[ib]!
+    a.resource = b.resource → b.port = .resDma → b.isWrite = true →
+    (∃ x, a.lo ≤ x ∧ x < a.hi ∧ b.lo ≤ x ∧ x < b.hi) →
+    HappensBefore fps k i := by
+  intro a b hres hbPort hbWr hwit
+  have hord := verifyProgramHazards_dram_ordered fps hok k i hki hi ia ib hia hib hres (Or.inr hbWr) hwit
+  unfold DramOrdered at hord
+  dsimp only at hord
+  have h1 : ¬ (fps[i]!.dramAccesses[ib]!.port = .kernel) := by rw [hbPort]; decide
+  have h2 : ¬ (fps[i]!.engine = .ne ∧ fps[i]!.dramAccesses[ib]!.port = .src1Dma) := fun h => by rw [hbPort] at h; cases h.2
+  have h3 : ¬ (fps[i]!.engine = .pe ∧ fps[i]!.dramAccesses[ib]!.port = .src2Dma) := fun h => by rw [hbPort] at h; cases h.2
+  have h4 : ¬ (fps[k]!.dramAccesses[ia]!.isWrite = true ∧ fps[i]!.dramAccesses[ib]!.isWrite = false) := fun h => by rw [hbWr] at h; cases h.2
+  simp only [h1, h2, h3, h4, ↓reduceIte] at hord
+  exact hord
+
+/-- Inter-task L2 race-freedom soundness: whenever production `verifyProgramHazards` accepts
+    a program `fps`, every pair of tasks `k < i < fps.size` with conflicting L2 accesses `(a, b)`
+    (at least one write) sharing any byte `x` is strictly ordered by `L2Ordered fps k i a b`. -/
+theorem verifyProgramHazards_l2_ordered
+    (fps : Array VerifiedTaskFootprint)
+    (hok : verifyProgramHazards fps = .ok ())
+    (k i : Nat) (hki : k < i) (hi : i < fps.size)
+    (ia ib : Nat) (hia : ia < fps[k]!.l2Accesses.size) (hib : ib < fps[i]!.l2Accesses.size) :
+    let a := fps[k]!.l2Accesses[ia]!
+    let b := fps[i]!.l2Accesses[ib]!
+    (a.isWrite = true ∨ b.isWrite = true) →
+    (∃ x, a.lo ≤ x ∧ x < a.hi ∧ b.lo ≤ x ∧ x < b.hi) →
+    L2Ordered fps k i a b := by
+  unfold verifyProgramHazards at hok
+  dsimp only at hok
+  obtain ⟨⟨⟩, _, hok⟩ := except_bind_ok hok
+  obtain ⟨⟨⟩, h2, _⟩ := except_bind_ok hok
+  unfold verifyPairwiseHazards at h2
+  intro a b hwr hwit
+  have hiOk := checkRange_ok h2 i (by omega) hi
+  have hkOk := checkRange_ok hiOk k (Nat.zero_le k) hki
+  obtain ⟨⟨⟩, hl2Ok, _⟩ := except_bind_ok hkOk
+  have hiaOk := checkRange_ok hl2Ok ia (Nat.zero_le ia) hia
+  have hibOk := checkRange_ok hiaOk ib (Nat.zero_le ib) hib
+  have hov : vIntervalsOverlap a.lo a.hi b.lo b.hi = true :=
+    vIntervalsOverlap_of_witness a.lo a.hi b.lo b.hi hwit
+  have hwrB : (a.isWrite || b.isWrite) = true := by
+    rcases hwr with h | h <;> simp [h]
+  obtain ⟨_, _, hneArr, hpeArr⟩ := vLatestEngArrays_eq fps
+  have hord : vL2PairOrdered fps (buildHBReachTables fps).1 (buildHBReachTables fps).2
+      (vLatestEngBefore fps .ne i) (vLatestEngBefore fps .pe i) k i a b = true := by
+    cases hbo : vL2PairOrdered fps (buildHBReachTables fps).1 (buildHBReachTables fps).2
+        (vLatestEngBefore fps .ne i) (vLatestEngBefore fps .pe i) k i a b with
+    | true => rfl
+    | false =>
+      dsimp only at hibOk
+      rw [hneArr i hi, hpeArr i hi] at hibOk
+      change (if ((a.isWrite || b.isWrite) && vIntervalsOverlap a.lo a.hi b.lo b.hi) = true then
+        if (!vL2PairOrdered fps (buildHBReachTables fps).1 (buildHBReachTables fps).2
+          (vLatestEngBefore fps .ne i) (vLatestEngBefore fps .pe i) k i a b) = true then _
+        else _ else _) = Except.ok () at hibOk
+      rw [hwrB, hov, hbo] at hibOk
+      cases hibOk
+  exact vL2PairOrdered_sound fps k i hi a b hord
+
+/-- Formal byte-level semantics of `WriteCoverage`: byte offset `x` is guaranteed written by `c`. -/
+def coversByte : WriteCoverage → Nat → Prop
+  | .dense lo hi, x => lo ≤ x ∧ x < hi
+  | .periodic start innerLen outerCount outerStride, x =>
+    ∃ j < outerCount, start + j * outerStride ≤ x ∧ x < start + j * outerStride + innerLen
+  | .sparse, _ => False
+
+private theorem collectDenseCoverages_sound (allCovs covs : List WriteCoverage) (acc : List (Nat × Nat))
+    (hsub : ∀ c ∈ covs, c ∈ allCovs)
+    (hacc : ∀ iv ∈ acc, ∀ x, iv.1 ≤ x → x < iv.2 → ∃ c ∈ allCovs, coversByte c x) :
+    ∀ iv ∈ collectDenseCoverages covs acc, ∀ x, iv.1 ≤ x → x < iv.2 →
+      ∃ c ∈ allCovs, coversByte c x := by
+  induction covs generalizing acc with
+  | nil => exact hacc
+  | cons c rest ih =>
+    cases c with
+    | dense lo hi =>
+      simp only [collectDenseCoverages]
+      apply ih _ (fun d hd => hsub d (List.mem_cons_of_mem _ hd))
+      intro iv hiv x hx1 hx2
+      split at hiv
+      · cases hiv with
+        | head => exact ⟨.dense lo hi, hsub _ List.mem_cons_self, hx1, hx2⟩
+        | tail _ hm => exact hacc iv hm x hx1 hx2
+      · exact hacc iv hiv x hx1 hx2
+    | periodic _ _ _ _ =>
+      exact ih acc (fun d hd => hsub d (List.mem_cons_of_mem _ hd)) hacc
+    | sparse =>
+      exact ih acc (fun d hd => hsub d (List.mem_cons_of_mem _ hd)) hacc
+
+private theorem insertInterval_pairwise (iv : Nat × Nat) (xs : List (Nat × Nat))
+    (hpw : xs.Pairwise (fun a b => a.1 ≤ b.1)) :
+    (insertInterval iv xs).Pairwise (fun a b => a.1 ≤ b.1) := by
+  induction xs with
+  | nil => exact List.Pairwise.cons (by simp) List.Pairwise.nil
+  | cons hd tl ih =>
+    unfold insertInterval
+    split
+    · rename_i hle
+      have ⟨hhd, _⟩ := List.pairwise_cons.mp hpw
+      apply List.Pairwise.cons _ hpw
+      intro y hy
+      cases hy with
+      | head => exact hle
+      | tail _ htl => exact Nat.le_trans hle (hhd y htl)
+    · rename_i hgt
+      have ⟨hhd, htlPw⟩ := List.pairwise_cons.mp hpw
+      apply List.Pairwise.cons _ (ih htlPw)
+      intro y hy
+      rw [mem_insertInterval] at hy
+      rcases hy with rfl | hmem
+      · omega
+      · exact hhd y hmem
+
+private theorem filterSortPeriodicGroup_spec (outerCount outerStride : Nat)
+    (allCovs covs : List WriteCoverage) (acc : List (Nat × Nat))
+    (hsub : ∀ c ∈ covs, c ∈ allCovs)
+    (haccPw : acc.Pairwise (fun a b => a.1 ≤ b.1))
+    (haccMem : ∀ p ∈ acc, WriteCoverage.periodic p.1 p.2 outerCount outerStride ∈ allCovs) :
+    let res := filterSortPeriodicGroup outerCount outerStride covs acc
+    res.Pairwise (fun a b => a.1 ≤ b.1) ∧
+    (∀ p ∈ res, WriteCoverage.periodic p.1 p.2 outerCount outerStride ∈ allCovs) := by
+  induction covs generalizing acc with
+  | nil => exact ⟨haccPw, haccMem⟩
+  | cons c rest ih =>
+    cases c with
+    | dense _ _ =>
+      exact ih acc (fun d hd => hsub d (List.mem_cons_of_mem _ hd)) haccPw haccMem
+    | sparse =>
+      exact ih acc (fun d hd => hsub d (List.mem_cons_of_mem _ hd)) haccPw haccMem
+    | periodic st len oc os =>
+      simp only [filterSortPeriodicGroup]
+      split
+      · rename_i hcond
+        simp only [Bool.and_eq_true, decide_eq_true_eq, beq_iff_eq] at hcond
+        rcases hcond with ⟨⟨⟨⟨_, _⟩, _⟩, rfl⟩, rfl⟩
+        apply ih _ (fun d hd => hsub d (List.mem_cons_of_mem _ hd))
+          (insertInterval_pairwise (st, len) acc haccPw)
+        intro p hp
+        rw [mem_insertInterval] at hp
+        rcases hp with rfl | hm
+        · exact hsub _ List.mem_cons_self
+        · exact haccMem p hm
+      · exact ih acc (fun d hd => hsub d (List.mem_cons_of_mem _ hd)) haccPw haccMem
+
+private theorem clusterPeriodicSorted_sound
+    (outerCount outerStride : Nat) (allCovs : List WriteCoverage)
+    (group : List (Nat × Nat)) (curBase? : Option Nat)
+    (curInner acc : List (Nat × Nat))
+    (hpw : group.Pairwise (fun a b => a.1 ≤ b.1))
+    (hgrp : ∀ p ∈ group, WriteCoverage.periodic p.1 p.2 outerCount outerStride ∈ allCovs)
+    (hbase : ∀ base, curBase? = some base →
+      (∀ p ∈ group, base ≤ p.1) ∧
+      (∀ iv ∈ curInner, ∃ len, iv.2 = iv.1 + len ∧
+        WriteCoverage.periodic (base + iv.1) len outerCount outerStride ∈ allCovs))
+    (hacc : ∀ iv ∈ acc, ∀ x, iv.1 ≤ x → x < iv.2 → ∃ c ∈ allCovs, coversByte c x) :
+    ∀ iv ∈ clusterPeriodicSorted outerCount outerStride group curBase? curInner acc,
+      ∀ x, iv.1 ≤ x → x < iv.2 → ∃ c ∈ allCovs, coversByte c x := by
+  have hflush : ∀ base curInner' iv,
+      (∀ ivIn ∈ curInner', ∃ len, ivIn.2 = ivIn.1 + len ∧
+        WriteCoverage.periodic (base + ivIn.1) len outerCount outerStride ∈ allCovs) →
+      periodicGroupCovered base outerCount outerStride curInner' = some iv →
+      ∀ x, iv.1 ≤ x → x < iv.2 → ∃ c ∈ allCovs, coversByte c x := by
+    intro base curInner' iv hcur hpg x hx1 hx2
+    obtain ⟨j, hjLt, ivIn, hivMem, hlo, hhi⟩ :=
+      periodicGroupCovered_sound base outerCount outerStride curInner' iv.1 iv.2 x hpg hx1 hx2
+    obtain ⟨len, hlenEq, hcMem⟩ := hcur ivIn hivMem
+    refine ⟨.periodic (base + ivIn.1) len outerCount outerStride, hcMem, j, hjLt, ?_, ?_⟩ <;> omega
+  induction group generalizing curBase? curInner acc with
+  | nil =>
+    cases curBase? with
+    | none => exact hacc
+    | some base =>
+      simp only [clusterPeriodicSorted]
+      cases hpg : periodicGroupCovered base outerCount outerStride curInner with
+      | none => exact hacc
+      | some iv =>
+        intro iv' hiv' x hx1 hx2
+        cases hiv' with
+        | head => exact hflush base curInner iv (hbase base rfl).2 hpg x hx1 hx2
+        | tail _ hm => exact hacc iv' hm x hx1 hx2
+  | cons p rest ih =>
+    rcases p with ⟨st, len⟩
+    have ⟨hpRest, hrestPw⟩ := List.pairwise_cons.mp hpw
+    have hpMem : WriteCoverage.periodic st len outerCount outerStride ∈ allCovs :=
+      hgrp (st, len) List.mem_cons_self
+    have hrestGrp : ∀ q ∈ rest, WriteCoverage.periodic q.1 q.2 outerCount outerStride ∈ allCovs :=
+      fun q hq => hgrp q (List.mem_cons_of_mem _ hq)
+    cases curBase? with
+    | none =>
+      simp only [clusterPeriodicSorted]
+      split
+      · apply ih (some st) [(0, len)] acc hrestPw hrestGrp _ hacc
+        intro b hb; cases hb
+        refine ⟨fun q hq => hpRest q hq, ?_⟩
+        intro iv hiv
+        simp only [List.mem_singleton] at hiv
+        subst hiv
+        exact ⟨len, by simp, by simpa using hpMem⟩
+      · exact ih none [] acc hrestPw hrestGrp (fun _ h => by cases h) hacc
+    | some base =>
+      have ⟨hgeAll, hcurInv⟩ := hbase base rfl
+      have hbaseLeSt : base ≤ st := hgeAll (st, len) List.mem_cons_self
+      simp only [clusterPeriodicSorted]
+      split
+      · have hacc' : ∀ iv ∈ (match periodicGroupCovered base outerCount outerStride curInner with
+            | some iv => iv :: acc | none => acc),
+            ∀ x, iv.1 ≤ x → x < iv.2 → ∃ c ∈ allCovs, coversByte c x := by
+          cases hpg : periodicGroupCovered base outerCount outerStride curInner with
+          | none => exact hacc
+          | some iv =>
+            intro iv' hiv' x hx1 hx2
+            cases hiv' with
+            | head => exact hflush base curInner iv hcurInv hpg x hx1 hx2
+            | tail _ hm => exact hacc iv' hm x hx1 hx2
+        split
+        · apply ih (some st) [(0, len)] _ hrestPw hrestGrp _ hacc'
+          intro b hb; cases hb
+          refine ⟨fun q hq => hpRest q hq, ?_⟩
+          intro iv hiv
+          simp only [List.mem_singleton] at hiv
+          subst hiv
+          exact ⟨len, by simp, by simpa using hpMem⟩
+        · exact ih none [] _ hrestPw hrestGrp (fun _ h => by cases h) hacc'
+      · split
+        · apply ih (some base) ((st - base, st - base + len) :: curInner) acc hrestPw hrestGrp _ hacc
+          intro b hb; cases hb
+          refine ⟨fun q hq => hgeAll q (List.mem_cons_of_mem _ hq), ?_⟩
+          intro iv hiv
+          cases hiv with
+          | head =>
+            have hadd : base + (st - base) = st := by omega
+            exact ⟨len, rfl, by rw [hadd]; exact hpMem⟩
+          | tail _ hm => exact hcurInv iv hm
+        · apply ih (some base) curInner acc hrestPw hrestGrp _ hacc
+          intro b hb; cases hb
+          exact ⟨fun q hq => hgeAll q (List.mem_cons_of_mem _ hq), hcurInv⟩
+
+private theorem collectPeriodicCoverages_sound
+    (allCovs : List WriteCoverage) (keys acc : List (Nat × Nat))
+    (hacc : ∀ iv ∈ acc, ∀ x, iv.1 ≤ x → x < iv.2 → ∃ c ∈ allCovs, coversByte c x) :
+    ∀ iv ∈ collectPeriodicCoverages allCovs keys acc,
+      ∀ x, iv.1 ≤ x → x < iv.2 → ∃ c ∈ allCovs, coversByte c x := by
+  induction keys generalizing acc with
+  | nil => exact hacc
+  | cons key rest ih =>
+    rcases key with ⟨oc, os⟩
+    simp only [collectPeriodicCoverages]
+    have ⟨hpw, hgrp⟩ := filterSortPeriodicGroup_spec oc os allCovs allCovs []
+      (fun _ h => h) List.Pairwise.nil (fun _ h => by cases h)
+    have hacc' := clusterPeriodicSorted_sound oc os allCovs _ none [] acc hpw hgrp
+      (fun _ h => by cases h) hacc
+    exact ih _ hacc'
+
+/-- Soundness of `Vane.Verify.effectiveCoveredIntervals`: every byte offset `x` inside any
+    interval emitted by `effectiveCoveredIntervals covs` is guaranteed written (`coversByte`)
+    by at least one descriptor `c ∈ covs` (dense or periodic). -/
+theorem effectiveCoveredIntervals_sound (covs : List WriteCoverage) (iv : Nat × Nat) (x : Nat)
+    (hiv : iv ∈ effectiveCoveredIntervals covs) (hx1 : iv.1 ≤ x) (hx2 : x < iv.2) :
+    ∃ c ∈ covs, coversByte c x := by
+  unfold effectiveCoveredIntervals at hiv
+  have hdense := collectDenseCoverages_sound covs covs [] (fun _ h => h) (fun _ h => by cases h)
+  exact collectPeriodicCoverages_sound covs (collectPeriodicKeys covs [])
+    (collectDenseCoverages covs []) hdense iv hiv x hx1 hx2
+
+private theorem collectTaskScratchWriters_mem
+    (k : Nat) (b : VerifiedDramAccess) (accs : Array VerifiedDramAccess) :
+    ∀ rem j acc,
+      rem = accs.size - j →
+      (∀ p ∈ acc.toList, p.1 = k → ∃ ia < accs.size, accs[ia]! = p.2 ∧
+        p.2.resource = .scratch ∧ p.2.port = .resDma ∧ p.2.isWrite = true ∧
+        vIntervalsOverlap p.2.lo p.2.hi b.lo b.hi = true) →
+      (∀ p ∈ (collectTaskScratchWriters k b accs j acc).toList,
+        p ∈ acc.toList ∨
+        (p.1 = k ∧ ∃ ia < accs.size, accs[ia]! = p.2 ∧
+          p.2.resource = .scratch ∧ p.2.port = .resDma ∧ p.2.isWrite = true ∧
+          vIntervalsOverlap p.2.lo p.2.hi b.lo b.hi = true)) := by
+  intro rem
+  induction rem with
+  | zero =>
+    intro j acc hrem _
+    have hnot : ¬ j < accs.size := by omega
+    unfold collectTaskScratchWriters
+    simp only [hnot, ↓reduceDIte]
+    intro p hp; exact Or.inl hp
+  | succ r ih =>
+    intro j acc hrem hacc
+    have hj : j < accs.size := by omega
+    unfold collectTaskScratchWriters
+    simp only [hj, ↓reduceDIte]
+    by_cases hcond : (accs[j].resource == .scratch && accs[j].port == .resDma &&
+                      accs[j].isWrite && vIntervalsOverlap accs[j].lo accs[j].hi b.lo b.hi) = true
+    · simp only [hcond, ↓reduceIte]
+      simp only [Bool.and_eq_true] at hcond
+      rcases hcond with ⟨⟨⟨hresB, hportB⟩, hwr⟩, hov⟩
+      have hres : accs[j].resource = .scratch := barResource_beq_eq hresB
+      have hport : accs[j].port = .resDma := dramAccessPort_beq_eq hportB
+      have hacc' : ∀ p ∈ (acc.push (k, accs[j])).toList, p.1 = k →
+          ∃ ia < accs.size, accs[ia]! = p.2 ∧
+          p.2.resource = .scratch ∧ p.2.port = .resDma ∧ p.2.isWrite = true ∧
+          vIntervalsOverlap p.2.lo p.2.hi b.lo b.hi = true := by
+        intro p hp hpk
+        simp only [Array.toList_push, List.mem_append, List.mem_singleton] at hp
+        rcases hp with hm | rfl
+        · exact hacc p hm hpk
+        · exact ⟨j, hj, getElem!_pos accs j hj, hres, hport, hwr, hov⟩
+      intro p hp
+      rcases ih (j + 1) (acc.push (k, accs[j])) (by omega) hacc' p hp with hm | hnew
+      · simp only [Array.toList_push, List.mem_append, List.mem_singleton] at hm
+        rcases hm with hold | rfl
+        · exact Or.inl hold
+        · exact Or.inr ⟨rfl, j, hj, getElem!_pos accs j hj, hres, hport, hwr, hov⟩
+      · exact Or.inr hnew
+    · simp only [hcond, Bool.false_eq_true, ↓reduceIte]
+      exact ih (j + 1) acc (by omega) hacc
+
+private theorem collectPriorScratchWriters_mem
+    (fps : Array VerifiedTaskFootprint) (b : VerifiedDramAccess) (hi : Nat) :
+    ∀ rem k acc,
+      rem = hi - k →
+      (∀ p ∈ acc.toList, p.1 < hi ∧
+        ∃ ia < fps[p.1]!.dramAccesses.size, fps[p.1]!.dramAccesses[ia]! = p.2 ∧
+        p.2.resource = .scratch ∧ p.2.port = .resDma ∧ p.2.isWrite = true ∧
+        vIntervalsOverlap p.2.lo p.2.hi b.lo b.hi = true) →
+      ∀ p ∈ (collectPriorScratchWriters fps b k hi acc).toList,
+        p.1 < hi ∧
+        ∃ ia < fps[p.1]!.dramAccesses.size, fps[p.1]!.dramAccesses[ia]! = p.2 ∧
+        p.2.resource = .scratch ∧ p.2.port = .resDma ∧ p.2.isWrite = true ∧
+        vIntervalsOverlap p.2.lo p.2.hi b.lo b.hi = true := by
+  intro rem
+  induction rem with
+  | zero =>
+    intro k acc hrem hacc
+    have hnot : ¬ k < hi := by omega
+    unfold collectPriorScratchWriters
+    simp only [hnot, ↓reduceDIte]
+    exact hacc
+  | succ r ih =>
+    intro k acc hrem hacc
+    have hk : k < hi := by omega
+    unfold collectPriorScratchWriters
+    simp only [hk, ↓reduceDIte]
+    have hacc' : ∀ p ∈ (collectTaskScratchWriters k b fps[k]!.dramAccesses 0 acc).toList,
+        p.1 < hi ∧
+        ∃ ia < fps[p.1]!.dramAccesses.size, fps[p.1]!.dramAccesses[ia]! = p.2 ∧
+        p.2.resource = .scratch ∧ p.2.port = .resDma ∧ p.2.isWrite = true ∧
+        vIntervalsOverlap p.2.lo p.2.hi b.lo b.hi = true := by
+      intro p hp
+      have hstep := collectTaskScratchWriters_mem k b fps[k]!.dramAccesses
+        fps[k]!.dramAccesses.size 0 acc (by omega)
+        (fun q hq hqk => by
+          have ⟨_, hex⟩ := hacc q hq
+          rw [hqk] at hex
+          exact hex) p hp
+      rcases hstep with hold | ⟨hpk, hex⟩
+      · exact hacc p hold
+      · subst hpk
+        exact ⟨hk, hex⟩
+    exact ih (k + 1) _ (by omega) hacc'
+
+/-- End-to-end S5 BAR 3 scratch read-before-write coverage & ordering soundness:
+    whenever production `verifyProgramHazards` accepts a program `fps`, for every task
+    `i < fps.size`, every BAR 3 scratch read `b` of task `i`, and every byte offset
+    `x ∈ [b.lo, b.hi)`, there exists an earlier producer task `p < i` and a BAR 3 scratch
+    `resDma` write `a` in task `p` such that:
+    1. `coversByte a.coverage x` (byte `x` is guaranteed written by `a`),
+    2. `vIntervalsOverlap a.lo a.hi b.lo b.hi = true`, and
+    3. `DramOrdered fps p i a b` (ordered before consumer `i` via `HappensBefore` / hardware barrier). -/
+theorem verifyProgramHazards_scratch_read_covered
+    (fps : Array VerifiedTaskFootprint)
+    (hok : verifyProgramHazards fps = .ok ())
+    (i : Nat) (hi : i < fps.size)
+    (ib : Nat) (hib : ib < fps[i]!.dramAccesses.size)
+    (x : Nat) :
+    let b := fps[i]!.dramAccesses[ib]!
+    b.resource = .scratch → b.isWrite = false → b.lo ≤ x → x < b.hi →
+    ∃ p < i, ∃ ia < fps[p]!.dramAccesses.size,
+      let a := fps[p]!.dramAccesses[ia]!
+      a.resource = .scratch ∧ a.port = .resDma ∧ a.isWrite = true ∧
+      coversByte a.coverage x ∧
+      vIntervalsOverlap a.lo a.hi b.lo b.hi = true ∧
+      DramOrdered fps p i a b := by
+  unfold verifyProgramHazards at hok
+  dsimp only at hok
+  obtain ⟨⟨⟩, _, hok⟩ := except_bind_ok hok
+  obtain ⟨⟨⟩, h2, hok⟩ := except_bind_ok hok
+  obtain ⟨⟨⟩, h3, _⟩ := except_bind_ok hok
+  unfold verifyScratchReadIntegrity at h3
+  unfold verifyPairwiseHazards at h2
+  intro b hbRes hbRd hxLo hxHi
+  have hiOk := checkRange_ok h3 i (Nat.zero_le i) hi
+  have hibOk := checkRange_ok hiOk ib (Nat.zero_le ib) hib
+  have hbCond : (b.resource == .scratch && !b.isWrite) = true := by
+    rw [hbRes, hbRd]; rfl
+  dsimp only at hibOk
+  change (if (b.resource == .scratch && !b.isWrite) = true then _ else _) = Except.ok () at hibOk
+  simp only [hbCond, ↓reduceIte] at hibOk
+  obtain ⟨_, hibOk⟩ := except_if_do_throw_ok hibOk
+  obtain ⟨_, hibOk⟩ := except_if_do_throw_ok hibOk
+  obtain ⟨_, hibOk⟩ := except_if_do_throw_ok hibOk
+  obtain ⟨_, hibOk⟩ := except_if_do_throw_ok hibOk
+  obtain ⟨hcovNotFalse, _⟩ := except_if_do_throw_ok hibOk
+  have hcovTrue : intervalsCover
+      (effectiveCoveredIntervals ((collectPriorScratchWriters fps b 0 i #[]).toList.map (fun (_, a) => a.coverage)))
+      b.lo b.hi = true := by
+    cases hc : intervalsCover
+        (effectiveCoveredIntervals ((collectPriorScratchWriters fps b 0 i #[]).toList.map (fun (_, a) => a.coverage)))
+        b.lo b.hi with
+    | true => rfl
+    | false =>
+      exact False.elim (hcovNotFalse (by
+        show (!intervalsCover
+          (effectiveCoveredIntervals ((collectPriorScratchWriters fps b 0 i #[]).toList.map (fun (_, a) => a.coverage)))
+          b.lo b.hi) = true
+        rw [hc]; rfl))
+  obtain ⟨iv, hivMem, hivLo, hivHi⟩ := intervalsCover_sound _ b.lo b.hi x hcovTrue hxLo hxHi
+  obtain ⟨cov, hcovMem, hcovX⟩ := effectiveCoveredIntervals_sound _ iv x hivMem hivLo hivHi
+  rw [List.mem_map] at hcovMem
+  obtain ⟨⟨p, a⟩, hpaMem, rfl⟩ := hcovMem
+  have hpaSpec := collectPriorScratchWriters_mem fps b i i 0 #[] (by omega)
+    (fun _ h => by simp at h) (p, a) hpaMem
+  rcases hpaSpec with ⟨hpLt, ia, hia, haEq, haRes, haPort, haWr, hov⟩
+  have hord : DramOrdered fps p i fps[p]!.dramAccesses[ia]! b := by
+    have hi2Ok := checkRange_ok h2 i (by omega) hi
+    have hp2Ok := checkRange_ok hi2Ok p (Nat.zero_le p) hpLt
+    obtain ⟨⟨⟩, _, hdramOk⟩ := except_bind_ok hp2Ok
+    have hia2Ok := checkRange_ok hdramOk ia (Nat.zero_le ia) hia
+    have hib2Ok := checkRange_ok hia2Ok ib (Nat.zero_le ib) hib
+    obtain ⟨_, _, _, hpeArr⟩ := vLatestEngArrays_eq fps
+    have hboTrue : vDramPairOrdered fps (buildHBReachTables fps).1
+        (vLatestEngBefore fps .pe i) p i fps[p]!.dramAccesses[ia]! b = true := by
+      cases hbo : vDramPairOrdered fps (buildHBReachTables fps).1
+          (vLatestEngBefore fps .pe i) p i fps[p]!.dramAccesses[ia]! b with
+      | true => rfl
+      | false =>
+        have hresB : (fps[p]!.dramAccesses[ia]!.resource == b.resource) = true := by
+          rw [haEq, haRes, hbRes]; rfl
+        have hwrB : (fps[p]!.dramAccesses[ia]!.isWrite || b.isWrite) = true := by
+          rw [haEq, haWr]; rfl
+        have hov' : vIntervalsOverlap fps[p]!.dramAccesses[ia]!.lo fps[p]!.dramAccesses[ia]!.hi b.lo b.hi = true := by
+          rw [haEq]; exact hov
+        dsimp only at hib2Ok
+        rw [hpeArr i hi] at hib2Ok
+        change (if (fps[p]!.dramAccesses[ia]!.resource == b.resource &&
+            (fps[p]!.dramAccesses[ia]!.isWrite || b.isWrite) &&
+            vIntervalsOverlap fps[p]!.dramAccesses[ia]!.lo fps[p]!.dramAccesses[ia]!.hi b.lo b.hi) = true then
+          if (!vDramPairOrdered fps (buildHBReachTables fps).1
+            (vLatestEngBefore fps .pe i) p i fps[p]!.dramAccesses[ia]! b) = true then _
+          else _ else _) = Except.ok () at hib2Ok
+        rw [hresB, hwrB, hov', hbo] at hib2Ok
+        cases hib2Ok
+    exact vDramPairOrdered_sound fps p i hi fps[p]!.dramAccesses[ia]! b hboTrue
+  refine ⟨p, hpLt, ia, hia, ?_, ?_, ?_, ?_, ?_, hord⟩
+  · rw [haEq]; exact haRes
+  · rw [haEq]; exact haPort
+  · rw [haEq]; exact haWr
+  · rw [haEq]; exact hcovX
+  · rw [haEq]; exact hov
+
+-- ============================================================================
+-- 20. Compiler Tiling / Plan Legality Bridge (Vane.Matmul, Vane.Tiling, Vane.Conv)
+-- ============================================================================
+
+private theorem findFirstSome_eq_some {α β : Type} {xs : List α} {f : α → Option β} {y : β}
+    (h : findFirstSome xs f = some y) : ∃ x ∈ xs, f x = some y := by
+  induction xs with
+  | nil => simp [findFirstSome] at h
+  | cons hd tl ih =>
+    unfold findFirstSome at h
+    cases hhd : f hd with
+    | some z =>
+      simp only [hhd, Option.some.injEq] at h
+      subst h
+      exact ⟨hd, List.mem_cons_self, hhd⟩
+    | none =>
+      simp only [hhd] at h
+      obtain ⟨x, hx, hfx⟩ := ih h
+      exact ⟨x, List.mem_cons_of_mem _ hx, hfx⟩
+
+private theorem mem_natRange_iff (lo hi x : Nat) :
+    x ∈ natRange lo hi ↔ lo ≤ x ∧ x < hi := by
+  have haux : ∀ d lo, d = hi - lo → (x ∈ natRange lo hi ↔ lo ≤ x ∧ x < hi) := by
+    intro d
+    induction d with
+    | zero =>
+      intro lo hd
+      have hnot : ¬ lo < hi := by omega
+      unfold natRange
+      simp only [hnot, ↓reduceDIte, List.not_mem_nil, false_iff]
+      omega
+    | succ r ih =>
+      intro lo hd
+      have hlt : lo < hi := by omega
+      unfold natRange
+      simp only [hlt, ↓reduceDIte, List.mem_cons, ih (lo + 1) (by omega)]
+      omega
+  exact haux (hi - lo) lo rfl
+
+/-- `ceilLog2 m` covers `m` (`m ≤ 2 ^ ceilLog2 m`) for all `m ≥ 1`, and `ceilLog2 m ≤ 4` for `m ≤ 16`. -/
+theorem ceilLog2_spec (m : Nat) :
+    (1 ≤ m → m ≤ 2 ^ ceilLog2 m) ∧ (m ≤ 16 → ceilLog2 m ≤ 4) := by
+  constructor
+  · intro hm
+    unfold ceilLog2
+    split
+    · omega
+    · have hpos : m - 1 ≠ 0 := by omega
+      have hlt : m - 1 < 2 ^ (Nat.log2 (m - 1) + 1) := by
+        have h := Nat.lt_log2_self (n := m - 1)
+        exact Nat.log2_lt hpos |>.mp (Nat.lt_succ_self _)
+      omega
+  · intro hm16
+    have hcases : m = 0 ∨ m = 1 ∨ m = 2 ∨ m = 3 ∨ m = 4 ∨ m = 5 ∨ m = 6 ∨ m = 7 ∨ m = 8 ∨
+        m = 9 ∨ m = 10 ∨ m = 11 ∨ m = 12 ∨ m = 13 ∨ m = 14 ∨ m = 15 ∨ m = 16 := by omega
+    rcases hcases with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl |
+        rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;> decide
+
+/-- `matmulChunkSize k` is always 64-byte aligned and covers `2 * k` fp16 bytes. -/
+theorem matmulChunkSize_aligned (k : Nat) :
+    matmulChunkSize k % 64 = 0 ∧ 2 * k ≤ matmulChunkSize k := by
+  unfold matmulChunkSize
+  exact ⟨alignUp_dvd (2 * k) 64 (by omega), alignUp_ge (2 * k) 64⟩
+
+/-- Any `MatmulSpec` accepted by `validateMatmulSpec` satisfies all dimension and 64 KiB chunk bounds. -/
+theorem validateMatmulSpec_bounds (spec : MatmulSpec)
+    (h : validateMatmulSpec spec = .ok ()) :
+    1 ≤ spec.b ∧ spec.b ≤ 65535 ∧
+    1 ≤ spec.m ∧ spec.m ≤ 2048 ∧
+    1 ≤ spec.k ∧ spec.k ≤ 65535 ∧
+    1 ≤ spec.n ∧ spec.n ≤ 65535 ∧
+    matmulChunkSize spec.k ≤ maxKernelChunkBytes := by
+  unfold validateMatmulSpec at h
+  obtain ⟨hb, h⟩ := except_if_do_throw_ok h
+  obtain ⟨hm, h⟩ := except_if_do_throw_ok h
+  obtain ⟨hk, h⟩ := except_if_do_throw_ok h
+  obtain ⟨hn, h⟩ := except_if_do_throw_ok h
+  obtain ⟨_, h⟩ := except_if_do_throw_ok h
+  dsimp only at h
+  obtain ⟨hcs, _⟩ := except_if_do_throw_ok h
+  simp only [Bool.or_eq_true, beq_iff_eq, decide_eq_true_eq, not_or] at hb hm hk hn
+  exact ⟨by omega, by omega, by omega, by omega, by omega, by omega, by omega, by omega, by omega⟩
+
+/-- Any scratch transpose planned by `planMatmulScratchTranspose` has a 64-byte-aligned scratch
+    allocation covering the full `[B, cols, 1, rows]` fp16 output tensor span. -/
+theorem planMatmulScratchTranspose_aligned_and_covers
+    (b rows cols : Nat) (cp : ViewCopy) (reqScratch : Nat)
+    (h : planMatmulScratchTranspose b rows cols = .ok (cp, reqScratch)) :
+    reqScratch % 64 = 0 ∧ b * cols * alignUp (2 * rows) 64 ≤ reqScratch := by
+  unfold planMatmulScratchTranspose at h
+  obtain ⟨_, h1⟩ := except_if_do_throw_ok h
+  split at h1
+  · rename_i h11
+    simp only [Bool.and_eq_true, beq_iff_eq] at h11
+    rcases h11 with ⟨rfl, rfl⟩
+    injection h1 with hpair
+    injection hpair with _ hreq
+    rw [← hreq]
+    have hal : alignUp (2 * 1) 64 = 64 := by decide
+    have hdma : Vane.Program.dmaLineBytes = 64 := rfl
+    rw [hdma, hal]
+    exact ⟨alignUp_dvd _ 64 (by omega), by simpa using alignUp_ge (b * 64) 64⟩
+  · obtain ⟨_, h2⟩ := except_if_do_throw_ok h1
+    injection h2 with hpair
+    injection hpair with _ hreq
+    rw [← hreq]
+    have hdma : Vane.Program.dmaLineBytes = 64 := rfl
+    rw [hdma]
+    exact ⟨alignUp_dvd _ 64 (by omega), Nat.le_trans (Nat.le_max_left _ _) (alignUp_ge _ 64)⟩
+
+private theorem maxEndOf_le (rs : List Range) (cap : Nat) (h : ∀ r ∈ rs, r.hi ≤ cap) :
+    maxEndOf rs ≤ cap := by
+  unfold maxEndOf
+  have haux : ∀ acc, acc ≤ cap → rs.foldl (fun a r => max a r.hi) acc ≤ cap := by
+    induction rs with
+    | nil => intro acc ha; exact ha
+    | cons r rest ih =>
+      intro acc ha
+      simp only [List.foldl_cons]
+      have hr : r.hi ≤ cap := h r List.mem_cons_self
+      exact ih (fun q hq => h q (List.mem_cons_of_mem _ hq)) (max acc r.hi) (by omega)
+  exact haux 0 (Nat.zero_le cap)
+
+private theorem option_ite_none_eq_some {α : Type} {c : Prop} [Decidable c] {x : Option α} {v : α}
+    (h : (if c then x else none) = some v) : c ∧ x = some v := by
+  by_cases hc : c
+  · simp [hc] at h; exact ⟨hc, h⟩
+  · simp [hc] at h
+
+/-- Direct legality bridge for production `chooseMatmulTaskPlan`: whenever it returns `.ok plan`,
+    the plan satisfies every structural, bitfield, coverage, strip-width, and 2 MiB L2 capacity
+    bound enforced by `Vane/Verify.lean`. -/
+theorem chooseMatmulTaskPlan_legal
+    (target : Target) (m k n : Nat) (srcIsL2 resIsL2 : Bool)
+    (occupied : List Range) (plan : MatmulTaskPlan)
+    (hok : chooseMatmulTaskPlan target m k n srcIsL2 resIsL2 occupied = .ok plan) :
+    1 ≤ m ∧ m ≤ 16 ∧
+    1 ≤ k ∧ 1 ≤ n ∧ n ≤ 65535 ∧
+    plan.tiling.f = ceilLog2 m ∧
+    plan.tiling.logNE = plan.tiling.f ∧
+    plan.tiling.f ≤ 4 ∧
+    m ≤ 2 ^ plan.tiling.f ∧
+    plan.tiling.fat = 0 ∧
+    plan.tiling.ocg = 0 ∧
+    plan.tiling.tileHeight = 1 ∧
+    plan.tiling.shPref ≤ plan.tiling.shMax ∧
+    plan.tiling.shMax ≤ 4 ∧
+    8 ≤ stripWidth plan.tiling ∧ stripWidth plan.tiling ≤ 256 ∧
+    ((∀ r ∈ occupied, r.hi ≤ l2CapacityBytes) → plan.l2TaskPeak ≤ l2CapacityBytes) := by
+  unfold chooseMatmulTaskPlan at hok
+  obtain ⟨hdims, hok⟩ := except_if_err_ok hok
+  simp only [Bool.or_eq_true, beq_iff_eq, decide_eq_true_eq, not_or] at hdims
+  have hm1 : 1 ≤ m := by omega
+  have hm16 : m ≤ 16 := by omega
+  have hk1 : 1 ≤ k := by omega
+  have hn1 : 1 ≤ n := by omega
+  have hn65 : n ≤ 65535 := by omega
+  dsimp only at hok
+  split at hok
+  · rename_i p hch
+    simp only [Except.ok.injEq] at hok
+    subst hok
+    obtain ⟨wantDirect, _, h1⟩ := findFirstSome_eq_some hch
+    obtain ⟨shPref, hshPrefMem, h2⟩ := findFirstSome_eq_some h1
+    split at h2
+    · rename_i hstrip
+      simp only [Bool.and_eq_true, decide_eq_true_eq] at hstrip
+      split at h2
+      · rename_i hshMaxStart
+        obtain ⟨shMax, hshMaxMem, hcand⟩ := findFirstSome_eq_some h2
+        rw [mem_natRange_iff] at hshPrefMem hshMaxMem
+        unfold tryMatmulPlanCandidate at hcand
+        dsimp only at hcand
+        obtain ⟨_, hcand⟩ := option_ite_none_eq_some hcand
+        obtain ⟨⟨sb, rb, pk⟩, hpl, hpEq⟩ := Option.map_eq_some_iff.mp hcand
+        subst hpEq
+        dsimp only
+        have hcl := ceilLog2_spec m
+        have hpeak : (∀ r ∈ occupied, r.hi ≤ l2CapacityBytes) → pk ≤ l2CapacityBytes := by
+          intro hocc
+          have hmaxOcc := maxEndOf_le occupied l2CapacityBytes hocc
+          cases srcIsL2 <;> cases resIsL2 <;> simp only [Bool.and_true, Bool.and_false, Bool.not_true,
+            Bool.not_false, ↓reduceIte, Bool.false_eq_true] at hpl
+          · split at hpl
+            · cases hpl
+            · rename_i sb' hf1
+              split at hpl
+              · cases hpl
+              · rename_i rb' hf2
+                simp only [Option.some.injEq, Prod.mk.injEq] at hpl
+                rcases hpl with ⟨rfl, rfl, rfl⟩
+                have hs1 := (findFreeOffset_sound _ _ _ _ hf1).1
+                have hs2 := (findFreeOffset_sound _ _ _ _ hf2).1
+                have ha1 := alignUp_ge (k * (2 * min (alignUp n 8) (max ((128 : Nat) >>> shPref) 32))) Vane.Program.dmaLineBytes
+                have ha2 := alignUp_ge (if decide (target.profile.directThreshold 0 shMax ≥ min 32 n) = true then ((1 : Nat) <<< ceilLog2 m) * 512 else m * (2 * min (alignUp n 8) (max ((128 : Nat) >>> shPref) 32))) Vane.Program.dmaLineBytes
+                omega
+          · obtain ⟨sb', hf1, hpl⟩ := Option.map_eq_some_iff.mp hpl
+            simp only [Prod.mk.injEq] at hpl
+            rcases hpl with ⟨rfl, rfl, rfl⟩
+            have hs1 := (findFreeOffset_sound _ _ _ _ hf1).1
+            have ha1 := alignUp_ge (k * (2 * min (alignUp n 8) (max ((128 : Nat) >>> shPref) 32))) Vane.Program.dmaLineBytes
+            omega
+          · obtain ⟨rb', hf1, hpl⟩ := Option.map_eq_some_iff.mp hpl
+            simp only [Prod.mk.injEq] at hpl
+            rcases hpl with ⟨rfl, rfl, rfl⟩
+            have hs1 := (findFreeOffset_sound _ _ _ _ hf1).1
+            have ha1 := alignUp_ge (if decide (target.profile.directThreshold 0 shMax ≥ min 32 n) = true then ((1 : Nat) <<< ceilLog2 m) * 512 else m * (2 * min (alignUp n 8) (max ((128 : Nat) >>> shPref) 32))) Vane.Program.dmaLineBytes
+            omega
+          · simp only [Option.some.injEq, Prod.mk.injEq] at hpl
+            rcases hpl with ⟨_, _, rfl⟩
+            exact hmaxOcc
+        refine ⟨hm1, hm16, hk1, hn1, hn65, rfl, rfl, hcl.2 hm16, hcl.1 hm1, rfl, rfl, rfl,
+          by omega, by omega, ?_, ?_, hpeak⟩
+        · simpa [stripWidth] using hstrip.1
+        · simpa [stripWidth] using hstrip.2
+      · simp at h2
+    · simp at h2
+  · cases hok
+
+/-- Full legality bounds extracted from `validateConvTiling`: covers `logNE`, `fat`, `f`, `wu`,
+    `ocg`, `cout` coverage, `stripWidth`, `shPref`, `shMax`, `tileHeight`, 64-byte L2 alignment,
+    and the 2 MiB L2 SRAM capacity cap. -/
+theorem validateConvTiling_full_bounds
+    (target : Target) (sh : ConvSpec) (t : Tiling)
+    (extraChunkBytes : Nat := 0) (hasBiasInKernel : Bool := false)
+    (h : validateConvTiling target sh t extraChunkBytes hasBiasInKernel = .ok ()) :
+    t.logNE ≤ 4 ∧
+    t.fat ≤ 1 ∧
+    t.f + t.fat ≤ t.logNE ∧
+    t.wu ≤ 3 ∧
+    (sh.effMode = .depthwise → t.ocg = 0) ∧
+    (sh.effMode = .dense →
+      t.ocg ≤ (if sh.kernelSize == 3 && sh.stride == 1 then target.profile.dense3x3Stride1MaxOcg else 4)) ∧
+    (sh.effMode = .dense → sh.kernelSize = 1 → sh.cout ≤ target.profile.conv1x1MaxCout t.f t.ocg) ∧
+    8 ≤ stripWidth t ∧ stripWidth t ≤ 256 ∧
+    t.shPref ≤ t.shMax ∧ t.shMax ≤ 4 ∧
+    1 ≤ t.tileHeight ∧ t.tileHeight ≤ sh.outH ∧
+    resBaseBytesConv sh t % 64 = 0 ∧
+    l2UseBytesConv target sh t ≤ l2CapacityBytes := by
+  unfold validateConvTiling at h
+  obtain ⟨⟨⟩, hsaf, hpol⟩ := except_bind_ok h
+  unfold validateConvSafety at hsaf
+  obtain ⟨⟨⟩, _, hsaf⟩ := except_bind_ok hsaf
+  obtain ⟨hLogNE, hsaf⟩ := except_if_err_ok hsaf
+  obtain ⟨hFat, hsaf⟩ := except_if_err_ok hsaf
+  obtain ⟨hFfat, hsaf⟩ := except_if_err_ok hsaf
+  obtain ⟨hWu, hsaf⟩ := except_if_err_ok hsaf
+  obtain ⟨⟨⟩, hocg, hsaf⟩ := except_bind_ok hsaf
+  obtain ⟨⟨⟩, hcov, hsaf⟩ := except_bind_ok hsaf
+  dsimp only at hsaf
+  obtain ⟨hstrip, hsaf⟩ := except_if_err_ok hsaf
+  obtain ⟨hSh, hsaf⟩ := except_if_err_ok hsaf
+  obtain ⟨hShMax, hsaf⟩ := except_if_err_ok hsaf
+  obtain ⟨hTh, hsaf⟩ := except_if_err_ok hsaf
+  obtain ⟨hL2, _⟩ := except_if_err_ok hsaf
+  simp only [Bool.or_eq_true, decide_eq_true_eq, not_or] at hstrip
+  have hThNe : t.tileHeight ≠ 0 := by simpa using hTh
+  unfold validateConvChooserPolicy at hpol
+  dsimp only at hpol
+  obtain ⟨_, hpol⟩ := except_if_do_throw_ok hpol
+  obtain ⟨_, hpol⟩ := except_if_do_throw_ok hpol
+  obtain ⟨_, hpol⟩ := except_if_do_throw_ok hpol
+  obtain ⟨hthHo, _⟩ := except_if_do_throw_ok hpol
+  have hocgDw : sh.effMode = .depthwise → t.ocg = 0 := by
+    intro hdw
+    unfold validateConvOcgSafety at hocg
+    rw [hdw] at hocg
+    obtain ⟨h0, _⟩ := except_if_err_ok hocg
+    simpa using h0
+  have hocgDense : sh.effMode = .dense →
+      t.ocg ≤ (if sh.kernelSize == 3 && sh.stride == 1 then target.profile.dense3x3Stride1MaxOcg else 4) := by
+    intro hd
+    unfold validateConvOcgSafety at hocg
+    rw [hd] at hocg
+    dsimp only at hocg
+    obtain ⟨hle, _⟩ := except_if_err_ok hocg
+    omega
+  have hcov1x1 : sh.effMode = .dense → sh.kernelSize = 1 →
+      sh.cout ≤ target.profile.conv1x1MaxCout t.f t.ocg := by
+    intro hd hk1
+    unfold validateConvCoverageSafety at hcov
+    rw [hd] at hcov
+    dsimp only at hcov
+    simp only [hk1, beq_self_eq_true, ↓reduceIte] at hcov
+    obtain ⟨hle, _⟩ := except_if_err_ok hcov
+    omega
+  exact ⟨by omega, by omega, by omega, by omega, hocgDw, hocgDense, hcov1x1,
+    by omega, by omega, by omega, by omega, by omega, by omega,
+    alignUp_dvd _ 64 (by omega), by omega⟩
+
+/-- Any tiling returned by production `chooseConvTiling` passes `validateConvTiling`. -/
+theorem chooseConvTiling_valid
+    (target : Target) (sh : ConvSpec) (t : Tiling)
+    (extraChunkBytes : Nat := 0) (hasBiasInKernel : Bool := false)
+    (h : chooseConvTiling target sh extraChunkBytes hasBiasInKernel = .ok t) :
+    validateConvTiling target sh t extraChunkBytes hasBiasInKernel = .ok () := by
+  unfold chooseConvTiling at h
+  obtain ⟨⟨⟩, _, h⟩ := except_bind_ok h
+  dsimp only at h
+  split at h
+  · rename_i cand hch
+    simp only [Except.ok.injEq] at h
+    subst h
+    obtain ⟨logNE, _, h1⟩ := findFirstSome_eq_some hch
+    obtain ⟨fat, _, h2⟩ := findFirstSome_eq_some h1
+    obtain ⟨f, _, h3⟩ := findFirstSome_eq_some h2
+    split at h3
+    · split at h3
+      · cases h3
+      · obtain ⟨shPref, _, h4⟩ := findFirstSome_eq_some h3
+        split at h4
+        · split at h4
+          · obtain ⟨shMax, _, h5⟩ := findFirstSome_eq_some h4
+            split at h5
+            · split at h5
+              · rename_i hv
+                simp only [Option.some.injEq] at h5
+                subst h5
+                exact hv
+              · cases h5
+            · simp at h5
+          · simp at h4
+        · simp at h4
+    · simp at h3
+  · cases h
+
+/-- Direct legality bridge for production `chooseConvTiling`: every `.ok t` satisfies all hardware
+    safety bounds, `ocg` & channel-coverage bounds, strip width, alignment, and the 2 MiB L2 cap. -/
+theorem chooseConvTiling_legal
+    (target : Target) (sh : ConvSpec) (t : Tiling)
+    (extraChunkBytes : Nat := 0) (hasBiasInKernel : Bool := false)
+    (h : chooseConvTiling target sh extraChunkBytes hasBiasInKernel = .ok t) :
+    t.logNE ≤ 4 ∧ t.fat ≤ 1 ∧ t.f + t.fat ≤ t.logNE ∧ t.wu ≤ 3 ∧
+    (sh.effMode = .depthwise → t.ocg = 0) ∧
+    (sh.effMode = .dense →
+      t.ocg ≤ (if sh.kernelSize == 3 && sh.stride == 1 then target.profile.dense3x3Stride1MaxOcg else 4)) ∧
+    (sh.effMode = .dense → sh.kernelSize = 1 → sh.cout ≤ target.profile.conv1x1MaxCout t.f t.ocg) ∧
+    8 ≤ stripWidth t ∧ stripWidth t ≤ 256 ∧
+    t.shPref ≤ t.shMax ∧ t.shMax ≤ 4 ∧
+    1 ≤ t.tileHeight ∧ t.tileHeight ≤ sh.outH ∧
+    resBaseBytesConv sh t % 64 = 0 ∧
+    l2UseBytesConv target sh t ≤ l2CapacityBytes :=
+  validateConvTiling_full_bounds target sh t extraChunkBytes hasBiasInKernel
+    (chooseConvTiling_valid target sh t extraChunkBytes hasBiasInKernel h)
+
+/-- Direct legality bridge for 1x1 conv tiling (`chooseTiling`): every `.ok t` satisfies
+    `ocg ≤ 4`, `Cout ≤ 2^(f + ocg + bonus)`, alignment, and `l2UseBytes ≤ 2 MiB`. -/
+theorem chooseTiling_conv1x1_legal
+    (target : Target) (sh : Conv1x1Shape) (t : Tiling)
+    (h : chooseTiling target sh = .ok t) :
+    t.logNE ≤ 4 ∧ t.fat ≤ 1 ∧ t.f + t.fat ≤ t.logNE ∧ t.wu ≤ 3 ∧
+    t.ocg ≤ 4 ∧
+    sh.cout ≤ target.profile.conv1x1MaxCout t.f t.ocg ∧
+    8 ≤ stripWidth t ∧ stripWidth t ≤ 256 ∧
+    t.shPref ≤ t.shMax ∧ t.shMax ≤ 4 ∧
+    1 ≤ t.tileHeight ∧ t.tileHeight ≤ sh.h ∧
+    l2UseBytes target sh t ≤ l2CapacityBytes := by
+  have hb := chooseConvTiling_legal target sh.toConvSpec t 0 false h
+  have heff : sh.toConvSpec.effMode = .dense := rfl
+  have hk1 : sh.toConvSpec.kernelSize = 1 := rfl
+  have hocg4 := hb.2.2.2.2.2.1 heff
+  have hcov := hb.2.2.2.2.2.2.1 heff hk1
+  exact ⟨hb.1, hb.2.1, hb.2.2.1, hb.2.2.2.1, hocg4, hcov,
+    hb.2.2.2.2.2.2.2.1, hb.2.2.2.2.2.2.2.2.1, hb.2.2.2.2.2.2.2.2.2.1, hb.2.2.2.2.2.2.2.2.2.2.1,
+    hb.2.2.2.2.2.2.2.2.2.2.2.1, hb.2.2.2.2.2.2.2.2.2.2.2.2.1, hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2⟩
+
+/-- Direct legality bridge for 3x3 conv tiling (`chooseConv3x3Tiling`): every `.ok t` satisfies
+    `ocg` bounds, strip width, tile height, and `l2UseBytes3x3 ≤ 2 MiB`. -/
+theorem chooseConv3x3Tiling_legal
+    (target : Target) (sh : Conv3x3Shape) (t : Tiling)
+    (h : chooseConv3x3Tiling target sh = .ok t) :
+    t.logNE ≤ 4 ∧ t.fat ≤ 1 ∧ t.f + t.fat ≤ t.logNE ∧ t.wu ≤ 3 ∧
+    (sh.effMode = .depthwise → t.ocg = 0) ∧
+    (sh.effMode = .dense →
+      t.ocg ≤ (if sh.stride == 1 then target.profile.dense3x3Stride1MaxOcg else 4)) ∧
+    8 ≤ stripWidth t ∧ stripWidth t ≤ 256 ∧
+    t.shPref ≤ t.shMax ∧ t.shMax ≤ 4 ∧
+    1 ≤ t.tileHeight ∧ t.tileHeight ≤ sh.outH ∧
+    l2UseBytes3x3 target sh t ≤ l2CapacityBytes := by
+  have hb := chooseConvTiling_legal target sh.toConvSpec t 0 false h
+  exact ⟨hb.1, hb.2.1, hb.2.2.1, hb.2.2.2.1, hb.2.2.2.2.1, hb.2.2.2.2.2.1,
+    hb.2.2.2.2.2.2.2.1, hb.2.2.2.2.2.2.2.2.1, hb.2.2.2.2.2.2.2.2.2.1, hb.2.2.2.2.2.2.2.2.2.2.1,
+    hb.2.2.2.2.2.2.2.2.2.2.2.1, hb.2.2.2.2.2.2.2.2.2.2.2.2.1, hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2⟩
+
+private theorem foldl_add_replicate (n s init : Nat) :
+    (Array.replicate n s).foldl (· + ·) init = init + n * s := by
+  induction n generalizing init with
+  | zero => simp
+  | succ k ih =>
+    have hpush : Array.replicate (k + 1) s = (Array.replicate k s).push s := by
+      apply Array.ext'
+      simp [List.replicate_succ']
+    rw [hpush, Array.foldl_push, ih]
+    rw [Nat.succ_mul]
+    omega
+
+/-- Soundness & output-channel conservation for production `chooseConv1x1OutputSlices`:
+    whenever `.ok slices` is returned, `1 ≤ slices.size ≤ 255`, the slice widths sum to exact
+    `cout`, and every slice width `s ∈ slices` admits a legal single-task `chooseConvTiling`. -/
+theorem chooseConv1x1OutputSlices_sound
+    (target : Target) (h w cin cout : Nat)
+    (extraChunkBytes : Nat := 0) (hasBias : Bool := false)
+    (slices : Array Nat)
+    (hok : chooseConv1x1OutputSlices target h w cin cout extraChunkBytes hasBias = .ok slices) :
+    1 ≤ slices.size ∧ slices.size ≤ 255 ∧
+    slices.foldl (· + ·) 0 = cout ∧
+    ∀ s ∈ slices.toList,
+      1 ≤ s ∧ s ≤ cout ∧
+      (chooseConvTiling target { kernelSize := 1, mode := .dense, h := h, w := w, cin := cin, cout := s }
+        extraChunkBytes (hasBias && s > 1)).isOk = true := by
+  unfold chooseConv1x1OutputSlices at hok
+  obtain ⟨⟨⟩, hsh, hok⟩ := except_bind_ok hok
+  have hcoutPos : 1 ≤ cout := by
+    unfold validateConvShape at hsh
+    obtain ⟨_, hsh⟩ := except_if_do_throw_ok hsh
+    obtain ⟨_, hsh⟩ := except_if_do_throw_ok hsh
+    obtain ⟨_, hsh⟩ := except_if_do_throw_ok hsh
+    obtain ⟨_, hsh⟩ := except_if_do_throw_ok hsh
+    obtain ⟨hc, _⟩ := except_if_do_throw_ok hsh
+    simp only [Bool.or_eq_true, beq_iff_eq, decide_eq_true_eq, not_or] at hc
+    omega
+  dsimp only at hok
+  split at hok
+  · rename_i hfit
+    simp only [pure, Except.pure, Except.ok.injEq] at hok
+    subst hok
+    refine ⟨by simp, by simp, by simp, ?_⟩
+    intro s hs
+    simp only [List.mem_singleton] at hs
+    subst hs
+    exact ⟨hcoutPos, Nat.le_refl _, hfit⟩
+  · obtain ⟨_, hok⟩ := except_if_do_throw_ok hok
+    split at hok
+    · rename_i sl hch
+      simp only [pure, Except.pure, Except.ok.injEq] at hok
+      subst hok
+      obtain ⟨alignStep, _, h1⟩ := findFirstSome_eq_some hch
+      obtain ⟨idx, _, htry⟩ := findFirstSome_eq_some h1
+      generalize (min (cout - 1) (target.profile.conv1x1MaxCout 4 4) / alignStep) * alignStep - idx * alignStep = s at htry
+      split at htry
+      · cases htry
+      · rename_i hsBounds
+        simp only [Bool.or_eq_true, beq_iff_eq, decide_eq_true_eq, not_or] at hsBounds
+        have hsPos : 1 ≤ s := by omega
+        have hsLt : s < cout := by omega
+        split at htry
+        · cases htry
+        · rename_i hnum255
+          split at htry
+          · rename_i hcan
+            simp only [Option.some.injEq] at htry
+            subst htry
+            simp only [Bool.and_eq_true, Bool.or_eq_true, beq_iff_eq] at hcan
+            rcases hcan with ⟨hfitS, hremCase⟩
+            have hdivMod : s * (cout / s) + cout % s = cout := Nat.div_add_mod cout s
+            have hmulComm : (cout / s) * s = s * (cout / s) := Nat.mul_comm _ _
+            have hqPos : 1 ≤ cout / s := Nat.div_pos (by omega) hsPos
+            have hceilEq : ceilDiv cout s = cout / s + (if cout % s = 0 then 0 else 1) := by
+              unfold ceilDiv
+              have hs0 : (s == 0) = false := by simp; omega
+              rw [hs0]; simp only [Bool.false_eq_true, ↓reduceIte]
+              by_cases hr0 : cout % s = 0
+              · simp only [hr0, ↓reduceIte, Nat.add_zero]
+                have h1 : cout + s - 1 = s * (cout / s) + (s - 1) := by omega
+                rw [h1, Nat.mul_add_div hsPos, show (s - 1) / s = 0 from Nat.div_eq_of_lt (by omega)]
+                omega
+              · simp only [hr0, ↓reduceIte]
+                have hrLt : cout % s < s := Nat.mod_lt cout hsPos
+                have hrPos : 1 ≤ cout % s := by omega
+                have h1 : cout + s - 1 = s * (cout / s + 1) + (cout % s - 1) := by
+                  rw [Nat.mul_add, Nat.mul_one]; omega
+                rw [h1, Nat.mul_add_div hsPos, show (cout % s - 1) / s = 0 from Nat.div_eq_of_lt (by omega)]
+            by_cases hr0 : cout % s = 0
+            · simp only [hr0, beq_self_eq_true, ↓reduceIte] at hceilEq ⊢
+              refine ⟨by simp; omega, by simp; omega, ?_, ?_⟩
+              · rw [foldl_add_replicate]; omega
+              · intro x hx
+                simp only [Array.toList_replicate, List.mem_replicate] at hx
+                rcases hx with ⟨_, rfl⟩
+                exact ⟨hsPos, by omega, hfitS⟩
+            · have hr0B : (cout % s == 0) = false := by simp [hr0]
+              simp only [hr0, hr0B, Bool.false_eq_true, ↓reduceIte] at hceilEq ⊢
+              have hfitRem : (chooseConvTiling target
+                  { kernelSize := 1, mode := .dense, h := h, w := w, cin := cin, cout := cout % s }
+                  extraChunkBytes (hasBias && decide (cout % s > 1))).isOk = true := by
+                rcases hremCase with heq | hokR
+                · exact absurd heq hr0
+                · exact hokR
+              refine ⟨by simp [Array.size_push], by simp [Array.size_push]; omega, ?_, ?_⟩
+              · rw [Array.foldl_push, foldl_add_replicate]; omega
+              · intro x hx
+                simp only [Array.toList_push, Array.toList_replicate, List.mem_append,
+                           List.mem_replicate, List.mem_singleton] at hx
+                rcases hx with ⟨_, rfl⟩ | rfl
+                · exact ⟨hsPos, by omega, hfitS⟩
+                · have hrLt : cout % s < s := Nat.mod_lt cout hsPos
+                  exact ⟨by omega, by omega, hfitRem⟩
+          · cases htry
+    · cases hok
 
 end Vane.Proofs
