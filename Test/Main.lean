@@ -15,6 +15,7 @@ open Vane.Pool
 open Vane.Conv
 open Vane.Conv1x1
 open Vane.Conv3x3
+open Vane.View
 
 structure TestResult where
   name : String
@@ -4854,8 +4855,420 @@ private def runTargetMatrixTests : IO (Array TestResult) := do
 
   return results
 
+-- ===========================================================================
+-- Milestone 5C Tests: Views, Large-Channel Output-Split Conv1x1/Linear, S5 Multi-Writer
+-- ===========================================================================
+
+private def rebuildTaskWithExtraWrites
+    (t : DecodedTask) (totalTasks : Nat) (extraPlain : Array RegWrite) : Except String TaskDesc := do
+  let ene ← decodeFieldChecked taskHeader8MultiLayout t.header[8]! "ene"
+  let mut plain : Array RegWrite := #[]
+  let mut bars : Array BarRegWrite := #[]
+  let mut kRelocs : Array TaskReloc := #[]
+  let mut i := 0
+  while i < t.writes.size do
+    let w := t.writes[i]!
+    match w.barSlot with
+    | none =>
+      plain := plain.push { byteAddr := w.byteAddr, value := w.value }
+      i := i + 1
+    | some slot =>
+      if i + 1 < t.writes.size && t.writes[i + 1]!.barSlot == some slot && t.writes[i + 1]!.byteAddr == w.byteAddr + 4 then
+        let bIdx := bars.size
+        bars := bars.push { baseByteAddr := w.byteAddr, barSlot := slot, values := #[w.value, t.writes[i + 1]!.value] }
+        if w.byteAddr == regKernelBaseLo then
+          kRelocs := kRelocs.push { barRecIndex := bIdx, payloadWordIndex := 0 }
+        i := i + 2
+      else
+        bars := bars.push { baseByteAddr := w.byteAddr, barSlot := slot, values := #[w.value] }
+        i := i + 1
+  pure {
+    taskId := t.taskIndex
+    logNE := 0
+    eneOverride := some ene.toNat
+    isFirst := t.taskIndex == 0
+    isLast := t.taskIndex + 1 == totalTasks
+    liveL2Mask := t.header[7]!
+    plainWrites := plain ++ extraPlain
+    barWrites := bars
+    kernelRelocs := kRelocs
+  }
+
+private def runM5cTests : IO (Array TestResult) := do
+  let mut results : Array TestResult := #[]
+
+  -- 1. Positive: transpose W-preserving (C<->H, N<->H, N<->C) on H16 & H17
+  results := results.push (checkOk "m5c: transpose W-preserving (C<->H, N<->H, N<->C) on H16 & H17" (do
+    let cases : Array (Shape4D × Array Nat) := #[
+      ({ n := 1, c := 16, h := 8, w := 32 }, #[0, 2, 1, 3]),
+      ({ n := 1, c := 13, h := 7, w := 19 }, #[0, 2, 1, 3]),
+      ({ n := 2, c := 8, h := 6, w := 32 }, #[2, 1, 0, 3]),
+      ({ n := 2, c := 8, h := 6, w := 32 }, #[1, 0, 2, 3]),
+      ({ n := 1, c := 8, h := 8, w := 16 }, #[0, 1, 2, 3])
+    ]
+    for tgt in #[Target.h16, Target.h17] do
+      for (sh, perm) in cases do
+        let vp ← planTranspose sh perm
+        let c ← compileView tgt vp
+        matrixVerify tgt c.hwx c.sections { total := 1, neConv := 0, neAct := 0, peOp := 0, neView := 1 }
+    pure ()
+  ))
+
+  -- 2. Positive: transpose T-mode (C<->W, c <= w) across all 4 groupCode regimes (1,2,4,8) & staged 9<=c<=16 on H16 & H17
+  results := results.push (checkOk "m5c: transpose T-mode C<->W (groupCode 1/2/4/8 & staged 9<=c<=16 w<32) on H16 & H17" (do
+    let cases : Array (Shape4D × Array Nat) := #[
+      ({ n := 1, c := 8,  h := 4, w := 16 }, #[0, 3, 2, 1]), -- groupCode=1
+      ({ n := 1, c := 12, h := 4, w := 16 }, #[0, 3, 2, 1]), -- groupCode=1, 9<=c<=16 & w<32
+      ({ n := 1, c := 24, h := 4, w := 32 }, #[0, 3, 2, 1]), -- groupCode=2, wideGroup=1
+      ({ n := 1, c := 48, h := 4, w := 64 }, #[0, 3, 2, 1]), -- groupCode=4, wideGroup=1
+      ({ n := 1, c := 80, h := 2, w := 96 }, #[0, 3, 2, 1]), -- groupCode=8, ocg=3 (must classify as neView!)
+      ({ n := 2, c := 16, h := 4, w := 32 }, #[0, 3, 2, 1])  -- 4D batch N=2 T-mode
+    ]
+    for tgt in #[Target.h16, Target.h17] do
+      for (sh, perm) in cases do
+        let vp ← planTranspose sh perm
+        let c ← compileView tgt vp
+        if sh.c == 12 && sh.w == 16 then
+          let tZero : Tiling := { logNE := 0, f := 0, fat := 0, ocg := 0, shPref := 0, shMax := 0, tileHeight := 4 }
+          if viewIsDirect tgt vp.copies[0]! tZero then
+            throw s!"{tgt.name}: expected viewIsDirect=false for 9<=c<=16, shPref=0, w<32"
+        matrixVerify tgt c.hwx c.sections { total := 1, neConv := 0, neAct := 0, peOp := 0, neView := 1 }
+    pure ()
+  ))
+
+  -- 3. Positive: slice (N/C/H/32-aligned W + strided H) on H16 & H17
+  results := results.push (checkOk "m5c: slice (N, C, H, 32-aligned W, strided H) on H16 & H17" (do
+    let cases : Array (Shape4D × Array Nat × Array Nat × Array Nat) := #[
+      ({ n := 1, c := 32, h := 8, w := 32 }, #[0, 8, 0, 0],  #[1, 24, 8, 32], #[1, 1, 1, 1]),
+      ({ n := 1, c := 16, h := 16, w := 32 }, #[0, 0, 4, 0], #[1, 16, 12, 32], #[1, 1, 1, 1]),
+      ({ n := 1, c := 8,  h := 8, w := 96 }, #[0, 0, 0, 32], #[1, 8, 8, 64],  #[1, 1, 1, 1]),
+      ({ n := 1, c := 16, h := 16, w := 32 }, #[0, 0, 1, 0], #[1, 16, 15, 32], #[1, 1, 2, 1]),
+      ({ n := 4, c := 8,  h := 6, w := 32 }, #[1, 0, 0, 0],  #[3, 8, 6, 32],  #[1, 1, 1, 1])
+    ]
+    for tgt in #[Target.h16, Target.h17] do
+      for (sh, beg, en, st) in cases do
+        let vp ← planSlice sh beg en st
+        let c ← compileView tgt vp
+        matrixVerify tgt c.hwx c.sections { total := 1, neConv := 0, neAct := 0, peOp := 0, neView := 1 }
+    pure ()
+  ))
+
+  -- 4. Positive: concat (C 2-input & 3-input, H, 32-aligned W) on H16 & H17
+  results := results.push (checkOk "m5c: concat (C 2/3-input, H, 32-aligned W) on H16 & H17" (do
+    let cases : Array (Array Shape4D × Nat) := #[
+      (#[( { n := 1, c := 16, h := 8, w := 32 } ), ( { n := 1, c := 24, h := 8, w := 32 } )], 1),
+      (#[( { n := 1, c := 8, h := 6, w := 16 } ), ( { n := 1, c := 12, h := 6, w := 16 } ), ( { n := 1, c := 4, h := 6, w := 16 } )], 1),
+      (#[( { n := 1, c := 8, h := 4, w := 32 } ), ( { n := 1, c := 8, h := 6, w := 32 } )], 2),
+      (#[( { n := 1, c := 8, h := 4, w := 32 } ), ( { n := 1, c := 8, h := 4, w := 64 } )], 3)
+    ]
+    for tgt in #[Target.h16, Target.h17] do
+      for (shs, ax) in cases do
+        let vp ← planConcat shs ax
+        let c ← compileView tgt vp
+        matrixVerify tgt c.hwx c.sections { total := shs.size, neConv := 0, neAct := 0, peOp := 0, neView := shs.size }
+    pure ()
+  ))
+
+  -- 5. Positive: split (C, H, 32-aligned W) & reshape (viewStrides) on H16 & H17
+  results := results.push (checkOk "m5c: split (C, H, 32-aligned W) & reshape (viewStrides) on H16 & H17" (do
+    for tgt in #[Target.h16, Target.h17] do
+      for part in [:3] do
+        let vp ← planSplitPart { n := 1, c := 24, h := 8, w := 32 } 1 #[8, 8, 8] part
+        let c ← compileView tgt vp
+        matrixVerify tgt c.hwx c.sections { total := 1, neConv := 0, neAct := 0, peOp := 0, neView := 1 }
+      let vpH ← planSplitPart { n := 1, c := 8, h := 12, w := 32 } 2 #[4, 8] 1
+      let cH ← compileView tgt vpH
+      matrixVerify tgt cH.hwx cH.sections { total := 1, neConv := 0, neAct := 0, peOp := 0, neView := 1 }
+      let vpW ← planSplitPart { n := 1, c := 8, h := 4, w := 96 } 3 #[32, 64] 1
+      let cW ← compileView tgt vpW
+      matrixVerify tgt cW.hwx cW.sections { total := 1, neConv := 0, neAct := 0, peOp := 0, neView := 1 }
+
+      let reshapes : Array (Shape4D × Shape4D) := #[
+        ({ n := 1, c := 16, h := 8, w := 32 }, { n := 1, c := 32, h := 4, w := 32 }),
+        ({ n := 1, c := 4,  h := 4, w := 64 }, { n := 1, c := 4,  h := 8, w := 32 }),
+        ({ n := 1, c := 8,  h := 4, w := 16 }, { n := 1, c := 32, h := 1, w := 16 }),
+        ({ n := 2, c := 8,  h := 4, w := 32 }, { n := 4, c := 4,  h := 4, w := 32 })
+      ]
+      for (xSh, ySh) in reshapes do
+        let vpR ← planReshape xSh ySh
+        let cR ← compileView tgt vpR
+        matrixVerify tgt cR.hwx cR.sections { total := 1, neConv := 0, neAct := 0, peOp := 0, neView := 1 }
+    pure ()
+  ))
+
+  -- 6. Positive: single-task conv1x1 bit-for-bit parity (chooseConv1x1OutputSlices == #[cout])
+  results := results.push (checkOk "m5c: small conv1x1 preserves single-task bit-for-bit parity with compileConv" (do
+    for tgt in #[Target.h16, Target.h17] do
+      let sh : Conv1x1Shape := { h := 8, w := 16, cin := 32, cout := 64 }
+      let slices ← chooseConv1x1OutputSlices tgt sh.h sh.w sh.cin sh.cout 0 true
+      if slices != #[64] then
+        throw s!"{tgt.name}: expected single slice #[64], got {slices}"
+      let w := mkM5aW1x1 32 64 5
+      let b := mkM5aBias 64
+      let cNew ← compileConv1x1 tgt sh w (some b) true
+      let cRef ← compileConv tgt sh.toConvSpec w (some b) true
+      if cNew.hwx != cRef.hwx then
+        throw s!"{tgt.name}: single-task conv1x1 HWX diverged from compileConv!"
+    pure ()
+  ))
+
+  -- 7. Positive: large-channel auto-split conv1x1 & linear on H16 & H17
+  results := results.push (checkOk "m5c: large-channel auto-split conv1x1 & linear (256->512, 512->512, 1024->512, 512->2048) on H16 & H17" (do
+    let cases : Array (Nat × Nat × Nat × Nat × ConvActivation × Bool) := #[
+      (4, 16, 256, 512, .relu, true),
+      (4, 16, 512, 512, .lut .gelu, true),
+      (4, 16, 1024, 512, .lut .gelu, true), -- > 64 KiB/chunk on both H16 & H17
+      (1, 16, 512, 2048, .none, false)      -- > 512 Cout on both H16 & H17
+    ]
+    for tgt in #[Target.h16, Target.h17] do
+      for (h, w, cin, cout, act, withBias) in cases do
+        let wts := mkM5aW1x1 cin cout 3
+        let bias? := if withBias then some (mkM5aBias cout) else none
+        let c ← compileLinear tgt w cin cout wts bias? h false act
+        if c.slices.foldl (· + ·) 0 != cout then
+          throw s!"{tgt.name} ({cin}->{cout}): slice sum != {cout}"
+        if ((cin == 1024 && cout == 512) || cout == 2048) && c.slices.size < 2 then
+          throw s!"{tgt.name} ({cin}->{cout}): expected multi-task split (>= 2 slices), got {c.slices}"
+        if tgt == .h16 && cout == 512 && c.slices.size < 2 then
+          throw s!"h16 ({cin}->512): expected multi-task split (> 256 Cout cap), got {c.slices}"
+        matrixVerify tgt c.hwx c.sections { total := c.slices.size, neConv := c.slices.size, neAct := 0, peOp := 0 }
+    pure ()
+  ))
+
+  -- 8. Positive: U-Net skip-connection graph (conv3x3 -> conv1x1 -> concat(C) -> conv1x1) on H16 & H17
+  let mkUnetSkipGraph := fun (tgt : Target) => ({
+    target := tgt
+    defaultPlacement := .auto
+    inputs := #[{ name := "x", shape := { c := 16, h := 8, w := 32 } }]
+    nodes := #[
+      { id := "enc", inputs := #["x"], op := .conv3x3 .dense 16 16 1 .same (mkM5aW3x3 16 16 false) (some (mkM5aBias 16)) .relu },
+      { id := "mid", inputs := #["enc"], op := .conv1x1 16 16 (mkM5aW1x1 16 16 2) none .relu },
+      { id := "cat", inputs := #["mid", "enc"], op := .concat 1 },
+      { id := "dec", inputs := #["cat"], op := .conv1x1 32 16 (mkM5aW1x1 32 16 9) (some (mkM5aBias 16)) .none }
+    ]
+  } : Vane.Graph.GraphSpec)
+
+  for tgt in #[Target.h16, Target.h17] do
+    results := results.push (checkOk s!"m5c: {tgt.name} U-Net skip-concat graph (conv3x3 -> conv1x1 -> concat -> conv1x1) verifies S1-S5" (do
+      let g ← Vane.Graph.compileGraph (mkUnetSkipGraph tgt)
+      if g.taskCount != 5 then
+        throw s!"expected 5 tasks (conv3x3 + conv1x1 + 2 concat copies + conv1x1), got {g.taskCount}"
+      matrixVerify tgt g.hwx g.sections { total := 5, neConv := 3, neAct := 0, peOp := 0, neView := 2 }
+    ))
+
+  -- 9. Positive: Large-hidden Transformer FFN graph (RMSNorm -> linear(256->1024)+GELU -> linear(1024->256) + residual) on H16 & H17
+  for tgt in #[Target.h16, Target.h17] do
+    results := results.push (checkOk s!"m5c: {tgt.name} large-hidden Transformer FFN graph (RMSNorm -> linear 256->1024 GELU -> linear 1024->256 + add) verifies S1-S5" (do
+      let g ← Vane.Graph.compileGraph {
+        target := tgt
+        defaultPlacement := .auto
+        inputs := #[{ name := "x", shape := { c := 256, h := 1, w := 32 } }]
+        nodes := #[
+          { id := "sq",      inputs := #["x"], op := .pe1 .square },
+          { id := "ms",      inputs := #["sq"], op := .reduce .mean { reduceC := true } 0 },
+          { id := "ms_eps",  inputs := #["ms"], op := .pe1 (.scalarAdd (floatToF16 0.001)) },
+          { id := "inv_rms", inputs := #["ms_eps"], op := .lut (.lut .rsqrt) },
+          { id := "norm",    inputs := #["x", "inv_rms"], op := .pe2 .mul false },
+          { id := "up",      inputs := #["norm"], op := .linear 256 1024 (mkM5aW1x1 256 1024 1) (some (mkM5aBias 1024)) (.lut .gelu) },
+          { id := "down",    inputs := #["up"],   op := .linear 1024 256 (mkM5aW1x1 1024 256 2) (some (mkM5aBias 256)) .none },
+          { id := "out",     inputs := #["down", "x"], op := .pe2 .add false }
+        ]
+      }
+      if g.taskCount < 9 then
+        throw s!"expected >= 9 tasks due to output-split linear(256->1024), got {g.taskCount}"
+      let s ← verifyM5aGraph g g.taskCount
+      if s.neConv < 3 || s.neChannelReduce != 1 || s.neAct != 1 || s.peOp != 4 then
+        throw s!"unexpected task mix: {repr s}"
+      pure ()
+    ))
+
+  -- 10. Positive: View-chained graphs (transpose -> slice -> reshape -> conv1x1, plus H/W concat -> conv1x1) on H16 & H17
+  results := results.push (checkOk "m5c: view-chained graphs (transpose->slice->reshape->conv1x1 & H/W concat->conv1x1) on H16 & H17" (do
+    for tgt in #[Target.h16, Target.h17] do
+      let g1 ← Vane.Graph.compileGraph {
+        target := tgt
+        inputs := #[{ name := "x", shape := { c := 8, h := 16, w := 32 } }]
+        nodes := #[
+          { id := "tr", inputs := #["x"], op := .transpose #[0, 2, 1, 3] },
+          { id := "sl", inputs := #["tr"], op := .slice #[0, 0, 0, 0] #[1, 8, 8, 32] #[1, 1, 1, 1] },
+          { id := "rs", inputs := #["sl"], op := .reshape { c := 16, h := 4, w := 32 } },
+          { id := "c0", inputs := #["rs"], op := .conv1x1 16 8 (mkM5aW1x1 16 8 3) none .relu }
+        ]
+      }
+      matrixVerify tgt g1.hwx g1.sections { total := 4, neConv := 1, neAct := 0, peOp := 0, neView := 3 }
+
+      let gH ← Vane.Graph.compileGraph {
+        target := tgt
+        inputs := #[
+          { name := "a", shape := { c := 8, h := 4, w := 32 } },
+          { name := "b", shape := { c := 8, h := 4, w := 32 } }
+        ]
+        nodes := #[
+          { id := "cat", inputs := #["a", "b"], op := .concat 2 },
+          { id := "c0",  inputs := #["cat"], op := .conv1x1 8 8 (mkM5aW1x1 8 8 4) none .none }
+        ]
+      }
+      matrixVerify tgt gH.hwx gH.sections { total := 3, neConv := 1, neAct := 0, peOp := 0, neView := 2 }
+
+      let gW ← Vane.Graph.compileGraph {
+        target := tgt
+        inputs := #[
+          { name := "a", shape := { c := 8, h := 4, w := 32 } },
+          { name := "b", shape := { c := 8, h := 4, w := 32 } }
+        ]
+        nodes := #[
+          { id := "cat", inputs := #["a", "b"], op := .concat 3 },
+          { id := "c0",  inputs := #["cat"], op := .conv1x1 8 8 (mkM5aW1x1 8 8 5) none .none }
+        ]
+      }
+      matrixVerify tgt gW.hwx gW.sections { total := 3, neConv := 1, neAct := 0, peOp := 0, neView := 2 }
+    pure ()
+  ))
+
+  -- 11. Negative compiler checks: unsupported T-mode C > W, non-32-aligned W views, non-contiguous reshape
+  results := results.push (checkErr "m5c neg: T-mode transpose C > W exceeding ane_hx_dma_tile rejected by planTranspose" (do
+    let _ ← planTranspose { n := 1, c := 64, h := 8, w := 16 } #[0, 3, 2, 1]
+    pure ()
+  ) "ane_hx_dma_tile")
+
+  results := results.push (checkErr "m5c neg: slice with non-32-aligned W begin rejected" (do
+    let _ ← planSlice { n := 1, c := 8, h := 8, w := 64 } #[0, 0, 0, 16] #[1, 8, 8, 48] #[1, 1, 1, 1]
+    pure ()
+  ) "multiple of 32")
+
+  results := results.push (checkErr "m5c neg: concat along W with non-32-aligned input width rejected" (do
+    let _ ← planConcat #[{ n := 1, c := 8, h := 4, w := 16 }, { n := 1, c := 8, h := 4, w := 32 }] 3
+    pure ()
+  ) "multiple of 32")
+
+  results := results.push (checkErr "m5c neg: split along W with non-32-aligned part start rejected" (do
+    let _ ← planSplitPart { n := 1, c := 8, h := 4, w := 48 } 3 #[16, 32] 1
+    pure ()
+  ) "multiple of 32")
+
+  results := results.push (checkErr "m5c neg: reshape crossing 64B padded W boundary rejected" (do
+    let _ ← planReshape { n := 1, c := 4, h := 4, w := 24 } { n := 1, c := 4, h := 2, w := 48 }
+    pure ()
+  ) "non-contiguous")
+
+  -- 12. Negative verifier tamper tests: unmodelled DMA registers (0x4d84, 0x5150, 0x5104)
+  let baseViewCopy ← match (do
+      let vp ← planTranspose { n := 1, c := 8, h := 8, w := 32 } #[0, 2, 1, 3]
+      compileView .h17 vp) with
+    | .ok c => pure c
+    | .error e => throw (IO.userError s!"baseViewCopy setup failed: {e}")
+
+  for (regAddr, regName) in #[(regSrc1DmaCrop, "0x4d84"), (regResDmaViewOff, "0x5150"), (regResDmaWarWait, "0x5104")] do
+    results := results.push (checkErr s!"m5c neg tamper: unmodelled DMA register {regName} rejected by verifier" (do
+      let textBytes ← readSlice baseViewCopy.hwx baseViewCopy.info.textSection.offset.toNat baseViewCopy.info.textSection.size.toNat
+      let decoded ← decodeTaskStream .h17 textBytes
+      let td ← rebuildTaskWithExtraWrites decoded[0]! 1 #[{ byteAddr := regAddr, value := 0x00000040 }]
+      let inSurf ← makeFp16Surface .h17 "x" "input_x" .input 8 8 32
+      let outSurf ← makeFp16Surface .h17 "y" "output_y" .output 8 8 32
+      let em ← emitProgram {
+        target := .h17, surfaces := #[inSurf, outSurf], tasks := #[td],
+        kernel := none, scratch := none, constants := zeroBytes textConstBytes, ident := some "vane"
+      }
+      let _ ← verifyHwxTasksSummary em.hwx em.info (requireKnownTask := true)
+      pure ()
+    ) "unmodelled DMA register")
+
+  -- 13. Negative verifier tamper tests on neView: out-of-bounds inOff/outOff, groupCode, transposeWideGroup, ocg, neScale, T-mode tile overflow
+  let baseTModeView ← match (do
+      let vp ← planTranspose { n := 1, c := 24, h := 4, w := 32 } #[0, 3, 2, 1]
+      compileView .h17 vp) with
+    | .ok c => pure c
+    | .error e => throw (IO.userError s!"baseTModeView setup failed: {e}")
+
+  results := results.push (checkErr "m5c neg tamper: neView out-of-bounds src1BaseLo (0x4d10) rejected by verifier" (do
+    tamperM5aTaskReg baseViewCopy.hwx baseViewCopy.info 0 regSrc1BaseLo 0x1000
+  ) "ane_hx_dma_tile bound")
+
+  results := results.push (checkErr "m5c neg tamper: neView out-of-bounds resBaseLo (0x5108) rejected by verifier" (do
+    tamperM5aTaskReg baseViewCopy.hwx baseViewCopy.info 0 regResBaseLo 0x1000
+  ) "ane_hx_dma_tile bound")
+
+  results := results.push (checkErr "m5c neg tamper: neView wrong dwGroups/groupCode rejected by verifier" (do
+    let badDw ← encodeWord dwGroupsLayout #[("perGroupIn", 1)]
+    tamperM5aTaskReg baseTModeView.hwx baseTModeView.info 0 regDwGroups badDw
+  ) "groupCode=1 != expected 2")
+
+  results := results.push (checkErr "m5c neg tamper: neView missing transposeWideGroup bit 29 for C=24 rejected by verifier" (do
+    let fNc ← findM5aTaskRegOffset baseTModeView.hwx baseTModeView.info 0 regNeCommon
+    let orig ← readU32LE baseTModeView.hwx fNc
+    tamperM5aTaskReg baseTModeView.hwx baseTModeView.info 0 regNeCommon (orig &&& (~~~((1 : UInt32) <<< 29)))
+  ) "transposeWideGroup")
+
+  results := results.push (checkErr "m5c neg tamper: neView wrong neTile.ocg for T-mode rejected by verifier" (do
+    let fNt ← findM5aTaskRegOffset baseTModeView.hwx baseTModeView.info 0 regNeTile
+    let orig ← readU32LE baseTModeView.hwx fNt
+    -- clear ocg bits [2:0] to 0 instead of 1
+    tamperM5aTaskReg baseTModeView.hwx baseTModeView.info 0 regNeTile (orig &&& (~~~(0x7 : UInt32)))
+  ) "neTile ocg")
+
+  results := results.push (checkErr "m5c neg tamper: neView wrong neScale (!= 0x3c00) rejected by verifier" (do
+    tamperM5aTaskReg baseViewCopy.hwx baseViewCopy.info 0 regNeScale 0x00004000
+  ) "neScale")
+
+  results := results.push (checkErr "m5c neg tamper: T-mode neView inflated resDmaPlaneStride exceeding ane_hx_dma_tile rejected" (do
+    let fPs ← findM5aTaskRegOffset baseTModeView.hwx baseTModeView.info 0 regResDmaPlaneStride
+    let orig ← readU32LE baseTModeView.hwx fPs
+    tamperM5aTaskReg baseTModeView.hwx baseTModeView.info 0 regResDmaPlaneStride (orig + 0x400)
+  ) "ane_hx_dma_tile bound")
+
+  -- 14. Negative verifier tamper: out-of-bounds resBaseLo on split conv1x1
+  let baseSplitConv ← match compileLinear .h16 16 256 512 (mkM5aW1x1 256 512 1) none 4 false .none with
+    | .ok c => pure c
+    | .error e => throw (IO.userError s!"baseSplitConv setup failed: {e}")
+
+  results := results.push (checkErr "m5c neg tamper: split conv1x1 out-of-bounds resBaseLo (0x5108) rejected by verifier" (do
+    let fRes ← findM5aTaskRegOffset baseSplitConv.hwx baseSplitConv.info 1 regResBaseLo
+    let orig ← readU32LE baseSplitConv.hwx fRes
+    tamperM5aTaskReg baseSplitConv.hwx baseSplitConv.info 1 regResBaseLo (orig + 0x1000)
+  ) "exceeds")
+
+  -- 15. Negative verifier tamper (S5 multi-writer): scratch read with gap between two writers rejected
+  let baseUnetH17 ← match Vane.Graph.compileGraph (mkUnetSkipGraph .h17) with
+    | .ok g => pure g
+    | .error e => throw (IO.userError s!"baseUnetH17 setup failed: {e}")
+
+  results := results.push (checkErr "m5c neg tamper: S5 multi-writer scratch read with gap between concat writers rejected" (do
+    -- In mkUnetSkipGraph: task 2 writes concat slice 0 ([0, 16*512)), task 3 writes slice 1 ([16*512, 32*512)),
+    -- task 4 (dec) reads [0, 32*512). Shrink task 2's Cin/Cout from 16 to 15 so [15*512, 16*512) is an unwritten gap!
+    let fCin ← findM5aTaskRegOffset baseUnetH17.hwx baseUnetH17.info 2 regCin
+    let fCout ← findM5aTaskRegOffset baseUnetH17.hwx baseUnetH17.info 2 regCout
+    let fRow ← findM5aTaskRegOffset baseUnetH17.hwx baseUnetH17.info 2 regSrc1RowStride
+    let fRowA ← findM5aTaskRegOffset baseUnetH17.hwx baseUnetH17.info 2 regSrc1RowBytesA
+    let fRowB ← findM5aTaskRegOffset baseUnetH17.hwx baseUnetH17.info 2 regSrc1RowBytesB
+    let chs := (← readU32LE baseUnetH17.hwx (← findM5aTaskRegOffset baseUnetH17.hwx baseUnetH17.info 2 regSrc1ChanStride)).toNat
+    let newU := (15 * chs).toUInt32
+    let h1 ← putU32LE baseUnetH17.hwx fCin 15
+    let h2 ← putU32LE h1 fCout 15
+    let h3 ← putU32LE h2 fRow newU
+    let h4 ← putU32LE h3 fRowA newU
+    let h5 ← putU32LE h4 fRowB newU
+    let badInfo ← validateHwx h5
+    let _ ← verifyHwxTasksSummary h5 badInfo (requireKnownTask := true)
+    pure ()
+  ) "partially covered")
+
+  -- 16. Negative verifier tamper (S5 multi-writer): unordered overlapping H-concat writers rejected
+  let baseConcatH ← match (do
+      let vp ← planConcat #[{ n := 1, c := 8, h := 4, w := 32 }, { n := 1, c := 8, h := 4, w := 32 }] 2
+      compileView .h17 vp) with
+    | .ok c => pure c
+    | .error e => throw (IO.userError s!"baseConcatH setup failed: {e}")
+
+  results := results.push (checkErr "m5c neg tamper: clearing waitNe5 on overlapping multi-writer H-concat rejected by S5" (do
+    let fCfg1 ← findM5aTaskRegOffset baseConcatH.hwx baseConcatH.info 1 regSrc1Cfg
+    let orig ← readU32LE baseConcatH.hwx fCfg1
+    tamperM5aTaskReg baseConcatH.hwx baseConcatH.info 1 regSrc1Cfg (orig &&& (~~~cfgBitWaitNe5))
+  ) "S5 ")
+
+  pure results
+
 def main : IO UInt32 := do
-  let results := (← runAllTests) ++ (← runM4Tests) ++ (← runM5aTests) ++ (← runM5bTests) ++ (← runTargetMatrixTests)
+  let results := (← runAllTests) ++ (← runM4Tests) ++ (← runM5aTests) ++ (← runM5bTests) ++ (← runM5cTests) ++ (← runTargetMatrixTests)
   let mut passed := 0
   let mut failed := 0
   for r in results do
