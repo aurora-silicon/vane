@@ -17,6 +17,9 @@ open Vane.Conv1x1
 open Vane.Conv3x3
 open Vane.View
 open Vane.Matmul
+open Vane.Frontend.SafeTensors
+open Vane.Frontend.Onnx
+open Vane.Frontend.Lower
 
 structure TestResult where
   name : String
@@ -6432,8 +6435,1006 @@ private def runM5dTests : IO (Array TestResult) := do
 
   pure results
 
+-- ============================================================================
+-- Milestone 7B: Lean-Native SafeTensors, ONNX Proto3 & Transformer Frontend Tests
+-- ============================================================================
+
+private def pbVI (name : String) (dims : Array Int) (symBatch : Bool := false) : ProtoBuilder := Id.run do
+  let mut sh := ProtoBuilder.empty
+  for i in [:dims.size] do
+    let mut db := ProtoBuilder.empty
+    if i == 0 && symBatch then
+      db := db.writeString 2 "batch"
+    else
+      db := db.writeInt64 1 dims[i]!
+    sh := sh.writeMessage 1 db
+  let tt := (ProtoBuilder.empty.writeInt64 1 onnxFloat).writeMessage 2 sh
+  let tp := ProtoBuilder.empty.writeMessage 1 tt
+  return (ProtoBuilder.empty.writeString 1 name).writeMessage 2 tp
+
+private def pbF32Tensor (name : String) (dims : Array Int) (vals : Array Float) (useRaw : Bool := false) : ProtoBuilder := Id.run do
+  let mut tb := (ProtoBuilder.empty.writeString 8 name).writeInt64 2 onnxFloat
+  tb := tb.writePackedInt64 1 dims
+  if useRaw then
+    let mut raw := ByteArray.emptyWithCapacity (4 * vals.size)
+    for v in vals do
+      raw := pushU32LE raw (floatToF32Bits v)
+    tb := tb.writeBytes 9 raw
+  else
+    tb := tb.writePackedFloat32 4 vals
+  return tb
+
+private def pbI64Tensor (name : String) (dims : Array Int) (vals : Array Int) : ProtoBuilder :=
+  (((ProtoBuilder.empty.writeString 8 name).writeInt64 2 onnxInt64).writePackedInt64 1 dims).writePackedInt64 7 vals
+
+private def pbF16Int32Tensor (name : String) (dims : Array Int) (vals : Array UInt16) : ProtoBuilder :=
+  (((ProtoBuilder.empty.writeString 8 name).writeInt64 2 onnxFloat16).writePackedInt64 1 dims).writePackedInt32 5
+    (vals.map fun u => (u.toNat : Int))
+
+private def pbExternalTensor (name : String) (dims : Array Int) : ProtoBuilder :=
+  (((ProtoBuilder.empty.writeString 8 name).writeInt64 2 onnxFloat).writePackedInt64 1 dims).writeInt64 14 onnxDataExternal
+
+private def pbAttrInt (name : String) (v : Int) : ProtoBuilder :=
+  ((ProtoBuilder.empty.writeString 1 name).writeInt64 3 v).writeInt64 20 attrInt
+
+private def pbAttrInts (name : String) (vals : Array Int) : ProtoBuilder :=
+  ((ProtoBuilder.empty.writeString 1 name).writePackedInt64 8 vals).writeInt64 20 attrInts
+
+private def pbAttrFloat (name : String) (v : Float) : ProtoBuilder :=
+  ((ProtoBuilder.empty.writeString 1 name).writeFloat32 2 v).writeInt64 20 attrFloat
+
+private def pbAttrString (name : String) (s : String) : ProtoBuilder :=
+  ((ProtoBuilder.empty.writeString 1 name).writeString 4 s).writeInt64 20 attrString
+
+private def pbAttrTensor (name : String) (tb : ProtoBuilder) : ProtoBuilder :=
+  ((ProtoBuilder.empty.writeString 1 name).writeMessage 5 tb).writeInt64 20 attrTensor
+
+private def pbNode (op name : String) (ins outs : Array String) (attrs : Array ProtoBuilder := #[]) : ProtoBuilder := Id.run do
+  let mut nb := (ProtoBuilder.empty.writeString 4 op).writeString 3 name
+  for s in ins do nb := nb.writeString 1 s
+  for s in outs do nb := nb.writeString 2 s
+  for a in attrs do nb := nb.writeMessage 5 a
+  return nb
+
+private def pbWrapModel (opset : Int) (gb : ProtoBuilder) : ByteArray :=
+  let op := (ProtoBuilder.empty.writeString 1 "").writeInt64 2 opset
+  let mb := ((ProtoBuilder.empty.writeInt64 1 9).writeMessage 8 op).writeMessage 7 gb
+  mb.bytes
+
+private def pbGraph (name : String) (inputs outputs : Array ProtoBuilder)
+    (inits nodes : Array ProtoBuilder) : ProtoBuilder := Id.run do
+  let mut gb := ProtoBuilder.empty.writeString 2 name
+  for vi in inputs do gb := gb.writeMessage 11 vi
+  for vi in outputs do gb := gb.writeMessage 12 vi
+  for t in inits do gb := gb.writeMessage 5 t
+  for nd in nodes do gb := gb.writeMessage 1 nd
+  return gb
+
+private def mkF32Bytes (vals : Array Float) : ByteArray := Id.run do
+  let mut bs := ByteArray.emptyWithCapacity (4 * vals.size)
+  for v in vals do
+    bs := pushU32LE bs (floatToF32Bits v)
+  return bs
+
+private def mkF16Bytes (vals : Array Float) : ByteArray := Id.run do
+  let mut bs := ByteArray.emptyWithCapacity (2 * vals.size)
+  for v in vals do
+    bs := pushU16LE bs (floatToF16 v)
+  return bs
+
+private def mkBF16Bytes (vals : Array Float) : ByteArray := Id.run do
+  let mut bs := ByteArray.emptyWithCapacity (2 * vals.size)
+  for v in vals do
+    let u32 := floatToF32Bits v
+    bs := pushU16LE bs ((u32 >>> 16) &&& 0xffff).toUInt16
+  return bs
+
+private def mkF64Bytes (vals : Array Float) : ByteArray := Id.run do
+  let mut bs := ByteArray.emptyWithCapacity (8 * vals.size)
+  for v in vals do
+    bs := pushU64LE bs v.toBits
+  return bs
+
+private def mkI64Bytes (vals : Array Int) : ByteArray := Id.run do
+  let mut bs := ByteArray.emptyWithCapacity (8 * vals.size)
+  for v in vals do
+    bs := pushU64LE bs (int64ToU64 v)
+  return bs
+
+private def mkI32Bytes (vals : Array Int) : ByteArray := Id.run do
+  let mut bs := ByteArray.emptyWithCapacity (4 * vals.size)
+  for v in vals do
+    bs := pushU32LE bs (int32ToU32 v)
+  return bs
+
+private def mkDetF32 (count : Nat) (scale : Float := 0.05) : Array Float :=
+  Array.ofFn (n := count) fun i =>
+    let k := (i.val % 7 : Nat)
+    (Float.ofNat k - 3.0) * scale
+
+private def verifyCompiledOnnx (co : CompiledOnnx) : Except String TaskVerifySummary := do
+  validateSections co.compiled.hwx co.compiled.sections
+  let s ← verifyHwxTasksSummary co.compiled.hwx co.compiled.info (requireKnownTask := true)
+  if s.total != co.compiled.taskCount then
+    throw s!"verified task count {s.total} != compiled taskCount {co.compiled.taskCount}"
+  pure s
+
+private def runM7bTests : IO (Array TestResult) := do
+  let mut results : Array TestResult := #[]
+
+  -- 1. SafeTensors round-trip & dtype decoding (F16, BF16, F32, F64, I64, I32, BOOL)
+  results := results.push (checkOk "m7b safetensors: write/parse round-trip across F16, BF16, F32, F64, I64, I32, BOOL" (do
+    let blob ← writeSafeTensors #[
+      { name := "w_f16", dtype := "F16", shape := #[2, 2], data := mkF16Bytes #[0.5, -1.0, 2.0, 0.25] },
+      { name := "w_bf16", dtype := "BF16", shape := #[2], data := mkBF16Bytes #[1.5, -0.5] },
+      { name := "w_f32", dtype := "F32", shape := #[2], data := mkF32Bytes #[0.25, -3.5] },
+      { name := "w_f64", dtype := "F64", shape := #[2], data := mkF64Bytes #[4.0, -0.125] },
+      { name := "idx_i64", dtype := "I64", shape := #[3], data := mkI64Bytes #[-1, 0, 42] },
+      { name := "idx_i32", dtype := "I32", shape := #[2], data := mkI32Bytes #[-7, 13] },
+      { name := "mask_bool", dtype := "BOOL", shape := #[2], data := ByteArray.mk #[0, 1] }
+    ] #[("format", "pt")]
+    let sf ← parseSafeTensors blob { strict := true }
+    if sf.tensors.size != 7 then throw s!"expected 7 tensors, got {sf.tensors.size}"
+    let f16v ← sf.toFp16 "w_f16"
+    if f16v != #[floatToF16 0.5, floatToF16 (-1.0), floatToF16 2.0, floatToF16 0.25] then
+      throw "w_f16 mismatch"
+    let bf16v ← sf.toFp16 "w_bf16"
+    if bf16v != #[floatToF16 1.5, floatToF16 (-0.5)] then throw "w_bf16 mismatch"
+    let f32v ← sf.toFp16 "w_f32"
+    if f32v != #[floatToF16 0.25, floatToF16 (-3.5)] then throw "w_f32 mismatch"
+    let f64v ← sf.toFp16 "w_f64"
+    if f64v != #[floatToF16 4.0, floatToF16 (-0.125)] then throw "w_f64 mismatch"
+    let i64v ← sf.toInt64 "idx_i64"
+    if i64v != #[-1, 0, 42] then throw s!"i64 mismatch: {i64v.toList}"
+    let i32v ← sf.toInt64 "idx_i32"
+    if i32v != #[-7, 13] then throw s!"i32 mismatch: {i32v.toList}"
+    let bv ← sf.toBool "mask_bool"
+    if bv != #[false, true] then throw "bool mismatch"
+    pure ()
+  ))
+
+  -- 2. SafeTensors negative tests
+  results := results.push (checkErr "m7b neg safetensors: truncated header (< 8B) rejected" (
+    parseSafeTensors (ByteArray.mk #[1, 2, 3])
+  ) "truncated")
+
+  results := results.push (checkErr "m7b neg safetensors: header_len == 0 rejected" (
+    parseSafeTensors (pushU64LE ByteArray.empty 0)
+  ) "header_len must be > 0")
+
+  results := results.push (checkErr "m7b neg safetensors: header_len > 100 MiB rejected" (
+    parseSafeTensors (pushU64LE ByteArray.empty (maxHeaderBytes + 1).toUInt64)
+  ) "exceeds limit")
+
+  results := results.push (checkErr "m7b neg safetensors: strict mode rejects overlapping spans" (do
+    let hdr := "{\"a\":{\"dtype\":\"F16\",\"shape\":[2],\"data_offsets\":[0,4]},\"b\":{\"dtype\":\"F16\",\"shape\":[2],\"data_offsets\":[2,6]}}"
+    let hBytes := hdr.toUTF8
+    let buf := (pushU64LE ByteArray.empty hBytes.size.toUInt64) ++ hBytes ++ zeroBytes 6
+    parseSafeTensors buf { strict := true }
+  ) "overlapping")
+
+  results := results.push (checkErr "m7b neg safetensors: span != shape * dtypeBytes rejected" (do
+    let hdr := "{\"a\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[0,4]}}"
+    let hBytes := hdr.toUTF8
+    let buf := (pushU64LE ByteArray.empty hBytes.size.toUInt64) ++ hBytes ++ zeroBytes 4
+    parseSafeTensors buf
+  ) "byte span")
+
+  results := results.push (checkErr "m7b neg safetensors: NaN weight rejected on toFp16" (do
+    let mut badF16 := ByteArray.empty
+    badF16 := pushU16LE badF16 f16QNaN
+    let blob ← writeSafeTensors #[{ name := "nan_w", dtype := "F16", shape := #[1], data := badF16 }]
+    let sf ← parseSafeTensors blob
+    sf.toFp16 "nan_w"
+  ) "non-finite")
+
+  results := results.push (checkErr "m7b neg safetensors: F32 overflow (> 65504) rejected on toFp16" (do
+    let blob ← writeSafeTensors #[{ name := "big_w", dtype := "F32", shape := #[1], data := mkF32Bytes #[100000.0] }]
+    let sf ← parseSafeTensors blob
+    sf.toFp16 "big_w"
+  ) "overflows fp16")
+
+  -- 3. ONNX Proto3 decoder unit & negative tests (including FLOAT16 in int32_data, depth > 32, bad wire types)
+  results := results.push (checkOk "m7b onnx proto3: FLOAT16 int32_data + raw_data + packed/unpacked fields" (do
+    let tF16 := pbF16Int32Tensor "w16" #[2] #[floatToF16 1.5, floatToF16 (-0.25)]
+    let tRaw := pbF32Tensor "w32" #[2] #[0.5, 2.0] (useRaw := true)
+    let gb := pbGraph "g" #[pbVI "x" #[1, 2, 1, 1]] #[pbVI "y" #[1, 2, 1, 1]] #[tF16, tRaw] #[]
+    let m ← parseOnnx (pbWrapModel 17 gb)
+    if m.defaultOpsetVersion != 17 then throw "opset mismatch"
+    let f16Vals ← m.graph.initializers[0]!.toFloat64
+    if f16Vals != #[1.5, -0.25] then throw s!"FLOAT16 int32_data mismatch: {f16Vals.toList}"
+    let f32Vals ← m.graph.initializers[1]!.toFloat64
+    if f32Vals != #[0.5, 2.0] then throw s!"FLOAT raw_data mismatch: {f32Vals.toList}"
+    pure ()
+  ))
+
+  results := results.push (checkErr "m7b neg onnx proto3: unsupported wire type 3 rejected" (
+    parseOnnx (ByteArray.mk #[((1 : UInt8) <<< 3) ||| 3])
+  ) "unsupported wire type")
+
+  results := results.push (checkErr "m7b neg onnx proto3: truncated varint rejected" (
+    parseOnnx (ByteArray.mk #[0x08, 0x80])
+  ) "truncated varint")
+
+  results := results.push (checkErr "m7b neg onnx proto3: missing graph rejected" (
+    parseOnnx (ProtoBuilder.empty.writeInt64 1 9).bytes
+  ) "missing graph")
+
+  results := results.push (checkErr "m7b neg onnx proto3: nesting depth > 32 rejected" (do
+    -- Nest GraphProto -> NodeProto -> AttributeProto.g -> GraphProto 15 times (> 32 message levels)
+    let mut g := ProtoBuilder.empty.writeString 2 "leaf"
+    for _ in [:15] do
+      let attr := (ProtoBuilder.empty.writeString 1 "body").writeMessage 6 g
+      let nd := (ProtoBuilder.empty.writeString 4 "If").writeMessage 5 attr
+      g := ProtoBuilder.empty.writeMessage 1 nd
+    let m := (ProtoBuilder.empty.writeInt64 1 9).writeMessage 7 g
+    parseOnnx m.bytes
+  ) "recursion depth limit")
+
+  results := results.push (checkErr "m7b neg onnx: EXTERNAL data_location without SafeTensors override rejected" (do
+    let gb := pbGraph "ext_g" #[pbVI "x" #[1, 4, 4, 4]] #[pbVI "y" #[1, 4, 4, 4]]
+      #[pbExternalTensor "w" #[4, 4, 1, 1]]
+      #[pbNode "Conv" "c0" #["x", "w"] #["y"]]
+    let m ← parseOnnx (pbWrapModel 17 gb)
+    lowerOnnx m {}
+  ) "EXTERNAL")
+
+  -- 4. ResNet residual block (Conv3x3 + BN + Relu + Conv1x1 + Add + Identity + Dropout + symbolic input shape)
+  let resnetOnnxBytes : ByteArray :=
+    let w1 := pbF32Tensor "w1" #[16, 16, 3, 3] (mkDetF32 (16 * 16 * 9) 0.03)
+    let bnS := pbF32Tensor "bn_s" #[16] (Array.replicate 16 1.25)
+    let bnB := pbF32Tensor "bn_b" #[16] (Array.replicate 16 0.1)
+    let bnM := pbF32Tensor "bn_m" #[16] (Array.replicate 16 0.05)
+    let bnV := pbF32Tensor "bn_v" #[16] (Array.replicate 16 0.9)
+    let w2 := pbF32Tensor "w2" #[16, 16, 1, 1] (mkDetF32 (16 * 16) 0.04)
+    let b2 := pbF32Tensor "b2" #[16] (Array.replicate 16 0.02)
+    let gb := pbGraph "resnet"
+      #[pbVI "x" #[1, 16, 8, 8] (symBatch := true)]
+      #[pbVI "y" #[1, 16, 8, 8]]
+      #[w1, bnS, bnB, bnM, bnV, w2, b2]
+      #[
+        pbNode "Identity" "id0" #["x"] #["x_id"],
+        pbNode "Conv" "c1" #["x_id", "w1"] #["c1_out"] #[pbAttrInts "pads" #[1, 1, 1, 1]],
+        pbNode "BatchNormalization" "bn1" #["c1_out", "bn_s", "bn_b", "bn_m", "bn_v"] #["bn1_out"] #[pbAttrFloat "epsilon" 1e-5],
+        pbNode "Relu" "r1" #["bn1_out"] #["r1_out"],
+        pbNode "Dropout" "dr1" #["r1_out"] #["dr1_out", "dr1_mask"],
+        pbNode "Conv" "c2" #["dr1_out", "w2", "b2"] #["c2_out"],
+        pbNode "Add" "add0" #["c2_out", "x_id"] #["y"]
+      ]
+    pbWrapModel 17 gb
+
+  for tgt in #[Target.h16, Target.h17] do
+    results := results.push (checkOk s!"m7b ({tgt.name}): ResNet residual (Conv3x3+BN+Relu+Conv1x1+Add, fused & --no-fuse)" (do
+      let m ← parseOnnx resnetOnnxBytes
+      let co ← compileOnnx m { target := tgt, inputShapes := #[("x", { c := 16, h := 8, w := 8 })] }
+      let _ ← verifyCompiledOnnx co
+      if co.lowered.summary.fusedBnCount != 1 then throw s!"expected fusedBnCount=1, got {co.lowered.summary.fusedBnCount}"
+      if co.lowered.summary.fusedActCount != 1 then throw s!"expected fusedActCount=1, got {co.lowered.summary.fusedActCount}"
+      if co.lowered.summary.elidedCount != 2 then throw s!"expected elidedCount=2, got {co.lowered.summary.elidedCount}"
+      let coNoFuse ← compileOnnx m { target := tgt, inputShapes := #[("x", { c := 16, h := 8, w := 8 })], noFuse := true }
+      let _ ← verifyCompiledOnnx coNoFuse
+      if coNoFuse.lowered.summary.fusedBnCount != 0 || coNoFuse.lowered.summary.fusedActCount != 0 then
+        throw "expected 0 fusions with noFuse=true"
+      pure ()
+    ))
+
+  -- 5. Pool + Reduce + Softmax + Log + Mul(x,Sigmoid(x)) -> Silu
+  let poolRedSoftBytes : ByteArray :=
+    let gb := pbGraph "pool_red_soft"
+      #[pbVI "x" #[1, 8, 8, 8]]
+      #[pbVI "y" #[1, 8, 1, 1]]
+      #[]
+      #[
+        pbNode "Sigmoid" "sig" #["x"] #["x_sig"],
+        pbNode "Mul" "silu_mul" #["x", "x_sig"] #["x_silu"],
+        pbNode "MaxPool" "mp" #["x_silu"] #["mp_out"] #[pbAttrInts "kernel_shape" #[2, 2], pbAttrInts "strides" #[2, 2]],
+        pbNode "AveragePool" "ap" #["mp_out"] #["ap_out"] #[pbAttrInts "kernel_shape" #[2, 2], pbAttrInts "strides" #[2, 2]],
+        pbNode "GlobalAveragePool" "gap" #["ap_out"] #["gap_out"],
+        pbNode "Softmax" "sm" #["gap_out"] #["y"] #[pbAttrInt "axis" 1]
+      ]
+    pbWrapModel 17 gb
+
+  for tgt in #[Target.h16, Target.h17] do
+    results := results.push (checkOk s!"m7b ({tgt.name}): Silu-pattern + MaxPool + AvgPool + GAP + Softmax" (do
+      let m ← parseOnnx poolRedSoftBytes
+      let co ← compileOnnx m { target := tgt }
+      let _ ← verifyCompiledOnnx co
+      if co.lowered.summary.outputShape != { n := 1, c := 8, h := 1, w := 1 } then
+        throw s!"unexpected output shape {repr co.lowered.summary.outputShape}"
+      pure ()
+    ))
+
+  -- 6. MLP: Gemm + static MatMul + Add bias + Relu fusion + Log
+  let mlpBytes : ByteArray :=
+    let w1 := pbF32Tensor "w1" #[16, 8] (mkDetF32 (16 * 8) 0.05)
+    let b1 := pbF32Tensor "b1" #[16] (Array.replicate 16 0.1)
+    let w2 := pbF32Tensor "w2" #[16, 8] (mkDetF32 (16 * 8) 0.05)
+    let b2 := pbF32Tensor "b2" #[8] (Array.replicate 8 0.05)
+    let gb := pbGraph "mlp"
+      #[pbVI "x" #[1, 8]]
+      #[pbVI "y" #[1, 8]]
+      #[w1, b1, w2, b2]
+      #[
+        pbNode "Gemm" "g1" #["x", "w1", "b1"] #["h1"] #[pbAttrInt "transB" 1],
+        pbNode "Relu" "r1" #["h1"] #["h1r"],
+        pbNode "MatMul" "mm2" #["h1r", "w2"] #["h2"],
+        pbNode "Add" "a2" #["h2", "b2"] #["h2b"],
+        pbNode "Sigmoid" "s2" #["h2b"] #["h2s"],
+        pbNode "Log" "log_out" #["h2s"] #["y"]
+      ]
+    pbWrapModel 17 gb
+
+  for tgt in #[Target.h16, Target.h17] do
+    results := results.push (checkOk s!"m7b ({tgt.name}): MLP (Gemm transB=1 + Relu + static MatMul+Add+Sigmoid + Log)" (do
+      let m ← parseOnnx mlpBytes
+      let co ← compileOnnx m { target := tgt }
+      let _ ← verifyCompiledOnnx co
+      if co.lowered.summary.fusedActCount != 2 then
+        throw s!"expected 2 fused activations, got {co.lowered.summary.fusedActCount}"
+      pure ()
+    ))
+
+  -- 7. Multi-Head SDPA: 4D (with Transpose + Div scale fusion & --no-fuse), 3D, and head-stacked
+  let sdpa4DBytes : ByteArray :=
+    let scaleT := pbF32Tensor "sqrt_d" #[] #[4.0]
+    let gb := pbGraph "sdpa4d"
+      #[pbVI "q" #[1, 4, 16, 16], pbVI "k" #[1, 4, 16, 16], pbVI "v" #[1, 4, 16, 16]]
+      #[pbVI "y" #[1, 4, 16, 16]]
+      #[scaleT]
+      #[
+        pbNode "Transpose" "kt" #["k"] #["k_t"] #[pbAttrInts "perm" #[0, 1, 3, 2]],
+        pbNode "MatMul" "qk" #["q", "k_t"] #["scores_raw"],
+        pbNode "Div" "scale" #["scores_raw", "sqrt_d"] #["scores"],
+        pbNode "Softmax" "sm" #["scores"] #["probs"] #[pbAttrInt "axis" (-1)],
+        pbNode "MatMul" "pv" #["probs", "v"] #["y"]
+      ]
+    pbWrapModel 17 gb
+
+  let sdpa3DBytes : ByteArray :=
+    let invScaleT := pbF32Tensor "inv_sqrt_d" #[] #[0.25]
+    let gb := pbGraph "sdpa3d"
+      #[pbVI "q" #[4, 16, 16], pbVI "k" #[4, 16, 16], pbVI "v" #[4, 16, 16]]
+      #[pbVI "y" #[4, 16, 16]]
+      #[invScaleT]
+      #[
+        pbNode "Transpose" "kt" #["k"] #["k_t"] #[pbAttrInts "perm" #[0, 2, 1]],
+        pbNode "MatMul" "qk" #["q", "k_t"] #["scores_raw"],
+        pbNode "Mul" "scale" #["scores_raw", "inv_sqrt_d"] #["scores"],
+        pbNode "Softmax" "sm" #["scores"] #["probs"] #[pbAttrInt "axis" (-1)],
+        pbNode "MatMul" "pv" #["probs", "v"] #["y"]
+      ]
+    pbWrapModel 17 gb
+
+  let sdpaStackedBytes : ByteArray :=
+    let gb := pbGraph "sdpa_stacked"
+      #[pbVI "q" #[1, 16, 1, 16], pbVI "k" #[1, 16, 1, 16], pbVI "v" #[1, 16, 1, 16]]
+      #[pbVI "y" #[1, 16, 1, 16]]
+      #[]
+      #[
+        pbNode "Transpose" "kt" #["k"] #["k_t"] #[pbAttrInts "perm" #[0, 3, 2, 1]],
+        pbNode "MatMul" "qk" #["q", "k_t"] #["scores"],
+        pbNode "Softmax" "sm" #["scores"] #["probs"] #[pbAttrInt "axis" 3],
+        pbNode "MatMul" "pv" #["probs", "v"] #["y"]
+      ]
+    pbWrapModel 17 gb
+
+  for tgt in #[Target.h16, Target.h17] do
+    results := results.push (checkOk s!"m7b ({tgt.name}): Multi-Head SDPA 4D (fused Transpose+Div scale & --no-fuse), 3D, and head-stacked" (do
+      let m4 ← parseOnnx sdpa4DBytes
+      let co4 ← compileOnnx m4 { target := tgt }
+      let s4 ← verifyCompiledOnnx co4
+      if co4.lowered.summary.fusedMatmulCount != 2 then
+        throw s!"4D SDPA: expected fusedMatmulCount=2, got {co4.lowered.summary.fusedMatmulCount}"
+      if s4.neMatmul < 2 then throw s!"4D SDPA: expected >= 2 matmul tasks, got {s4.neMatmul}"
+      let co4NoFuse ← compileOnnx m4 { target := tgt, noFuse := true }
+      let _ ← verifyCompiledOnnx co4NoFuse
+      if co4NoFuse.lowered.summary.fusedMatmulCount != 0 then
+        throw "4D SDPA --no-fuse: expected fusedMatmulCount=0"
+
+      let m3 ← parseOnnx sdpa3DBytes
+      let co3 ← compileOnnx m3 { target := tgt }
+      let _ ← verifyCompiledOnnx co3
+      if co3.lowered.summary.fusedMatmulCount != 2 then
+        throw s!"3D SDPA: expected fusedMatmulCount=2, got {co3.lowered.summary.fusedMatmulCount}"
+
+      let mSt ← parseOnnx sdpaStackedBytes
+      let coSt ← compileOnnx mSt { target := tgt, allowViewOps := false }
+      let _ ← verifyCompiledOnnx coSt
+      pure ()
+    ))
+
+  -- 8. Complete Pre-LN Multi-Head Transformer Block with external `.safetensors` weights!
+  let transformerBlockTest (tgt : Target) : Except String Unit := do
+    -- C = 32, L = 16, 2 heads of D = 16, FFN = 64
+    let sfBlob ← writeSafeTensors #[
+      { name := "ln1_g", dtype := "F32", shape := #[16], data := mkF32Bytes (Array.replicate 16 1.0) },
+      { name := "ln1_b", dtype := "F32", shape := #[16], data := mkF32Bytes (Array.replicate 16 0.0) },
+      { name := "wq", dtype := "F16", shape := #[32, 32, 1, 1], data := mkF16Bytes (mkDetF32 (32 * 32) 0.04) },
+      { name := "wk", dtype := "F16", shape := #[32, 32, 1, 1], data := mkF16Bytes (mkDetF32 (32 * 32) 0.03) },
+      { name := "wv", dtype := "BF16", shape := #[32, 32, 1, 1], data := mkBF16Bytes (mkDetF32 (32 * 32) 0.03) },
+      { name := "wo", dtype := "F32", shape := #[32, 32, 1, 1], data := mkF32Bytes (mkDetF32 (32 * 32) 0.03) },
+      { name := "ln2_g", dtype := "F32", shape := #[16], data := mkF32Bytes (Array.replicate 16 1.0) },
+      { name := "ln2_b", dtype := "F32", shape := #[16], data := mkF32Bytes (Array.replicate 16 0.0) },
+      { name := "w_up", dtype := "F16", shape := #[64, 32, 1, 1], data := mkF16Bytes (mkDetF32 (64 * 32) 0.03) },
+      { name := "w_dn", dtype := "F16", shape := #[32, 64, 1, 1], data := mkF16Bytes (mkDetF32 (32 * 64) 0.03) }
+    ] #[("arch", "transformer_block")]
+    let sf ← parseSafeTensors sfBlob { strict := true }
+
+    let gb := pbGraph "transformer_block"
+      #[pbVI "x" #[1, 32, 1, 16]]
+      #[pbVI "y" #[1, 32, 1, 16]]
+      #[
+        pbExternalTensor "ln1_g" #[16], pbExternalTensor "ln1_b" #[16],
+        pbExternalTensor "wq" #[32, 32, 1, 1], pbExternalTensor "wk" #[32, 32, 1, 1],
+        pbExternalTensor "wv" #[32, 32, 1, 1], pbExternalTensor "wo" #[32, 32, 1, 1],
+        pbExternalTensor "ln2_g" #[16], pbExternalTensor "ln2_b" #[16],
+        pbExternalTensor "w_up" #[64, 32, 1, 1], pbExternalTensor "w_dn" #[32, 64, 1, 1],
+        pbI64Tensor "sh_heads" #[4] #[1, 2, 16, 16],
+        pbI64Tensor "sh_flat" #[4] #[1, 32, 1, 16],
+        pbF32Tensor "sqrt_d" #[] #[4.0]
+      ]
+      #[
+        pbNode "LayerNormalization" "ln1" #["x", "ln1_g", "ln1_b"] #["x1"] #[pbAttrInt "axis" (-1), pbAttrFloat "epsilon" 1e-5],
+        pbNode "Conv" "q_proj" #["x1", "wq"] #["q0"],
+        pbNode "Conv" "k_proj" #["x1", "wk"] #["k0"],
+        pbNode "Conv" "v_proj" #["x1", "wv"] #["v0"],
+        pbNode "Reshape" "q_rs" #["q0", "sh_heads"] #["q1"],
+        pbNode "Reshape" "k_rs" #["k0", "sh_heads"] #["k1"],
+        pbNode "Reshape" "v_rs" #["v0", "sh_heads"] #["v1"],
+        -- [1, 2, D=16, L=16] -> [1, 2, L=16, D=16]
+        pbNode "Transpose" "q_tr" #["q1"] #["q2"] #[pbAttrInts "perm" #[0, 1, 3, 2]],
+        pbNode "Transpose" "v_tr" #["v1"] #["v2"] #[pbAttrInts "perm" #[0, 1, 3, 2]],
+        -- Q[1,2,L,D] @ K[1,2,D,L] -> scores[1,2,L,L]
+        pbNode "MatMul" "qk" #["q2", "k1"] #["sc0"],
+        pbNode "Div" "sc_div" #["sc0", "sqrt_d"] #["sc1"],
+        pbNode "Softmax" "sm" #["sc1"] #["probs"] #[pbAttrInt "axis" (-1)],
+        -- probs[1,2,L,L] @ V[1,2,L,D] -> ctx[1,2,L,D]
+        pbNode "MatMul" "pv" #["probs", "v2"] #["ctx0"],
+        pbNode "Transpose" "ctx_tr" #["ctx0"] #["ctx1"] #[pbAttrInts "perm" #[0, 1, 3, 2]],
+        pbNode "Reshape" "ctx_rs" #["ctx1", "sh_flat"] #["ctx2"],
+        pbNode "Conv" "o_proj" #["ctx2", "wo"] #["attn_out"],
+        pbNode "Add" "res1" #["x", "attn_out"] #["h1"],
+        pbNode "LayerNormalization" "ln2" #["h1", "ln2_g", "ln2_b"] #["h2"] #[pbAttrInt "axis" (-1), pbAttrFloat "epsilon" 1e-5],
+        pbNode "Conv" "ffn_up" #["h2", "w_up"] #["u0"],
+        pbNode "Gelu" "ffn_gelu" #["u0"] #["u1"],
+        pbNode "Conv" "ffn_dn" #["u1", "w_dn"] #["ffn_out"],
+        pbNode "Add" "res2" #["h1", "ffn_out"] #["y"]
+      ]
+    let m ← parseOnnx (pbWrapModel 17 gb)
+    let co ← compileOnnx m { target := tgt, safeTensors := some sf }
+    let summary ← verifyCompiledOnnx co
+    if co.lowered.summary.safeTensorsUsed != 10 then
+      throw s!"expected safeTensorsUsed=10, got {co.lowered.summary.safeTensorsUsed}"
+    if summary.neMatmul < 2 then
+      throw s!"expected >= 2 matmul tasks in Transformer block, got {summary.neMatmul}"
+    pure ()
+
+  for tgt in #[Target.h16, Target.h17] do
+    results := results.push (checkOk s!"m7b ({tgt.name}): Pre-LN Multi-Head Transformer Block with SafeTensors weights" (
+      transformerBlockTest tgt
+    ))
+
+  -- 9. Unfused RMSNorm (Pow(2.0), Pow(-0.5)) + Pow(0.5), Pow(-1.0), Pow(1.0) + negative Pow(3.0)
+  let rmsNormBytes : ByteArray :=
+    let gb := pbGraph "rmsnorm"
+      #[pbVI "x" #[1, 16, 1, 32]]
+      #[pbVI "y" #[1, 16, 1, 32]]
+      #[pbF32Tensor "two" #[] #[2.0], pbF32Tensor "eps" #[] #[1e-5], pbF32Tensor "neg_half" #[] #[-0.5], pbF32Tensor "one" #[] #[1.0]]
+      #[
+        pbNode "Pow" "id1" #["x", "one"] #["x1"],
+        pbNode "Pow" "sq" #["x1", "two"] #["x2"],
+        pbNode "ReduceMean" "ms" #["x2"] #["mean_sq"] #[pbAttrInts "axes" #[-1], pbAttrInt "keepdims" 1],
+        pbNode "Add" "ms_eps" #["mean_sq", "eps"] #["ms_e"],
+        pbNode "Pow" "inv_rms" #["ms_e", "neg_half"] #["r"],
+        pbNode "Mul" "norm" #["x1", "r"] #["y"]
+      ]
+    pbWrapModel 17 gb
+
+  for tgt in #[Target.h16, Target.h17] do
+    results := results.push (checkOk s!"m7b ({tgt.name}): Unfused RMSNorm (Pow 2.0, -0.5, 1.0 elision)" (do
+      let m ← parseOnnx rmsNormBytes
+      let co ← compileOnnx m { target := tgt }
+      let _ ← verifyCompiledOnnx co
+      if co.lowered.summary.elidedCount != 1 then
+        throw s!"expected Pow(1.0) elidedCount=1, got {co.lowered.summary.elidedCount}"
+      pure ()
+    ))
+
+  results := results.push (checkOk "m7b (h17): Pow(0.5) -> sqrt and Pow(-1.0) -> inverse" (do
+    let gb := pbGraph "pow_misc"
+      #[pbVI "x" #[1, 8, 4, 8]]
+      #[pbVI "y" #[1, 8, 4, 8]]
+      #[pbF32Tensor "half" #[] #[0.5], pbF32Tensor "neg1" #[] #[-1.0]]
+      #[
+        pbNode "Pow" "p1" #["x", "half"] #["h"],
+        pbNode "Pow" "p2" #["h", "neg1"] #["y"]
+      ]
+    let m ← parseOnnx (pbWrapModel 17 gb)
+    let co ← compileOnnx m { target := .h17 }
+    let _ ← verifyCompiledOnnx co
+    pure ()
+  ))
+
+  results := results.push (checkErr "m7b neg: unsupported Pow(x, 3.0) rejected" (do
+    let gb := pbGraph "pow_bad"
+      #[pbVI "x" #[1, 8, 4, 8]]
+      #[pbVI "y" #[1, 8, 4, 8]]
+      #[pbF32Tensor "three" #[] #[3.0]]
+      #[pbNode "Pow" "pbad" #["x", "three"] #["y"]]
+    let m ← parseOnnx (pbWrapModel 17 gb)
+    lowerOnnx m {}
+  ) "unsupported Pow exponent")
+
+  -- 10. U-Net Conv -> Split -> Conv -> Concat view graph (default views, opset <13, >=13, 18, and --allow-view-ops=false)
+  let mkUNetSplitBytes (opset : Int) (splitMode : Nat) : ByteArray :=
+    -- splitMode: 0 = opset <13 attr, 1 = opset >=13 const input, 2 = opset 18 default equal split
+    let wIn := pbF32Tensor "w_in" #[16, 16, 1, 1] (mkDetF32 (16 * 16) 0.05)
+    let wA := pbF32Tensor "w_a" #[8, 8, 3, 3] (mkDetF32 (8 * 8 * 9) 0.04)
+    let wB := pbF32Tensor "w_b" #[8, 8, 1, 1] (mkDetF32 (8 * 8) 0.05)
+    let inits :=
+      if splitMode == 1 then #[wIn, wA, wB, pbI64Tensor "sp_sz" #[2] #[8, 8]]
+      else #[wIn, wA, wB]
+    let splitNode :=
+      if splitMode == 0 then
+        pbNode "Split" "sp" #["c0"] #["s0", "s1"] #[pbAttrInt "axis" 1, pbAttrInts "split" #[8, 8]]
+      else if splitMode == 1 then
+        pbNode "Split" "sp" #["c0", "sp_sz"] #["s0", "s1"] #[pbAttrInt "axis" 1]
+      else
+        pbNode "Split" "sp" #["c0"] #["s0", "s1"] #[pbAttrInt "axis" 1, pbAttrInt "num_outputs" 2]
+    let gb := pbGraph "unet_split"
+      #[pbVI "x" #[1, 16, 8, 8]]
+      #[pbVI "y" #[1, 16, 8, 8]]
+      inits
+      #[
+        pbNode "Conv" "c_in" #["x", "w_in"] #["c0"],
+        splitNode,
+        pbNode "Conv" "c_a" #["s0", "w_a"] #["a_out"] #[pbAttrInts "pads" #[1, 1, 1, 1]],
+        pbNode "Conv" "c_b" #["s1", "w_b"] #["b_out"],
+        pbNode "Concat" "cat" #["a_out", "b_out"] #["y"] #[pbAttrInt "axis" 1]
+      ]
+    pbWrapModel opset gb
+
+  for tgt in #[Target.h16, Target.h17] do
+    results := results.push (checkOk s!"m7b ({tgt.name}): U-Net Conv->Split->Conv->Concat (opset 11, 13, 18, default views)" (do
+      for (opset, mode) in #[(11, 0), (13, 1), (18, 2)] do
+        let m ← parseOnnx (mkUNetSplitBytes opset mode)
+        let co ← compileOnnx m { target := tgt } -- allowViewOps := true by default!
+        let s ← verifyCompiledOnnx co
+        if s.neView < 4 then throw s!"expected >= 4 view tasks (2 split slices + 2 concat copies), got {s.neView}"
+      pure ()
+    ))
+
+  results := results.push (checkErr "m7b neg: U-Net Split/Concat rejected when --allow-view-ops=false" (do
+    let m ← parseOnnx (mkUNetSplitBytes 18 2)
+    lowerOnnx m { allowViewOps := false }
+  ) "--allow-view-ops=true")
+
+  results := results.push (checkErr "m7b neg: W-axis Split with misaligned start offset (16 % 32 != 0) rejected" (do
+    let gb := pbGraph "w_split_bad"
+      #[pbVI "x" #[1, 4, 4, 32]]
+      #[pbVI "y" #[1, 4, 4, 32]]
+      #[]
+      #[
+        pbNode "Split" "sp" #["x"] #["s0", "s1"] #[pbAttrInt "axis" 3],
+        pbNode "Concat" "cat" #["s0", "s1"] #["y"] #[pbAttrInt "axis" 3]
+      ]
+    let m ← parseOnnx (pbWrapModel 18 gb)
+    lowerOnnx m {}
+  ) "multiple of 32")
+
+  -- 11. LayerNormalization along C (H=W=1, non-uniform affine) and along W (uniform & runtime affine)
+  for tgt in #[Target.h16, Target.h17] do
+    results := results.push (checkOk s!"m7b ({tgt.name}): LayerNormalization along C (H=W=1, non-uniform) and W (uniform & runtime)" (do
+      -- Along C on [1, 16, 1, 1] (true ONNX suffix [16, 1, 1] semantics) with non-uniform constant scale & bias
+      let scaleC := Array.ofFn (n := 16) fun i => 0.8 + 0.02 * Float.ofNat i.val
+      let biasC := Array.ofFn (n := 16) fun i => -0.1 + 0.01 * Float.ofNat i.val
+      for paramSh in #[#[16], #[16, 1, 1], #[1, 16, 1, 1]] do
+        let gbC := pbGraph "ln_c"
+          #[pbVI "x" #[1, 16, 1, 1]] #[pbVI "y" #[1, 16, 1, 1]]
+          #[pbF32Tensor "g" paramSh scaleC, pbF32Tensor "b" paramSh biasC]
+          #[pbNode "LayerNormalization" "ln" #["x", "g", "b"] #["y"] #[pbAttrInt "axis" 1, pbAttrFloat "epsilon" 1e-5]]
+        let mC ← parseOnnx (pbWrapModel 17 gbC)
+        let coC ← compileOnnx mC { target := tgt }
+        let _ ← verifyCompiledOnnx coC
+
+      -- Along W with uniform constant scale & bias
+      let gbW := pbGraph "ln_w"
+        #[pbVI "x" #[1, 8, 4, 16]] #[pbVI "y" #[1, 8, 4, 16]]
+        #[pbF32Tensor "g" #[16] (Array.replicate 16 1.5), pbF32Tensor "b" #[16] (Array.replicate 16 0.25)]
+        #[pbNode "LayerNormalization" "ln" #["x", "g", "b"] #["y"] #[pbAttrInt "axis" (-1), pbAttrFloat "epsilon" 1e-5]]
+      let mW ← parseOnnx (pbWrapModel 17 gbW)
+      let coW ← compileOnnx mW { target := tgt }
+      let _ ← verifyCompiledOnnx coW
+
+      -- Along W with runtime scale & bias inputs
+      let gbWR := pbGraph "ln_w_rt"
+        #[pbVI "x" #[1, 8, 4, 16], pbVI "g" #[1, 1, 1, 16], pbVI "b" #[1, 1, 1, 16]]
+        #[pbVI "y" #[1, 8, 4, 16]] #[]
+        #[pbNode "LayerNormalization" "ln" #["x", "g", "b"] #["y"] #[pbAttrInt "axis" (-1), pbAttrFloat "epsilon" 1e-5]]
+      let mWR ← parseOnnx (pbWrapModel 17 gbWR)
+      let coWR ← compileOnnx mWR { target := tgt }
+      let _ ← verifyCompiledOnnx coWR
+      pure ()
+    ))
+
+  -- 12. Gelu(approximate): "", "none" accepted; "tanh" (standalone & fused) and invalid explicitly rejected
+  results := results.push (checkOk "m7b: Gelu(approximate) '' and 'none' (exact erf)" (do
+    for approx in #["", "none"] do
+      let attrs := if approx.isEmpty then #[] else #[pbAttrString "approximate" approx]
+      let gb := pbGraph "gelu_exact" #[pbVI "x" #[1, 8, 4, 8]] #[pbVI "y" #[1, 8, 4, 8]] #[]
+        #[pbNode "Gelu" "g0" #["x"] #["y"] attrs]
+      let m ← parseOnnx (pbWrapModel 20 gb)
+      let co ← compileOnnx m { target := .h17 }
+      let _ ← verifyCompiledOnnx co
+      if !co.lowered.summary.warnings.isEmpty then throw s!"expected 0 warnings for approximate='{approx}'"
+    pure ()
+  ))
+
+  results := results.push (checkErr "m7b neg: standalone Gelu(approximate='tanh') rejected" (do
+    let gb := pbGraph "gelu_tanh" #[pbVI "x" #[1, 8, 4, 8]] #[pbVI "y" #[1, 8, 4, 8]] #[]
+      #[pbNode "Gelu" "g0" #["x"] #["y"] #[pbAttrString "approximate" "tanh"]]
+    let m ← parseOnnx (pbWrapModel 20 gb)
+    lowerOnnx m {}
+  ) "approximate='tanh' is not supported")
+
+  results := results.push (checkErr "m7b neg: fused Conv+Gelu(approximate='tanh') rejected" (do
+    let gb := pbGraph "conv_gelu_tanh" #[pbVI "x" #[1, 8, 4, 8]] #[pbVI "y" #[1, 8, 4, 8]]
+      #[pbF32Tensor "w" #[8, 8, 1, 1] (mkDetF32 64 0.05)]
+      #[
+        pbNode "Conv" "c0" #["x", "w"] #["c0_out"],
+        pbNode "Gelu" "g0" #["c0_out"] #["y"] #[pbAttrString "approximate" "tanh"]
+      ]
+    let m ← parseOnnx (pbWrapModel 20 gb)
+    lowerOnnx m {}
+  ) "approximate='tanh' is not supported")
+
+  results := results.push (checkErr "m7b neg: Gelu(approximate='bad') rejected" (do
+    let gb := pbGraph "gelu_bad" #[pbVI "x" #[1, 8, 4, 8]] #[pbVI "y" #[1, 8, 4, 8]] #[]
+      #[pbNode "Gelu" "g0" #["x"] #["y"] #[pbAttrString "approximate" "bad"]]
+    let m ← parseOnnx (pbWrapModel 20 gb)
+    lowerOnnx m {}
+  ) "unsupported approximate")
+
+  -- 13. Negative MatMul constraint checks (inner K mismatch, M > 2048, transposeB N > 128)
+  results := results.push (checkErr "m7b neg matmul: inner K mismatch rejected" (do
+    let gb := pbGraph "mm_bad_k" #[pbVI "a" #[1, 2, 16, 32], pbVI "b" #[1, 2, 16, 32]] #[pbVI "y" #[1, 2, 16, 32]] #[]
+      #[pbNode "MatMul" "mm" #["a", "b"] #["y"]]
+    let m ← parseOnnx (pbWrapModel 17 gb)
+    lowerOnnx m {}
+  ) "inner dimension mismatch")
+
+  results := results.push (checkErr "m7b neg matmul: M > 2048 rejected" (do
+    let gb := pbGraph "mm_big_m" #[pbVI "a" #[1, 1, 2049, 16], pbVI "b" #[1, 1, 16, 16]] #[pbVI "y" #[1, 1, 2049, 16]] #[]
+      #[pbNode "MatMul" "mm" #["a", "b"] #["y"]]
+    let m ← parseOnnx (pbWrapModel 17 gb)
+    lowerOnnx m {}
+  ) "M=2049")
+
+  results := results.push (checkErr "m7b neg matmul: transposeB with N > 128 rejected" (do
+    let gb := pbGraph "mm_big_trb" #[pbVI "a" #[1, 2, 16, 32], pbVI "b" #[1, 2, 129, 32]] #[pbVI "y" #[1, 2, 16, 129]] #[]
+      #[
+        pbNode "Transpose" "bt" #["b"] #["b_t"] #[pbAttrInts "perm" #[0, 1, 3, 2]],
+        pbNode "MatMul" "mm" #["a", "b_t"] #["y"]
+      ]
+    let m ← parseOnnx (pbWrapModel 17 gb)
+    lowerOnnx m {}
+  ) "transposeB requires N=129 <= 128")
+
+  -- Review regression #1: 4D MatMul must reject folded Transpose with [0,3,2,1] perm
+  results := results.push (checkErr "m7b neg matmul: 4D MatMul rejects folded [0,3,2,1] Transpose perm on RHS" (do
+    let gb := pbGraph "mm_4d_bad_perm"
+      #[pbVI "a" #[1, 4, 16, 4], pbVI "b" #[1, 4, 1, 4]]
+      #[pbVI "y" #[1, 4, 16, 4]] #[]
+      #[
+        pbNode "Transpose" "bt" #["b"] #["b_t"] #[pbAttrInts "perm" #[0, 3, 2, 1]],
+        pbNode "MatMul" "mm" #["a", "b_t"] #["y"]
+      ]
+    let m ← parseOnnx (pbWrapModel 17 gb)
+    lowerOnnx m {}
+  ) "4D MatMul RHS folded Transpose perm")
+
+  -- Review regression #2: head-stacked MatMul (trA && trB) forces heads=1 (rejects A.C != B.W)
+  results := results.push (checkErr "m7b neg matmul: head-stacked MatMul (trA+trB) rejects multi-head A.C != B.W" (do
+    let gb := pbGraph "mm_hs_bad_trab"
+      #[pbVI "a" #[1, 16, 1, 4], pbVI "b" #[1, 8, 1, 8]]
+      #[pbVI "y" #[1, 4, 1, 8]] #[]
+      #[
+        pbNode "Transpose" "at" #["a"] #["a_t"] #[pbAttrInts "perm" #[0, 3, 2, 1]],
+        pbNode "Transpose" "bt" #["b"] #["b_t"] #[pbAttrInts "perm" #[0, 3, 2, 1]],
+        pbNode "MatMul" "mm" #["a_t", "b_t"] #["y"]
+      ]
+    let m ← parseOnnx (pbWrapModel 17 gb)
+    lowerOnnx m {}
+  ) "heads=1")
+
+  -- Review regression #3: static-weight MatMul rejects 3D [H, M, K] input
+  results := results.push (checkErr "m7b neg matmul: static-weight MatMul rejects 3D [H,M,K] input" (do
+    let w := pbF32Tensor "w" #[8, 4] (mkDetF32 32 0.05)
+    let gb := pbGraph "mm_static_3d" #[pbVI "x" #[2, 4, 8]] #[pbVI "y" #[2, 4, 4]] #[w]
+      #[pbNode "MatMul" "mm" #["x", "w"] #["y"]]
+    let m ← parseOnnx (pbWrapModel 17 gb)
+    lowerOnnx m {}
+  ) "requires 2D [1,C] or 4D [1,C,H,W]")
+
+  -- Review regression #4: Gelu invalid UTF-8 bytes in approximate attribute rejected
+  results := results.push (checkErr "m7b neg gelu: invalid UTF-8 in approximate attribute rejected" (do
+    let badAttr := ((ProtoBuilder.empty.writeString 1 "approximate").writeBytes 4 (ByteArray.mk #[0xff, 0xfe])).writeInt64 20 attrString
+    let gb := pbGraph "gelu_bad_utf8" #[pbVI "x" #[1, 8, 4, 8]] #[pbVI "y" #[1, 8, 4, 8]] #[]
+      #[pbNode "Gelu" "g0" #["x"] #["y"] #[badAttr]]
+    let m ← parseOnnx (pbWrapModel 20 gb)
+    lowerOnnx m {}
+  ) "invalid UTF-8")
+
+  -- 14. External review Blocker 1 regressions: LayerNormalization axis=1 on 4D & Scale/B suffix validation
+  results := results.push (checkErr "m7b neg ln: LayerNormalization(axis=1) on 4D [1,16,4,8] rejected" (do
+    let gb := pbGraph "ln_c_4d_bad"
+      #[pbVI "x" #[1, 16, 4, 8]] #[pbVI "y" #[1, 16, 4, 8]]
+      #[pbF32Tensor "g" #[16] (Array.replicate 16 1.0), pbF32Tensor "b" #[16] (Array.replicate 16 0.0)]
+      #[pbNode "LayerNormalization" "ln" #["x", "g", "b"] #["y"] #[pbAttrInt "axis" 1, pbAttrFloat "epsilon" 1e-5]]
+    let m ← parseOnnx (pbWrapModel 17 gb)
+    lowerOnnx m {}
+  ) "only supported when H=1 and W=1")
+
+  results := results.push (checkErr "m7b neg ln: LayerNormalization Scale shape [2,8] rejected for C=16" (do
+    let gb := pbGraph "ln_bad_scale_sh"
+      #[pbVI "x" #[1, 16, 1, 1]] #[pbVI "y" #[1, 16, 1, 1]]
+      #[pbF32Tensor "g" #[2, 8] (Array.replicate 16 1.0)]
+      #[pbNode "LayerNormalization" "ln" #["x", "g"] #["y"] #[pbAttrInt "axis" 1]]
+    let m ← parseOnnx (pbWrapModel 17 gb)
+    lowerOnnx m {}
+  ) "incompatible with normalized suffix")
+
+  results := results.push (checkErr "m7b neg ln: LayerNormalization runtime Scale [1,16,1,1] rejected for axis=-1" (do
+    let gb := pbGraph "ln_bad_rt_scale"
+      #[pbVI "x" #[1, 8, 4, 16], pbVI "g" #[1, 16, 1, 1]] #[pbVI "y" #[1, 8, 4, 16]] #[]
+      #[pbNode "LayerNormalization" "ln" #["x", "g"] #["y"] #[pbAttrInt "axis" (-1)]]
+    let m ← parseOnnx (pbWrapModel 17 gb)
+    lowerOnnx m {}
+  ) "incompatible with normalized suffix")
+
+  -- 15. External review Blocker 2 regressions: Rank-3 [H,M,K] ops (Concat, Slice, Broadcast, Flatten, Output shape)
+  results := results.push (checkErr "m7b neg rank3: Concat rank-3 axis=1 rejected" (do
+    let gb := pbGraph "cat3_ax1"
+      #[pbVI "a" #[2, 4, 8], pbVI "b" #[2, 4, 8]] #[pbVI "y" #[2, 8, 8]] #[]
+      #[pbNode "Concat" "cat" #["a", "b"] #["y"] #[pbAttrInt "axis" 1]]
+    let m ← parseOnnx (pbWrapModel 17 gb)
+    lowerOnnx m {}
+  ) "3D Concat axis 1 not supported")
+
+  results := results.push (checkErr "m7b neg rank3: Concat rank-3 axis=0 rejected" (do
+    let gb := pbGraph "cat3_ax0"
+      #[pbVI "a" #[2, 4, 8], pbVI "b" #[2, 4, 8]] #[pbVI "y" #[4, 4, 8]] #[]
+      #[pbNode "Concat" "cat" #["a", "b"] #["y"] #[pbAttrInt "axis" 0]]
+    let m ← parseOnnx (pbWrapModel 17 gb)
+    lowerOnnx m {}
+  ) "3D Concat axis 0 not supported")
+
+  results := results.push (checkErr "m7b neg rank3: Concat rank-3 mismatched (H,M) [2,6,8]+[3,4,8] rejected" (do
+    let gb := pbGraph "cat3_bad_hm"
+      #[pbVI "a" #[2, 6, 8], pbVI "b" #[3, 4, 8]] #[pbVI "y" #[2, 6, 16]] #[]
+      #[pbNode "Concat" "cat" #["a", "b"] #["y"] #[pbAttrInt "axis" 2]]
+    let m ← parseOnnx (pbWrapModel 17 gb)
+    lowerOnnx m {}
+  ) "mismatched (H,M)")
+
+  results := results.push (checkOk "m7b rank3: Concat axis=2 and Slice axes=[2] on [2,4,64] compile and verify" (do
+    let gbCat := pbGraph "cat3_ax2"
+      #[pbVI "a" #[2, 4, 32], pbVI "b" #[2, 4, 32]] #[pbVI "y" #[2, 4, 64]] #[]
+      #[pbNode "Concat" "cat" #["a", "b"] #["y"] #[pbAttrInt "axis" 2]]
+    let mCat ← parseOnnx (pbWrapModel 17 gbCat)
+    let coCat ← compileOnnx mCat { target := .h17 }
+    let _ ← verifyCompiledOnnx coCat
+
+    let gbSl := pbGraph "slice3_ax2"
+      #[pbVI "x" #[2, 4, 64]] #[pbVI "y" #[2, 4, 32]]
+      #[pbI64Tensor "st" #[1] #[0], pbI64Tensor "en" #[1] #[32], pbI64Tensor "ax" #[1] #[2]]
+      #[pbNode "Slice" "sl" #["x", "st", "en", "ax"] #["y"]]
+    let mSl ← parseOnnx (pbWrapModel 17 gbSl)
+    let coSl ← compileOnnx mSl { target := .h17 }
+    let _ ← verifyCompiledOnnx coSl
+    if coSl.lowered.summary.outputShape != { n := 1, c := 8, h := 1, w := 32 } then
+      throw s!"unexpected 3D Slice output shape {repr coSl.lowered.summary.outputShape}"
+    pure ()
+  ))
+
+  results := results.push (checkErr "m7b neg rank3: Slice rank-3 axes=[1] rejected" (do
+    let gb := pbGraph "slice3_ax1"
+      #[pbVI "x" #[2, 4, 64]] #[pbVI "y" #[2, 2, 64]]
+      #[pbI64Tensor "st" #[1] #[0], pbI64Tensor "en" #[1] #[2], pbI64Tensor "ax" #[1] #[1]]
+      #[pbNode "Slice" "sl" #["x", "st", "en", "ax"] #["y"]]
+    let m ← parseOnnx (pbWrapModel 17 gb)
+    lowerOnnx m {}
+  ) "3D Slice axis 1 not supported")
+
+  results := results.push (checkErr "m7b neg rank3: Slice rank-3 axes=[-2] rejected" (do
+    let gb := pbGraph "slice3_axneg2"
+      #[pbVI "x" #[2, 4, 64]] #[pbVI "y" #[2, 2, 64]]
+      #[pbI64Tensor "st" #[1] #[0], pbI64Tensor "en" #[1] #[2], pbI64Tensor "ax" #[1] #[-2]]
+      #[pbNode "Slice" "sl" #["x", "st", "en", "ax"] #["y"]]
+    let m ← parseOnnx (pbWrapModel 17 gb)
+    lowerOnnx m {}
+  ) "3D Slice axis -2 not supported")
+
+  results := results.push (checkErr "m7b neg rank3: Slice rank-3 axes=[3] out of range rejected" (do
+    let gb := pbGraph "slice3_ax3"
+      #[pbVI "x" #[2, 4, 64]] #[pbVI "y" #[2, 4, 32]]
+      #[pbI64Tensor "st" #[1] #[0], pbI64Tensor "en" #[1] #[32], pbI64Tensor "ax" #[1] #[3]]
+      #[pbNode "Slice" "sl" #["x", "st", "en", "ax"] #["y"]]
+    let m ← parseOnnx (pbWrapModel 17 gb)
+    lowerOnnx m {}
+  ) "out of range [0,2]")
+
+  results := results.push (checkErr "m7b neg rank3: elementwise broadcast [3,1,4]+[1,3,4] rejected" (do
+    let gb := pbGraph "bcast3_bad"
+      #[pbVI "a" #[3, 1, 4], pbVI "b" #[1, 3, 4]] #[pbVI "y" #[3, 3, 4]] #[]
+      #[pbNode "Add" "add0" #["a", "b"] #["y"]]
+    let m ← parseOnnx (pbWrapModel 17 gb)
+    lowerOnnx m {}
+  ) "incompatible with ANE physical layout")
+
+  results := results.push (checkErr "m7b neg rank3: elementwise [2,3,4]+[3,2,4] rejected" (do
+    let gb := pbGraph "bcast3_bad2"
+      #[pbVI "a" #[2, 3, 4], pbVI "b" #[3, 2, 4]] #[pbVI "y" #[2, 3, 4]] #[]
+      #[pbNode "Add" "add0" #["a", "b"] #["y"]]
+    let m ← parseOnnx (pbWrapModel 17 gb)
+    lowerOnnx m {}
+  ) "incompatible ONNX broadcast shapes")
+
+  results := results.push (checkOk "m7b rank3: elementwise [2,3,4]+[1,1,4] compiles and verifies" (do
+    let gb := pbGraph "bcast3_ok"
+      #[pbVI "a" #[2, 3, 4], pbVI "b" #[1, 1, 4]] #[pbVI "y" #[2, 3, 4]] #[]
+      #[pbNode "Add" "add0" #["a", "b"] #["y"]]
+    let m ← parseOnnx (pbWrapModel 17 gb)
+    let co ← compileOnnx m { target := .h17 }
+    let _ ← verifyCompiledOnnx co
+    pure ()
+  ))
+
+  results := results.push (checkErr "m7b neg rank3: Flatten rank-3 [2,4,8] axis=1 rejected" (do
+    let gb := pbGraph "flat3_bad"
+      #[pbVI "x" #[2, 4, 8]] #[pbVI "y" #[2, 32]] #[]
+      #[pbNode "Flatten" "fl" #["x"] #["y"] #[pbAttrInt "axis" 1]]
+    let m ← parseOnnx (pbWrapModel 17 gb)
+    lowerOnnx m {}
+  ) "batch dimension 2 != 1")
+
+  results := results.push (checkOk "m7b rank3: Flatten [1,8,1] axis=1 -> [1,8] compiles and verifies" (do
+    let gb := pbGraph "flat3_ok"
+      #[pbVI "x" #[1, 8, 1]] #[pbVI "y" #[1, 8]] #[]
+      #[pbNode "Flatten" "fl" #["x"] #["y"] #[pbAttrInt "axis" 1]]
+    let m ← parseOnnx (pbWrapModel 17 gb)
+    let co ← compileOnnx m { target := .h17 }
+    let _ ← verifyCompiledOnnx co
+    pure ()
+  ))
+
+  results := results.push (checkErr "m7b neg output shape: declared output dim mismatch rejected" (do
+    let gb := pbGraph "out_sh_bad"
+      #[pbVI "x" #[1, 8, 4, 4]] #[pbVI "y" #[1, 4, 4, 4]] #[]
+      #[pbNode "Relu" "r0" #["x"] #["y"]]
+    let m ← parseOnnx (pbWrapModel 17 gb)
+    lowerOnnx m {}
+  ) "declared output dim[1]=4")
+
+  results := results.push (checkErr "m7b neg output shape: declared output rank mismatch rejected" (do
+    let gb := pbGraph "out_rk_bad"
+      #[pbVI "x" #[1, 8, 1, 1]] #[pbVI "y" #[1, 8]] #[]
+      #[pbNode "Relu" "r0" #["x"] #["y"]]
+    let m ← parseOnnx (pbWrapModel 17 gb)
+    lowerOnnx m {}
+  ) "declared output rank 2")
+
+  -- 16. Ported parser & lowering regression guards
+  results := results.push (checkErr "m7b neg onnx proto3: varint overflow (10th byte = 0x02) rejected" (
+    readVarint { buf := ByteArray.mk #[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02], pos := 0 }
+  ) "varint overflow")
+
+  results := results.push (checkErr "m7b neg onnx proto3: truncated length-delimited field rejected" (
+    -- Field 2 (producer_name, wire type 2 = bytes), length 10, only 2 bytes present
+    parseOnnx (ByteArray.mk #[0x12, 0x0a, 0x01, 0x02])
+  ) "exceeds remaining")
+
+  results := results.push (checkErr "m7b neg safetensors: header_len = 2^64 - 1 rejected" (
+    parseSafeTensors ((pushU64LE ByteArray.empty 0xffffffffffffffff) ++ zeroBytes 8)
+  ) "exceeds limit")
+
+  results := results.push (checkErr "m7b neg safetensors: header_len past EOF rejected" (
+    parseSafeTensors ((pushU64LE ByteArray.empty 64) ++ zeroBytes 8)
+  ) "exceeds remaining file size")
+
+  results := results.push (checkErr "m7b neg safetensors: data offset past EOF rejected" (do
+    let hdr := "{\"w\":{\"dtype\":\"F16\",\"shape\":[4],\"data_offsets\":[0,8]}}"
+    let hBytes := hdr.toUTF8
+    parseSafeTensors ((pushU64LE ByteArray.empty hBytes.size.toUInt64) ++ hBytes ++ zeroBytes 4)
+  ) "exceeds data section size")
+
+  results := results.push (checkErr "m7b neg safetensors: begin > end rejected" (do
+    let hdr := "{\"w\":{\"dtype\":\"F16\",\"shape\":[1],\"data_offsets\":[4,2]}}"
+    let hBytes := hdr.toUTF8
+    parseSafeTensors ((pushU64LE ByteArray.empty hBytes.size.toUInt64) ++ hBytes ++ zeroBytes 8)
+  ) "begin 4 > end 2")
+
+  results := results.push (checkErr "m7b neg safetensors: shape-product overflow rejected" (do
+    let hdr := "{\"w\":{\"dtype\":\"F32\",\"shape\":[3037000500,3037000500],\"data_offsets\":[0,0]}}"
+    let hBytes := hdr.toUTF8
+    parseSafeTensors ((pushU64LE ByteArray.empty hBytes.size.toUInt64) ++ hBytes)
+  ) "overflow")
+
+  results := results.push (checkErr "m7b neg safetensors: trailing non-JSON garbage rejected" (do
+    let hdr := "{\"w\":{\"dtype\":\"F16\",\"shape\":[1],\"data_offsets\":[0,2]}} GARBAGE"
+    let hBytes := hdr.toUTF8
+    parseSafeTensors ((pushU64LE ByteArray.empty hBytes.size.toUInt64) ++ hBytes ++ zeroBytes 2)
+  ) "invalid JSON")
+
+  results := results.push (checkErr "m7b neg safetensors: trailing JSON object rejected" (do
+    let hdr := "{\"w\":{\"dtype\":\"F16\",\"shape\":[1],\"data_offsets\":[0,2]}}{\"extra\":1}"
+    let hBytes := hdr.toUTF8
+    parseSafeTensors ((pushU64LE ByteArray.empty hBytes.size.toUInt64) ++ hBytes ++ zeroBytes 2)
+  ) "invalid JSON")
+
+  results := results.push (checkOk "m7b fusion guard: multi-consumer Conv+Relu, Conv+BN, and graph-output Conv not fused" (do
+    let w := pbF32Tensor "w" #[2, 2, 1, 1] #[1.0, 0.0, 0.0, 1.0]
+    -- Multi-consumer Conv -> Relu + Add(r_out, c_out)
+    let gbMcRelu := pbGraph "mc_relu"
+      #[pbVI "x" #[1, 2, 2, 2]] #[pbVI "y" #[1, 2, 2, 2]] #[w]
+      #[
+        pbNode "Conv" "c1" #["x", "w"] #["c_out"],
+        pbNode "Relu" "r1" #["c_out"] #["r_out"],
+        pbNode "Add" "a1" #["r_out", "c_out"] #["y"]
+      ]
+    let m1 ← parseOnnx (pbWrapModel 17 gbMcRelu)
+    let r1 ← lowerOnnx m1 {}
+    if r1.summary.fusedActCount != 0 || r1.spec.nodes.size != 3 then
+      throw s!"expected multi-consumer Conv+Relu not fused, got fusedAct={r1.summary.fusedActCount} nodes={r1.spec.nodes.size}"
+
+    -- Multi-consumer Conv -> BN + Add(bn_out, c_out)
+    let gbMcBn := pbGraph "mc_bn"
+      #[pbVI "x" #[1, 2, 2, 2]] #[pbVI "y" #[1, 2, 2, 2]]
+      #[w, pbF32Tensor "s" #[2] #[1.0, 1.0], pbF32Tensor "b" #[2] #[0.0, 0.0],
+        pbF32Tensor "m" #[2] #[0.0, 0.0], pbF32Tensor "v" #[2] #[1.0, 1.0]]
+      #[
+        pbNode "Conv" "c1" #["x", "w"] #["c_out"],
+        pbNode "BatchNormalization" "bn1" #["c_out", "s", "b", "m", "v"] #["bn_out"],
+        pbNode "Add" "a1" #["bn_out", "c_out"] #["y"]
+      ]
+    let m2 ← parseOnnx (pbWrapModel 17 gbMcBn)
+    let r2 ← lowerOnnx m2 {}
+    if r2.summary.fusedBnCount != 0 || r2.spec.nodes.size != 3 then
+      throw s!"expected multi-consumer Conv+BN not folded, got fusedBn={r2.summary.fusedBnCount} nodes={r2.spec.nodes.size}"
+
+    -- Graph-output Conv with dead Relu consumer not fused
+    let gbOut := pbGraph "conv_out"
+      #[pbVI "x" #[1, 2, 2, 2]] #[pbVI "c_out" #[1, 2, 2, 2]] #[w]
+      #[
+        pbNode "Conv" "c1" #["x", "w"] #["c_out"],
+        pbNode "Relu" "dead_r" #["c_out"] #["dead_y"]
+      ]
+    let m3 ← parseOnnx (pbWrapModel 17 gbOut)
+    let r3 ← lowerOnnx m3 {}
+    if r3.summary.fusedActCount != 0 || r3.spec.nodes.size != 1 then
+      throw s!"expected graph-output Conv not fused, got fusedAct={r3.summary.fusedActCount} nodes={r3.spec.nodes.size}"
+    pure ()
+  ))
+
+  results := results.push (checkErr "m7b neg fusion guard: MatMul+Add spatial [1,1,2,2] constant not misfolded as channel bias" (do
+    let gb := pbGraph "mm_spatial_add"
+      #[pbVI "x" #[1, 2, 2, 2]] #[pbVI "y" #[1, 4, 2, 2]]
+      #[
+        pbF32Tensor "w" #[2, 4] (Array.replicate 8 0.0),
+        pbF32Tensor "spatial_c" #[1, 1, 2, 2] #[1.0, 2.0, 3.0, 4.0]
+      ]
+      #[
+        pbNode "MatMul" "mm" #["x", "w"] #["h"],
+        pbNode "Add" "add_sp" #["h", "spatial_c"] #["y"]
+      ]
+    let m ← parseOnnx (pbWrapModel 17 gb)
+    lowerOnnx m {}
+  ) "non-scalar constant")
+
+  pure results
+
 def main : IO UInt32 := do
-  let results := (← runAllTests) ++ (← runM4Tests) ++ (← runM5aTests) ++ (← runM5bTests) ++ (← runM5cTests) ++ (← runM5dTests) ++ (← runTargetMatrixTests)
+  let results := (← runAllTests) ++ (← runM4Tests) ++ (← runM5aTests) ++ (← runM5bTests) ++ (← runM5cTests) ++ (← runM5dTests) ++ (← runM7bTests) ++ (← runTargetMatrixTests)
   let mut passed := 0
   let mut failed := 0
   for r in results do

@@ -18,4 +18,7 @@ import Vane.Conv3x3
 import Vane.View
 import Vane.Matmul
 import Vane.Graph
+import Vane.Frontend.SafeTensors
+import Vane.Frontend.Onnx
+import Vane.Frontend.Lower
 import Vane.Proofs

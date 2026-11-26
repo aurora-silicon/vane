@@ -324,8 +324,11 @@ def planTranspose (x : Shape4D) (perm : Array Nat) : Except String ViewPlan := d
         if perm[i]! == ax then return i
       return 0
     let rem : Array Nat := (#[0, 1, 2] : Array Nat).filter (fun a => a != aC)
-    let aN := rem[0]!
-    let aH := rem[1]!
+    let (aN, aH) :=
+      if xArr[rem[0]!]! == 1 && xArr[rem[1]!]! > 1 && posOf rem[1]! < posOf 3 then
+        (rem[1]!, rem[0]!)
+      else
+        (rem[0]!, rem[1]!)
 
     let tn := xArr[aN]!
     let tc := xArr[aC]!
