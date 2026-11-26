@@ -63,18 +63,22 @@ def makeFp16Surface
     (target : Target)
     (shortName symbolName : String)
     (direction : SurfaceDirection)
-    (channels height width : Nat) : Except String SurfaceSpec := do
-  if channels == 0 || height == 0 || width == 0 then
-    throw s!"surface '{shortName}': dimensions (C={channels}, H={height}, W={width}) must all be >= 1"
+    (channels height width : Nat)
+    (n : Nat := 1) : Except String SurfaceSpec := do
+  if n == 0 || channels == 0 || height == 0 || width == 0 then
+    throw s!"surface '{shortName}': dimensions (N={n}, C={channels}, H={height}, W={width}) must all be >= 1"
+  let nU32 ← natToU32Checked n s!"surface '{shortName}' batch N"
   let cU32 ← natToU32Checked channels s!"surface '{shortName}' channels"
   let hU32 ← natToU32Checked height s!"surface '{shortName}' height"
   let wU32 ← natToU32Checked width s!"surface '{shortName}' width"
   let rowStride := alignUp (2 * width) dmaLineBytes
   let planeStride := height * rowStride
-  let span := channels * planeStride
+  let batchStride := channels * planeStride
+  let span := n * batchStride
   let alloc := alignUp span pageSize
   let rowStrideU64 ← natToU64Checked rowStride s!"surface '{shortName}' rowStride"
   let planeStrideU64 ← natToU64Checked planeStride s!"surface '{shortName}' planeStride"
+  let batchStrideU64 ← natToU64Checked batchStride s!"surface '{shortName}' batchStride"
   let spanU64 ← natToU64Checked span s!"surface '{shortName}' span"
   let allocU64 ← natToU64Checked alloc s!"surface '{shortName}' allocSize"
   let sectSize : UInt64 := if target.profile.fvmlibUseSpanSize then spanU64 else allocU64
@@ -82,13 +86,13 @@ def makeFp16Surface
     shortName := shortName
     symbolName := symbolName
     direction := direction
-    n := 1
+    n := nU32
     channels := cU32
     height := hU32
     width := wU32
     rowStride := rowStrideU64
     planeStride := planeStrideU64
-    batchStride := spanU64
+    batchStride := batchStrideU64
     sectionSize := some sectSize
     allocSize := some allocU64
   }
