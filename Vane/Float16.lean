@@ -79,6 +79,60 @@ def f16ToF32Bits (h : UInt16) : UInt32 :=
     let e32 : UInt32 := (exp + (127 - 15)).toUInt32
     sign ||| (e32 <<< 23) ||| (frac.toUInt32 <<< 13)
 
+/-- Convert an IEEE-754 binary64 `Float` to IEEE-754 binary32 bits (round-to-nearest-even). -/
+def floatToF32Bits (f : Float) : UInt32 :=
+  let bits := f.toBits
+  let sign : UInt32 := ((bits >>> 32) &&& 0x80000000).toUInt32
+  let exp : Nat := ((bits >>> 52) &&& 0x7ff).toNat
+  let frac : UInt64 := bits &&& (((1 : UInt64) <<< 52) - 1)
+  if exp == 0x7ff then
+    if frac == 0 then
+      sign ||| 0x7f800000
+    else
+      let payload := (frac >>> 29).toUInt32 &&& 0x003fffff
+      sign ||| 0x7fc00000 ||| (if payload == 0 then 0x00200000 else payload)
+  else if exp == 0 then
+    sign
+  else
+    let e : Int := (exp : Int) - 1023
+    let sig : UInt64 := ((1 : UInt64) <<< 52) ||| frac
+    if e > 128 then
+      sign ||| 0x7f800000
+    else if e >= -126 then
+      let shift : UInt64 := 29
+      let q0 := sig >>> shift
+      let rem := sig &&& (((1 : UInt64) <<< shift) - 1)
+      let half : UInt64 := (1 : UInt64) <<< 28
+      let roundUp := rem > half || (rem == half && (q0 &&& 1) == 1)
+      let (q, eFin) :=
+        if roundUp then
+          let q1 := q0 + 1
+          if q1 == 0x1000000 then (0x800000, e + 1) else (q1, e)
+        else
+          (q0, e)
+      if eFin > 127 then
+        sign ||| 0x7f800000
+      else
+        sign ||| (((eFin + 127).toNat.toUInt32) <<< 23) ||| (q.toUInt32 &&& 0x007fffff)
+    else
+      -- Subnormal / underflow: target LSB is 2^-149, sig LSB is 2^(e - 52) -> shift = -97 - e
+      let shift : Nat := (-97 - e).toNat
+      if shift > 53 then
+        sign
+      else if shift == 53 then
+        if frac > 0 then sign ||| 0x00000001 else sign
+      else
+        let s64 := shift.toUInt64
+        let q0 := sig >>> s64
+        let rem := sig &&& (((1 : UInt64) <<< s64) - 1)
+        let half : UInt64 := (1 : UInt64) <<< (shift - 1).toUInt64
+        let roundUp := rem > half || (rem == half && (q0 &&& 1) == 1)
+        let q := if roundUp then q0 + 1 else q0
+        if q == 0x800000 then
+          sign ||| 0x00800000
+        else
+          sign ||| q.toUInt32
+
 /-- Direct binary64 `Float` to IEEE-754 binary16 conversion without double rounding.
     When `tiesAway = false`, uses round-to-nearest-even (`NaN -> 0x7e00`).
     When `tiesAway = true`, rounds ties away from zero (`NaN -> 0x7e00`). -/

@@ -11,6 +11,7 @@ open Vane.Program
 open Vane.Verify
 open Vane.Pe
 open Vane.Lut
+open Vane.Pool
 open Vane.Conv
 open Vane.Conv1x1
 open Vane.Conv3x3
@@ -3785,7 +3786,7 @@ private def runM4Tests : IO (Array TestResult) := do
     let orig ← readU32LE baseNeSrcStageAhead.hwx fCfg1
     let stripped := orig &&& (~~~cfgBitWaitNe5)
     tamperTaskRegAndVerify baseNeSrcStageAhead.hwx baseNeSrcStageAhead.info 1 regSrc1Cfg stripped
-  ) "neSrcStageAhead")
+  ) "srcStageAhead")
 
   pure results
 
@@ -4171,8 +4172,561 @@ private def runM5aTests : IO (Array TestResult) := do
 
   pure results
 
+-- ===========================================================================
+-- Milestone 5B Tests: Pooling, Reductions, L2 PE2 Broadcast, Verifier Tampers
+-- ===========================================================================
+
+private def runM5bTests : IO (Array TestResult) := do
+  let mut results : Array TestResult := #[]
+
+  -- 1. Positive: PE window pooling (H16 & H17) across max/avg, excl=true/false, valid/same/custom, multi-strip, H16 staged
+  results := results.push (checkOk "m5b: pePool H16 & H17 (max/avg, excl, valid/same/custom, multi-strip, H16 staged)" (do
+    let cases : Array (PoolKind × TensorDims × Nat × Nat × Nat × Nat × PoolPad × Bool) := #[
+      (.max, { c := 16, h := 16, w := 16 }, 2, 2, 2, 2, .valid, true),
+      (.avg, { c := 16, h := 16, w := 16 }, 3, 3, 1, 1, .same, true),
+      (.avg, { c := 16, h := 16, w := 16 }, 3, 3, 1, 1, .same, false),
+      (.max, { c := 8, h := 13, w := 17 }, 5, 5, 2, 2, .custom 2 1 1 2, true),
+      (.max, { c := 8, h := 12, w := 160 }, 2, 2, 2, 2, .valid, true), -- multi-strip Ow=80
+      (.avg, { c := 4, h := 2, w := 2 }, 2, 2, 2, 2, .valid, true)     -- sEff=1 edge case
+    ]
+    for tgt in #[Target.h16, Target.h17] do
+      for (op, dims, kh, kw, sh, sw, pad, excl) in cases do
+        let c ← compilePool { target := tgt, op := op, dims := dims, kh := kh, kw := kw, sh := sh, sw := sw, pad := pad, excludePad := excl }
+        if c.backend != .pePool then
+          throw s!"expected pePool backend, got {c.backend.name}"
+        let s ← verifyHwxTasksSummary c.hwx c.info (requireKnownTask := true)
+        if s.pePool != 1 then
+          throw s!"expected 1 pePool task, got {repr s}"
+    -- H16 staged multi-strip pePool: large C forces k=5 (T=32) with Ow=56 > 32 -> direct=false on H16
+    let stagedH16 ← compilePool {
+      target := .h16, op := .max, dims := { c := 5120, h := 2, w := 112 },
+      kh := 2, kw := 2, sh := 2, sw := 2, pad := .valid
+    }
+    if stagedH16.direct then
+      throw "expected H16 multi-strip k=5 pePool to use staged mode (direct=false)"
+    let sStg ← verifyHwxTasksSummary stagedH16.hwx stagedH16.info (requireKnownTask := true)
+    if sStg.pePool != 1 then
+      throw s!"expected 1 verified H16 staged pePool task, got {repr sStg}"
+    pure ()
+  ))
+
+  -- 2. Positive: PE tensor reductions (H16 & H17) across all 10 ops, all 7 axis subsets, multi-strip/multi-tile, sD > 1
+  results := results.push (checkOk "m5b: peReduce H16 & H17 (all 10 ops, all 7 axis subsets, multi-strip/multi-tile, sD>1)" (do
+    let allOps : Array ReduceOp := #[
+      .sum, .mean, .max, .min, .l1, .sumSquare, .l2, .invSum, .rsqrtSumSquare, .rsqrtMeanSquare
+    ]
+    for tgt in #[Target.h16, Target.h17] do
+      for op in allOps do
+        let eps : UInt16 := if op.usesEps then floatToF16CanonicalZero 0.001 else 0
+        let c ← compileReduce { target := tgt, op := op, dims := { c := 8, h := 6, w := 32 }, axes := { reduceW := true }, eps := eps }
+        if c.backend != .peReduce || c.outDims != { c := 8, h := 6, w := 1 } then
+          throw s!"peReduce {op.name} unexpected backend/outDims"
+        let s ← verifyHwxTasksSummary c.hwx c.info (requireKnownTask := true)
+        if s.peReduce != 1 then
+          throw s!"expected 1 peReduce task for {op.name}"
+      -- All 7 axis subsets (W-containing on W=16, and W=1 for h/c/ch)
+      let axisCases : Array (TensorDims × ReduceAxes × TensorDims) := #[
+        ({ c := 1, h := 6, w := 16 }, { reduceW := true }, { c := 1, h := 6, w := 1 }),   -- [W] C=1
+        ({ c := 4, h := 6, w := 16 }, { reduceW := true }, { c := 4, h := 6, w := 1 }),   -- [W] C>1
+        ({ c := 4, h := 6, w := 16 }, { reduceH := true, reduceW := true }, { c := 4, h := 1, w := 1 }),
+        ({ c := 4, h := 6, w := 16 }, { reduceC := true, reduceW := true }, { c := 1, h := 6, w := 1 }),
+        ({ c := 8, h := 4, w := 16 }, { reduceC := true, reduceH := true, reduceW := true }, { c := 1, h := 1, w := 1 }), -- C > H (sD > 1)
+        ({ c := 4, h := 8, w := 16 }, { reduceC := true, reduceH := true, reduceW := true }, { c := 1, h := 1, w := 1 }), -- C <= H (sD > 1)
+        ({ c := 4, h := 6, w := 1 },  { reduceH := true }, { c := 4, h := 1, w := 1 }),
+        ({ c := 4, h := 6, w := 1 },  { reduceC := true }, { c := 1, h := 6, w := 1 }),
+        ({ c := 4, h := 6, w := 1 },  { reduceC := true, reduceH := true }, { c := 1, h := 1, w := 1 })
+      ]
+      for (dims, axes, expOut) in axisCases do
+        let c ← compileReduce { target := tgt, op := .mean, dims := dims, axes := axes }
+        if c.outDims != expOut then
+          throw s!"peReduce axes={axes.name} outDims={repr c.outDims} != {repr expOut}"
+        let _ ← verifyHwxTasksSummary c.hwx c.info (requireKnownTask := true)
+      -- Multi-strip + multi-tile (W=512, C=64, H=64 -> exceeds 2 MiB single tile -> th < sH)
+      let big ← compileReduce { target := tgt, op := .sumSquare, dims := { c := 64, h := 64, w := 512 }, axes := { reduceH := true, reduceW := true } }
+      let _ ← verifyHwxTasksSummary big.hwx big.info (requireKnownTask := true)
+    pure ()
+  ))
+
+  -- 3. Positive: Weightless NE window pooling (7x7, 15x15, max/avg, s1/s2) + global pool fast-path
+  results := results.push (checkOk "m5b: nePool H16 & H17 (7x7, 15x15, max/avg, s1/s2) + global pool fast-path" (do
+    let cases : Array (PoolKind × TensorDims × Nat × Nat × Nat × Nat × PoolPad × Bool) := #[
+      (.max, { c := 16, h := 16, w := 16 }, 7, 7, 1, 1, .same, false),
+      (.avg, { c := 16, h := 16, w := 16 }, 7, 7, 2, 2, .same, false),
+      (.max, { c := 8, h := 32, w := 32 }, 15, 15, 2, 2, .valid, false),
+      (.avg, { c := 8, h := 32, w := 32 }, 15, 15, 2, 2, .same, false),
+      (.avg, { c := 8, h := 24, w := 24 }, 10, 10, 1, 1, .valid, true) -- even k=10 s1 valid
+    ]
+    for tgt in #[Target.h16, Target.h17] do
+      for (op, dims, kh, kw, sh, sw, pad, excl) in cases do
+        let c ← compilePool { target := tgt, op := op, dims := dims, kh := kh, kw := kw, sh := sh, sw := sw, pad := pad, excludePad := excl }
+        if c.backend != .nePool then
+          throw s!"expected nePool backend, got {c.backend.name}"
+        if c.info.kernelSection.isSome then
+          throw "weightless nePool must have zero __KERN_0"
+        let s ← verifyHwxTasksSummary c.hwx c.info (requireKnownTask := true)
+        if s.nePool != 1 then
+          throw s!"expected 1 nePool task, got {repr s}"
+      -- Global pool fast-path: 8x8 valid on 8x8 input lowers to peReduce [H, W]
+      let gap ← compilePool { target := tgt, op := .avg, dims := { c := 32, h := 8, w := 8 }, kh := 8, kw := 8, sh := 1, sw := 1, pad := .valid }
+      if gap.backend != .peReduceGlobal || gap.outDims != { c := 32, h := 1, w := 1 } then
+        throw s!"expected peReduceGlobal 32x1x1, got {gap.backend.name} {repr gap.outDims}"
+      let sGap ← verifyHwxTasksSummary gap.hwx gap.info (requireKnownTask := true)
+      if sGap.peReduce != 1 then
+        throw s!"expected 1 peReduce task for global avg_pool, got {repr sGap}"
+    pure ()
+  ))
+
+  -- 4. Positive: Weightless NE channel reduction (max/min/sum/mean, odd C, multi-strip)
+  results := results.push (checkOk "m5b: neChannelReduce H16 & H17 (max/min/sum/mean, odd C=17, multi-strip W=160)" (do
+    for tgt in #[Target.h16, Target.h17] do
+      for op in #[ReduceOp.max, .min, .sum, .mean] do
+        for dims in #[({ c := 17, h := 8, w := 23 } : TensorDims), { c := 64, h := 12, w := 160 }] do
+          let c ← compileReduce { target := tgt, op := op, dims := dims, axes := { reduceC := true } }
+          if c.backend != .neChannelReduce || c.outDims != { c := 1, h := dims.h, w := dims.w } then
+            throw s!"neChannelReduce {op.name} unexpected backend/outDims"
+          if c.info.kernelSection.isSome then
+            throw "weightless neChannelReduce must have zero __KERN_0"
+          let s ← verifyHwxTasksSummary c.hwx c.info (requireKnownTask := true)
+          if s.neChannelReduce != 1 then
+            throw s!"expected 1 neChannelReduce task, got {repr s}"
+    pure ()
+  ))
+
+  -- 5. Positive: 100% L2-resident DAGs (rms_norm, layer_norm, softmax, channel-softmax prefix, ResNet block) on H16 & H17
+  for tgt in #[Target.h16, Target.h17] do
+    results := results.push (checkOk s!"m5b: {tgt.name} 100% L2-resident rms_norm, layer_norm, softmax, channel-softmax & ResNet DAGs" (do
+      -- (a) RMSNorm along W (0 B scratch, 0 B kernel)
+      let rms ← Vane.Graph.compileGraph {
+        target := tgt, defaultPlacement := .auto
+        inputs := #[{ name := "x", shape := { c := 16, h := 8, w := 64 } }]
+        nodes := #[
+          { id := "inv_rms", inputs := #["x"], op := .reduce .rsqrtMeanSquare { reduceW := true } (floatToF16CanonicalZero 0.001) },
+          { id := "out", inputs := #["x", "inv_rms"], op := .pe2 .mul false }
+        ]
+      }
+      let sRms ← verifyM5aGraph rms 2
+      if rms.scratchBytes != 0 || rms.kernelBytes != 0 || sRms.peReduce != 1 || sRms.peOp != 1 then
+        throw s!"rms_norm unexpected scratch={rms.scratchBytes} kern={rms.kernelBytes} summary={repr sRms}"
+
+      -- (b) LayerNorm along W (4 tasks, 0 B scratch, 0 B kernel)
+      let ln ← Vane.Graph.compileGraph {
+        target := tgt, defaultPlacement := .auto
+        inputs := #[{ name := "x", shape := { c := 16, h := 8, w := 64 } }]
+        nodes := #[
+          { id := "mu", inputs := #["x"], op := .reduce .mean { reduceW := true } },
+          { id := "xc", inputs := #["x", "mu"], op := .pe2 .sub false },
+          { id := "inv_std", inputs := #["xc"], op := .reduce .rsqrtMeanSquare { reduceW := true } (floatToF16CanonicalZero 0.001) },
+          { id := "out", inputs := #["xc", "inv_std"], op := .pe2 .mul false }
+        ]
+      }
+      let sLn ← verifyM5aGraph ln 4
+      if ln.scratchBytes != 0 || ln.kernelBytes != 0 || sLn.peReduce != 2 || sLn.peOp != 2 then
+        throw s!"layer_norm unexpected scratch={ln.scratchBytes} kern={ln.kernelBytes} summary={repr sLn}"
+
+      -- (c) Softmax along W (6 tasks, 0 B scratch)
+      let sm ← Vane.Graph.compileGraph {
+        target := tgt, defaultPlacement := .auto
+        inputs := #[{ name := "x", shape := { c := 8, h := 8, w := 64 } }]
+        nodes := #[
+          { id := "mx", inputs := #["x"], op := .reduce .max { reduceW := true } },
+          { id := "shifted", inputs := #["x", "mx"], op := .pe2 .sub false },
+          { id := "scaled", inputs := #["shifted"], op := .pe1 (PeOp.scalarMul fp16InvLn2Bits) },
+          { id := "ex", inputs := #["scaled"], op := .lut (.lut .exp2) },
+          { id := "inv_s", inputs := #["ex"], op := .reduce .invSum { reduceW := true } },
+          { id := "out", inputs := #["ex", "inv_s"], op := .pe2 .mul false }
+        ]
+      }
+      let sSm ← verifyM5aGraph sm 6
+      if sm.scratchBytes != 0 || sSm.peReduce != 2 || sSm.peOp != 3 || sSm.neAct != 1 then
+        throw s!"softmax unexpected scratch={sm.scratchBytes} summary={repr sSm}"
+
+      -- (d) Channel-axis softmax prefix (neChannelReduce -> pe2 C-broadcast sub -> smul -> lut exp2 -> neChannelReduce sum, 0 B scratch)
+      let csm ← Vane.Graph.compileGraph {
+        target := tgt, defaultPlacement := .auto
+        inputs := #[{ name := "x", shape := { c := 32, h := 8, w := 32 } }]
+        nodes := #[
+          { id := "mx", inputs := #["x"], op := .reduce .max { reduceC := true } },
+          { id := "shifted", inputs := #["x", "mx"], op := .pe2 .sub false },
+          { id := "scaled", inputs := #["shifted"], op := .pe1 (PeOp.scalarMul fp16InvLn2Bits) },
+          { id := "ex", inputs := #["scaled"], op := .lut (.lut .exp2) },
+          { id := "sum_ex", inputs := #["ex"], op := .reduce .sum { reduceC := true } }
+        ]
+      }
+      let sCsm ← verifyM5aGraph csm 5
+      if csm.scratchBytes != 0 || sCsm.neChannelReduce != 2 || sCsm.peOp != 2 || sCsm.neAct != 1 then
+        throw s!"channel-softmax unexpected scratch={csm.scratchBytes} summary={repr sCsm}"
+
+      -- (e) ResNet block: conv3x3 -> max_pool 3x3 s2 -> conv1x1 + skip -> global avg_pool -> conv1x1 head
+      let resnet ← Vane.Graph.compileGraph {
+        target := tgt, defaultPlacement := .auto
+        inputs := #[{ name := "x", shape := { c := 16, h := 16, w := 16 } }]
+        nodes := #[
+          { id := "stem", inputs := #["x"], op := .conv3x3 .dense 16 16 1 .same (mkM5aW3x3 16 16 false) (some (mkM5aBias 16)) .relu },
+          { id := "pool", inputs := #["stem"], op := .pool .max 3 3 2 2 .same true },
+          { id := "proj", inputs := #["pool"], op := .conv1x1 16 16 (mkM5aW1x1 16 16 3) (some (mkM5aBias 16)) .relu },
+          { id := "skip", inputs := #["proj", "pool"], op := .pe2 .add false },
+          { id := "gap", inputs := #["skip"], op := .pool .avg 8 8 1 1 .valid true },
+          { id := "head", inputs := #["gap"], op := .conv1x1 16 8 (mkM5aW1x1 16 8 5) (some (mkM5aBias 8)) .none }
+        ]
+      }
+      let sRes ← verifyM5aGraph resnet 6
+      if resnet.scratchBytes != 0 || sRes.neConv != 3 || sRes.pePool != 1 || sRes.peOp != 1 || sRes.peReduce != 1 then
+        throw s!"resnet unexpected scratch={resnet.scratchBytes} summary={repr sRes}"
+      pure ()
+    ))
+
+  -- 6. Positive: DRAM fallback when L2-resident PE2 broadcast cannot fit at th == out.h (auto-spill)
+  results := results.push (checkOk "m5b: auto-spill fallback to DRAM when L2 PE2 broadcast cannot fit th == out.h" (do
+    -- x is 128x256x64 (4 MiB); inv_rms is 128x256x1 (512 KiB, fits in L2 alone),
+    -- but at th == out.h = 256 even k=5 staging of x needs 2 MiB -> exceeds L2 -> spills inv_rms to DRAM!
+    let bigRms ← Vane.Graph.compileGraph {
+      target := .h17, defaultPlacement := .auto
+      inputs := #[{ name := "x", shape := { c := 128, h := 256, w := 64 } }]
+      nodes := #[
+        { id := "inv_rms", inputs := #["x"], op := .reduce .rsqrtMeanSquare { reduceW := true } (floatToF16CanonicalZero 0.001) },
+        { id := "out", inputs := #["x", "inv_rms"], op := .pe2 .mul false }
+      ]
+    }
+    let _ ← verifyM5aGraph bigRms 2
+    if bigRms.scratchBytes == 0 then
+      throw "expected auto-spill to DRAM when full tensor + broadcast cannot fit th == out.h in 2 MiB L2"
+    pure ()
+  ))
+
+  -- 7. Negative compiler checks: StripMode rejects graphs containing pool or reduce; unsupported reduce/pool configs rejected
+  results := results.push (checkErr "m5b neg: StripMode.fixed rejects graph containing pool" (do
+    let _ ← Vane.Graph.compileGraph {
+      target := .h17, stripMode := .fixed 4
+      inputs := #[{ name := "x", shape := { c := 8, h := 16, w := 16 } }]
+      nodes := #[{ id := "p", inputs := #["x"], op := .pool .max 2 2 2 2 .valid true }]
+    }
+    pure ()
+  ) "pool operation is not supported")
+
+  results := results.push (checkErr "m5b neg: StripMode.fixed rejects graph containing reduce" (do
+    let _ ← Vane.Graph.compileGraph {
+      target := .h17, stripMode := .fixed 4
+      inputs := #[{ name := "x", shape := { c := 8, h := 16, w := 16 } }]
+      nodes := #[{ id := "r", inputs := #["x"], op := .reduce .mean { reduceW := true } }]
+    }
+    pure ()
+  ) "reduce operation is not supported")
+
+  results := results.push (checkErr "m5b neg: compiler rejects NE stride-1 max_pool k=9" (do
+    compilePool { target := .h17, op := .max, dims := { c := 8, h := 16, w := 16 }, kh := 9, kw := 9, sh := 1, sw := 1, pad := .same }
+  ) "stride-1 max_pool")
+
+  results := results.push (checkErr "m5b neg: compiler rejects NE stride-1 avg_pool odd k=9" (do
+    compilePool { target := .h17, op := .avg, dims := { c := 8, h := 16, w := 16 }, kh := 9, kw := 9, sh := 1, sw := 1, pad := .same, excludePad := false }
+  ) "stride-1 avg_pool")
+
+  results := results.push (checkErr "m5b neg: compiler rejects reduce over H alone when W > 1" (do
+    compileReduce { target := .h17, op := .sum, dims := { c := 8, h := 8, w := 16 }, axes := { reduceH := true } }
+  ) "transpose")
+
+  -- 8. Negative static-verifier tamper tests (per m5b.md §2.8)
+  let basePePool ← match compilePool {
+      target := .h17, op := .max, dims := { c := 8, h := 16, w := 16 }, kh := 3, kw := 3, sh := 2, sw := 2, pad := .same
+    } with
+    | .ok c => pure c
+    | .error e => throw (IO.userError s!"basePePool setup failed: {e}")
+
+  results := results.push (checkErr "m5b neg tamper: PE pool kh=6 (> 5) rejected by verifier" (do
+    let fCfg ← findM5aTaskRegOffset basePePool.hwx basePePool.info 0 regConvCfg
+    let origCfg ← readU32LE basePePool.hwx fCfg
+    -- Replace kh[12:6] with 6
+    let badCfg := (origCfg &&& (~~~((0x7f : UInt32) <<< 6))) ||| ((6 : UInt32) <<< 6)
+    tamperM5aTaskReg basePePool.hwx basePePool.info 0 regConvCfg badCfg
+  ) "must be in 1..5")
+
+  results := results.push (checkErr "m5b neg tamper: PE pool illegal 0x4500 opcode rejected by verifier" (do
+    tamperM5aTaskReg basePePool.hwx basePePool.info 0 regPeOp 0x00000005
+  ) "illegal PE pool 0x4500")
+
+  results := results.push (checkErr "m5b neg tamper: PE pool 0x4100 cmpFlags mismatch rejected by verifier" (do
+    tamperM5aTaskReg basePePool.hwx basePePool.info 0 regCmpFlags cmpFlagMinValue
+  ) "cmpFlags")
+
+  results := results.push (checkErr "m5b neg tamper: PE pool L2 overlap (resBase = src1Base) rejected by verifier" (do
+    tamperM5aTaskReg basePePool.hwx basePePool.info 0 regResBase 0
+  ) "overlapping L2")
+
+  let baseNeMaxPool ← match compilePool {
+      target := .h17, op := .max, dims := { c := 8, h := 24, w := 24 }, kh := 7, kw := 7, sh := 1, sw := 1, pad := .same, excludePad := false
+    } with
+    | .ok c => pure c
+    | .error e => throw (IO.userError s!"baseNeMaxPool setup failed: {e}")
+
+  results := results.push (checkErr "m5b neg tamper: NE pool max_pool s1 k=9 rejected by verifier" (do
+    let fCfg ← findM5aTaskRegOffset baseNeMaxPool.hwx baseNeMaxPool.info 0 regConvCfg
+    let origCfg ← readU32LE baseNeMaxPool.hwx fCfg
+    let badCfg := (origCfg &&& (~~~((0x7f : UInt32) <<< 6))) ||| ((9 : UInt32) <<< 6)
+    tamperM5aTaskReg baseNeMaxPool.hwx baseNeMaxPool.info 0 regConvCfg badCfg
+  ) "stride-1 max_pool unsupported")
+
+  results := results.push (checkErr "m5b neg tamper: NE pool kh=16 (> 15) rejected by verifier" (do
+    let fCfg ← findM5aTaskRegOffset baseNeMaxPool.hwx baseNeMaxPool.info 0 regConvCfg
+    let origCfg ← readU32LE baseNeMaxPool.hwx fCfg
+    let badCfg := (origCfg &&& (~~~((0x7f : UInt32) <<< 6))) ||| ((16 : UInt32) <<< 6)
+    tamperM5aTaskReg baseNeMaxPool.hwx baseNeMaxPool.info 0 regConvCfg badCfg
+  ) "must be in 1..15")
+
+  let baseNeAvgPool ← match compilePool {
+      target := .h17, op := .avg, dims := { c := 8, h := 24, w := 24 }, kh := 7, kw := 7, sh := 1, sw := 1, pad := .same, excludePad := false
+    } with
+    | .ok c => pure c
+    | .error e => throw (IO.userError s!"baseNeAvgPool setup failed: {e}")
+
+  results := results.push (checkErr "m5b neg tamper: NE pool avg_pool s1 odd k=9 rejected by verifier" (do
+    let fCfg ← findM5aTaskRegOffset baseNeAvgPool.hwx baseNeAvgPool.info 0 regConvCfg
+    let origCfg ← readU32LE baseNeAvgPool.hwx fCfg
+    let badCfg := (origCfg &&& (~~~((0x7f : UInt32) <<< 6))) ||| ((9 : UInt32) <<< 6)
+    tamperM5aTaskReg baseNeAvgPool.hwx baseNeAvgPool.info 0 regConvCfg badCfg
+  ) "stride-1 avg_pool unsupported")
+
+  let basePeRed ← match compileReduce {
+      target := .h17, op := .max, dims := { c := 8, h := 6, w := 32 }, axes := { reduceH := true, reduceW := true }
+    } with
+    | .ok c => pure c
+    | .error e => throw (IO.userError s!"basePeRed setup failed: {e}")
+
+  results := results.push (checkErr "m5b neg tamper: PE reduce mismatched Wout != Win rejected by verifier" (do
+    tamperM5aTaskReg basePeRed.hwx basePeRed.info 0 regWout 16
+  ) "!= input dims")
+
+  results := results.push (checkErr "m5b neg tamper: PE reduce illegal 0x4500 opcode rejected by verifier" (do
+    tamperM5aTaskReg basePeRed.hwx basePeRed.info 0 regPeOp 0x00000001
+  ) "illegal PE reduce 0x4500")
+
+  results := results.push (checkErr "m5b neg tamper: PE reduce 0x4100 mismatch rejected by verifier" (do
+    tamperM5aTaskReg basePeRed.hwx basePeRed.info 0 regCmpFlags cmpFlagMinValue
+  ) "cmpFlags")
+
+  results := results.push (checkErr "m5b neg tamper: PE reduce th > sH rejected by verifier" (do
+    tamperM5aTaskReg basePeRed.hwx basePeRed.info 0 regTH 7
+  ) "tileHeight=7 out of range")
+
+  let baseNeChanRed ← match compileReduce {
+      target := .h17, op := .max, dims := { c := 16, h := 8, w := 32 }, axes := { reduceC := true }
+    } with
+    | .ok c => pure c
+    | .error e => throw (IO.userError s!"baseNeChanRed setup failed: {e}")
+
+  results := results.push (checkErr "m5b neg tamper: NE channel reduce Cout != 1 rejected by verifier" (do
+    tamperM5aTaskReg baseNeChanRed.hwx baseNeChanRed.info 0 regCout 2
+  ) "requires Cout=1")
+
+  results := results.push (checkErr "m5b neg tamper: NE channel reduce 0x0030 != (Cin << 16) rejected by verifier" (do
+    tamperM5aTaskReg baseNeChanRed.hwx baseNeChanRed.info 0 regDwGroups ((17 : UInt32) <<< 16)
+  ) "chanCount=17 != Cin=16")
+
+  results := results.push (checkErr "m5b neg tamper: NE channel reduce unknown 0x4904 rejected by verifier" (do
+    tamperM5aTaskReg baseNeChanRed.hwx baseNeChanRed.info 0 regNeOp 0x00103c0f
+  ) "unknown NE channel reduce neOp")
+
+  -- Reject L2-resident PE2 broadcast consumer when th < outH
+  let baseL2Bcast ← match Vane.Graph.compileGraph {
+      target := .h17, defaultPlacement := .auto
+      inputs := #[{ name := "x", shape := { c := 8, h := 8, w := 32 } }]
+      nodes := #[
+        { id := "mu", inputs := #["x"], op := .reduce .mean { reduceW := true } },
+        { id := "xc", inputs := #["x", "mu"], op := .pe2 .sub false }
+      ]
+    } with
+    | .ok g => pure g
+    | .error e => throw (IO.userError s!"baseL2Bcast setup failed: {e}")
+
+  results := results.push (checkErr "m5b neg tamper: L2-resident PE2 broadcast consumer with th < outH rejected by verifier" (do
+    let fTh ← findM5aTaskRegOffset baseL2Bcast.hwx baseL2Bcast.info 1 regTH
+    let fTile ← findM5aTaskRegOffset baseL2Bcast.hwx baseL2Bcast.info 1 regPeTile
+    let origTile ← readU32LE baseL2Bcast.hwx fTile
+    let k := (origTile &&& 0xf).toNat
+    let newTh := 4
+    let newM := min (8 - k) (ceilLog2 newTh)
+    let newTile : UInt32 := (k.toUInt32) ||| ((newM.toUInt32) <<< 4)
+    let h1 ← putU32LE baseL2Bcast.hwx fTh newTh.toUInt32
+    let h2 ← putU32LE h1 fTile newTile
+    let badInfo ← validateHwx h2
+    let _ ← verifyHwxTasks h2 badInfo (requireKnownTask := true)
+    pure ()
+  ) "L2-resident PE2 broadcast")
+
+  -- 9. Silicon-discovered DRAM-scratch sync rules: general PE/NE srcStageAhead & multi-batch (BatchN > 1) depKind=1
+  let baseLnDram ← match Vane.Graph.compileGraph {
+      target := .h16, defaultPlacement := .dram
+      inputs := #[{ name := "x", shape := { c := 8, h := 6, w := 32 } }]
+      nodes := #[
+        { id := "mu", inputs := #["x"], op := .reduce .mean { reduceW := true } },
+        { id := "xc", inputs := #["x", "mu"], op := .pe2 .sub false },
+        { id := "inv_std", inputs := #["xc"], op := .reduce .rsqrtMeanSquare { reduceW := true } (floatToF16CanonicalZero 0.001) },
+        { id := "out", inputs := #["xc", "inv_std"], op := .pe2 .mul false }
+      ]
+    } with
+    | .ok g => pure g
+    | .error e => throw (IO.userError s!"baseLnDram setup failed: {e}")
+
+  let baseRedToNeDram ← match Vane.Graph.compileGraph {
+      target := .h16, defaultPlacement := .dram
+      inputs := #[{ name := "x", shape := { c := 8, h := 6, w := 32 } }]
+      nodes := #[
+        { id := "mu", inputs := #["x"], op := .reduce .mean { reduceW := true } },
+        { id := "proj", inputs := #["mu"], op := .conv1x1 8 8 (mkM5aW1x1 8 8 1) none .none }
+      ]
+    } with
+    | .ok g => pure g
+    | .error e => throw (IO.userError s!"baseRedToNeDram setup failed: {e}")
+
+  let baseRedToPe1Dram ← match Vane.Graph.compileGraph {
+      target := .h16, defaultPlacement := .dram
+      inputs := #[{ name := "x", shape := { c := 8, h := 6, w := 32 } }]
+      nodes := #[
+        { id := "mu", inputs := #["x"], op := .reduce .mean { reduceW := true } },
+        { id := "scaled", inputs := #["mu"], op := .pe1 (PeOp.scalarMul 0x3800) }
+      ]
+    } with
+    | .ok g => pure g
+    | .error e => throw (IO.userError s!"baseRedToPe1Dram setup failed: {e}")
+
+  results := results.push (checkOk "m5b: LayerNorm(axis=W) DRAM + peReduce(w)->PE/NE emit depKind=1 (BatchN>1) & waitPe22 (srcStageAhead)" (do
+    for tgt in #[Target.h16, Target.h17] do
+      let lnDram ← Vane.Graph.compileGraph {
+        target := tgt, defaultPlacement := .dram
+        inputs := #[{ name := "x", shape := { c := 8, h := 6, w := 32 } }]
+        nodes := #[
+          { id := "mu", inputs := #["x"], op := .reduce .mean { reduceW := true } },
+          { id := "xc", inputs := #["x", "mu"], op := .pe2 .sub false },
+          { id := "inv_std", inputs := #["xc"], op := .reduce .rsqrtMeanSquare { reduceW := true } (floatToF16CanonicalZero 0.001) },
+          { id := "out", inputs := #["xc", "inv_std"], op := .pe2 .mul false }
+        ]
+      }
+      let s ← verifyM5aGraph lnDram 4
+      if s.peReduce != 2 || s.peOp != 2 || lnDram.scratchBytes == 0 then
+        throw s!"{tgt.name} lnDram unexpected summary={repr s} scratch={lnDram.scratchBytes}"
+      -- Task 1 (xc): src2Dep reads task 0 (BatchN=6 > 1) -> depKind=1; src1Cfg sets bit 22 (srcStageAhead)
+      let w1s2 ← readU32LE lnDram.hwx (← findM5aTaskRegOffset lnDram.hwx lnDram.info 1 regSrc2Dep)
+      let dk1s2 ← decodeFieldChecked (srcDepMultiLayout "src2Dep") w1s2 "depKind"
+      if dk1s2 != 1 then
+        throw s!"{tgt.name} lnDram task 1 src2Dep depKind={dk1s2} != 1"
+      let w1c1 ← readU32LE lnDram.hwx (← findM5aTaskRegOffset lnDram.hwx lnDram.info 1 regSrc1Cfg)
+      if (w1c1 &&& cfgBitWaitPe22) == 0 then
+        throw s!"{tgt.name} lnDram task 1 src1Cfg {toHex w1c1.toNat} missing bit 22 (waitPe22 for srcStageAhead)"
+      -- Task 2 (inv_std): src1Dep reads task 1 (BatchN=1) -> depKind=2
+      let w2s1 ← readU32LE lnDram.hwx (← findM5aTaskRegOffset lnDram.hwx lnDram.info 2 regSrc1Dep)
+      let dk2s1 ← decodeFieldChecked (srcDepMultiLayout "src1Dep") w2s1 "depKind"
+      if dk2s1 != 2 then
+        throw s!"{tgt.name} lnDram task 2 src1Dep depKind={dk2s1} != 2"
+      -- Task 3 (out): src1Dep reads task 1 (BatchN=1) -> depKind=2; src2Dep reads task 2 (BatchN=6 > 1) -> depKind=1; src1Cfg sets bit 22
+      let w3s1 ← readU32LE lnDram.hwx (← findM5aTaskRegOffset lnDram.hwx lnDram.info 3 regSrc1Dep)
+      let dk3s1 ← decodeFieldChecked (srcDepMultiLayout "src1Dep") w3s1 "depKind"
+      if dk3s1 != 2 then
+        throw s!"{tgt.name} lnDram task 3 src1Dep depKind={dk3s1} != 2"
+      let w3s2 ← readU32LE lnDram.hwx (← findM5aTaskRegOffset lnDram.hwx lnDram.info 3 regSrc2Dep)
+      let dk3s2 ← decodeFieldChecked (srcDepMultiLayout "src2Dep") w3s2 "depKind"
+      if dk3s2 != 1 then
+        throw s!"{tgt.name} lnDram task 3 src2Dep depKind={dk3s2} != 1"
+      let w3c1 ← readU32LE lnDram.hwx (← findM5aTaskRegOffset lnDram.hwx lnDram.info 3 regSrc1Cfg)
+      if (w3c1 &&& cfgBitWaitPe22) == 0 then
+        throw s!"{tgt.name} lnDram task 3 src1Cfg {toHex w3c1.toNat} missing bit 22 (waitPe22 for srcStageAhead)"
+    -- Also verify NE consumer (peReduce(w) -> DRAM -> neConv1x1) emits depKind=1, depDist=0
+    let _ ← verifyM5aGraph baseRedToNeDram 2
+    let wNe ← readU32LE baseRedToNeDram.hwx (← findM5aTaskRegOffset baseRedToNeDram.hwx baseRedToNeDram.info 1 regSrc1Dep)
+    let dkNe ← decodeFieldChecked (srcDepMultiLayout "src1Dep") wNe "depKind"
+    let ddNe ← decodeFieldChecked (srcDepMultiLayout "src1Dep") wNe "depDist"
+    if dkNe != 1 || ddNe != 0 then
+      throw s!"peReduce(w)->neConv1x1 DRAM task 1 src1Dep expected (depKind=1, depDist=0), got ({dkNe}, {ddNe})"
+    -- Also verify PE src1 consumer (peReduce(w) -> DRAM -> pe1) emits depKind=1
+    let _ ← verifyM5aGraph baseRedToPe1Dram 2
+    let wPe1 ← readU32LE baseRedToPe1Dram.hwx (← findM5aTaskRegOffset baseRedToPe1Dram.hwx baseRedToPe1Dram.info 1 regSrc1Dep)
+    let dkPe1 ← decodeFieldChecked (srcDepMultiLayout "src1Dep") wPe1 "depKind"
+    if dkPe1 != 1 then
+      throw s!"peReduce(w)->pe1 DRAM task 1 src1Dep expected depKind=1, got {dkPe1}"
+    pure ()
+  ))
+
+  results := results.push (checkErr "m5b neg tamper: clearing PE src1Cfg bit 22 when src1Stage overlaps prior PE resStage rejected ([srcStageAhead])" (do
+    let fCfg1 ← findM5aTaskRegOffset baseLnDram.hwx baseLnDram.info 1 regSrc1Cfg
+    let origCfg1 ← readU32LE baseLnDram.hwx fCfg1
+    let stripped := origCfg1 &&& (~~~cfgBitWaitPe22)
+    tamperM5aTaskReg baseLnDram.hwx baseLnDram.info 1 regSrc1Cfg stripped
+  ) "[srcStageAhead]")
+
+  results := results.push (checkErr "m5b neg tamper: PE src2Dep reading BatchN>1 peReduce scratch with depKind=2 rejected ([multiBatchRaw])" (do
+    let fDep ← findM5aTaskRegOffset baseLnDram.hwx baseLnDram.info 1 regSrc2Dep
+    let origDep ← readU32LE baseLnDram.hwx fDep
+    let badDep := (origDep &&& (~~~((0x3 : UInt32) <<< 28))) ||| ((2 : UInt32) <<< 28)
+    tamperM5aTaskReg baseLnDram.hwx baseLnDram.info 1 regSrc2Dep badDep
+  ) "[multiBatchRaw]")
+
+  results := results.push (checkErr "m5b neg tamper: NE src1Dep reading BatchN>1 peReduce scratch with depKind=2 rejected ([multiBatchRaw])" (do
+    let fDep ← findM5aTaskRegOffset baseRedToNeDram.hwx baseRedToNeDram.info 1 regSrc1Dep
+    let origDep ← readU32LE baseRedToNeDram.hwx fDep
+    let badDep := (origDep &&& (~~~((0x3 : UInt32) <<< 28))) ||| ((2 : UInt32) <<< 28)
+    tamperM5aTaskReg baseRedToNeDram.hwx baseRedToNeDram.info 1 regSrc1Dep badDep
+  ) "[multiBatchRaw]")
+
+  results := results.push (checkErr "m5b neg tamper: PE src1Dep reading BatchN>1 peReduce scratch with depKind=2 rejected ([multiBatchRaw])" (do
+    let fDep ← findM5aTaskRegOffset baseRedToPe1Dram.hwx baseRedToPe1Dram.info 1 regSrc1Dep
+    let origDep ← readU32LE baseRedToPe1Dram.hwx fDep
+    let badDep := (origDep &&& (~~~((0x3 : UInt32) <<< 28))) ||| ((2 : UInt32) <<< 28)
+    tamperM5aTaskReg baseRedToPe1Dram.hwx baseRedToPe1Dram.info 1 regSrc1Dep badDep
+  ) "[multiBatchRaw]")
+
+  -- 10. [M2] Additional negative verifier tamper tests (H16 staged PE pool direct=1, peReduce 4D DMA OOB, L2 PE2 broadcast handoff)
+  let baseStagedPePoolH16 ← match compilePool {
+      target := .h16, op := .max, dims := { c := 5120, h := 2, w := 112 },
+      kh := 2, kw := 2, sh := 2, sw := 2, pad := .valid
+    } with
+    | .ok c => pure c
+    | .error e => throw (IO.userError s!"baseStagedPePoolH16 setup failed: {e}")
+
+  results := results.push (checkErr "m5b [M2] neg tamper: H16 multi-strip k=5 pePool resCfg/resDep direct=1 rejected by verifier" (do
+    let fCfg ← findM5aTaskRegOffset baseStagedPePoolH16.hwx baseStagedPePoolH16.info 0 regResCfg
+    let fDep ← findM5aTaskRegOffset baseStagedPePoolH16.hwx baseStagedPePoolH16.info 0 regResDep
+    let origCfg ← readU32LE baseStagedPePoolH16.hwx fCfg
+    let origDep ← readU32LE baseStagedPePoolH16.hwx fDep
+    let h1 ← putU32LE baseStagedPePoolH16.hwx fCfg (origCfg ||| ((1 : UInt32) <<< 3))
+    let h2 ← putU32LE h1 fDep (origDep ||| ((1 : UInt32) <<< 24))
+    let badInfo ← validateHwx h2
+    let _ ← verifyHwxTasks h2 badInfo (requireKnownTask := true)
+    pure ()
+  ) "PE pool direct")
+
+  let basePeRed4dChw ← match compileReduce {
+      target := .h17, op := .sum, dims := { c := 8, h := 4, w := 32 },
+      axes := { reduceC := true, reduceH := true, reduceW := true }
+    } with
+    | .ok c => pure c
+    | .error e => throw (IO.userError s!"basePeRed4dChw setup failed: {e}")
+
+  let basePeRed4dW ← match compileReduce {
+      target := .h17, op := .mean, dims := { c := 8, h := 6, w := 32 },
+      axes := { reduceW := true }
+    } with
+    | .ok c => pure c
+    | .error e => throw (IO.userError s!"basePeRed4dW setup failed: {e}")
+
+  results := results.push (checkErr "m5b [M2] neg tamper: peReduce input 4D DMA stride (sD>1 0x4d20) inflated past input surface capacity rejected" (do
+    let fD ← findM5aTaskRegOffset basePeRed4dChw.hwx basePeRed4dChw.info 0 regSrc1DmaDStride
+    let origD ← readU32LE basePeRed4dChw.hwx fD
+    tamperM5aTaskReg basePeRed4dChw.hwx basePeRed4dChw.info 0 regSrc1DmaDStride (origD + 0x10000)
+  ) "exceeds")
+
+  results := results.push (checkErr "m5b [M2] neg tamper: peReduce output 4D DMA stride (sN>1 0x511c) inflated past output surface capacity rejected" (do
+    let fN ← findM5aTaskRegOffset basePeRed4dW.hwx basePeRed4dW.info 0 regResDmaNStride
+    let origN ← readU32LE basePeRed4dW.hwx fN
+    tamperM5aTaskReg basePeRed4dW.hwx basePeRed4dW.info 0 regResDmaNStride (origN + 0x10000)
+  ) "exceeds")
+
+  results := results.push (checkErr "m5b [M2] neg tamper: L2-resident PE2 broadcast src2Cfg setting L2 handoff bit rejected by verifier" (do
+    let fCfg2 ← findM5aTaskRegOffset baseL2Bcast.hwx baseL2Bcast.info 1 regSrc2Cfg
+    let origCfg2 ← readU32LE baseL2Bcast.hwx fCfg2
+    tamperM5aTaskReg baseL2Bcast.hwx baseL2Bcast.info 1 regSrc2Cfg (origCfg2 ||| cfgBitHandoffPe)
+  ) "must use whole-task wait, not L2 handoff")
+
+  pure results
+
 def main : IO UInt32 := do
-  let results := (← runAllTests) ++ (← runM4Tests) ++ (← runM5aTests)
+  let results := (← runAllTests) ++ (← runM4Tests) ++ (← runM5aTests) ++ (← runM5bTests)
   let mut passed := 0
   let mut failed := 0
   for r in results do

@@ -11,6 +11,7 @@ open Vane.Tiling
 open Vane.Verify
 open Vane.Pe
 open Vane.Lut
+open Vane.Pool
 open Vane.Conv
 open Vane.Conv1x1
 open Vane.Conv3x3
@@ -35,6 +36,11 @@ private def usage : String :=
   "                   --h <H> --w <W> --c <C>\n" ++
   "                   [--alpha F] [--beta F] [--lo F] [--hi F] [--eps F] [--scalar F]\n" ++
   "                   --out-dir <dir>\n" ++
+  "  vane compile-pool --target <h16|h17> --op <max|avg> --h <H> --w <W> --c <C>\n" ++
+  "                    --kh <KH> --kw <KW> [--sh <SH>] [--sw <SW>] [--pad <valid|same|custom>]\n" ++
+  "                    [--pt N --pb N --pl N --pr N] [--exclude-pad <true|false>] --out-dir <dir>\n" ++
+  "  vane compile-reduce --target <h16|h17> --op <sum|mean|max|min|l1|sum_square|l2|inv_sum|rsqrt_sum_square|rsqrt_mean_square>\n" ++
+  "                      --h <H> --w <W> --c <C> --axes <w|h|c|hw|cw|ch|chw> [--eps F] --out-dir <dir>\n" ++
   "  vane compile-graph --spec <graph.json> [--strip-height <off|auto|N>] --out-dir <dir>\n"
 
 private def requireArgValue (flag : String) (rest : List String) : Except String (String × List String) :=
@@ -47,6 +53,17 @@ private def parsePosNat (flag s : String) : Except String Nat :=
   | some n =>
     if n == 0 then throw s!"{flag} must be >= 1, got 0" else pure n
   | none => throw s!"invalid positive integer '{s}' for {flag}"
+
+private def parseNonNegNat (flag s : String) : Except String Nat :=
+  match s.toNat? with
+  | some n => pure n
+  | none => throw s!"invalid non-negative integer '{s}' for {flag}"
+
+private def parseBoolArg (flag s : String) : Except String Bool :=
+  match s.toLower with
+  | "true" | "1" => pure true
+  | "false" | "0" => pure false
+  | _ => throw s!"invalid boolean '{s}' for {flag} (expected true or false)"
 
 private def parseFloatArg (flag s : String) : Except String Float :=
   match parseFloat? s with
@@ -490,7 +507,7 @@ private def cmdValidate (args : List String) : IO UInt32 := do
   IO.println s!"surfaces ({info.surfaces.size}): {String.intercalate ", " surfDesc}"
   IO.println s!"tasks: {info.taskStream.taskCount} (records={info.records}, text={info.textSection.size}B, relocs={info.relocCount})"
   if summary.total > 0 then
-    IO.println s!"verified_tasks: {summary.total} (conv={summary.neConv}, ne_act={summary.neAct}, pe={summary.peOp})"
+    IO.println s!"verified_tasks: {summary.total} (conv={summary.neConv}, ne_act={summary.neAct}, pe={summary.peOp}, pe_pool={summary.pePool}, pe_reduce={summary.peReduce}, ne_pool={summary.nePool}, ne_chan_reduce={summary.neChannelReduce})"
     if summary.neConv > 0 then
       IO.println s!"verified_conv_tasks: {summary.neConv}"
   IO.println s!"bar_refs: {formatBarSlots info.taskStream.barSlots}"
@@ -1334,6 +1351,350 @@ private def cmdCompileLut (args : List String) : IO UInt32 := do
   )
   return 0
 
+private def renderPoolManifestJson (compiled : CompiledPool) : String :=
+  let info := compiled.info
+  let secs := compiled.sections
+  let sp := compiled.spec
+  "{\n" ++
+  s!"  \"op\": \"{sp.op.opName}\",\n" ++
+  s!"  \"backend\": \"{compiled.backend.name}\",\n" ++
+  s!"  \"target\": \"{sp.target.name}\",\n" ++
+  "  \"hwx\": \"program.hwx\",\n" ++
+  "  \"sections\": {\n" ++
+  "    \"generic\": {\"file\": \"generic.bin\", \"size\": " ++ toString secs.generic.size ++ "},\n" ++
+  "    \"operation\": {\"file\": \"operation.bin\", \"size\": " ++ toString secs.operation.size ++ "},\n" ++
+  "    \"procedure\": {\"file\": \"procedure.bin\", \"size\": " ++ toString secs.procedure.size ++ "},\n" ++
+  "    \"text_properties\": {\"file\": \"text-properties.bin\", \"size\": " ++ toString secs.textProperties.size ++ "}\n" ++
+  "  },\n" ++
+  "  \"pool\": {\n" ++
+  s!"    \"kh\": {sp.kh}, \"kw\": {sp.kw}, \"sh\": {sp.sh}, \"sw\": {sp.sw},\n" ++
+  s!"    \"pad\": \"{escapeJsonString sp.pad.name}\",\n" ++
+  s!"    \"exclude_pad\": {if sp.excludePad then "true" else "false"}\n" ++
+  "  },\n" ++
+  s!"  \"direct\": {if compiled.direct then "true" else "false"},\n" ++
+  s!"  \"l2_use_bytes\": {compiled.l2UseBytes},\n" ++
+  s!"  \"task_count\": {info.taskStream.taskCount},\n" ++
+  s!"  \"record_count\": {info.records},\n" ++
+  s!"  \"relocation_count\": {info.relocCount},\n" ++
+  s!"  \"has_kernel\": {if info.kernelSection.isSome then "true" else "false"},\n" ++
+  s!"  \"has_scratch\": {if info.scratchSection.isSome then "true" else "false"},\n" ++
+  "  \"surfaces\": [\n" ++
+  renderSurfacesJson info.surfaces ++ "\n" ++
+  "  ]\n" ++
+  "}\n"
+
+private def renderReduceManifestJson (compiled : CompiledReduce) : String :=
+  let info := compiled.info
+  let secs := compiled.sections
+  let sp := compiled.spec
+  "{\n" ++
+  "  \"op\": \"reduce\",\n" ++
+  s!"  \"reduce_op\": \"{sp.op.name}\",\n" ++
+  s!"  \"axes\": \"{sp.axes.name}\",\n" ++
+  s!"  \"backend\": \"{compiled.backend.name}\",\n" ++
+  s!"  \"target\": \"{sp.target.name}\",\n" ++
+  "  \"hwx\": \"program.hwx\",\n" ++
+  "  \"sections\": {\n" ++
+  "    \"generic\": {\"file\": \"generic.bin\", \"size\": " ++ toString secs.generic.size ++ "},\n" ++
+  "    \"operation\": {\"file\": \"operation.bin\", \"size\": " ++ toString secs.operation.size ++ "},\n" ++
+  "    \"procedure\": {\"file\": \"procedure.bin\", \"size\": " ++ toString secs.procedure.size ++ "},\n" ++
+  "    \"text_properties\": {\"file\": \"text-properties.bin\", \"size\": " ++ toString secs.textProperties.size ++ "}\n" ++
+  "  },\n" ++
+  s!"  \"eps_f16\": {sp.eps.toNat},\n" ++
+  s!"  \"direct\": {if compiled.direct then "true" else "false"},\n" ++
+  s!"  \"l2_use_bytes\": {compiled.l2UseBytes},\n" ++
+  s!"  \"task_count\": {info.taskStream.taskCount},\n" ++
+  s!"  \"record_count\": {info.records},\n" ++
+  s!"  \"relocation_count\": {info.relocCount},\n" ++
+  s!"  \"has_kernel\": {if info.kernelSection.isSome then "true" else "false"},\n" ++
+  s!"  \"has_scratch\": {if info.scratchSection.isSome then "true" else "false"},\n" ++
+  "  \"surfaces\": [\n" ++
+  renderSurfacesJson info.surfaces ++ "\n" ++
+  "  ]\n" ++
+  "}\n"
+
+private def cmdCompilePool (args : List String) : IO UInt32 := do
+  let mut targetStr : Option String := none
+  let mut opStr : Option String := none
+  let mut hStr : Option String := none
+  let mut wStr : Option String := none
+  let mut cStr : Option String := none
+  let mut khStr : Option String := none
+  let mut kwStr : Option String := none
+  let mut shStr : Option String := none
+  let mut swStr : Option String := none
+  let mut padStr : String := "valid"
+  let mut ptStr : Option String := none
+  let mut pbStr : Option String := none
+  let mut plStr : Option String := none
+  let mut prStr : Option String := none
+  let mut exclStr : Option String := none
+  let mut outDir : Option String := none
+  let mut rest := args
+
+  while !rest.isEmpty do
+    match rest with
+    | "--target" :: tl =>
+      match requireArgValue "--target" tl with
+      | .ok (v, tl') => targetStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--op" :: tl =>
+      match requireArgValue "--op" tl with
+      | .ok (v, tl') => opStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--h" :: tl =>
+      match requireArgValue "--h" tl with
+      | .ok (v, tl') => hStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--w" :: tl =>
+      match requireArgValue "--w" tl with
+      | .ok (v, tl') => wStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--c" :: tl =>
+      match requireArgValue "--c" tl with
+      | .ok (v, tl') => cStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--kh" :: tl =>
+      match requireArgValue "--kh" tl with
+      | .ok (v, tl') => khStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--kw" :: tl =>
+      match requireArgValue "--kw" tl with
+      | .ok (v, tl') => kwStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--sh" :: tl =>
+      match requireArgValue "--sh" tl with
+      | .ok (v, tl') => shStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--sw" :: tl =>
+      match requireArgValue "--sw" tl with
+      | .ok (v, tl') => swStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--pad" :: tl =>
+      match requireArgValue "--pad" tl with
+      | .ok (v, tl') => padStr := v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--pt" :: tl =>
+      match requireArgValue "--pt" tl with
+      | .ok (v, tl') => ptStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--pb" :: tl =>
+      match requireArgValue "--pb" tl with
+      | .ok (v, tl') => pbStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--pl" :: tl =>
+      match requireArgValue "--pl" tl with
+      | .ok (v, tl') => plStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--pr" :: tl =>
+      match requireArgValue "--pr" tl with
+      | .ok (v, tl') => prStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--exclude-pad" :: tl =>
+      match requireArgValue "--exclude-pad" tl with
+      | .ok (v, tl') => exclStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--out-dir" :: tl =>
+      match requireArgValue "--out-dir" tl with
+      | .ok (v, tl') => outDir := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | flag :: _ =>
+      IO.eprintln s!"error: unknown argument '{flag}' for compile-pool"
+      IO.eprintln usage
+      return 1
+    | [] => break
+
+  let some tStr := targetStr
+    | do IO.eprintln "error: --target <h16|h17> is required"; return 1
+  let some target := Target.parse? tStr
+    | do IO.eprintln s!"error: unknown target '{tStr}' (expected h16 or h17)"; return 1
+  let some oStr := opStr
+    | do IO.eprintln "error: --op <max|avg> is required"; return 1
+  let some poolOp := PoolKind.parse? oStr
+    | do IO.eprintln s!"error: unknown pool op '{oStr}' (expected max or avg)"; return 1
+  let some hRaw := hStr
+    | do IO.eprintln "error: --h <H> is required"; return 1
+  let some wRaw := wStr
+    | do IO.eprintln "error: --w <W> is required"; return 1
+  let some cRaw := cStr
+    | do IO.eprintln "error: --c <C> is required"; return 1
+  let some khRaw := khStr
+    | do IO.eprintln "error: --kh <KH> is required"; return 1
+  let some kwRaw := kwStr
+    | do IO.eprintln "error: --kw <KW> is required"; return 1
+  let some dirStr := outDir
+    | do IO.eprintln "error: --out-dir <dir> is required"; return 1
+
+  let spec ← match (do
+      let h ← parsePosNat "--h" hRaw
+      let w ← parsePosNat "--w" wRaw
+      let c ← parsePosNat "--c" cRaw
+      let kh ← parsePosNat "--kh" khRaw
+      let kw ← parsePosNat "--kw" kwRaw
+      let sh ← match shStr with | some s => parsePosNat "--sh" s | none => pure 1
+      let sw ← match swStr with | some s => parsePosNat "--sw" s | none => pure 1
+      let excl ← match exclStr with | some s => parseBoolArg "--exclude-pad" s | none => pure true
+      let pad ← match padStr.toLower with
+        | "valid" => pure PoolPad.valid
+        | "same" => pure PoolPad.same
+        | "custom" =>
+          let pt ← match ptStr with | some s => parseNonNegNat "--pt" s | none => pure 0
+          let pb ← match pbStr with | some s => parseNonNegNat "--pb" s | none => pure 0
+          let pl ← match plStr with | some s => parseNonNegNat "--pl" s | none => pure 0
+          let pr ← match prStr with | some s => parseNonNegNat "--pr" s | none => pure 0
+          pure (PoolPad.custom pt pb pl pr)
+        | other => throw s!"unknown --pad '{other}' (expected valid, same, or custom)"
+      pure ({
+        target := target, op := poolOp, dims := { c := c, h := h, w := w },
+        kh := kh, kw := kw, sh := sh, sw := sw, pad := pad, excludePad := excl
+      } : PoolSpec)) with
+    | .ok s => pure s
+    | .error e => IO.eprintln s!"error: {e}"; return 1
+
+  let compiled ← match compilePool spec with
+    | .ok c => pure c
+    | .error e => IO.eprintln s!"error: compile-pool failed: {e}"; return 1
+
+  let manifest := renderPoolManifestJson compiled
+  let dir := System.FilePath.mk dirStr
+  try
+    IO.FS.createDirAll dir
+    IO.FS.writeBinFile (dir / "program.hwx") compiled.hwx
+    IO.FS.writeBinFile (dir / "generic.bin") compiled.sections.generic
+    IO.FS.writeBinFile (dir / "operation.bin") compiled.sections.operation
+    IO.FS.writeBinFile (dir / "procedure.bin") compiled.sections.procedure
+    IO.FS.writeBinFile (dir / "text-properties.bin") compiled.sections.textProperties
+    IO.FS.writeFile (dir / "manifest.json") manifest
+  catch e =>
+    IO.eprintln s!"error: failed to write pool outputs to '{dirStr}': {e}"
+    return 1
+
+  IO.println (
+    s!"compiled {target.name} {spec.op.opName} ({spec.dims.c}x{spec.dims.h}x{spec.dims.w} -> " ++
+    s!"{compiled.outDims.c}x{compiled.outDims.h}x{compiled.outDims.w}, k={spec.kh}x{spec.kw}, " ++
+    s!"s={spec.sh}x{spec.sw}, pad={spec.pad.name}, backend={compiled.backend.name}) to {dirStr}: " ++
+    s!"hwx={compiled.hwx.size}B l2={compiled.l2UseBytes}B direct={compiled.direct}"
+  )
+  return 0
+
+private def cmdCompileReduce (args : List String) : IO UInt32 := do
+  let mut targetStr : Option String := none
+  let mut opStr : Option String := none
+  let mut hStr : Option String := none
+  let mut wStr : Option String := none
+  let mut cStr : Option String := none
+  let mut axesStr : Option String := none
+  let mut epsStr : Option String := none
+  let mut outDir : Option String := none
+  let mut rest := args
+
+  while !rest.isEmpty do
+    match rest with
+    | "--target" :: tl =>
+      match requireArgValue "--target" tl with
+      | .ok (v, tl') => targetStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--op" :: tl =>
+      match requireArgValue "--op" tl with
+      | .ok (v, tl') => opStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--h" :: tl =>
+      match requireArgValue "--h" tl with
+      | .ok (v, tl') => hStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--w" :: tl =>
+      match requireArgValue "--w" tl with
+      | .ok (v, tl') => wStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--c" :: tl =>
+      match requireArgValue "--c" tl with
+      | .ok (v, tl') => cStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--axes" :: tl =>
+      match requireArgValue "--axes" tl with
+      | .ok (v, tl') => axesStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--eps" :: tl =>
+      match requireArgValue "--eps" tl with
+      | .ok (v, tl') => epsStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--out-dir" :: tl =>
+      match requireArgValue "--out-dir" tl with
+      | .ok (v, tl') => outDir := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | flag :: _ =>
+      IO.eprintln s!"error: unknown argument '{flag}' for compile-reduce"
+      IO.eprintln usage
+      return 1
+    | [] => break
+
+  let some tStr := targetStr
+    | do IO.eprintln "error: --target <h16|h17> is required"; return 1
+  let some target := Target.parse? tStr
+    | do IO.eprintln s!"error: unknown target '{tStr}' (expected h16 or h17)"; return 1
+  let some oStr := opStr
+    | do IO.eprintln "error: --op <reduce_op> is required"; return 1
+  let some redOp := ReduceOp.parse? oStr
+    | do IO.eprintln s!"error: unknown reduce op '{oStr}'"; return 1
+  let some hRaw := hStr
+    | do IO.eprintln "error: --h <H> is required"; return 1
+  let some wRaw := wStr
+    | do IO.eprintln "error: --w <W> is required"; return 1
+  let some cRaw := cStr
+    | do IO.eprintln "error: --c <C> is required"; return 1
+  let some axRaw := axesStr
+    | do IO.eprintln "error: --axes <w|h|c|hw|cw|ch|chw> is required"; return 1
+  let some axes := ReduceAxes.parse? axRaw
+    | do IO.eprintln s!"error: invalid --axes '{axRaw}' (expected w, h, c, hw, cw, ch, or chw)"; return 1
+  let some dirStr := outDir
+    | do IO.eprintln "error: --out-dir <dir> is required"; return 1
+
+  let spec ← match (do
+      let h ← parsePosNat "--h" hRaw
+      let w ← parsePosNat "--w" wRaw
+      let c ← parsePosNat "--c" cRaw
+      let eps ← match epsStr with
+        | some s =>
+          let f ← parseFloatArg "--eps" s
+          if f < 0.0 then
+            throw s!"--eps must be >= 0, got '{s}'"
+          let bits := floatToF16CanonicalZero f
+          if !f16IsFinite bits then
+            throw s!"--eps value {f} overflows finite fp16 range"
+          pure bits
+        | none => pure 0
+      pure ({
+        target := target, op := redOp, dims := { c := c, h := h, w := w },
+        axes := axes, eps := eps
+      } : ReduceSpec)) with
+    | .ok s => pure s
+    | .error e => IO.eprintln s!"error: {e}"; return 1
+
+  let compiled ← match compileReduce spec with
+    | .ok c => pure c
+    | .error e => IO.eprintln s!"error: compile-reduce failed: {e}"; return 1
+
+  let manifest := renderReduceManifestJson compiled
+  let dir := System.FilePath.mk dirStr
+  try
+    IO.FS.createDirAll dir
+    IO.FS.writeBinFile (dir / "program.hwx") compiled.hwx
+    IO.FS.writeBinFile (dir / "generic.bin") compiled.sections.generic
+    IO.FS.writeBinFile (dir / "operation.bin") compiled.sections.operation
+    IO.FS.writeBinFile (dir / "procedure.bin") compiled.sections.procedure
+    IO.FS.writeBinFile (dir / "text-properties.bin") compiled.sections.textProperties
+    IO.FS.writeFile (dir / "manifest.json") manifest
+  catch e =>
+    IO.eprintln s!"error: failed to write reduce outputs to '{dirStr}': {e}"
+    return 1
+
+  IO.println (
+    s!"compiled {target.name} reduce {spec.op.name} axes={spec.axes.name} ({spec.dims.c}x{spec.dims.h}x{spec.dims.w} -> " ++
+    s!"{compiled.outDims.c}x{compiled.outDims.h}x{compiled.outDims.w}, backend={compiled.backend.name}) to {dirStr}: " ++
+    s!"hwx={compiled.hwx.size}B l2={compiled.l2UseBytes}B direct={compiled.direct}"
+  )
+  return 0
+
 private def jsonObjField? (j : Json) (key : String) : Option Json :=
   match j.getObjVal? key with
   | .ok v => if v.isNull then none else some v
@@ -1364,6 +1725,22 @@ private def jsonOptPosNat (j : Json) (key ctx : String) : Except String (Option 
     match v.getNat? with
     | .ok n => if n == 0 then throw s!"{ctx}: field '{key}' must be >= 1" else pure (some n)
     | .error e => throw s!"{ctx}: invalid positive integer '{key}' ({e})"
+
+private def jsonOptNat (j : Json) (key ctx : String) : Except String (Option Nat) :=
+  match jsonObjField? j key with
+  | none => pure none
+  | some v =>
+    match v.getNat? with
+    | .ok n => pure (some n)
+    | .error e => throw s!"{ctx}: invalid non-negative integer '{key}' ({e})"
+
+private def jsonOptBoolDefault (j : Json) (key ctx : String) (defaultVal : Bool) : Except String Bool :=
+  match jsonObjField? j key with
+  | none => pure defaultVal
+  | some v =>
+    match v.getBool? with
+    | .ok b => pure b
+    | .error e => throw s!"{ctx}: invalid boolean field '{key}' ({e})"
 
 private def jsonOptFloat (j : Json) (key ctx : String) : Except String (Option Float) :=
   match jsonObjField? j key with
@@ -1742,8 +2119,70 @@ private def cmdCompileGraph (args : List String) : IO UInt32 := do
           | .error e => IO.eprintln s!"error: {e}"; return 1
         pure parsed
 
+      | "max_pool" | "avg_pool" =>
+        let poolKind : PoolKind := if ndOpStr == "max_pool" then .max else .avg
+        let parsed ← match (do
+            if ndInputs.size != 1 then throw s!"{ctx} ({ndOpStr}): expected 1 input"
+            let some inDims := lookupShape ndInputs[0]!
+              | throw s!"{ctx}: unknown input '{ndInputs[0]!}'"
+            let kh ← jsonReqPosNat nj "kh" ctx
+            let kw ← jsonReqPosNat nj "kw" ctx
+            let sh := (← jsonOptPosNat nj "sh" ctx).getD 1
+            let sw := (← jsonOptPosNat nj "sw" ctx).getD 1
+            let padStr := ((← jsonOptStr nj "pad" ctx).getD "valid").toLower
+            let pad ← match padStr with
+              | "valid" => pure PoolPad.valid
+              | "same" => pure PoolPad.same
+              | "custom" =>
+                let pt := (← jsonOptNat nj "pt" ctx).getD 0
+                let pb := (← jsonOptNat nj "pb" ctx).getD 0
+                let pl := (← jsonOptNat nj "pl" ctx).getD 0
+                let pr := (← jsonOptNat nj "pr" ctx).getD 0
+                pure (PoolPad.custom pt pb pl pr)
+              | other => throw s!"{ctx} ({ndOpStr}): unknown pad '{other}' (expected valid, same, or custom)"
+            let excl ← jsonOptBoolDefault nj "exclude_pad" ctx true
+            let pspec : PoolSpec := {
+              target := target, op := poolKind, dims := inDims,
+              kh := kh, kw := kw, sh := sh, sw := sw, pad := pad, excludePad := excl
+            }
+            let (_, gh, gw) ← resolvePoolBackend pspec
+            let outDims : TensorDims := { c := inDims.c, h := gh.out, w := gw.out }
+            pure (NodeOp.pool poolKind kh kw sh sw pad excl, outDims)) with
+          | .ok v => pure v
+          | .error e => IO.eprintln s!"error: {e}"; return 1
+        pure parsed
+
+      | "reduce" =>
+        let parsed ← match (do
+            if ndInputs.size != 1 then throw s!"{ctx} (reduce): expected 1 input"
+            let some inDims := lookupShape ndInputs[0]!
+              | throw s!"{ctx}: unknown input '{ndInputs[0]!}'"
+            let redOpStr ← jsonReqStr nj "reduce_op" ctx
+            let some redOp := ReduceOp.parse? redOpStr
+              | throw s!"{ctx} (reduce): unknown reduce_op '{redOpStr}'"
+            let axesStr ← jsonReqStr nj "axes" ctx
+            let some axes := ReduceAxes.parse? axesStr
+              | throw s!"{ctx} (reduce): invalid axes '{axesStr}' (expected w, h, c, hw, cw, ch, or chw)"
+            let eps : UInt16 ← match ← jsonOptFloat nj "eps" ctx with
+              | none => pure 0
+              | some f =>
+                if f < 0.0 then
+                  throw s!"{ctx} (reduce): eps must be >= 0, got {f}"
+                let bits := floatToF16CanonicalZero f
+                if !f16IsFinite bits then
+                  throw s!"{ctx} (reduce): eps value {f} overflows finite fp16 range"
+                pure bits
+            let rspec : ReduceSpec := {
+              target := target, op := redOp, dims := inDims, axes := axes, eps := eps
+            }
+            let (_, outDims) ← resolveReduceBackend rspec
+            pure (NodeOp.reduce redOp axes eps, outDims)) with
+          | .ok v => pure v
+          | .error e => IO.eprintln s!"error: {e}"; return 1
+        pure parsed
+
       | other =>
-        IO.eprintln s!"error: {ctx}: unsupported node op '{other}' (expected conv1x1, conv3x3, pe, or lut)"
+        IO.eprintln s!"error: {ctx}: unsupported node op '{other}' (expected conv1x1, conv3x3, pe, lut, max_pool, avg_pool, or reduce)"
         return 1
 
     graphNodes := graphNodes.push {
@@ -1800,6 +2239,8 @@ def main (args : List String) : IO UInt32 := do
   | "compile-conv3x3" :: rest => cmdCompileConv3x3 rest
   | "compile-pe" :: rest => cmdCompilePe rest
   | "compile-lut" :: rest => cmdCompileLut rest
+  | "compile-pool" :: rest => cmdCompilePool rest
+  | "compile-reduce" :: rest => cmdCompileReduce rest
   | "compile-graph" :: rest => cmdCompileGraph rest
   | "--help" :: _ | "-h" :: _ | [] =>
     IO.println usage
