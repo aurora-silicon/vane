@@ -175,6 +175,32 @@ private def vVerifyLutBytes (kBytes : ByteArray) (lutStart : Nat) (label : Strin
 private def vStripW (fat shPref : Nat) : Nat :=
   (128 <<< fat) >>> shPref
 
+private def vFirstDiv (wd base : Nat) : Nat := Id.run do
+  for i in [:6] do
+    let d := base >>> i
+    if d > 0 && wd % d == 0 then
+      return i
+  return 6
+
+private def vCover (wAligned stripW base : Nat) : Nat :=
+  if stripW == 0 || wAligned == 0 then
+    6
+  else if wAligned <= stripW then
+    min 4 (vFirstDiv wAligned base)
+  else
+    let fullDiv := vFirstDiv stripW base
+    let rem := wAligned % stripW
+    let mx := if rem == 0 then fullDiv else max fullDiv (vFirstDiv rem base)
+    min 4 mx
+
+private def vCoverMin (w stripW fat : Nat) : Nat :=
+  let wuBase : Nat := (128 : Nat) <<< fat
+  let c8 := vCover (alignUp w 8) stripW wuBase
+  let c16 := vCover (alignUp w 16) stripW wuBase
+  let c32 := vCover (alignUp w 32) stripW wuBase
+  let c64 := vCover (alignUp w 64) stripW wuBase
+  min (min c8 c16) (min c32 c64)
+
 private def vSrcPx (kernelSize stride winReg padLeft stripW : Nat) : Nat :=
   if kernelSize == 1 then
     min (alignUp winReg 8) (max stripW 32)
@@ -3941,6 +3967,16 @@ def verifyNeViewTaskMulti
   let tmin := vStripW fat shMin
   if stripW < 8 || stripW > 256 || tmin < 8 || tmin > 256 then
     throw s!"{prefixMsg}: strip width T={stripW}, tmin={tmin} outside [8, 256]"
+
+  if transposeCW then
+    if f > 4 then
+      throw s!"{prefixMsg}: T-mode F={f} exceeds maximum 4"
+    let maxCov := (1 : Nat) <<< (f + ocg)
+    if c > maxCov then
+      throw s!"{prefixMsg}: T-mode C={c} exceeds channel-group coverage 2^(F+ocg)={maxCov} (F={f}, ocg={ocg})"
+    let minShMax := vCoverMin w stripW fat
+    if shMax < minShMax then
+      throw s!"{prefixMsg}: T-mode shMax={shMax} < required coverMin(W={w}, T={stripW}, fat={fat})={minShMax}"
 
   -- 3. NE copy op & scale
   let wNeOp ← requireDecodedWrite task.writes regNeOp "neOp"

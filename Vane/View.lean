@@ -332,6 +332,9 @@ def planTranspose (x : Shape4D) (perm : Array Nat) : Except String ViewPlan := d
     let th := xArr[aH]!
     let tw := xArr[3]!
 
+    if tc > 128 then
+      throw s!"transpose T-mode ({x.n}x{x.c}x{x.h}x{x.w} -> {y.n}x{y.c}x{y.h}x{y.w}): channel count C={tc} exceeds single-task T-mode coverage bound 128 (requires c <= 2^(F + ocg) <= 128)"
+
     let inNSt := if tn > 1 then xs[aN]! else 0
     let inPSt := if tc > 1 then xs[aC]! else 0
     let inRSt := if th > 1 then xs[aH]! else 0
@@ -607,54 +610,90 @@ def chooseViewTaskPlan
     (target : Target) (cp : ViewCopy) (occupied : List Range := []) : Except String ViewTaskPlan := do
   if cp.n == 0 || cp.c == 0 || cp.h == 0 || cp.w == 0 || cp.d == 0 then
     throw s!"view copy: dimensions (N={cp.n}, C={cp.c}, H={cp.h}, D={cp.d}, W={cp.w}) must all be >= 1"
-  let ocg := if cp.transposeCW then groupCodeLog2 cp.c else 0
-  let fats : Array Nat := #[0, 1]
-  -- Prefer direct=true first, then fallback to staged mode if needed
-  for wantDirect in #[true, false] do
-    for fat in fats do
-      let logNE := fat
-      for shPref in [:5] do
-        let stripW := (128 <<< fat) >>> shPref
-        if stripW >= 8 && stripW <= 256 then
+  if cp.transposeCW && cp.c > 128 then
+    throw s!"view copy T-mode: channel count C={cp.c} exceeds single-task T-mode coverage bound 128 (requires c <= 2^(F + ocg) <= 128)"
+
+  let tryCandidate := fun (probe : Tiling) =>
+    match viewStageBasesForTh target cp probe occupied cp.h with
+    | some (sb, rb, pk, dir) =>
+      some ({
+        tiling := { probe with tileHeight := cp.h }
+        direct := dir
+        srcStageBase := sb
+        resStageBase := rb
+        l2TaskPeak := pk
+      } : ViewTaskPlan)
+    | none =>
+      if cp.h > 1 then
+        Id.run do
+          let mut lo : Nat := 1
+          let mut hi : Nat := cp.h - 1
+          let mut best : Option (Nat × Nat × Nat × Nat × Bool) := none
+          while lo <= hi do
+            let mid := (lo + hi) / 2
+            match viewStageBasesForTh target cp probe occupied mid with
+            | some (sb, rb, pk, dir) =>
+              best := some (mid, sb, rb, pk, dir)
+              lo := mid + 1
+            | none =>
+              if mid == 0 then break
+              hi := mid - 1
+          return best.map fun (th, sb, rb, pk, dir) => {
+            tiling := { probe with tileHeight := th }
+            direct := dir
+            srcStageBase := sb
+            resStageBase := rb
+            l2TaskPeak := pk
+          }
+      else
+        none
+
+  if cp.transposeCW then
+    -- Hardware-verified T-mode tiling: F=4, logNE=4, fat=0, WU=0, ocg=groupCodeLog2(c),
+    -- shMax = max(shPref, coverMin(w, stripW, 0)) <= 4. Try widest strips first (shPref=0..4)
+    -- so direct shapes stay direct and staged (9<=c<=16, w<32) naturally uses shPref=0 staged mode.
+    let ocg := groupCodeLog2 cp.c
+    let fat := 0
+    for shPref in [:5] do
+      let stripW := (128 <<< fat) >>> shPref
+      if stripW >= 8 && stripW <= 256 then
+        let shMax := max shPref (coverMin cp.w stripW fat)
+        if shMax <= 4 then
           let probe : Tiling := {
-            logNE := logNE
-            f := 0
+            logNE := 4
+            f := 4
             fat := fat
             ocg := ocg
             shPref := shPref
-            shMax := shPref
+            shMax := shMax
             tileHeight := 1
           }
-          if viewIsDirect target cp probe == wantDirect then
-            if let some (sb, rb, pk, dir) := viewStageBasesForTh target cp probe occupied cp.h then
-              return {
-                tiling := { probe with tileHeight := cp.h }
-                direct := dir
-                srcStageBase := sb
-                resStageBase := rb
-                l2TaskPeak := pk
+          if let some plan := tryCandidate probe then
+            return plan
+  else
+    -- Plain view copy: F=0, logNE=fat, ocg=0, fats=#[0,1], shMax = max(shPref, coverMin(w, stripW, fat)) <= 4.
+    -- Prefer direct=true first, then fallback to staged mode if needed.
+    let fats : Array Nat := #[0, 1]
+    for wantDirect in #[true, false] do
+      for fat in fats do
+        let logNE := fat
+        for shPref in [:5] do
+          let stripW := (128 <<< fat) >>> shPref
+          if stripW >= 8 && stripW <= 256 then
+            let shMax := max shPref (coverMin cp.w stripW fat)
+            if shMax <= 4 then
+              let probe : Tiling := {
+                logNE := logNE
+                f := 0
+                fat := fat
+                ocg := 0
+                shPref := shPref
+                shMax := shMax
+                tileHeight := 1
               }
-            if cp.h > 1 then
-              let mut lo : Nat := 1
-              let mut hi : Nat := cp.h - 1
-              let mut best : Option (Nat × Nat × Nat × Nat × Bool) := none
-              while lo <= hi do
-                let mid := (lo + hi) / 2
-                match viewStageBasesForTh target cp probe occupied mid with
-                | some (sb, rb, pk, dir) =>
-                  best := some (mid, sb, rb, pk, dir)
-                  lo := mid + 1
-                | none =>
-                  if mid == 0 then break
-                  hi := mid - 1
-              if let some (th, sb, rb, pk, dir) := best then
-                return {
-                  tiling := { probe with tileHeight := th }
-                  direct := dir
-                  srcStageBase := sb
-                  resStageBase := rb
-                  l2TaskPeak := pk
-                }
+              if viewIsDirect target cp probe == wantDirect then
+                if let some plan := tryCandidate probe then
+                  return plan
   throw s!"no legal {target.name} NE view tiling fits 2 MiB L2 for (N={cp.n}, C={cp.c}, H={cp.h}, D={cp.d}, W={cp.w}, transposeCW={cp.transposeCW})"
 
 /-- Choose a legal standalone `Tiling` for `ViewCopy` within 2 MiB L2 SRAM. -/

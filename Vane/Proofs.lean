@@ -2028,6 +2028,17 @@ theorem groupCode_eq_pow (c : Nat) : groupCode c = 1 <<< groupCodeLog2 c := by
     · rfl
     · split <;> rfl
 
+/-- Single-task T-mode channel-group coverage bound: for all `c ≤ 128`,
+    `F = 4` with `ocg = groupCodeLog2 c` covers all `c` channels (`c ≤ 2 ^ (4 + groupCodeLog2 c)`). -/
+theorem tmode_channel_coverage_le_128 (c : Nat) (hc : c ≤ 128) :
+    c ≤ 2 ^ (4 + groupCodeLog2 c) := by
+  unfold groupCodeLog2
+  split
+  · omega
+  · split
+    · omega
+    · split <;> omega
+
 /-- `prefixStartsAux` preserves list length. -/
 theorem prefixStartsAux_length (acc : Nat) (sizes : List Nat) :
     (prefixStartsAux acc sizes).length = sizes.length := by

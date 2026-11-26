@@ -4914,24 +4914,35 @@ private def runM5cTests : IO (Array TestResult) := do
     pure ()
   ))
 
-  -- 2. Positive: transpose T-mode (C<->W, c <= w) across all 4 groupCode regimes (1,2,4,8) & staged 9<=c<=16 on H16 & H17
-  results := results.push (checkOk "m5c: transpose T-mode C<->W (groupCode 1/2/4/8 & staged 9<=c<=16 w<32) on H16 & H17" (do
-    let cases : Array (Shape4D × Array Nat) := #[
-      ({ n := 1, c := 8,  h := 4, w := 16 }, #[0, 3, 2, 1]), -- groupCode=1
-      ({ n := 1, c := 12, h := 4, w := 16 }, #[0, 3, 2, 1]), -- groupCode=1, 9<=c<=16 & w<32
-      ({ n := 1, c := 24, h := 4, w := 32 }, #[0, 3, 2, 1]), -- groupCode=2, wideGroup=1
-      ({ n := 1, c := 48, h := 4, w := 64 }, #[0, 3, 2, 1]), -- groupCode=4, wideGroup=1
-      ({ n := 1, c := 80, h := 2, w := 96 }, #[0, 3, 2, 1]), -- groupCode=8, ocg=3 (must classify as neView!)
-      ({ n := 2, c := 16, h := 4, w := 32 }, #[0, 3, 2, 1])  -- 4D batch N=2 T-mode
+  -- 2. Positive: transpose T-mode (C<->W, c <= min(w, 128)) across direct & staged shapes checking F=4, logNE=4, wu=0, c <= 2^(F+ocg), shMax >= coverMin on H16 & H17
+  results := results.push (checkOk "m5c: transpose T-mode C<->W (direct c=4..128 & staged c=12 w=16, F=4/logNE=4/WU=0/coverMin) on H16 & H17" (do
+    let cases : Array (Shape4D × Array Nat × Bool) := #[
+      ({ n := 1, c := 4,   h := 4, w := 32  }, #[0, 3, 2, 1], true),  -- groupCode=1, direct=true
+      ({ n := 1, c := 12,  h := 4, w := 16  }, #[0, 3, 2, 1], false), -- groupCode=1, 9<=c<=16 & w<32 -> staged direct=false
+      ({ n := 1, c := 16,  h := 4, w := 32  }, #[0, 3, 2, 1], true),  -- groupCode=1, direct=true
+      ({ n := 1, c := 24,  h := 4, w := 32  }, #[0, 3, 2, 1], true),  -- groupCode=2, wideGroup=1
+      ({ n := 1, c := 32,  h := 4, w := 32  }, #[0, 3, 2, 1], true),  -- groupCode=2, square 32x32
+      ({ n := 1, c := 48,  h := 4, w := 64  }, #[0, 3, 2, 1], true),  -- groupCode=4, wideGroup=1
+      ({ n := 1, c := 64,  h := 4, w := 64  }, #[0, 3, 2, 1], true),  -- groupCode=4, square 64x64
+      ({ n := 1, c := 80,  h := 2, w := 96  }, #[0, 3, 2, 1], true),  -- groupCode=8, ocg=3 (must classify as neView!)
+      ({ n := 1, c := 128, h := 2, w := 128 }, #[0, 3, 2, 1], true),  -- groupCode=8, max 128-channel T-mode
+      ({ n := 2, c := 16,  h := 4, w := 32  }, #[0, 3, 2, 1], true)   -- 4D batch N=2 T-mode
     ]
     for tgt in #[Target.h16, Target.h17] do
-      for (sh, perm) in cases do
+      for (sh, perm, expDirect) in cases do
         let vp ← planTranspose sh perm
         let c ← compileView tgt vp
-        if sh.c == 12 && sh.w == 16 then
-          let tZero : Tiling := { logNE := 0, f := 0, fat := 0, ocg := 0, shPref := 0, shMax := 0, tileHeight := 4 }
-          if viewIsDirect tgt vp.copies[0]! tZero then
-            throw s!"{tgt.name}: expected viewIsDirect=false for 9<=c<=16, shPref=0, w<32"
+        let tp := c.taskPlans[0]!
+        let t := tp.tiling
+        if t.f != 4 || t.logNE != 4 || t.fat != 0 || t.wu != 0 then
+          throw s!"{tgt.name} T-mode C={sh.c} W={sh.w}: expected F=4,logNE=4,fat=0,WU=0, got F={t.f},logNE={t.logNE},fat={t.fat},WU={t.wu}"
+        if sh.c > ((1 : Nat) <<< (t.f + t.ocg)) then
+          throw s!"{tgt.name} T-mode C={sh.c}: violates C <= 2^(F+ocg)={((1 : Nat) <<< (t.f + t.ocg))}"
+        let minSh := coverMin sh.w (stripWidth t) t.fat
+        if t.shMax < minSh then
+          throw s!"{tgt.name} T-mode C={sh.c} W={sh.w}: shMax={t.shMax} < coverMin={minSh}"
+        if tp.direct != expDirect then
+          throw s!"{tgt.name} T-mode C={sh.c} W={sh.w}: direct={tp.direct} != expected {expDirect}"
         matrixVerify tgt c.hwx c.sections { total := 1, neConv := 0, neAct := 0, peOp := 0, neView := 1 }
     pure ()
   ))
@@ -5125,7 +5136,23 @@ private def runM5cTests : IO (Array TestResult) := do
     pure ()
   ))
 
-  -- 11. Negative compiler checks: unsupported T-mode C > W, non-32-aligned W views, non-contiguous reshape
+  -- 11. Negative compiler checks: unsupported T-mode C > 128, C > W, non-32-aligned W views, non-contiguous reshape
+  results := results.push (checkErr "m5c neg: T-mode transpose C=129 (> 128) rejected by planTranspose" (do
+    let _ ← planTranspose { n := 1, c := 129, h := 2, w := 129 } #[0, 3, 2, 1]
+    pure ()
+  ) "128")
+
+  results := results.push (checkErr "m5c neg: T-mode transpose C=192 (> 128) rejected by planTranspose" (do
+    let _ ← planTranspose { n := 1, c := 192, h := 2, w := 192 } #[0, 3, 2, 1]
+    pure ()
+  ) "128")
+
+  results := results.push (checkErr "m5c neg: T-mode chooseViewTaskPlan rejects C=129 (> 128)" (do
+    let cp : ViewCopy := { n := 1, c := 129, h := 2, w := 129, transposeCW := true }
+    let _ ← chooseViewTaskPlan .h17 cp []
+    pure ()
+  ) "128")
+
   results := results.push (checkErr "m5c neg: T-mode transpose C > W exceeding ane_hx_dma_tile rejected by planTranspose" (do
     let _ ← planTranspose { n := 1, c := 64, h := 8, w := 16 } #[0, 3, 2, 1]
     pure ()
@@ -5215,6 +5242,31 @@ private def runM5cTests : IO (Array TestResult) := do
     let orig ← readU32LE baseTModeView.hwx fPs
     tamperM5aTaskReg baseTModeView.hwx baseTModeView.info 0 regResDmaPlaneStride (orig + 0x400)
   ) "ane_hx_dma_tile bound")
+
+  results := results.push (checkErr "m5c neg tamper: T-mode neView F tampered down (C > 2^(F+ocg)) rejected by verifier" (do
+    -- baseTModeView has C=24, W=32, ocg=1, F=4, logNE=4, fat=0, WU=0.
+    -- Tamper F from 4 to 2 and WU from 0 to 2 (preserving WU+F+fat == logNE=4), so 2^(2+1)=8 < 24.
+    let fNc ← findM5aTaskRegOffset baseTModeView.hwx baseTModeView.info 0 regNeCommon
+    let fNt ← findM5aTaskRegOffset baseTModeView.hwx baseTModeView.info 0 regNeTile
+    let origNc ← readU32LE baseTModeView.hwx fNc
+    let origNt ← readU32LE baseTModeView.hwx fNt
+    let badNc := (origNc &&& (~~~((0x7 : UInt32) <<< 19))) ||| ((2 : UInt32) <<< 19)
+    let badNt := (origNt &&& (~~~((0x3 : UInt32) <<< 4))) ||| ((2 : UInt32) <<< 4)
+    let h1 ← putU32LE baseTModeView.hwx fNc badNc
+    let h2 ← putU32LE h1 fNt badNt
+    let badInfo ← validateHwx h2
+    let _ ← verifyHwxTasksSummary h2 badInfo (requireKnownTask := true)
+    pure ()
+  ) "channel-group coverage")
+
+  results := results.push (checkErr "m5c neg tamper: T-mode neView shMax tampered below coverMin rejected by verifier" (do
+    -- baseTModeView has C=24, W=32, fat=0, shPref=0, shMin=0, shMax=1 (coverMin(32, 128, 0) = 1).
+    -- Tamper shMax bits [18:16] from 1 down to 0.
+    let fNc ← findM5aTaskRegOffset baseTModeView.hwx baseTModeView.info 0 regNeCommon
+    let origNc ← readU32LE baseTModeView.hwx fNc
+    let badNc := origNc &&& (~~~((0x7 : UInt32) <<< 16))
+    tamperM5aTaskReg baseTModeView.hwx baseTModeView.info 0 regNeCommon badNc
+  ) "coverMin")
 
   -- 14. Negative verifier tamper: out-of-bounds resBaseLo on split conv1x1
   let baseSplitConv ← match compileLinear .h16 16 256 512 (mkM5aW1x1 256 512 1) none 4 false .none with
