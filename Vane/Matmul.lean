@@ -136,71 +136,90 @@ def planMatmulScratchTranspose (b rows cols : Nat) : Except String (ViewCopy × 
   }
   pure (cp, reqScratch)
 
-private def maxEndOf (rs : List Range) : Nat :=
+/-- Highest end offset among occupied L2 ranges. -/
+def maxEndOf (rs : List Range) : Nat :=
   rs.foldl (fun acc r => max acc r.hi) 0
+
+/-- Try constructing a legal `MatmulTaskPlan` for candidate `(wantDirect, shPref, shMax)`. -/
+def tryMatmulPlanCandidate
+    (target : Target) (m k n f : Nat)
+    (srcIsL2 resIsL2 : Bool) (occupied : List Range)
+    (wantDirect : Bool) (shPref shMax : Nat) : Option MatmulTaskPlan :=
+  let stripW := (128 : Nat) >>> shPref
+  let direct := if resIsL2 then false else (target.profile.directThreshold 0 shMax >= min 32 n)
+  if resIsL2 || direct == wantDirect then
+    let chs := 2 * min (alignUp n 8) (max stripW 32)
+    let srcSz := if srcIsL2 then 0 else k * chs
+    let resSz :=
+      if resIsL2 then 0
+      else if direct then ((1 : Nat) <<< f) * 512
+      else m * chs
+    let placed? : Option (Nat × Nat × Nat) :=
+      if srcIsL2 && resIsL2 then
+        some (0, 0, maxEndOf occupied)
+      else if !srcIsL2 && resIsL2 then
+        let srcAligned := alignUp srcSz dmaLineBytes
+        (findFreeOffset occupied srcAligned l2CapacityBytes).map fun sb =>
+          (sb, 0, max (maxEndOf occupied) (sb + srcSz))
+      else if srcIsL2 && !resIsL2 then
+        let resAligned := alignUp resSz dmaLineBytes
+        (findFreeOffset occupied resAligned l2CapacityBytes).map fun rb =>
+          (0, rb, max (maxEndOf occupied) (rb + resSz))
+      else
+        let srcAligned := alignUp srcSz dmaLineBytes
+        let resAligned := alignUp resSz dmaLineBytes
+        match findFreeOffset occupied srcAligned l2CapacityBytes with
+        | none => none
+        | some sb =>
+          let occ2 := { base := sb, bytes := srcAligned } :: occupied
+          match findFreeOffset occ2 resAligned l2CapacityBytes with
+          | none => none
+          | some rb =>
+            some (sb, rb, max (maxEndOf occupied) (max (sb + srcSz) (rb + resSz)))
+    placed?.map fun (sb, rb, pk) => {
+      tiling := {
+        logNE := f
+        f := f
+        fat := 0
+        ocg := 0
+        shPref := shPref
+        shMax := shMax
+        tileHeight := 1
+      }
+      direct := direct
+      srcStageBase := sb
+      resStageBase := rb
+      l2TaskPeak := pk
+    }
+  else
+    none
 
 /-- Choose a legal tiling and L2 staging placement for a single dynamic runtime-kernel `neMatmul` task
     with `1 <= Mi <= 16` output rows, `K` inner dimension, and `N` output columns. -/
 def chooseMatmulTaskPlan
     (target : Target) (m k n : Nat)
-    (srcIsL2 resIsL2 : Bool) (occupied : List Range := []) : Except String MatmulTaskPlan := do
+    (srcIsL2 resIsL2 : Bool) (occupied : List Range := []) : Except String MatmulTaskPlan :=
   if m == 0 || m > 16 || k == 0 || n == 0 || n > 65535 then
-    throw s!"matmul tiling: invalid single-task shape (Mi={m}, K={k}, N={n}; Mi must be in 1..16)"
-  let f := ceilLog2 m
-  for wantDirect in #[true, false] do
-    for shPref in [:5] do
-      let stripW := (128 : Nat) >>> shPref
-      if stripW >= 8 && stripW <= 256 then
-        let shMaxStart := max shPref (coverMin n stripW 0)
-        if shMaxStart <= 4 then
-          for shMax in [shMaxStart : 5] do
-            let direct := if resIsL2 then false else (target.profile.directThreshold 0 shMax >= min 32 n)
-            if resIsL2 || direct == wantDirect then
-              let chs := 2 * min (alignUp n 8) (max stripW 32)
-              let srcSz := if srcIsL2 then 0 else k * chs
-              let resSz :=
-                if resIsL2 then 0
-                else if direct then ((1 : Nat) <<< f) * 512
-                else m * chs
-              let placed? : Option (Nat × Nat × Nat) :=
-                if srcIsL2 && resIsL2 then
-                  some (0, 0, maxEndOf occupied)
-                else if !srcIsL2 && resIsL2 then
-                  let srcAligned := alignUp srcSz dmaLineBytes
-                  (findFreeOffset occupied srcAligned l2CapacityBytes).map fun sb =>
-                    (sb, 0, max (maxEndOf occupied) (sb + srcSz))
-                else if srcIsL2 && !resIsL2 then
-                  let resAligned := alignUp resSz dmaLineBytes
-                  (findFreeOffset occupied resAligned l2CapacityBytes).map fun rb =>
-                    (0, rb, max (maxEndOf occupied) (rb + resSz))
-                else
-                  let srcAligned := alignUp srcSz dmaLineBytes
-                  let resAligned := alignUp resSz dmaLineBytes
-                  match findFreeOffset occupied srcAligned l2CapacityBytes with
-                  | none => none
-                  | some sb =>
-                    let occ2 := { base := sb, bytes := srcAligned } :: occupied
-                    match findFreeOffset occ2 resAligned l2CapacityBytes with
-                    | none => none
-                    | some rb =>
-                      some (sb, rb, max (maxEndOf occupied) (max (sb + srcSz) (rb + resSz)))
-              if let some (sb, rb, pk) := placed? then
-                return {
-                  tiling := {
-                    logNE := f
-                    f := f
-                    fat := 0
-                    ocg := 0
-                    shPref := shPref
-                    shMax := shMax
-                    tileHeight := 1
-                  }
-                  direct := direct
-                  srcStageBase := sb
-                  resStageBase := rb
-                  l2TaskPeak := pk
-                }
-  throw s!"no legal {target.name} dynamic matmul tiling fits 2 MiB L2 for (M={m}, K={k}, N={n})"
+    .error s!"matmul tiling: invalid single-task shape (Mi={m}, K={k}, N={n}; Mi must be in 1..16)"
+  else
+    let f := ceilLog2 m
+    let chosen? : Option MatmulTaskPlan :=
+      findFirstSome [true, false] fun wantDirect =>
+        findFirstSome (natRange 0 5) fun shPref =>
+          let stripW := (128 : Nat) >>> shPref
+          if stripW >= 8 && stripW <= 256 then
+            let shMaxStart := max shPref (coverMin n stripW 0)
+            if shMaxStart <= 4 then
+              findFirstSome (natRange shMaxStart 5) fun shMax =>
+                tryMatmulPlanCandidate target m k n f srcIsL2 resIsL2 occupied wantDirect shPref shMax
+            else
+              none
+          else
+            none
+    match chosen? with
+    | some plan => .ok plan
+    | none =>
+      .error s!"no legal {target.name} dynamic matmul tiling fits 2 MiB L2 for (M={m}, K={k}, N={n})"
 
 /-- Lower one dynamic runtime-kernel NE `MatMul` task (`1 <= m <= 16`, full matrix rows `totalM >= m`)
     into a multi-task `TaskDesc`. -/

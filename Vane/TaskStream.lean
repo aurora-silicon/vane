@@ -182,15 +182,14 @@ def isAllowedRegWord (w : Nat) : Bool :=
   let byteAddr := w * 4
   allowedRegBlocks.any fun (lo, hi) => lo <= byteAddr && byteAddr < hi
 
+/-- Population count of the lowest `k` bits of `m`. -/
+def popcountBits (m : Nat) : Nat → Nat
+  | 0 => 0
+  | i + 1 => popcountBits m i + (if ((m >>> i) &&& 1) == 1 then 1 else 0)
+
 /-- Population count of a 16-bit mask. -/
 def popcount16 (mask : UInt16) : Nat :=
-  let m := mask.toNat
-  Id.run do
-    let mut c : Nat := 0
-    for i in [:16] do
-      if ((m >>> i) &&& 1) == 1 then
-        c := c + 1
-    return c
+  popcountBits mask.toNat 16
 
 /-- A register-write record inside a task body. -/
 inductive RegRecord where

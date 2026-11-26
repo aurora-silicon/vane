@@ -5029,7 +5029,8 @@ def verifyNeMatmulTaskMulti
 -- S5: Independent Whole-Program Multi-Task Happens-Before & Hazard Checker
 -- ============================================================================
 
-private def vIntervalsOverlap (lo1 hi1 lo2 hi2 : Nat) : Bool :=
+/-- Return `true` iff half-open intervals `[lo1, hi1)` and `[lo2, hi2)` overlap. -/
+def vIntervalsOverlap (lo1 hi1 lo2 hi2 : Nat) : Bool :=
   lo1 < hi2 && lo2 < hi1
 
 /-- Insert a half-open interval `(lo, hi)` into a list sorted ascending by `lo`. -/
@@ -5068,72 +5069,98 @@ def periodicGroupCovered
   else
     none
 
+/-- Collect non-empty `.dense` intervals from `covs`. -/
+def collectDenseCoverages : List WriteCoverage → List (Nat × Nat) → List (Nat × Nat)
+  | [], acc => acc
+  | .dense lo hi :: rest, acc =>
+    collectDenseCoverages rest (if lo < hi then (lo, hi) :: acc else acc)
+  | _ :: rest, acc => collectDenseCoverages rest acc
+
+/-- Collect distinct `(outerCount, outerStride)` keys from positive `.periodic` entries in `covs`. -/
+def collectPeriodicKeys : List WriteCoverage → List (Nat × Nat) → List (Nat × Nat)
+  | [], acc => acc
+  | .periodic _ innerLen outerCount outerStride :: rest, acc =>
+    if innerLen > 0 && outerCount > 0 && outerStride > 0 then
+      let key := (outerCount, outerStride)
+      let acc' := if acc.contains key then acc else acc ++ [key]
+      collectPeriodicKeys rest acc'
+    else
+      collectPeriodicKeys rest acc
+  | _ :: rest, acc => collectPeriodicKeys rest acc
+
+/-- Filter `.periodic` entries matching `(outerCount, outerStride)` and sort `(start, innerLen)` ascending. -/
+def filterSortPeriodicGroup (outerCount outerStride : Nat) :
+    List WriteCoverage → List (Nat × Nat) → List (Nat × Nat)
+  | [], acc => acc
+  | .periodic st len oc os :: rest, acc =>
+    let acc' :=
+      if len > 0 && oc > 0 && os > 0 && oc == outerCount && os == outerStride then
+        insertInterval (st, len) acc
+      else
+        acc
+    filterSortPeriodicGroup outerCount outerStride rest acc'
+  | _ :: rest, acc => filterSortPeriodicGroup outerCount outerStride rest acc
+
+/-- Cluster sorted `(start, innerLen)` periodic entries into contiguous `outerStride` windows
+    and emit covered dense intervals via `periodicGroupCovered`. -/
+def clusterPeriodicSorted (outerCount outerStride : Nat) :
+    List (Nat × Nat) → Option Nat → List (Nat × Nat) → List (Nat × Nat) → List (Nat × Nat)
+  | [], none, _, acc => acc
+  | [], some base, curInner, acc =>
+    match periodicGroupCovered base outerCount outerStride curInner with
+    | some iv => iv :: acc
+    | none => acc
+  | (st, len) :: rest, none, _, acc =>
+    if len <= outerStride then
+      clusterPeriodicSorted outerCount outerStride rest (some st) [(0, len)] acc
+    else
+      clusterPeriodicSorted outerCount outerStride rest none [] acc
+  | (st, len) :: rest, some base, curInner, acc =>
+    if st >= base + outerStride then
+      let acc' := match periodicGroupCovered base outerCount outerStride curInner with
+        | some iv => iv :: acc
+        | none => acc
+      if len <= outerStride then
+        clusterPeriodicSorted outerCount outerStride rest (some st) [(0, len)] acc'
+      else
+        clusterPeriodicSorted outerCount outerStride rest none [] acc'
+    else
+      let rel := st - base
+      if rel + len <= outerStride then
+        clusterPeriodicSorted outerCount outerStride rest (some base) ((rel, rel + len) :: curInner) acc
+      else
+        clusterPeriodicSorted outerCount outerStride rest (some base) curInner acc
+
+/-- Process all periodic `(outerCount, outerStride)` keys against `covs`. -/
+def collectPeriodicCoverages (covs : List WriteCoverage) :
+    List (Nat × Nat) → List (Nat × Nat) → List (Nat × Nat)
+  | [], acc => acc
+  | (outerCount, outerStride) :: rest, acc =>
+    let group := filterSortPeriodicGroup outerCount outerStride covs []
+    let acc' := clusterPeriodicSorted outerCount outerStride group none [] acc
+    collectPeriodicCoverages covs rest acc'
+
 /-- Convert exact `WriteCoverage` descriptors into guaranteed-written dense byte intervals:
     - `.dense lo hi` emits `(lo, hi)` directly;
     - `.periodic start innerLen outerCount outerStride` entries with matching `(outerCount, outerStride)`
       are clustered by `start` within one `outerStride` window and emit `(clusterBase, clusterBase + outerCount * outerStride)`
       iff `periodicGroupCovered` proves `[0, outerStride)` is completely covered;
     - `.sparse` contributes nothing. -/
-def effectiveCoveredIntervals (covs : List WriteCoverage) : List (Nat × Nat) := Id.run do
-  let mut denseIvs : List (Nat × Nat) := []
-  let mut periodicKeys : Array (Nat × Nat) := #[]
-  let mut periodicEntries : Array (Nat × Nat × Nat × Nat) := #[]
-  for c in covs do
-    match c with
-    | .dense lo hi =>
-      if lo < hi then
-        denseIvs := (lo, hi) :: denseIvs
-    | .periodic start innerLen outerCount outerStride =>
-      if innerLen > 0 && outerCount > 0 && outerStride > 0 then
-        periodicEntries := periodicEntries.push (start, innerLen, outerCount, outerStride)
-        let key := (outerCount, outerStride)
-        if !periodicKeys.contains key then
-          periodicKeys := periodicKeys.push key
-    | .sparse => pure ()
+def effectiveCoveredIntervals (covs : List WriteCoverage) : List (Nat × Nat) :=
+  let denseIvs := collectDenseCoverages covs []
+  let keys := collectPeriodicKeys covs []
+  collectPeriodicCoverages covs keys denseIvs
 
-  for (outerCount, outerStride) in periodicKeys do
-    let mut group : List (Nat × Nat) := []
-    for (st, len, oc, os) in periodicEntries do
-      if oc == outerCount && os == outerStride then
-        group := insertInterval (st, len) group
-    -- Cluster sorted `(start, innerLen)` entries by contiguous `outerStride` windows
-    let mut curBase? : Option Nat := none
-    let mut curInner : List (Nat × Nat) := []
-    for (st, len) in group do
-      match curBase? with
-      | none =>
-        if len <= outerStride then
-          curBase? := some st
-          curInner := [(0, len)]
-      | some base =>
-        if st >= base + outerStride then
-          if let some iv := periodicGroupCovered base outerCount outerStride curInner then
-            denseIvs := iv :: denseIvs
-          if len <= outerStride then
-            curBase? := some st
-            curInner := [(0, len)]
-          else
-            curBase? := none
-            curInner := []
-        else
-          let rel := st - base
-          if rel + len <= outerStride then
-            curInner := (rel, rel + len) :: curInner
-    if let some base := curBase? then
-      if let some iv := periodicGroupCovered base outerCount outerStride curInner then
-        denseIvs := iv :: denseIvs
+/-- Return the largest task index `< i` running on engine `eng`, or `none`. -/
+def vLatestEngBefore (fps : Array VerifiedTaskFootprint) (eng : Engine) : Nat → Option Nat
+  | 0 => none
+  | i + 1 =>
+    match fps[i]? with
+    | some fp => if fp.engine == eng then some i else vLatestEngBefore fps eng i
+    | none => vLatestEngBefore fps eng i
 
-  return denseIvs
-
-private def vLatestEngBefore (fps : Array VerifiedTaskFootprint) (eng : Engine) (i : Nat) : Option Nat := Id.run do
-  let mut best : Option Nat := none
-  for j in [:i] do
-    if h : j < fps.size then
-      if fps[j].engine == eng then
-        best := some j
-  return best
-
-private def vSrc1DramReadsFromWrite (tj ti : VerifiedTaskFootprint) : Bool :=
+/-- Return `true` iff `ti.src1Dma` reads a DRAM range overlapping a DRAM write in `tj`. -/
+def vSrc1DramReadsFromWrite (tj ti : VerifiedTaskFootprint) : Bool :=
   ti.dramAccesses.any fun b =>
     b.port == .src1Dma &&
       tj.dramAccesses.any fun a =>
@@ -5172,20 +5199,28 @@ def stepHBL (fps : Array VerifiedTaskFootprint) (j i : Nat) : Bool :=
     stepHB fps j i ||
       (fps[i]!.engine == .ne && vLatestEngBefore fps .ne i == some j)
 
+/-- Tail-recursive O(N) helper for `vLatestEngArrays`. -/
+def vLatestEngArraysAux (fps : Array VerifiedTaskFootprint) (n i : Nat)
+    (lastNe lastPe : Option Nat)
+    (neArr peArr : Array (Option Nat)) :
+    Array (Option Nat) × Array (Option Nat) :=
+  if _ : i < n then
+    let neArr' := neArr.push lastNe
+    let peArr' := peArr.push lastPe
+    let (lastNe', lastPe') := match fps[i]? with
+      | some fp =>
+        match fp.engine with
+        | .ne => (some i, lastPe)
+        | .pe => (lastNe, some i)
+      | none => (lastNe, lastPe)
+    vLatestEngArraysAux fps n (i + 1) lastNe' lastPe' neArr' peArr'
+  else
+    (neArr, peArr)
+termination_by n - i
+
 /-- Precompute `(latestNeBefore, latestPeBefore)` in O(N) time for all `i < fps.size`. -/
-private def vLatestEngArrays (fps : Array VerifiedTaskFootprint) : Array (Option Nat) × Array (Option Nat) := Id.run do
-  let n := fps.size
-  let mut neArr : Array (Option Nat) := Array.mkEmpty n
-  let mut peArr : Array (Option Nat) := Array.mkEmpty n
-  let mut lastNe : Option Nat := none
-  let mut lastPe : Option Nat := none
-  for i in [:n] do
-    neArr := neArr.push lastNe
-    peArr := peArr.push lastPe
-    match fps[i]!.engine with
-    | .ne => lastNe := some i
-    | .pe => lastPe := some i
-  return (neArr, peArr)
+def vLatestEngArrays (fps : Array VerifiedTaskFootprint) : Array (Option Nat) × Array (Option Nat) :=
+  vLatestEngArraysAux fps fps.size 0 none none (Array.mkEmpty fps.size) (Array.mkEmpty fps.size)
 
 /-- Build transitive-closure reachability tables `(hbTbl, hblTbl)` for `stepHB` and `stepHBL`
     by precomputing the direct-edge boolean matrices in O(N^2) time before running `reachTable`. -/
@@ -5222,20 +5257,19 @@ def buildHBReachTables (fps : Array VerifiedTaskFootprint) : Array (Array Bool) 
   let hblStep := fun j i => if j < i && i < n then (hblMat[i]!)[j]! else false
   (reachTable hbStep n, reachTable hblStep n)
 
-/-- Verify Clause S5 (whole-program hazard freedom + live L2-resident integrity) across all `N` tasks. -/
-def verifyProgramHazards (fps : Array VerifiedTaskFootprint) : Except String Unit := do
-  let n := fps.size
-  let (hbTbl, hblTbl) := buildHBReachTables fps
-  let (latestNeArr, latestPeArr) := vLatestEngArrays fps
-  let hb := fun a b => reachB hbTbl a b
-  let hbl := fun a b => reachB hblTbl a b
-  let hbEq := fun a b => a == b || hb a b
-  let hblEq := fun a b => a == b || hbl a b
+/-- Run a fallible check `f` over every index `i` in `[lo, hi)` in ascending order. -/
+def checkRange (lo hi : Nat) (f : Nat → Except String Unit) : Except String Unit :=
+  if _ : lo < hi then
+    match f lo with
+    | .ok () => checkRange (lo + 1) hi f
+    | .error e => .error e
+  else
+    .ok ()
+termination_by hi - lo
 
-  -- 1. Live L2-resident integrity & exact header[7] (liveL2Mask) validation (Clauses S2 & S5):
-  --    Every L2-resident read must match an intact prior resL2 write that was not clobbered by any
-  --    intermediate task's L2 write; every resL2 write must have at least one matching consumer;
-  --    and every non-last task's header[7] must equal the exact 64 KiB block mask of live L2 tensors.
+/-- Phase 1 of S5: live L2-resident integrity & exact `header[7]` (`liveL2Mask`) validation. -/
+def verifyL2LiveIntegrity (fps : Array VerifiedTaskFootprint) : Except String Unit := do
+  let n := fps.size
   let mut resL2Spans : Array (Nat × Nat × Nat × Option Nat) := #[]
   for i in [:n] do
     for a in fps[i]!.l2Accesses do
@@ -5282,107 +5316,120 @@ def verifyProgramHazards (fps : Array VerifiedTaskFootprint) : Except String Uni
       if gotMask != expMask then
         throw s!"S2 header[7] liveL2Mask mismatch on task {i}: got {toHex gotMask.toNat}, expected {toHex expMask.toNat}"
 
-  -- 2. Pairwise hazard verification across all 0 <= k < i < n
-  for i in [1 : n] do
+/-- Access-level `src1Dma` `depKind` RAW barrier predicate for task pair `(k, i)`. -/
+def vDramRawKind (fps : Array VerifiedTaskFootprint) (hbEq : Nat → Nat → Bool) (k i : Nat) : Bool :=
+  let ti := fps[i]!
+  ti.sync.hasSrc1Dma &&
+  (ti.sync.src1DepKind == 1 || ti.sync.src1DepKind == 2) &&
+  ti.sync.src1DepDist == 0 &&
+  hbEq k (i - 1)
+
+/-- Access-level PE `src2Dma` `depKind` barrier predicate for task pair `(k, i)`. -/
+def vSrc2Kind (fps : Array VerifiedTaskFootprint) (hbEq : Nat → Nat → Bool) (k i : Nat) : Bool :=
+  let ti := fps[i]!
+  fps[i - 1]!.engine == .pe &&
+  ti.sync.hasSrc2Dma &&
+  (ti.sync.src2DepKind == 1 || ti.sync.src2DepKind == 2) &&
+  ti.sync.src2DepDist == 0 &&
+  hbEq k (i - 1)
+
+/-- Access-level PE wait-bit-22 barrier predicate for task pair `(k, i)`. -/
+def vSrc2Wait22 (ti : VerifiedTaskFootprint) (hbEq : Nat → Nat → Bool) (latestPe : Option Nat) (k : Nat) : Bool :=
+  (ti.sync.src1WaitPe22 || ti.sync.src2WaitPe22) &&
+  match latestPe with
+  | some j => hbEq k j
+  | none => false
+
+/-- Access-level NE wait-bit-5 barrier predicate for task pair `(k, i)`. -/
+def vSrc2Wait5 (fps : Array VerifiedTaskFootprint) (hbEq : Nat → Nat → Bool) (k i : Nat) : Bool :=
+  let ti := fps[i]!
+  let tk := fps[k]!
+  (ti.sync.src1WaitNe5 || ti.sync.src2WaitNe5) &&
+  (tk.engine == .ne || anyLt (fun j => fps[j]!.engine == .ne && hbEq k j) i)
+
+/-- Ordering predicate for conflicting L2 access pair `(a, b)` on tasks `(k, i)`. -/
+def vL2PairOrdered
+    (fps : Array VerifiedTaskFootprint) (hbTbl hblTbl : Array (Array Bool))
+    (latestNe latestPe : Option Nat) (k i : Nat) (a b : VerifiedL2Access) : Bool :=
+  let ti := fps[i]!
+  let hbEq := fun x y => x == y || reachB hbTbl x y
+  let hbl := fun x y => reachB hblTbl x y
+  let hblEq := fun x y => x == y || hbl x y
+  let handoff2 : Bool :=
+    a.isWrite &&
+    ((b.role == .src1L2 && ti.sync.src1HandoffNe) ||
+     (b.role == .src2L2 && ti.sync.src2HandoffNe)) &&
+    match latestNe with
+    | some j => hblEq k j
+    | none => false
+  let handoff3 : Bool :=
+    a.isWrite &&
+    b.role == .src1L2 &&
+    ti.sync.src1HandoffPe &&
+    match latestPe with
+    | some j => hblEq k j
+    | none => false
+  if ti.engine == .pe && (b.role == .src2Stage || b.role == .src2L2) then
+    vSrc2Wait22 ti hbEq latestPe k || vSrc2Wait5 fps hbEq k i || vSrc2Kind fps hbEq k i ||
+      (b.role == .src2L2 && handoff2)
+  else if b.role == .src1Stage && a.role == .resStage then
+    vSrc2Wait5 fps hbEq k i || vSrc2Wait22 ti hbEq latestPe k
+  else
+    hbl k i || handoff2 || handoff3
+
+/-- Ordering predicate for conflicting DRAM access pair `(a, b)` on tasks `(k, i)`. -/
+def vDramPairOrdered
+    (fps : Array VerifiedTaskFootprint) (hbTbl : Array (Array Bool))
+    (latestPe : Option Nat) (k i : Nat) (a b : VerifiedDramAccess) : Bool :=
+  let ti := fps[i]!
+  let hb := fun x y => reachB hbTbl x y
+  let hbEq := fun x y => x == y || hb x y
+  if b.port == .kernel then
+    a.isWrite && match ti.extProducerTask with
+      | some p => hbEq k p
+      | none => false
+  else if ti.engine == .ne && b.port == .src1Dma then
+    a.isWrite && vDramRawKind fps hbEq k i
+  else if ti.engine == .pe && b.port == .src2Dma then
+    vSrc2Kind fps hbEq k i || vSrc2Wait22 ti hbEq latestPe k || vSrc2Wait5 fps hbEq k i || vDramRawKind fps hbEq k i
+  else if a.isWrite && !b.isWrite then
+    hb k i || vDramRawKind fps hbEq k i
+  else
+    hb k i
+
+/-- Phase 2 of S5: pairwise inter-task L2 & DRAM hazard verification across all `0 <= k < i < n`. -/
+def verifyPairwiseHazards
+    (fps : Array VerifiedTaskFootprint)
+    (hbTbl hblTbl : Array (Array Bool))
+    (latestNeArr latestPeArr : Array (Option Nat)) : Except String Unit :=
+  checkRange 1 fps.size fun i =>
     let ti := fps[i]!
     let latestNe := latestNeArr[i]!
     let latestPe := latestPeArr[i]!
-
-    for k in [:i] do
+    checkRange 0 i fun k =>
       let tk := fps[k]!
-
-      -- Common access-level ordering predicates for pair (k, i)
-      let dramRawKind : Bool :=
-        ti.sync.hasSrc1Dma &&
-        (ti.sync.src1DepKind == 1 || ti.sync.src1DepKind == 2) &&
-        ti.sync.src1DepDist == 0 &&
-        hbEq k (i - 1)
-
-      let src2Kind : Bool :=
-        fps[i - 1]!.engine == .pe &&
-        ti.sync.hasSrc2Dma &&
-        (ti.sync.src2DepKind == 1 || ti.sync.src2DepKind == 2) &&
-        ti.sync.src2DepDist == 0 &&
-        hbEq k (i - 1)
-
-      let src2Wait22 : Bool :=
-        (ti.sync.src1WaitPe22 || ti.sync.src2WaitPe22) &&
-        match latestPe with
-        | some j => hbEq k j
-        | none => false
-
-      let src2Wait5 : Bool :=
-        (ti.sync.src1WaitNe5 || ti.sync.src2WaitNe5) &&
-        (if tk.engine == .ne then true
-         else Id.run do
-          let mut ok := false
-          for j in [:i] do
-            if fps[j]!.engine == .ne && hbEq k j then
-              ok := true
-              break
-          return ok)
-
       -- A. Check all conflicting L2 pairs
-      for a in tk.l2Accesses do
-        for b in ti.l2Accesses do
+      (checkRange 0 tk.l2Accesses.size fun ia =>
+        let a := tk.l2Accesses[ia]!
+        checkRange 0 ti.l2Accesses.size fun ib =>
+          let b := ti.l2Accesses[ib]!
           if (a.isWrite || b.isWrite) && vIntervalsOverlap a.lo a.hi b.lo b.hi then
-            let handoff2 : Bool :=
-              a.isWrite &&
-              ((b.role == .src1L2 && ti.sync.src1HandoffNe) ||
-               (b.role == .src2L2 && ti.sync.src2HandoffNe)) &&
-              match latestNe with
-              | some j => hblEq k j
-              | none => false
-
-            let handoff3 : Bool :=
-              a.isWrite &&
-              b.role == .src1L2 &&
-              ti.sync.src1HandoffPe &&
-              match latestPe with
-              | some j => hblEq k j
-              | none => false
-
-            let ordered : Bool :=
-              if ti.engine == .pe && (b.role == .src2Stage || b.role == .src2L2) then
-                -- src2AheadPE: plain HB/HBL does NOT order PE src2 staging fill or L2 read
-                src2Wait22 || src2Wait5 || src2Kind ||
-                  (b.role == .src2L2 && handoff2)
-              else if b.role == .src1Stage && a.role == .resStage then
-                -- srcStageAhead: plain HBL/HB does NOT order NE or PE DMA src1Stage fill over draining resStage
-                src2Wait5 || src2Wait22
-              else
-                hbl k i || handoff2 || handoff3
-
-            if !ordered then
+            if !vL2PairOrdered fps hbTbl hblTbl latestNe latestPe k i a b then
               let xeTag := if tk.engine != ti.engine then " [XE cross-engine]" else ""
               let src2Tag := if ti.engine == .pe && (b.role == .src2Stage || b.role == .src2L2) then " [src2AheadPE]" else ""
               let stageAheadTag := if b.role == .src1Stage && a.role == .resStage then " [srcStageAhead]" else ""
-              throw s!"S5 L2 hazard{xeTag}{src2Tag}{stageAheadTag}: unordered conflict between task {k} ({a.role.name} [{toHex a.lo}, {toHex a.hi})) and task {i} ({b.role.name} [{toHex b.lo}, {toHex b.hi}))"
-
+              .error s!"S5 L2 hazard{xeTag}{src2Tag}{stageAheadTag}: unordered conflict between task {k} ({a.role.name} [{toHex a.lo}, {toHex a.hi})) and task {i} ({b.role.name} [{toHex b.lo}, {toHex b.hi}))"
+            else
+              .ok ()
+          else
+            .ok ()) >>= fun () =>
       -- B. Check all conflicting DRAM pairs
-      for a in tk.dramAccesses do
-        for b in ti.dramAccesses do
+      checkRange 0 tk.dramAccesses.size fun ia =>
+        let a := tk.dramAccesses[ia]!
+        checkRange 0 ti.dramAccesses.size fun ib =>
+          let b := ti.dramAccesses[ib]!
           if a.resource == b.resource && (a.isWrite || b.isWrite) && vIntervalsOverlap a.lo a.hi b.lo b.hi then
-            let ordered : Bool :=
-              if b.port == .kernel then
-                -- Scratch-produced dynamic kernel RAW: ordered via 10-word extended header [producerTaskId]
-                a.isWrite && match ti.extProducerTask with
-                  | some p => hbEq k p
-                  | none => false
-              else if ti.engine == .ne && b.port == .src1Dma then
-                -- srcReadNE: plain HB does NOT order NE src1 DRAM read; requires depKind at depDist == 0
-                a.isWrite && dramRawKind
-              else if ti.engine == .pe && b.port == .src2Dma then
-                -- src2AheadPE: plain HB does NOT order PE src2 DRAM read
-                src2Kind || src2Wait22 || src2Wait5 || dramRawKind
-              else if a.isWrite && !b.isWrite then
-                -- PE src1Dma RAW
-                hb k i || dramRawKind
-              else
-                -- DRAM WAR or WAW (scratch reuse): requires full whole-task HB
-                hb k i
-
-            if !ordered then
+            if !vDramPairOrdered fps hbTbl latestPe k i a b then
               let kindTag :=
                 if b.port == .kernel then " [kernelRaw]"
                 else if ti.engine == .ne && b.port == .src1Dma then " [srcReadNE]"
@@ -5390,43 +5437,65 @@ def verifyProgramHazards (fps : Array VerifiedTaskFootprint) : Except String Uni
                 else if !a.isWrite && b.isWrite then " [DRAM WAR]"
                 else if a.isWrite && b.isWrite then " [DRAM WAW]"
                 else " [DRAM RAW]"
-              throw s!"S5 DRAM hazard{kindTag}: unordered conflict on {a.resource.name} between task {k} ({a.port.name} [{toHex a.lo}, {toHex a.hi})) and task {i} ({b.port.name} [{toHex b.lo}, {toHex b.hi}))"
-
-            -- BAR 3 DRAM-scratch read coherence: every scratch RAW reader (NE or PE, src1Dma or src2Dma)
-            -- must set depKind in {1, 2} on its own reading port (0x4d00 / 0x4d04).
-            if a.resource == .scratch && a.isWrite && !b.isWrite then
+              .error s!"S5 DRAM hazard{kindTag}: unordered conflict on {a.resource.name} between task {k} ({a.port.name} [{toHex a.lo}, {toHex a.hi})) and task {i} ({b.port.name} [{toHex b.lo}, {toHex b.hi}))"
+            else if a.resource == .scratch && a.isWrite && !b.isWrite then
               if b.port == .src1Dma && !(ti.sync.src1DepKind == 1 || ti.sync.src1DepKind == 2) then
-                throw s!"S5 DRAM scratch coherence: task {i} src1Dma reading scratch [{toHex b.lo}, {toHex b.hi}) written by task {k} must set 0x4d00 depKind to 1 or 2 (got {ti.sync.src1DepKind})"
-              if b.port == .src2Dma && !(ti.sync.src2DepKind == 1 || ti.sync.src2DepKind == 2) then
-                throw s!"S5 DRAM scratch coherence: task {i} src2Dma reading scratch [{toHex b.lo}, {toHex b.hi}) written by task {k} must set 0x4d04 depKind to 1 or 2 (got {ti.sync.src2DepKind})"
+                .error s!"S5 DRAM scratch coherence: task {i} src1Dma reading scratch [{toHex b.lo}, {toHex b.hi}) written by task {k} must set 0x4d00 depKind to 1 or 2 (got {ti.sync.src1DepKind})"
+              else if b.port == .src2Dma && !(ti.sync.src2DepKind == 1 || ti.sync.src2DepKind == 2) then
+                .error s!"S5 DRAM scratch coherence: task {i} src2Dma reading scratch [{toHex b.lo}, {toHex b.hi}) written by task {k} must set 0x4d04 depKind to 1 or 2 (got {ti.sync.src2DepKind})"
+              else
+                .ok ()
+            else
+              .ok ()
+          else
+            .ok ()
 
-  -- 3. BAR 3 DRAM-scratch read integrity (Clause S5):
-  --    Every task reading BAR 3 scratch must (a) unconditionally set depKind in {1, 2} on its reading
-  --    port (even with no prior overlapping write), and (b) have prior ordered overlapping resDma
-  --    writes whose union covers [b.lo, b.hi) completely (rejecting uninitialized or gap reads),
-  --    and set depKind == 1 whenever any active (non-superseded) contributing writer has BatchN > 1.
-  for i in [:n] do
+/-- Collect all BAR 3 scratch `resDma` writes in `accs[j..)` overlapping `b`. -/
+def collectTaskScratchWriters
+    (k : Nat) (b : VerifiedDramAccess) (accs : Array VerifiedDramAccess)
+    (j : Nat) (acc : Array (Nat × VerifiedDramAccess)) : Array (Nat × VerifiedDramAccess) :=
+  if h : j < accs.size then
+    let a := accs[j]
+    let acc' :=
+      if a.resource == .scratch && a.port == .resDma && a.isWrite && vIntervalsOverlap a.lo a.hi b.lo b.hi then
+        acc.push (k, a)
+      else
+        acc
+    collectTaskScratchWriters k b accs (j + 1) acc'
+  else
+    acc
+termination_by accs.size - j
+
+/-- Collect all prior BAR 3 scratch `resDma` writes in tasks `[k, hi)` overlapping `b`. -/
+def collectPriorScratchWriters
+    (fps : Array VerifiedTaskFootprint) (b : VerifiedDramAccess)
+    (k hi : Nat) (acc : Array (Nat × VerifiedDramAccess)) : Array (Nat × VerifiedDramAccess) :=
+  if _ : k < hi then
+    let acc' := collectTaskScratchWriters k b fps[k]!.dramAccesses 0 acc
+    collectPriorScratchWriters fps b (k + 1) hi acc'
+  else
+    acc
+termination_by hi - k
+
+/-- Phase 3 of S5: BAR 3 DRAM-scratch read integrity, coverage, and `[multiBatchRaw]` coherence. -/
+def verifyScratchReadIntegrity (fps : Array VerifiedTaskFootprint) : Except String Unit :=
+  checkRange 0 fps.size fun i =>
     let ti := fps[i]!
-    for b in ti.dramAccesses do
-      if b.resource == .scratch && !b.isWrite then
+    checkRange 0 ti.dramAccesses.size fun ib =>
+      let b := ti.dramAccesses[ib]!
+      if b.resource == .scratch && !b.isWrite then do
         if b.port == .src1Dma && !(ti.sync.src1DepKind == 1 || ti.sync.src1DepKind == 2) then
           throw s!"S5 DRAM scratch coherence: task {i} src1Dma reading scratch [{toHex b.lo}, {toHex b.hi}) must set 0x4d00 depKind to 1 or 2 (got {ti.sync.src1DepKind})"
         if b.port == .src2Dma && !(ti.sync.src2DepKind == 1 || ti.sync.src2DepKind == 2) then
           throw s!"S5 DRAM scratch coherence: task {i} src2Dma reading scratch [{toHex b.lo}, {toHex b.hi}) must set 0x4d04 depKind to 1 or 2 (got {ti.sync.src2DepKind})"
         if b.port == .kernel && ti.extProducerTask.isNone then
           throw s!"S5 DRAM scratch coherence: task {i} kernel reading scratch [{toHex b.lo}, {toHex b.hi}) requires extended header extProducerTask"
-        let mut priorWriters : Array (Nat × VerifiedDramAccess) := #[]
-        for k in [:i] do
-          for a in fps[k]!.dramAccesses do
-            if a.resource == .scratch && a.port == .resDma && a.isWrite && vIntervalsOverlap a.lo a.hi b.lo b.hi then
-              priorWriters := priorWriters.push (k, a)
+        let priorWriters := collectPriorScratchWriters fps b 0 i #[]
         if priorWriters.isEmpty then
           throw s!"S5 DRAM scratch integrity: task {i} {b.port.name} reads uninitialized scratch [{toHex b.lo}, {toHex b.hi}) with no prior overlapping resDma write"
         let writerIvs : List (Nat × Nat) := effectiveCoveredIntervals (priorWriters.toList.map (fun (_, a) => a.coverage))
         if !intervalsCover writerIvs b.lo b.hi then
           throw s!"S5 DRAM scratch integrity: task {i} {b.port.name} scratch read [{toHex b.lo}, {toHex b.hi}) is only partially covered by prior resDma writers (uninitialized gap)"
-        -- Check [multiBatchRaw] whenever the consumer itself is multi-batch or any active
-        -- (not completely superseded by later dense/periodic writers) contributing writer has BatchN > 1.
         if ti.isMultiBatch then
           if b.port == .src1Dma && ti.sync.src1DepKind != 1 then
             throw s!"S5 DRAM scratch coherence [multiBatchRaw]: multi-batch task {i} src1Dma reading scratch [{toHex b.lo}, {toHex b.hi}) must set 0x4d00 depKind to 1 (got {ti.sync.src1DepKind})"
@@ -5448,19 +5517,31 @@ def verifyProgramHazards (fps : Array VerifiedTaskFootprint) : Except String Uni
                 throw s!"S5 DRAM scratch coherence [multiBatchRaw]: task {i} src1Dma reading multi-batch (BatchN > 1) scratch [{toHex b.lo}, {toHex b.hi}) written by task {p} must set 0x4d00 depKind to 1 (got {ti.sync.src1DepKind})"
               if b.port == .src2Dma && ti.sync.src2DepKind != 1 then
                 throw s!"S5 DRAM scratch coherence [multiBatchRaw]: task {i} src2Dma reading multi-batch (BatchN > 1) scratch [{toHex b.lo}, {toHex b.hi}) written by task {p} must set 0x4d04 depKind to 1 (got {ti.sync.src2DepKind})"
+      else
+        .ok ()
 
-  -- 4. Reject pairwise intra-task BAR 3 scratch read/write or write/write overlap on any task
-  for i in [:n] do
+/-- Phase 4 of S5: reject pairwise intra-task BAR 3 scratch read/write or write/write overlap on any task. -/
+def verifyIntraTaskScratch (fps : Array VerifiedTaskFootprint) : Except String Unit :=
+  checkRange 0 fps.size fun i =>
     let accs := fps[i]!.dramAccesses
-    for idx1 in [:accs.size] do
-      for idx2 in [idx1 + 1 : accs.size] do
+    checkRange 0 accs.size fun idx1 =>
+      checkRange (idx1 + 1) accs.size fun idx2 =>
         let a := accs[idx1]!
         let b := accs[idx2]!
         if a.resource == .scratch && b.resource == .scratch && (a.isWrite || b.isWrite) &&
            vIntervalsOverlap a.lo a.hi b.lo b.hi then
-          throw s!"S5 intra-task scratch hazard: task {i} has overlapping BAR 3 scratch accesses {a.port.name} [{toHex a.lo}, {toHex a.hi}) and {b.port.name} [{toHex b.lo}, {toHex b.hi})"
+          .error s!"S5 intra-task scratch hazard: task {i} has overlapping BAR 3 scratch accesses {a.port.name} [{toHex a.lo}, {toHex a.hi}) and {b.port.name} [{toHex b.lo}, {toHex b.hi})"
+        else
+          .ok ()
 
-  pure ()
+/-- Verify Clause S5 (whole-program hazard freedom + live L2-resident integrity) across all `N` tasks. -/
+def verifyProgramHazards (fps : Array VerifiedTaskFootprint) : Except String Unit :=
+  let (hbTbl, hblTbl) := buildHBReachTables fps
+  let (latestNeArr, latestPeArr) := vLatestEngArrays fps
+  verifyL2LiveIntegrity fps >>= fun () =>
+  verifyPairwiseHazards fps hbTbl hblTbl latestNeArr latestPeArr >>= fun () =>
+  verifyScratchReadIntegrity fps >>= fun () =>
+  verifyIntraTaskScratch fps
 
 -- ============================================================================
 -- Unified Whole-Program Entry Points

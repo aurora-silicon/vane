@@ -664,61 +664,83 @@ def maxTileHeightConv (target : Target) (sh : ConvSpec) (probe : Tiling) : Nat :
           return th
   return 0
 
+/-- Return the first `some y` produced by `f` over `xs`. -/
+def findFirstSome {α β : Type} : List α → (α → Option β) → Option β
+  | [], _ => none
+  | x :: rest, f =>
+    match f x with
+    | some y => some y
+    | none => findFirstSome rest f
+
+/-- Ascending list of natural numbers `[lo, hi)`. -/
+def natRange (lo hi : Nat) : List Nat :=
+  if _ : lo < hi then
+    lo :: natRange (lo + 1) hi
+  else
+    []
+termination_by hi - lo
+
 /-- Deterministic independent tile chooser for single-task fp16 NE convolutions (1x1 and 3x3).
     Computes maximal legal `tileHeight` in O(1) per candidate and validates through `validateConvTiling`.
     Pass `extraChunkBytes := 128` when fusing a 128-byte LUT into every kernel chunk. -/
 def chooseConvTiling
     (target : Target) (sh : ConvSpec)
-    (extraChunkBytes : Nat := 0) (hasBiasInKernel : Bool := false) : Except String Tiling := do
-  validateConvShape sh
-
+    (extraChunkBytes : Nat := 0) (hasBiasInKernel : Bool := false) : Except String Tiling :=
+  validateConvShape sh >>= fun () =>
   let eff := sh.effMode
   let wo := sh.outW
   let maxF := min 4 (ceilLog2 sh.cout)
-  let fCandidates : Array Nat :=
+  let fCandidates : List Nat :=
     if eff == .depthwise && sh.cout >= 16 then
-      #[4]
+      [4]
     else
-      Id.run do
-        let mut fs : Array Nat := #[]
-        for step in [:maxF + 1] do
-          fs := fs.push (maxF - step)
-        return fs
-
-  let logNEs : Array Nat := #[4, 3, 2, 1, 0]
-  let fats : Array Nat := #[0, 1]
-
-  for logNE in logNEs do
-    for fat in fats do
-      for f in fCandidates do
-        if f + fat <= logNE && (logNE - f - fat) <= 3 then
-          if let some ocg := chooseConvOcg? target sh f then
-            for shPref in [:5] do
-              let stripW := (128 <<< fat) >>> shPref
-              if stripW >= 8 && stripW <= 256 then
-                let cMin := coverMin wo stripW fat
-                let shMaxStart := max shPref cMin
-                if shMaxStart <= 4 then
-                  for shMax in [shMaxStart : 5] do
-                    let probe : Tiling := {
-                      logNE := logNE
-                      f := f
-                      fat := fat
-                      ocg := ocg
-                      shPref := shPref
-                      shMax := shMax
-                      tileHeight := 1
-                      srcSkew := 0
-                      resSkew := 0
-                    }
-                    let maxTh := maxTileHeightConv target sh probe
-                    if maxTh >= 1 then
-                      let cand : Tiling := { probe with tileHeight := maxTh }
-                      match validateConvTiling target sh cand extraChunkBytes hasBiasInKernel with
-                      | .ok () => return cand
-                      | .error _ => pure ()
-
-  throw s!"no legal {target.name} tiling found for {sh.kernelSize}x{sh.kernelSize} {sh.mode.name} conv shape (H={sh.h}, W={sh.w}, Cin={sh.cin}, Cout={sh.cout}, s={sh.stride}, pad={sh.pad.name})"
+      (natRange 0 (maxF + 1)).map (fun step => maxF - step)
+  let logNEs : List Nat := [4, 3, 2, 1, 0]
+  let fats : List Nat := [0, 1]
+  let chosen? : Option Tiling :=
+    findFirstSome logNEs fun logNE =>
+      findFirstSome fats fun fat =>
+        findFirstSome fCandidates fun f =>
+          if f + fat <= logNE && (logNE - f - fat) <= 3 then
+            match chooseConvOcg? target sh f with
+            | none => none
+            | some ocg =>
+              findFirstSome (natRange 0 5) fun shPref =>
+                let stripW := (128 <<< fat) >>> shPref
+                if stripW >= 8 && stripW <= 256 then
+                  let cMin := coverMin wo stripW fat
+                  let shMaxStart := max shPref cMin
+                  if shMaxStart <= 4 then
+                    findFirstSome (natRange shMaxStart 5) fun shMax =>
+                      let probe : Tiling := {
+                        logNE := logNE
+                        f := f
+                        fat := fat
+                        ocg := ocg
+                        shPref := shPref
+                        shMax := shMax
+                        tileHeight := 1
+                        srcSkew := 0
+                        resSkew := 0
+                      }
+                      let maxTh := maxTileHeightConv target sh probe
+                      if maxTh >= 1 then
+                        let cand : Tiling := { probe with tileHeight := maxTh }
+                        match validateConvTiling target sh cand extraChunkBytes hasBiasInKernel with
+                        | .ok () => some cand
+                        | .error _ => none
+                      else
+                        none
+                  else
+                    none
+                else
+                  none
+          else
+            none
+  match chosen? with
+  | some cand => .ok cand
+  | none =>
+    .error s!"no legal {target.name} tiling found for {sh.kernelSize}x{sh.kernelSize} {sh.mode.name} conv shape (H={sh.h}, W={sh.w}, Cin={sh.cin}, Cout={sh.cout}, s={sh.stride}, pad={sh.pad.name})"
 
 -- ============================================================================
 -- Compatibility wrappers for Conv1x1Shape and Conv3x3Shape callers
