@@ -70,6 +70,7 @@ func usage(w io.Writer) {
 	fmt.Fprintln(w, "  vane-runner gen-pool --op <max|avg> --h H --w W --c C --kh KH --kw KW [--sh SH] [--sw SW] [--pad <valid|same|custom>] [--pt N --pb N --pl N --pr N] [--exclude-pad] [--seed N] --out-dir DIR [--json]")
 	fmt.Fprintln(w, "  vane-runner gen-reduce --op <sum|mean|max|min|l1|sum_square|l2|inv_sum|rsqrt_sum_square|rsqrt_mean_square> --h H --w W --c C --axes <w|h|c|hw|cw|ch|chw> [--eps F] [--seed N] --out-dir DIR [--json]")
 	fmt.Fprintln(w, "  vane-runner gen-view --op <transpose|slice|concat|split|reshape> [op flags] [--seed N] --out-dir DIR [--json]")
+	fmt.Fprintln(w, "  vane-runner gen-matmul [--b B] --m M --k K --n N [--transpose-a] [--transpose-b] [--scale F] [--seed N] --out-dir DIR [--json]")
 	fmt.Fprintln(w, "  vane-runner gen-graph --spec PATH --out-dir DIR [--seed N] [--json]")
 	fmt.Fprintln(w, "  vane-runner compare-conv --manifest PATH --actual PATH --expected PATH [--atol F] [--rtol F] [--max-ulp N] [--json]")
 	fmt.Fprintln(w, "  vane-runner compare-conv1x1 --manifest PATH --actual PATH --expected PATH [--atol F] [--rtol F] [--max-ulp N] [--json]")
@@ -102,6 +103,8 @@ func runCLI(args []string, tr ane.Transport, stdout, stderr io.Writer) int {
 		return cmdGenReduce(args[1:], stdout, stderr)
 	case "gen-view":
 		return cmdGenView(args[1:], stdout, stderr)
+	case "gen-matmul":
+		return cmdGenMatmul(args[1:], stdout, stderr)
 	case "gen-graph":
 		return cmdGenGraph(args[1:], stdout, stderr)
 	case "compare-conv":
@@ -1951,6 +1954,152 @@ func cmdGenView(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
+func cmdGenMatmul(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("gen-matmul", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	b := fs.Int("b", 1, "Batch / head count B")
+	m := fs.Int("m", 0, "Logical M (rows of A and output)")
+	k := fs.Int("k", 0, "Inner dimension K")
+	n := fs.Int("n", 0, "Logical N (cols of B and output)")
+	transposeA := fs.Bool("transpose-a", false, "Transpose A (physical shape [B, K, 1, M])")
+	transposeB := fs.Bool("transpose-b", false, "Transpose B (physical shape [B, N, 1, K])")
+	scale := fs.Float64("scale", 1.0, "Post-accumulation fp16 scale factor")
+	seed := fs.Uint64("seed", 1, "Deterministic PRNG seed")
+	outDir := fs.String("out-dir", "", "Output directory for generated test vectors")
+	asJSON := fs.Bool("json", false, "Emit JSON summary")
+
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	if *b <= 0 || *m <= 0 || *k <= 0 || *n <= 0 {
+		fmt.Fprintln(stderr, "error: --b, --m, --k, and --n must all be positive integers")
+		return 1
+	}
+	if *outDir == "" {
+		fmt.Fprintln(stderr, "error: --out-dir DIR is required")
+		return 1
+	}
+	if math.IsNaN(*scale) || math.IsInf(*scale, 0) {
+		fmt.Fprintf(stderr, "error: --scale must be finite, got %v\n", *scale)
+		return 1
+	}
+	scaleBits := fp16.FromFloat64(*scale)
+	if !fp16.IsFinite(scaleBits) {
+		fmt.Fprintf(stderr, "error: --scale %v overflows fp16\n", *scale)
+		return 1
+	}
+
+	aC, aW := *m, *k
+	if *transposeA {
+		aC, aW = *k, *m
+	}
+	bC, bW := *k, *n
+	if *transposeB {
+		bC, bW = *n, *k
+	}
+
+	rng := rand.New(rand.NewPCG(*seed, *seed^0x517cc1b727220a95))
+	valScale := math.Min(0.5, 1.5/math.Sqrt(float64(*k)))
+
+	inA, err := ref.NewTensor(*b, aC, 1, aW)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	for i := range inA.Data {
+		inA.Data[i] = fp16.FromFloat64((rng.Float64()*2.0 - 1.0) * valScale)
+	}
+	inB, err := ref.NewTensor(*b, bC, 1, bW)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	for i := range inB.Data {
+		inB.Data[i] = fp16.FromFloat64((rng.Float64()*2.0 - 1.0) * valScale)
+	}
+
+	yF64, err := ref.EvalMatmulF64(inA, inB, 1, *transposeA, *transposeB, *scale)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: float64 matmul reference failed: %v\n", err)
+		return 1
+	}
+	yQ1516, err := ref.EvalMatmulQ1516(inA, inB, 1, *transposeA, *transposeB, scaleBits)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: Q15.16 matmul reference failed: %v\n", err)
+		return 1
+	}
+
+	bufA, err := packTensor64B(inA)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: pack input0: %v\n", err)
+		return 1
+	}
+	bufB, err := packTensor64B(inB)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: pack input1: %v\n", err)
+		return 1
+	}
+	expF64Buf, err := packTensor64B(yF64)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: pack expected_f64: %v\n", err)
+		return 1
+	}
+	expQBuf, err := packTensor64B(yQ1516)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: pack expected_q1516: %v\n", err)
+		return 1
+	}
+
+	if err := os.MkdirAll(*outDir, 0o755); err != nil {
+		fmt.Fprintf(stderr, "error: create out-dir: %v\n", err)
+		return 1
+	}
+	writeFile := func(name string, data []byte) error {
+		return os.WriteFile(filepath.Join(*outDir, name), data, 0o644)
+	}
+	if err := writeFile("input0.bin", bufA); err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	if err := writeFile("input1.bin", bufB); err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	if err := writeFile("expected_f64.bin", expF64Buf); err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	if err := writeFile("expected_q1516.bin", expQBuf); err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+
+	summary := map[string]any{
+		"b":           *b,
+		"m":           *m,
+		"k":           *k,
+		"n":           *n,
+		"transpose_a": *transposeA,
+		"transpose_b": *transposeB,
+		"scale":       *scale,
+		"scale_f16":   fmt.Sprintf("0x%04x", scaleBits),
+		"input_files": []string{"input0.bin", "input1.bin"},
+		"in_bytes":    []int{len(bufA), len(bufB)},
+		"out_shape":   []int{yF64.N, yF64.C, yF64.H, yF64.W},
+		"out_bytes":   len(expQBuf),
+		"seed":        *seed,
+		"out_dir":     *outDir,
+	}
+	if *asJSON {
+		raw, _ := json.MarshalIndent(summary, "", "  ")
+		fmt.Fprintln(stdout, string(raw))
+	} else {
+		fmt.Fprintf(stdout, "generated matmul B=%d M=%d K=%d N=%d trA=%t trB=%t scale=%g (in=%dB,%dB out=%dB) in %s\n",
+			*b, *m, *k, *n, *transposeA, *transposeB, *scale, len(bufA), len(bufB), len(expQBuf), *outDir)
+	}
+	return 0
+}
+
 func packTight64Surface(t ref.Tensor) ([]byte, int, int, int, error) {
 	rowStride := ref.AlignUp(2*t.W, 64)
 	planeStride := t.H * rowStride
@@ -2428,6 +2577,53 @@ func cmdGenGraph(args []string, stdout, stderr io.Writer) int {
 				fmt.Fprintf(stderr, "error: node %q (reshape): out_shape must have length 4 or 3\n", nd.ID)
 				return 1
 			}
+
+		case "matmul":
+			if len(nd.Inputs) != 2 {
+				fmt.Fprintf(stderr, "error: node %q (matmul): expected 2 inputs\n", nd.ID)
+				return 1
+			}
+			dA, okA := shapes[nd.Inputs[0]]
+			dB, okB := shapes[nd.Inputs[1]]
+			if !okA || !okB {
+				fmt.Fprintf(stderr, "error: node %q (matmul): unknown input in %v\n", nd.ID, nd.Inputs)
+				return 1
+			}
+			if dA.h != 1 || dB.h != 1 {
+				fmt.Fprintf(stderr, "error: node %q (matmul): requires H=1 for both inputs, got %d and %d\n", nd.ID, dA.h, dB.h)
+				return 1
+			}
+			heads := nd.Heads
+			if heads == 0 {
+				heads = 1
+			}
+			if heads < 1 || dA.c%heads != 0 || dB.c%heads != 0 {
+				fmt.Fprintf(stderr, "error: node %q (matmul): invalid heads=%d for C=(%d,%d)\n", nd.ID, heads, dA.c, dB.c)
+				return 1
+			}
+			aC, bC := dA.c/heads, dB.c/heads
+			var mDim, kA, kB, nDim int
+			if nd.TransposeA {
+				kA, mDim = aC, dA.w
+			} else {
+				mDim, kA = aC, dA.w
+			}
+			if nd.TransposeB {
+				nDim, kB = bC, dB.w
+			} else {
+				kB, nDim = bC, dB.w
+			}
+			if kA != kB {
+				fmt.Fprintf(stderr, "error: node %q (matmul): inner dimension mismatch K=%d vs K=%d\n", nd.ID, kA, kB)
+				return 1
+			}
+			if nd.Scale != nil {
+				if math.IsNaN(*nd.Scale) || math.IsInf(*nd.Scale, 0) || !fp16.IsFinite(fp16.FromFloat64(*nd.Scale)) {
+					fmt.Fprintf(stderr, "error: node %q (matmul): scale %v must be finite fp16\n", nd.ID, *nd.Scale)
+					return 1
+				}
+			}
+			shapes[nd.ID] = dims3{heads * mDim, 1, nDim}
 
 		default:
 			fmt.Fprintf(stderr, "error: node %q: unsupported op %q\n", nd.ID, nd.Op)

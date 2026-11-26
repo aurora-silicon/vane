@@ -189,6 +189,9 @@ type GraphNodeSpec struct {
 	Step         []int           `json:"step,omitempty"`
 	Axis         *int            `json:"axis,omitempty"`
 	OutShape     []int           `json:"out_shape,omitempty"`
+	Heads        int             `json:"heads,omitempty"`
+	TransposeA   bool            `json:"transpose_a,omitempty"`
+	TransposeB   bool            `json:"transpose_b,omitempty"`
 }
 
 // EffectiveCin returns Cin if set, otherwise K (for linear nodes).
@@ -720,6 +723,29 @@ func evalGraph(spec GraphSpec, inputs map[string]Tensor, nodeWeights map[string]
 				return Tensor{}, nil, fmt.Errorf("node %q (reshape): out_shape must have length 4 or 3, got %d", nd.ID, len(nd.OutShape))
 			}
 			out, err = Reshape(x, osh)
+
+		case "matmul":
+			if len(nd.Inputs) != 2 {
+				return Tensor{}, nil, fmt.Errorf("node %q (matmul): expected 2 inputs, got %d", nd.ID, len(nd.Inputs))
+			}
+			a, ok1 := env[nd.Inputs[0]]
+			if !ok1 {
+				return Tensor{}, nil, fmt.Errorf("node %q (matmul): unknown input %q", nd.ID, nd.Inputs[0])
+			}
+			b, ok2 := env[nd.Inputs[1]]
+			if !ok2 {
+				return Tensor{}, nil, fmt.Errorf("node %q (matmul): unknown input %q", nd.ID, nd.Inputs[1])
+			}
+			heads := nd.Heads
+			if heads == 0 {
+				heads = 1
+			}
+			out, err = EvalMatmul(a, b, MatmulSpec{
+				Heads:      heads,
+				TransposeA: nd.TransposeA,
+				TransposeB: nd.TransposeB,
+				Scale:      nd.Scale,
+			}, exactHW)
 
 		default:
 			return Tensor{}, nil, fmt.Errorf("node %q: unsupported op %q", nd.ID, nd.Op)
