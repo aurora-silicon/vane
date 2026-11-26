@@ -4612,11 +4612,11 @@ private def runM5bTests : IO (Array TestResult) := do
       let w1c1 ← readU32LE lnDram.hwx (← findM5aTaskRegOffset lnDram.hwx lnDram.info 1 regSrc1Cfg)
       if (w1c1 &&& cfgBitWaitPe22) == 0 then
         throw s!"{tgt.name} lnDram task 1 src1Cfg {toHex w1c1.toNat} missing bit 22 (waitPe22 for srcStageAhead)"
-      -- Task 2 (inv_std): src1Dep reads task 1 (BatchN=1) -> depKind=2
+      -- Task 2 (inv_std): multi-batch (BatchN=6 > 1) consumer reading scratch -> depKind=1
       let w2s1 ← readU32LE lnDram.hwx (← findM5aTaskRegOffset lnDram.hwx lnDram.info 2 regSrc1Dep)
       let dk2s1 ← decodeFieldChecked (srcDepMultiLayout "src1Dep") w2s1 "depKind"
-      if dk2s1 != 2 then
-        throw s!"{tgt.name} lnDram task 2 src1Dep depKind={dk2s1} != 2"
+      if dk2s1 != 1 then
+        throw s!"{tgt.name} lnDram task 2 src1Dep depKind={dk2s1} != 1"
       -- Task 3 (out): src1Dep reads task 1 (BatchN=1) -> depKind=2; src2Dep reads task 2 (BatchN=6 > 1) -> depKind=1; src1Cfg sets bit 22
       let w3s1 ← readU32LE lnDram.hwx (← findM5aTaskRegOffset lnDram.hwx lnDram.info 3 regSrc1Dep)
       let dk3s1 ← decodeFieldChecked (srcDepMultiLayout "src1Dep") w3s1 "depKind"
@@ -5598,7 +5598,7 @@ private def rebuildDynTask
       plain := plain.push { byteAddr := w.byteAddr, value := w.value }
       i := i + 1
     | some slot =>
-      if i + 1 < ws.size && ws[i + 1]!.barSlot == some slot && ws[i + 1]!.byteAddr == w.byteAddr + 4 then
+      if slot != barSlotConfigZero && i + 1 < ws.size && ws[i + 1]!.barSlot == some slot && ws[i + 1]!.byteAddr == w.byteAddr + 4 then
         bars := bars.push { baseByteAddr := w.byteAddr, barSlot := slot, values := #[w.value, ws[i + 1]!.value] }
         i := i + 2
       else
@@ -5724,21 +5724,24 @@ private def mkTransformerBlockGraph (target : Target) : Vane.Graph.GraphSpec :=
 private def runM5dTests : IO (Array TestResult) := do
   let mut results : Array TestResult := #[]
 
-  -- 1. Positive: standalone compileMatmul across H16 & H17 covering all modes
+  -- 1. Positive: standalone compileMatmul across H16 & H17 covering all modes (including Mi <= 16 row-slicing for M > 16)
   for tgt in Target.all do
-    results := results.push (checkOk s!"m5d ({tgt.name}): standalone compileMatmul matrix (B=1/4, M=1/8/32, trA/trB/both, scale)" (do
+    results := results.push (checkOk s!"m5d ({tgt.name}): standalone compileMatmul matrix (B=1/4, M=1/8/16/20/32, trA/trB/both, scale)" (do
       let scaleInvSqrt32 := floatToF16CanonicalZero (1.0 / Float.sqrt 32.0)
-      let cases : Array (MatmulSpec × Nat) := #[
-        ({ b := 1, m := 1,  k := 16, n := 16, transposeA := false, transposeB := false, scaleBits := f16PosOne }, 1),
-        ({ b := 1, m := 8,  k := 32, n := 32, transposeA := false, transposeB := false, scaleBits := f16PosOne }, 1),
-        ({ b := 1, m := 32, k := 32, n := 128, transposeA := false, transposeB := false, scaleBits := scaleInvSqrt32 }, 1),
-        ({ b := 4, m := 16, k := 32, n := 32, transposeA := false, transposeB := false, scaleBits := f16PosOne }, 1),
-        ({ b := 1, m := 32, k := 32, n := 64, transposeA := false, transposeB := true,  scaleBits := scaleInvSqrt32 }, 2),
-        ({ b := 4, m := 16, k := 32, n := 32, transposeA := false, transposeB := true,  scaleBits := scaleInvSqrt32 }, 2),
-        ({ b := 1, m := 16, k := 32, n := 32, transposeA := true,  transposeB := false, scaleBits := f16PosOne }, 2),
-        ({ b := 4, m := 16, k := 32, n := 32, transposeA := true,  transposeB := true,  scaleBits := scaleInvSqrt32 }, 3)
+      let cases : Array (MatmulSpec × Nat × Nat) := #[
+        ({ b := 1, m := 1,  k := 16, n := 16, transposeA := false, transposeB := false, scaleBits := f16PosOne }, 1, 0),
+        ({ b := 1, m := 8,  k := 32, n := 32, transposeA := false, transposeB := false, scaleBits := f16PosOne }, 1, 0),
+        ({ b := 1, m := 32, k := 32, n := 128, transposeA := false, transposeB := false, scaleBits := scaleInvSqrt32 }, 2, 0),
+        ({ b := 4, m := 16, k := 32, n := 32, transposeA := false, transposeB := false, scaleBits := f16PosOne }, 1, 0),
+        ({ b := 4, m := 32, k := 32, n := 32, transposeA := false, transposeB := false, scaleBits := scaleInvSqrt32 }, 2, 0),
+        ({ b := 1, m := 32, k := 32, n := 64, transposeA := false, transposeB := true,  scaleBits := scaleInvSqrt32 }, 2, 1),
+        ({ b := 4, m := 16, k := 32, n := 32, transposeA := false, transposeB := true,  scaleBits := scaleInvSqrt32 }, 1, 1),
+        ({ b := 4, m := 32, k := 32, n := 32, transposeA := false, transposeB := true,  scaleBits := scaleInvSqrt32 }, 2, 1),
+        ({ b := 1, m := 16, k := 32, n := 32, transposeA := true,  transposeB := false, scaleBits := f16PosOne }, 1, 1),
+        ({ b := 4, m := 20, k := 32, n := 32, transposeA := true,  transposeB := true,  scaleBits := scaleInvSqrt32 }, 2, 2)
       ]
-      for (sp, expTasks) in cases do
+      for (sp, expMm, expView) in cases do
+        let expTasks := expMm + expView
         let c ← compileMatmul tgt sp
         if c.taskCount != expTasks then
           throw s!"{tgt.name} {repr sp}: taskCount={c.taskCount} != {expTasks}"
@@ -5747,8 +5750,8 @@ private def runM5dTests : IO (Array TestResult) := do
         let info ← validateHwx c.hwx
         validateSectionsWithInfo info c.sections
         let s ← verifyHwxTasksSummary c.hwx info (requireKnownTask := true)
-        if s.neMatmul != 1 || s.neView != expTasks - 1 || s.total != expTasks then
-          throw s!"{tgt.name} {repr sp}: summary mismatch {repr s}"
+        if s.neMatmul != expMm || s.neView != expView || s.total != expTasks then
+          throw s!"{tgt.name} {repr sp}: summary mismatch {repr s} (expected mm={expMm}, view={expView})"
       pure ()
     ))
 
@@ -5759,14 +5762,21 @@ private def runM5dTests : IO (Array TestResult) := do
       let info ← validateHwx g.hwx
       validateSectionsWithInfo info g.sections
       let s ← verifyHwxTasksSummary g.hwx info (requireKnownTask := true)
-      if s.neMatmul != 2 || s.neView != 1 || s.peReduce != 2 || s.neAct != 2 || s.peOp != 2 || s.total != 9 then
+      if s.neMatmul != 4 || s.neView != 1 || s.peReduce != 2 || s.neAct != 2 || s.peOp != 2 || s.total != 11 then
         throw s!"{tgt.name} SDPA summary mismatch: {repr s}"
-      -- Verify the second matmul (probs @ V) uses a 10-word extended header (scratch-produced kernel P)
+      -- Verify both P @ V slices use 10-word extended headers and slice 0 sets keepLive=1 (0xc1)
       let textBytes ← readSlice g.hwx info.textSection.offset.toNat info.textSection.size.toNat
       let tasks ← decodeTaskStream tgt textBytes
+      let prevTask := tasks[tasks.size - 2]!
       let lastTask := tasks[tasks.size - 1]!
-      if lastTask.header.size != 10 then
-        throw s!"expected 10-word extended header on P @ V matmul, got {lastTask.header.size} words"
+      if prevTask.header.size != 10 || lastTask.header.size != 10 then
+        throw s!"expected 10-word extended headers on P @ V slices, got {prevTask.header.size} and {lastTask.header.size} words"
+      match prevTask.writes.find? (fun w => w.byteAddr == regChunkSlot 0) with
+      | some w0 =>
+        let kl ← decodeFieldChecked chunkSlotDynLayout w0.value "keepLive"
+        if kl != 1 then
+          throw s!"expected keepLive=1 on P @ V slice 0 chunkSlot[0], got {toHex w0.value.toNat}"
+      | none => throw "missing chunkSlot[0] on P @ V slice 0"
       pure ()
     ))
 
@@ -5777,12 +5787,12 @@ private def runM5dTests : IO (Array TestResult) := do
       let info ← validateHwx g.hwx
       validateSectionsWithInfo info g.sections
       let s ← verifyHwxTasksSummary g.hwx info (requireKnownTask := true)
-      if s.neMatmul != 2 || s.total != g.taskCount then
-        throw s!"{tgt.name} Transformer block summary mismatch: {repr s} (expected {g.taskCount} tasks, 2 neMatmul)"
+      if s.neMatmul != 4 || s.total != g.taskCount then
+        throw s!"{tgt.name} Transformer block summary mismatch: {repr s} (expected {g.taskCount} tasks, 4 neMatmul)"
       pure ()
     ))
 
-  -- 4. Positive: single-head matmul in graph IR with L2-resident B & Y (auto) and DRAM mode, plus multi-writer linear -> matmul A
+  -- 4. Positive: single-head matmul in graph IR with L2-resident B & Y (auto) and DRAM mode, plus multi-slice linear -> matmul A
   for tgt in Target.all do
     results := results.push (checkOk s!"m5d ({tgt.name}): single-head matmul L2/DRAM graph & multi-slice linear -> matmul kernel" (do
       for pl in #[Vane.Graph.EdgePlacementMode.auto, Vane.Graph.EdgePlacementMode.dram] do
@@ -5802,7 +5812,7 @@ private def runM5dTests : IO (Array TestResult) := do
         let s1 ← verifyHwxTasksSummary g1.hwx g1.info (requireKnownTask := true)
         if s1.neMatmul != 1 || s1.peOp != 2 || s1.total != 3 then
           throw s!"{tgt.name} ({pl.name}) summary mismatch: {repr s1}"
-      -- Multi-slice output-split linear (512 channels on H16 splits into 2 tasks) feeding matmul kernel A
+      -- Multi-slice output-split linear (512 channels on H16 splits into 2 tasks) feeding 32-slice matmul kernel A (512 / 16)
       let gSplit ← Vane.Graph.compileGraph {
         target := tgt
         defaultPlacement := .auto
@@ -5816,7 +5826,7 @@ private def runM5dTests : IO (Array TestResult) := do
         ]
       }
       let s2 ← verifyHwxTasksSummary gSplit.hwx gSplit.info (requireKnownTask := true)
-      if s2.neMatmul != 1 || s2.total != gSplit.taskCount then
+      if s2.neMatmul != 32 || s2.total != gSplit.taskCount then
         throw s!"{tgt.name} multi-slice linear->matmul summary mismatch: {repr s2}"
       pure ()
     ))
@@ -6163,6 +6173,262 @@ private def runM5dTests : IO (Array TestResult) := do
   results := results.push (checkErr "m5d neg tamper #22: chunkSlot 0x41 on external-input kernel rejected" (do
     tamperM5aTaskReg baseExtH17.hwx baseExtH17.info 0 (regChunkSlot 0) 0x0041
   ) "must encode 0x21")
+
+  -- Tamper 23: Cout > 16 on ocg = 0 neMatmul rejected (silicon 16-slot limit)
+  results := results.push (checkErr "m5d neg tamper #23a: ocg=0 neMatmul Cout=17 (> 16) rejected" (do
+    tamperM5aTaskReg baseExtH17.hwx baseExtH17.info 0 regCout 17
+  ) "exceeds 16 chunk slots")
+
+  results := results.push (checkErr "m5d neg tamper #23b: ocg=0 neMatmul Cout=32 (> 16) rejected" (do
+    tamperM5aTaskReg baseExtH17.hwx baseExtH17.info 0 regCout 32
+  ) "exceeds 16 chunk slots")
+
+  -- Tamper 24: Bad neOp rejected
+  results := results.push (checkErr "m5d neg tamper #24: bad neOp (0x00103c01) rejected" (do
+    tamperM5aTaskReg baseExtH17.hwx baseExtH17.info 0 regNeOp 0x00103c01
+  ) "neOp")
+
+  -- Tamper 25: Invalid neTile (ocg != 0, fat != 0, WU != 0) rejected
+  results := results.push (checkErr "m5d neg tamper #25a: neTile ocg=1 rejected" (do
+    let w ← encodeWord neTileLayout #[("ocg", 1), ("fat", 0), ("WU", 0)]
+    tamperM5aTaskReg baseExtH17.hwx baseExtH17.info 0 regNeTile w
+  ) "ocg=0, fat=0, WU=0")
+
+  results := results.push (checkErr "m5d neg tamper #25b: neTile fat=1 rejected" (do
+    let w ← encodeWord neTileLayout #[("ocg", 0), ("fat", 1), ("WU", 0)]
+    tamperM5aTaskReg baseExtH17.hwx baseExtH17.info 0 regNeTile w
+  ) "ocg=0, fat=0, WU=0")
+
+  results := results.push (checkErr "m5d neg tamper #25c: neTile WU=1 rejected" (do
+    let w ← encodeWord neTileLayout #[("ocg", 0), ("fat", 0), ("WU", 1)]
+    tamperM5aTaskReg baseExtH17.hwx baseExtH17.info 0 regNeTile w
+  ) "ocg=0, fat=0, WU=0")
+
+  -- Tamper 26: Under-provisioned 2^F < Mi rejected (M=16 with F=3, logNE=3 => 2^3=8 < 16)
+  results := results.push (checkErr "m5d neg tamper #26: under-provisioned 2^F < Mi (F=3, M=16) rejected" (do
+    let textBytes ← readSlice baseExtH17.hwx baseExtH17.info.textSection.offset.toNat baseExtH17.info.textSection.size.toNat
+    let tasks ← decodeTaskStream .h17 textBytes
+    let td0 ← rebuildDynTask tasks[0]! 1 none fun ws =>
+      ws.map fun w =>
+        if w.byteAddr == regNeCommon then
+          let cleared := w.value &&& (~~~((7 : UInt32) <<< 19))
+          { w with value := cleared ||| ((3 : UInt32) <<< 19) }
+        else w
+    let td := { td0 with eneOverride := some 4 }
+    let sA ← makeFp16Surface .h17 "a" "input_a" .input 16 1 32 4
+    let sB ← makeFp16Surface .h17 "b" "input_b" .input 32 1 32 4
+    let sY ← makeFp16Surface .h17 "y" "output_y" .output 16 1 32 4
+    let em ← emitProgram { target := .h17, surfaces := #[sA, sB, sY], tasks := #[td] }
+    let _ ← verifyHwxTasksSummary em.hwx em.info (requireKnownTask := true)
+    pure ()
+  ) "2^F=")
+
+  -- Tamper 27: kernelBase targeting static __KERN_0 rejected
+  results := results.push (checkErr "m5d neg tamper #27: kernelBase targeting __KERN_0 rejected" (do
+    let textBytes ← readSlice baseExtH17.hwx baseExtH17.info.textSection.offset.toNat baseExtH17.info.textSection.size.toNat
+    let tasks ← decodeTaskStream .h17 textBytes
+    -- With 3 surfaces (BAR slots 6, 7, 8) and a static kernel section, __KERN_0 gets BAR slot 9.
+    let td ← rebuildDynTask tasks[0]! 1 none fun ws =>
+      ws.map fun w =>
+        if w.byteAddr == regKernelBaseLo || w.byteAddr == regKernelBaseHi then
+          { w with barSlot := some 9 }
+        else w
+    let sA ← makeFp16Surface .h17 "a" "input_a" .input 16 1 32 4
+    let sB ← makeFp16Surface .h17 "b" "input_b" .input 32 1 32 4
+    let sY ← makeFp16Surface .h17 "y" "output_y" .output 16 1 32 4
+    let em ← emitProgram {
+      target := .h17, surfaces := #[sA, sB, sY], tasks := #[td],
+      kernel := some (zeroBytes 64)
+    }
+    let _ ← verifyHwxTasksSummary em.hwx em.info (requireKnownTask := true)
+    pure ()
+  ) "static __KERN_0")
+
+  -- Tamper 28a & 28b: Mach-O __KERN_0 relocation on neMatmul (kernelBaseLo and non-kernelBaseLo reg)
+  -- Use a 2-task conv1x1 -> matmul graph so __KERN_0 is legitimately present & referenced by task 0,
+  -- then attach a spurious Mach-O __KERN_0 reloc onto task 1 (neMatmul).
+  let baseConvMm ← match Vane.Graph.compileGraph {
+      target := .h17, defaultPlacement := .dram
+      inputs := #[
+        { name := "x", shape := { c := 8, h := 1, w := 32 }, shortName := "x" },
+        { name := "b", shape := { c := 32, h := 1, w := 32 }, shortName := "b" }
+      ]
+      nodes := #[
+        { id := "c0", inputs := #["x"], op := .conv1x1 8 8 (mkM5aW1x1 8 8 1) none .none },
+        { id := "mm", inputs := #["c0", "b"], op := .matmul 1 false false f16PosOne }
+      ]
+    } with
+    | .ok g => pure g
+    | .error e => throw (IO.userError s!"baseConvMm setup failed: {e}")
+
+  let rebuildConvMmWithMmReloc (targetReg : Nat) : Except String Unit := do
+    let textBytes ← readSlice baseConvMm.hwx baseConvMm.info.textSection.offset.toNat baseConvMm.info.textSection.size.toNat
+    let tasks ← decodeTaskStream .h17 textBytes
+    let td0Base ← rebuildDynTask tasks[0]! 2
+    let some c0KernIdx := td0Base.barWrites.findIdx? (fun br => br.baseByteAddr == regKernelBaseLo)
+      | throw "missing conv task kernelBaseLo bar write"
+    let td0 := { td0Base with kernelRelocs := #[{ barRecIndex := c0KernIdx, payloadWordIndex := 0 }] }
+    let td1Base ← rebuildDynTask tasks[1]! 2
+    let some relIdx := td1Base.barWrites.findIdx? (fun br => br.baseByteAddr == targetReg)
+      | throw s!"missing matmul target reg {toHex targetReg} bar write"
+    let td1 := { td1Base with kernelRelocs := #[{ barRecIndex := relIdx, payloadWordIndex := 0 }] }
+    let sX ← makeFp16Surface .h17 "x" "input_x" .input 8 1 32 1
+    let sB ← makeFp16Surface .h17 "b" "input_b" .input 32 1 32 1
+    let sY ← makeFp16Surface .h17 "y" "output_mm" .output 8 1 32 1
+    let kSec := baseConvMm.info.kernelSection.get!
+    let kBytes ← readSlice baseConvMm.hwx kSec.offset.toNat kSec.size.toNat
+    let scSec := baseConvMm.info.scratchSection.get!
+    let em ← emitProgram {
+      target := .h17, surfaces := #[sX, sB, sY], tasks := #[td0, td1],
+      kernel := some kBytes,
+      scratch := some { size := scSec.size, usable := scSec.size.toUInt32 }
+    }
+    let _ ← verifyHwxTasksSummary em.hwx em.info (requireKnownTask := true)
+    pure ()
+
+  results := results.push (checkErr "m5d neg tamper #28a: Mach-O __KERN_0 reloc on neMatmul kernelBaseLo rejected" (
+    rebuildConvMmWithMmReloc regKernelBaseLo
+  ) "Mach-O __KERN_0 relocation")
+
+  results := results.push (checkErr "m5d neg tamper #28b: Mach-O __KERN_0 reloc on neMatmul non-kernelBaseLo reg rejected" (
+    rebuildConvMmWithMmReloc regSrc1BaseLo
+  ) "Mach-O __KERN_0 relocation")
+
+  -- Tamper 29: Misaligned kernelBaseLo % 64 != 0 rejected
+  results := results.push (checkErr "m5d neg tamper #29: misaligned kernelBaseLo (32 % 64 != 0) rejected" (do
+    tamperM5aTaskReg baseExtH17.hwx baseExtH17.info 0 regKernelBaseLo 32
+  ) "not 64-byte aligned")
+
+  -- Tamper 30: Spurious barSlot on non-BAR register rejected
+  results := results.push (checkErr "m5d neg tamper #30: spurious barSlot on non-BAR reg (neScale) rejected" (do
+    let textBytes ← readSlice baseExtH17.hwx baseExtH17.info.textSection.offset.toNat baseExtH17.info.textSection.size.toNat
+    let tasks ← decodeTaskStream .h17 textBytes
+    let td ← rebuildDynTask tasks[0]! 1 none fun ws =>
+      ws.map fun w => if w.byteAddr == regNeScale then { w with barSlot := some barSlotConfigZero } else w
+    let sA ← makeFp16Surface .h17 "a" "input_a" .input 16 1 32 4
+    let sB ← makeFp16Surface .h17 "b" "input_b" .input 32 1 32 4
+    let sY ← makeFp16Surface .h17 "y" "output_y" .output 16 1 32 4
+    let em ← emitProgram { target := .h17, surfaces := #[sA, sB, sY], tasks := #[td] }
+    let _ ← verifyHwxTasksSummary em.hwx em.info (requireKnownTask := true)
+    pure ()
+  ) "unexpected BAR slot")
+
+  -- Tamper 31: keepLive=1 (0xc1) on final task rejected
+  results := results.push (checkErr "m5d neg tamper #31: keepLive=1 (0xc1) on final scratch-produced task rejected" (do
+    let fSlot ← findM5aTaskRegOffset baseProdH17.hwx baseProdH17.info 1 (regChunkSlot 0)
+    let orig ← readU32LE baseProdH17.hwx fSlot
+    tamperM5aTaskReg baseProdH17.hwx baseProdH17.info 1 (regChunkSlot 0) (orig ||| ((1 : UInt32) <<< 7))
+  ) "cannot set keepLive")
+
+  -- Tamper 32a & 32b: Wrong chunkOffset[s] and wrong chunkSize[s]
+  results := results.push (checkErr "m5d neg tamper #32a: wrong chunkOffset[1] rejected" (do
+    tamperM5aTaskReg baseExtH17.hwx baseExtH17.info 0 (regChunkOffset 1) 128
+  ) "chunkOffset[1]")
+
+  results := results.push (checkErr "m5d neg tamper #32b: wrong chunkSize[0] rejected" (do
+    tamperM5aTaskReg baseExtH17.hwx baseExtH17.info 0 (regChunkSize 0) 128
+  ) "chunkSize[0]")
+
+  -- Tamper 33: Offset/size written on inactive chunk slot (slot 8 when M=8) rejected
+  results := results.push (checkErr "m5d neg tamper #33: chunkOffset on inactive slot 8 (M=8) rejected" (do
+    let textBytes ← readSlice baseProdH17.hwx baseProdH17.info.textSection.offset.toNat baseProdH17.info.textSection.size.toNat
+    let tasks ← decodeTaskStream .h17 textBytes
+    let td0 ← rebuildDynTask tasks[0]! 2
+    let td1 ← rebuildDynTask tasks[1]! 2 none fun ws =>
+      ws.push { byteAddr := regChunkOffset 8, value := 512, barSlot := none, payloadOffset := 0 }
+    let sA ← makeFp16Surface .h17 "a" "input_a" .input 32 1 8 1
+    let sB ← makeFp16Surface .h17 "b" "input_b" .input 32 1 32 1
+    let sY ← makeFp16Surface .h17 "y" "output_y" .output 8 1 32 1
+    let scSec := baseProdH17.info.scratchSection.get!
+    let em ← emitProgram {
+      target := .h17, surfaces := #[sA, sB, sY], tasks := #[td0, td1],
+      scratch := some { size := scSec.size, usable := scSec.size.toUInt32 }
+    }
+    let _ ← verifyHwxTasksSummary em.hwx em.info (requireKnownTask := true)
+    pure ()
+  ) "inactive chunk slot 8")
+
+  -- Tamper 34: neMatmul L2 overflow (> 2 MiB) rejected
+  results := results.push (checkErr "m5d neg tamper #34: neMatmul L2 resBase past 2 MiB rejected" (do
+    tamperM5aTaskReg baseExtH17.hwx baseExtH17.info 0 regResBase 0x001fffc0
+  ) "exceeds 2 MiB")
+
+  -- Tamper 35a & 35b: src1 DMA OOB and res DMA OOB rejected
+  results := results.push (checkErr "m5d neg tamper #35a: neMatmul src1 DMA out-of-bounds rejected" (do
+    tamperM5aTaskReg baseExtH17.hwx baseExtH17.info 0 regSrc1BaseLo 64
+  ) "input DMA range")
+
+  results := results.push (checkErr "m5d neg tamper #35b: neMatmul res DMA out-of-bounds rejected" (do
+    tamperM5aTaskReg baseExtH17.hwx baseExtH17.info 0 regResBaseLo 64
+  ) "output DMA range")
+
+  -- Tamper 36: Intra-task BAR 3 scratch read/write overlap rejected
+  results := results.push (checkErr "m5d neg tamper #36: intra-task BAR 3 scratch kernel/res overlap rejected" (do
+    let gIntra ← Vane.Graph.compileGraph {
+      target := .h17, defaultPlacement := .dram
+      inputs := #[
+        { name := "a", shape := { c := 8, h := 1, w := 32 }, shortName := "a" },
+        { name := "b", shape := { c := 32, h := 1, w := 32 }, shortName := "b" }
+      ]
+      nodes := #[
+        { id := "a1",  inputs := #["a"], op := .pe1 .abs },
+        { id := "mm",  inputs := #["a1", "b"], op := .matmul 1 false false f16PosOne },
+        { id := "out", inputs := #["mm"], op := .pe1 .abs }
+      ]
+    }
+    let fKern ← findM5aTaskRegOffset gIntra.hwx gIntra.info 1 regKernelBaseLo
+    let kernOff ← readU32LE gIntra.hwx fKern
+    tamperM5aTaskReg gIntra.hwx gIntra.info 1 regResBaseLo kernOff
+  ) "intra-task BAR 3 scratch overlap")
+
+  -- Tamper 37: Multi-batch consumer reading single-batch scratch producer with depKind=2 rejected ([multiBatchRaw])
+  results := results.push (checkErr "m5d neg tamper #37: multi-batch matmul consumer depKind=2 rejected by [multiBatchRaw]" (do
+    let gMbCons ← Vane.Graph.compileGraph {
+      target := .h17, defaultPlacement := .dram
+      inputs := #[
+        { name := "a", shape := { c := 32, h := 1, w := 32 }, shortName := "a" },
+        { name := "b", shape := { c := 128, h := 1, w := 32 }, shortName := "b" }
+      ]
+      nodes := #[
+        { id := "b1", inputs := #["b"], op := .pe1 .abs },
+        { id := "mm", inputs := #["a", "b1"], op := .matmul 4 false false f16PosOne }
+      ]
+    }
+    let wBadDep ← encodeWord (srcDepMultiLayout "src1Dep") #[
+      ("code", srcDepCodeDma), ("task", 1), ("depDist", 0), ("depKind", 2)
+    ]
+    tamperM5aTaskReg gMbCons.hwx gMbCons.info 1 regSrc1Dep wBadDep
+  ) "[multiBatchRaw]")
+
+  -- Tamper 38: Coalesced 2-word BAR-4 record for chunkSlot[0..1] rejected (single-word granularity)
+  results := results.push (checkErr "m5d neg tamper #38: multi-word BAR-4 chunkSlot[0..1] record rejected" (do
+    let textBytes ← readSlice baseExtH17.hwx baseExtH17.info.textSection.offset.toNat baseExtH17.info.textSection.size.toNat
+    let tasks ← decodeTaskStream .h17 textBytes
+    let td0 ← rebuildDynTask tasks[0]! 1
+    let some w0 := td0.barWrites.find? (fun br => br.baseByteAddr == regChunkSlot 0)
+      | throw "missing chunkSlot[0]"
+    let some w1 := td0.barWrites.find? (fun br => br.baseByteAddr == regChunkSlot 1)
+      | throw "missing chunkSlot[1]"
+    let filtered := td0.barWrites.filter fun br =>
+      br.baseByteAddr != regChunkSlot 0 && br.baseByteAddr != regChunkSlot 1
+    let coalesced : BarRegWrite := {
+      baseByteAddr := regChunkSlot 0
+      barSlot := barSlotConfigZero
+      values := #[w0.values[0]!, w1.values[0]!]
+    }
+    let td := { td0 with barWrites := filtered.push coalesced }
+    let sA ← makeFp16Surface .h17 "a" "input_a" .input 16 1 32 4
+    let sB ← makeFp16Surface .h17 "b" "input_b" .input 32 1 32 4
+    let sY ← makeFp16Surface .h17 "y" "output_y" .output 16 1 32 4
+    let em ← emitProgram { target := .h17, surfaces := #[sA, sB, sY], tasks := #[td] }
+    let _ ← verifyHwxTasksSummary em.hwx em.info (requireKnownTask := true)
+    pure ()
+  ) "single-word BAR slot 4")
+
+  -- Tamper 39: Invalid resDmaNStride (< M * rowBN) rejected
+  results := results.push (checkErr "m5d neg tamper #39: invalid resDmaNStride (< M * rowBN) rejected" (do
+    tamperM5aTaskReg baseExtH17.hwx baseExtH17.info 0 regResDmaNStride 64
+  ) "resDmaNStride")
 
   pure results
 

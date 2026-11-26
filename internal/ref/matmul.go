@@ -8,7 +8,7 @@ import (
 )
 
 // MatmulSpec configures a batched or multi-head dynamic matrix multiplication.
-// Heads <= 0 defaults to 1. Scale == nil defaults to 1.0.
+// Heads == 0 defaults to 1. Scale == nil defaults to 1.0.
 type MatmulSpec struct {
 	Heads      int
 	TransposeA bool

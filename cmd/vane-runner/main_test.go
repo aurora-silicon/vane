@@ -1912,21 +1912,24 @@ func TestM5dMatmulAndAttentionCLI(t *testing.T) {
 
 	// 1. Standalone gen-matmul + vane compile-matmul + vane validate --check-tasks + section parity + compare-surface
 	matmulCases := []struct {
-		name   string
-		target string
-		b      int
-		m      int
-		k      int
-		n      int
-		trA    bool
-		trB    bool
-		scale  string
+		name      string
+		target    string
+		b         int
+		m         int
+		k         int
+		n         int
+		trA       bool
+		trB       bool
+		scale     string
+		expMatmul int
 	}{
-		{"h17_plain", "h17", 1, 16, 32, 32, false, false, "1.0"},
-		{"h16_batched_scale", "h16", 4, 16, 32, 32, false, false, "0.176776695"},
-		{"h17_trB_batched", "h17", 4, 16, 32, 32, false, true, "0.176776695"},
-		{"h16_trA", "h16", 1, 16, 32, 32, true, false, "0.5"},
-		{"h17_trAB_batched", "h17", 2, 16, 32, 32, true, true, "0.25"},
+		{"h17_plain", "h17", 1, 16, 32, 32, false, false, "1.0", 1},
+		{"h16_batched_scale", "h16", 4, 16, 32, 32, false, false, "0.176776695", 1},
+		{"h17_trB_batched", "h17", 4, 16, 32, 32, false, true, "0.176776695", 1},
+		{"h16_trA", "h16", 1, 16, 32, 32, true, false, "0.5", 1},
+		{"h17_trAB_batched", "h17", 2, 16, 32, 32, true, true, "0.25", 1},
+		{"h17_sliced_m32_trB_batched", "h17", 4, 32, 32, 32, false, true, "0.176776695", 2},
+		{"h16_sliced_m20_trAB", "h16", 2, 20, 32, 32, true, true, "0.25", 2},
 	}
 
 	for idx, tc := range matmulCases {
@@ -1975,8 +1978,9 @@ func TestM5dMatmulAndAttentionCLI(t *testing.T) {
 				"--sections", compDir,
 				"--check-tasks",
 			)
-			if !strings.Contains(valOut, "status: ok") || !strings.Contains(valOut, "ne_matmul=1") {
-				t.Fatalf("validate compile-matmul %s unexpected output:\n%s", tc.name, valOut)
+			wantTag := fmt.Sprintf("ne_matmul=%d", tc.expMatmul)
+			if !strings.Contains(valOut, "status: ok") || !strings.Contains(valOut, wantTag) {
+				t.Fatalf("validate compile-matmul %s unexpected output (want %s):\n%s", tc.name, wantTag, valOut)
 			}
 
 			// Verify Go BuildSectionsFromHWX matches Lean sections byte-for-byte
@@ -2044,7 +2048,7 @@ func TestM5dMatmulAndAttentionCLI(t *testing.T) {
 		t.Fatalf("gen-graph sdpa failed rc=%d stderr=%s", rc, stderr.String())
 	}
 	runVane(t, vaneBin, "compile-graph", "--spec", filepath.Join(sdpaVec, "graph_resolved.json"), "--out-dir", sdpaComp)
-	if out := runVane(t, vaneBin, "validate", "--hwx", filepath.Join(sdpaComp, "program.hwx"), "--sections", sdpaComp, "--check-tasks"); !strings.Contains(out, "status: ok") || !strings.Contains(out, "ne_matmul=2") {
+	if out := runVane(t, vaneBin, "validate", "--hwx", filepath.Join(sdpaComp, "program.hwx"), "--sections", sdpaComp, "--check-tasks"); !strings.Contains(out, "status: ok") || !strings.Contains(out, "ne_matmul=4") {
 		t.Fatalf("validate sdpa graph failed:\n%s", out)
 	}
 
@@ -2113,7 +2117,7 @@ func TestM5dMatmulAndAttentionCLI(t *testing.T) {
 		t.Fatalf("gen-graph transformer_block failed rc=%d stderr=%s", rc, stderr.String())
 	}
 	runVane(t, vaneBin, "compile-graph", "--spec", filepath.Join(tbVec, "graph_resolved.json"), "--out-dir", tbComp)
-	if out := runVane(t, vaneBin, "validate", "--hwx", filepath.Join(tbComp, "program.hwx"), "--sections", tbComp, "--check-tasks"); !strings.Contains(out, "status: ok") || !strings.Contains(out, "ne_matmul=2") {
+	if out := runVane(t, vaneBin, "validate", "--hwx", filepath.Join(tbComp, "program.hwx"), "--sections", tbComp, "--check-tasks"); !strings.Contains(out, "status: ok") || !strings.Contains(out, "ne_matmul=4") {
 		t.Fatalf("validate transformer_block graph failed:\n%s", out)
 	}
 
