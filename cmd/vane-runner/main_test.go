@@ -1550,3 +1550,174 @@ func TestPoolReduceAndNormGraphsCLI(t *testing.T) {
 		t.Fatalf("resnet graph validate failed:\n%s", out)
 	}
 }
+
+func makeTestAnecBytes(t *testing.T) []byte {
+	t.Helper()
+	payload := make([]byte, 0x200)
+	binary.LittleEndian.PutUint32(payload[0:4], 0x00001234)
+	buf := make([]byte, ane.AnecHeaderSize+len(payload))
+	binary.LittleEndian.PutUint64(buf[0x000:0x008], uint64(len(payload)))
+	binary.LittleEndian.PutUint32(buf[0x008:0x00c], 0x100) // td_size
+	binary.LittleEndian.PutUint32(buf[0x00c:0x010], 1)     // td_count
+	binary.LittleEndian.PutUint64(buf[0x010:0x018], 0x100) // tsk_size
+	binary.LittleEndian.PutUint64(buf[0x018:0x020], 0x100) // krn_size
+	binary.LittleEndian.PutUint32(buf[0x020:0x024], 1)     // src_count
+	binary.LittleEndian.PutUint32(buf[0x024:0x028], 1)     // dst_count
+	binary.LittleEndian.PutUint32(buf[0x028+4*0:], 1)      // tiles[0] = 16 KiB
+	binary.LittleEndian.PutUint32(buf[0x028+4*4:], 1)      // tiles[4] (dst0) = 16 KiB
+	binary.LittleEndian.PutUint32(buf[0x028+4*5:], 1)      // tiles[5] (src0) = 16 KiB
+	copy(buf[ane.AnecHeaderSize:], payload)
+	return buf
+}
+
+func TestMultiABIProbeAndRunAnecCLI(t *testing.T) {
+	mixedTr := ane.NewMockTransport(map[string]ane.MockDeviceSpec{
+		"/dev/accel/accel0": {GetCapsErr: syscall.ENOTTY},
+		"/dev/accel/accel1": {ABIVersion: ane.ABIV1, ChipFamily: ane.ChipH13},
+		"/dev/accel/accel2": {ABIVersion: ane.ABIV2, ChipFamily: ane.ChipH14, SectionSize: 24, BindSize: 24, ExecIOSize: 32},
+		"/dev/accel/accel3": {ABIVersion: ane.ABIV3, ChipFamily: ane.ChipH16},
+		"/dev/accel/accel4": {ABIVersion: ane.ABIV3, ChipFamily: ane.ChipH17},
+	}, nil)
+
+	// 1. probe without --abi lists all 4 ANE devices (v1, v2, v3/H16, v3/H17)
+	var stdout, stderr bytes.Buffer
+	if rc := runCLI([]string{"probe"}, mixedTr, &stdout, &stderr); rc != 0 {
+		t.Fatalf("probe failed rc=%d stderr=%s", rc, stderr.String())
+	}
+	text := stdout.String()
+	for _, want := range []string{
+		"device=/dev/accel/accel1 abi=v1 chip=H13 caps_size=32\n",
+		"device=/dev/accel/accel2 abi=v2 chip=H14 caps_size=32 section_size=24 bind_size=24 exec_io_size=32\n",
+		"device=/dev/accel/accel3 abi=v3 chip=H16 caps_size=32\n",
+		"device=/dev/accel/accel4 abi=v3 chip=H17 caps_size=32\n",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("probe text missing %q:\n%s", want, text)
+		}
+	}
+
+	// 2. probe --abi 1 filters to H13 only
+	stdout.Reset()
+	stderr.Reset()
+	if rc := runCLI([]string{"probe", "--abi", "1", "--json"}, mixedTr, &stdout, &stderr); rc != 0 {
+		t.Fatalf("probe --abi 1 --json failed rc=%d stderr=%s", rc, stderr.String())
+	}
+	var devs []ane.DeviceCaps
+	if err := json.Unmarshal(stdout.Bytes(), &devs); err != nil || len(devs) != 1 || devs[0].ABIVersion != ane.ABIV1 || devs[0].ChipFamily != ane.ChipH13 {
+		t.Fatalf("unexpected probe --abi 1 JSON: %s (err=%v)", stdout.String(), err)
+	}
+
+	// 3. probe --json reports all 4 devices including v2 sizes
+	stdout.Reset()
+	stderr.Reset()
+	if rc := runCLI([]string{"probe", "--json"}, mixedTr, &stdout, &stderr); rc != 0 {
+		t.Fatalf("probe --json failed rc=%d stderr=%s", rc, stderr.String())
+	}
+	devs = nil
+	if err := json.Unmarshal(stdout.Bytes(), &devs); err != nil || len(devs) != 4 {
+		t.Fatalf("unexpected probe --json: %s (err=%v)", stdout.String(), err)
+	}
+	if devs[1].SectionSize != 24 || devs[1].BindSize != 24 || devs[1].ExecIOSize != 32 {
+		t.Fatalf("expected ABI v2 size fields in JSON, got %+v", devs[1])
+	}
+
+	// 4. run-anec end-to-end on mock H13 ABI v1 device
+	tmp := t.TempDir()
+	anecPath := filepath.Join(tmp, "model.anec")
+	inPath := filepath.Join(tmp, "in.bin")
+	expPath := filepath.Join(tmp, "exp.bin")
+	outPath := filepath.Join(tmp, "out.bin")
+	jsonPath := filepath.Join(tmp, "report.json")
+
+	if err := os.WriteFile(anecPath, makeTestAnecBytes(t), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	elemCount := ane.PageSize16K / 2
+	inVals := make([]uint16, elemCount)
+	expVals := make([]uint16, elemCount)
+	for i := range inVals {
+		v := float64(i%19-9) * 0.25
+		inVals[i] = fp16.FromFloat64(v)
+		if v < 0 {
+			v = 0
+		}
+		expVals[i] = fp16.FromFloat64(v)
+	}
+	if err := os.WriteFile(inPath, fp16.EncodeLE(inVals), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(expPath, fp16.EncodeLE(expVals), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	h13Tr := ane.NewMockTransport(map[string]ane.MockDeviceSpec{
+		"/dev/accel/accel0": {ABIVersion: ane.ABIV3, ChipFamily: ane.ChipH17},
+		"/dev/accel/accel1": {ABIVersion: ane.ABIV1, ChipFamily: ane.ChipH13},
+	}, func(inputs [][]byte, _ int) []byte {
+		vals, _ := fp16.DecodeLE(inputs[0])
+		out := make([]uint16, len(vals))
+		for i, v := range vals {
+			f := fp16.ToFloat64(v)
+			if f < 0 {
+				f = 0
+			}
+			out[i] = fp16.FromFloat64(f)
+		}
+		return fp16.EncodeLE(out)
+	})
+
+	stdout.Reset()
+	stderr.Reset()
+	rc := runCLI([]string{
+		"run-anec",
+		"--anec", anecPath,
+		"--input", inPath,
+		"--expected", expPath,
+		"--runs", "3",
+		"--warmup", "1",
+		"--output-out", outPath,
+		"--json-out", jsonPath,
+		"--json",
+	}, h13Tr, &stdout, &stderr)
+	if rc != 0 {
+		t.Fatalf("run-anec failed rc=%d stderr=%s", rc, stderr.String())
+	}
+	var rep ane.RunReport
+	if err := json.Unmarshal(stdout.Bytes(), &rep); err != nil {
+		t.Fatalf("parse run-anec JSON: %v\n%s", err, stdout.String())
+	}
+	if rep.Mode != "abi-v1" || rep.ABIVersion != ane.ABIV1 || rep.ChipFamily != ane.ChipH13 || rep.Runs != 3 || rep.Warmup != 1 || !rep.Repeatable {
+		t.Fatalf("unexpected run-anec report: %+v", rep)
+	}
+	if rep.Comparison == nil || !rep.Comparison.Passed {
+		t.Fatalf("expected comparison passed, got %+v", rep.Comparison)
+	}
+	if h13Tr.SubmitCalls != 4 || h13Tr.ActiveBOCount() != 0 || h13Tr.TotalAllocatedBOs == 0 || h13Tr.TotalAllocatedBOs != h13Tr.TotalFreedBOs {
+		t.Fatalf("expected 4 submits and leak-free BO lifecycle, got submits=%d activeBOs=%d alloc=%d freed=%d",
+			h13Tr.SubmitCalls, h13Tr.ActiveBOCount(), h13Tr.TotalAllocatedBOs, h13Tr.TotalFreedBOs)
+	}
+	gotOut, err := os.ReadFile(outPath)
+	if err != nil || !bytes.Equal(gotOut, fp16.EncodeLE(expVals)) {
+		t.Fatalf("run-anec --output-out mismatch (err=%v)", err)
+	}
+	if _, err := os.Stat(jsonPath); err != nil {
+		t.Fatalf("run-anec --json-out missing: %v", err)
+	}
+
+	// 5. run-anec returns ExitSkip (4) when only H17/v3 or no device is present
+	h17OnlyTr := ane.NewMockTransport(map[string]ane.MockDeviceSpec{
+		"/dev/accel/accel0": {ABIVersion: ane.ABIV3, ChipFamily: ane.ChipH17},
+	}, nil)
+	stdout.Reset()
+	stderr.Reset()
+	if rc := runCLI([]string{"run-anec", "--anec", anecPath}, h17OnlyTr, &stdout, &stderr); rc != ane.ExitSkip {
+		t.Fatalf("run-anec on H17-only device rc=%d, want %d", rc, ane.ExitSkip)
+	}
+
+	emptyTr := ane.NewMockTransport(map[string]ane.MockDeviceSpec{}, nil)
+	stdout.Reset()
+	stderr.Reset()
+	if rc := runCLI([]string{"run-anec", "--anec", anecPath}, emptyTr, &stdout, &stderr); rc != ane.ExitSkip {
+		t.Fatalf("run-anec on empty device set rc=%d, want %d", rc, ane.ExitSkip)
+	}
+}

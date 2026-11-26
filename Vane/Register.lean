@@ -165,25 +165,18 @@ def taskHeader8MultiLayout : WordLayout := {
 
 /-- Named constants for 9-word task header words 2 and 4. -/
 def taskHeader2FirstFlags : UInt32 := 0x68
-def taskHeader4H17Base : UInt32 := 0x00fff800
-def taskHeader4H16Base : UInt32 := 0x00fff820
 def taskHeader4FirstBit : UInt32 := 0x00000008
-def taskHeader4H17EdgeBits : UInt32 := 0x00000060
-def taskHeader4H16EdgeBits : UInt32 := 0x00000040
 def taskHeaderWord2Const : UInt32 := ((1 : UInt32) <<< 26) ||| taskHeader2FirstFlags
-def taskHeaderWord4Const : UInt32 := taskHeader4H17Base ||| taskHeader4FirstBit ||| taskHeader4H17EdgeBits
 def taskHeaderWord4CopyConst : UInt32 := taskHeader2FirstFlags
 
 /-- Target- and position-specific `header[4]` word for multi-task streams. -/
 def taskHeaderWord4Multi (target : Target) (isFirst isLast : Bool) : UInt32 :=
+  let prof := target.profile
   let firstBit := if isFirst then taskHeader4FirstBit else 0
-  match target with
-  | .h17 =>
-    let edgeBits := if isFirst || isLast then taskHeader4H17EdgeBits else 0
-    taskHeader4H17Base ||| firstBit ||| edgeBits
-  | .h16 =>
-    let edgeBits := if isFirst || isLast then taskHeader4H16EdgeBits else 0
-    taskHeader4H16Base ||| firstBit ||| edgeBits
+  let edgeBits := if isFirst || isLast then prof.taskHeader4EdgeBits else 0
+  prof.taskHeader4Base ||| firstBit ||| edgeBits
+
+def taskHeaderWord4Const : UInt32 := taskHeaderWord4Multi .h17 true true
 
 /-- 64 KiB L2 block size for `header[7]` live-L2 bitmasks (32 blocks cover 2 MiB). -/
 def l2MaskBlockBytes : Nat := 0x10000
@@ -651,14 +644,12 @@ def out2Layout : WordLayout := {
   ]
 }
 
--- Target-dependent fixed constants
-def targetCfgValue : Target → UInt32
-  | .h16 => 0x00100000
-  | .h17 => 0x00200000
+-- Target-dependent fixed constants (delegated to Target.profile)
+def targetCfgValue (target : Target) : UInt32 :=
+  target.profile.targetCfgValue
 
-def neCfgValue : Target → UInt32
-  | .h16 => 0x00000082
-  | .h17 => 0x10000082
+def neCfgValue (target : Target) : UInt32 :=
+  target.profile.neCfgValue
 
 /-- `0x4900` neCfg: target base (`0x00000082` on H16, `0x10000082` on H17), `sparse[8:8]`. -/
 def neCfgLayout (target : Target) : WordLayout := {
@@ -670,9 +661,8 @@ def neCfgLayout (target : Target) : WordLayout := {
   ]
 }
 
-def resDepCode : Target → UInt32
-  | .h16 => 0x31
-  | .h17 => 0x21
+def resDepCode (target : Target) : UInt32 :=
+  target.profile.resDepCode
 
 -- Named multi-task port config, dependency, and BAR constants
 def portModeL2 : UInt32 := 0

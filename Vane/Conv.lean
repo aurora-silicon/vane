@@ -180,10 +180,10 @@ def decodeSparseStream (bs : ByteArray) (offset : Nat := 0) : Except String (Arr
 -- Unified wide3x3 condition, kernel chunk packer, register lowering, compiler
 -- ============================================================================
 
-/-- Compute `neCommon` bit 27 (`wide3x3`): `true` iff 3x3, `target == h17`, `effMode == dense`,
+/-- Compute `neCommon` bit 27 (`wide3x3`): `true` iff 3x3, target supports wide3x3, `effMode == dense`,
     `stride == 1`, and `maxBlockSlots <= 32768 * rep`. -/
 def computeWide3x3Conv (target : Target) (sh : ConvSpec) (t : Tiling) : Bool :=
-  if sh.kernelSize != 3 || target != .h17 || sh.effMode != .dense || sh.stride != 1 then
+  if sh.kernelSize != 3 || !target.profile.supportsWide3x3 || sh.effMode != .dense || sh.stride != 1 then
     false
   else
     let rep := ((1 : Nat) <<< t.logNE) >>> t.f
@@ -331,20 +331,19 @@ def packConvKernelChunks
       if chunk.size > maxKernelChunkBytes then
         throw s!"{sh.kernelSize}x{sh.kernelSize} kernel group {g} chunk size {chunk.size}B exceeds maximum {maxKernelChunkBytes}B (64 KiB)"
 
-      match target with
-      | .h17 =>
-        let s := g * rep
-        if s >= 16 then
-          throw s!"chunk slot index {s} exceeds 0..15"
-        slotChunks := slotChunks.push (s, chunk)
-        totalKernelBytes := totalKernelBytes + chunk.size
-      | .h16 =>
+      if target.profile.replicateKernelChunkSlots then
         for j in [:rep] do
           let s := g * rep + j
           if s >= 16 then
             throw s!"chunk slot index {s} exceeds 0..15"
           slotChunks := slotChunks.push (s, chunk)
           totalKernelBytes := totalKernelBytes + chunk.size
+      else
+        let s := g * rep
+        if s >= 16 then
+          throw s!"chunk slot index {s} exceeds 0..15"
+        slotChunks := slotChunks.push (s, chunk)
+        totalKernelBytes := totalKernelBytes + chunk.size
 
   if slotChunks.isEmpty || totalKernelBytes == 0 then
     throw "kernel packer produced 0 active chunk slots"

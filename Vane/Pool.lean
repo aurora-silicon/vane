@@ -350,9 +350,7 @@ def poolStripPx (usedW kw sw pl stripW ow : Nat) : Nat :=
 def pePoolDirect (target : Target) (ow k : Nat) : Bool :=
   let stripW := (1 : Nat) <<< k
   let multi := ow > stripW
-  match target with
-  | .h17 => !multi || stripW >= 32
-  | .h16 => !multi || stripW >= 64
+  !multi || stripW >= target.profile.poolMultiStripMinW
 
 /-- Logical source axis mapped onto one of the 4 PE reduction dimensions `(N, C, H, D)`. -/
 inductive PeRedLogAxis where

@@ -1,5 +1,6 @@
-// Command vane-runner provides Linux accel/ane ABI v3 device probing, HWX execution,
-// deterministic conv/PE/LUT test vector generation, and strided surface comparison.
+// Command vane-runner provides Linux accel/ane multi-ABI device probing, ABI v3 HWX
+// and ABI v1 .anec execution, deterministic conv/PE/LUT test vector generation, and
+// strided surface comparison.
 package main
 
 import (
@@ -55,10 +56,13 @@ func (f *optFloatFlag) Set(s string) error {
 
 func usage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  vane-runner probe [--device PATH] [--json]")
+	fmt.Fprintln(w, "  vane-runner probe [--abi N] [--device PATH] [--json]")
 	fmt.Fprintln(w, "  vane-runner run --hwx PATH [--sections-dir DIR] [--input PATH]... [--alt-input PATH]... [--output-out PATH]")
 	fmt.Fprintln(w, "                  [--expected PATH] [--runs N] [--warmup N] [--in-place] [--atol F] [--rtol F]")
 	fmt.Fprintln(w, "                  [--max-ulp N] [--device PATH] [--json] [--json-out PATH]")
+	fmt.Fprintln(w, "  vane-runner run-anec --anec PATH [--input PATH]... [--alt-input PATH]... [--output-out PATH]")
+	fmt.Fprintln(w, "                       [--expected PATH] [--runs N] [--warmup N] [--atol F] [--rtol F]")
+	fmt.Fprintln(w, "                       [--max-ulp N] [--device PATH] [--json] [--json-out PATH]")
 	fmt.Fprintln(w, "  vane-runner gen-conv1x1 --h H --w W --cin C --cout O [--bias] [--relu | --act NAME [act flags]] [--lut-bin PATH] [--seed N] --out-dir DIR [--json]")
 	fmt.Fprintln(w, "  vane-runner gen-conv3x3 --mode <dense|depthwise> --h H --w W --cin C --cout O --stride <1|2> --pad <same|valid> [--bias] [--relu | --act NAME [act flags]] [--lut-bin PATH] [--seed N] --out-dir DIR [--json]")
 	fmt.Fprintln(w, "  vane-runner gen-pe --op <abs|square|linear|chain|sadd|ssub|srsub|smul|sdiv|add|sub|rsub|mul|max|min> --h H --w W --c C [--z-h ZH --z-w ZW --z-c ZC] [--alpha F] [--beta F] [--in-scale F] [--bias F] [--scale F] [--scalar F] [--edge-values] [--seed N] --out-dir DIR [--json]")
@@ -81,6 +85,8 @@ func runCLI(args []string, tr ane.Transport, stdout, stderr io.Writer) int {
 		return cmdProbe(args[1:], tr, stdout, stderr)
 	case "run":
 		return cmdRun(args[1:], tr, stdout, stderr)
+	case "run-anec":
+		return cmdRunAnec(args[1:], tr, stdout, stderr)
 	case "gen-conv1x1":
 		return cmdGenConv1x1(args[1:], stdout, stderr)
 	case "gen-conv3x3":
@@ -245,13 +251,18 @@ func loadOrBuildLut(spec ref.ActSpec, lutBinPath string) ([]byte, uint16, *uint1
 func cmdProbe(args []string, tr ane.Transport, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("probe", flag.ContinueOnError)
 	fs.SetOutput(stderr)
+	abiFilter := fs.Uint("abi", 0, "Filter by ANE ABI version (0 = all, or 1/2/3)")
 	device := fs.String("device", "", "Explicit /dev/accel/accel* device path")
 	asJSON := fs.Bool("json", false, "Emit JSON output")
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
+	if *abiFilter > 3 {
+		fmt.Fprintf(stderr, "error: --abi must be 0 (all) or 1..3, got %d\n", *abiFilter)
+		return 1
+	}
 
-	devs, err := ane.ProbeDevices(tr, *device)
+	devs, err := ane.ProbeDevicesFilter(tr, *device, uint32(*abiFilter))
 	if err != nil {
 		if errors.Is(err, ane.ErrNoMatchingDevice) {
 			fmt.Fprintf(stderr, "skip: %v\n", err)
@@ -264,7 +275,11 @@ func cmdProbe(args []string, tr ane.Transport, stdout, stderr io.Writer) int {
 		if *asJSON {
 			fmt.Fprintln(stdout, "[]")
 		}
-		fmt.Fprintln(stderr, "skip: no matching accel/ane ABI v3 device found")
+		if *abiFilter != 0 {
+			fmt.Fprintf(stderr, "skip: no matching accel/ane ABI v%d device found\n", *abiFilter)
+		} else {
+			fmt.Fprintln(stderr, "skip: no matching accel/ane device found")
+		}
 		return ane.ExitSkip
 	}
 	if *asJSON {
@@ -273,7 +288,13 @@ func cmdProbe(args []string, tr ane.Transport, stdout, stderr io.Writer) int {
 		return 0
 	}
 	for _, d := range devs {
-		fmt.Fprintf(stdout, "device=%s abi=v%d chip=H%d caps_size=%d\n", d.Path, d.ABIVersion, d.ChipFamily, d.Size)
+		if d.SectionSize != 0 || d.BindSize != 0 || d.ExecIOSize != 0 {
+			fmt.Fprintf(stdout, "device=%s abi=v%d chip=H%d caps_size=%d section_size=%d bind_size=%d exec_io_size=%d\n",
+				d.Path, d.ABIVersion, d.ChipFamily, d.Size, d.SectionSize, d.BindSize, d.ExecIOSize)
+		} else {
+			fmt.Fprintf(stdout, "device=%s abi=v%d chip=H%d caps_size=%d\n",
+				d.Path, d.ABIVersion, d.ChipFamily, d.Size)
+		}
 	}
 	return 0
 }
@@ -393,6 +414,171 @@ func cmdRun(args []string, tr ane.Transport, stdout, stderr io.Writer) int {
 		Runs:      *runs,
 		Warmup:    *warmup,
 		InPlace:   *inPlace,
+		AltInputs: altInputPayloads,
+		Expected:  expectedBytes,
+		Atol:      *atol,
+		Rtol:      *rtol,
+		MaxULP:    maxULP,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+
+	if *outputOut != "" {
+		if err := os.MkdirAll(filepath.Dir(*outputOut), 0o755); err != nil {
+			fmt.Fprintf(stderr, "error: create output dir: %v\n", err)
+			return 1
+		}
+		if err := os.WriteFile(*outputOut, outBytes, 0o644); err != nil {
+			fmt.Fprintf(stderr, "error: write output %q: %v\n", *outputOut, err)
+			return 1
+		}
+	}
+
+	if *jsonOut != "" {
+		if err := os.MkdirAll(filepath.Dir(*jsonOut), 0o755); err != nil {
+			fmt.Fprintf(stderr, "error: create json-out dir: %v\n", err)
+			return 1
+		}
+		raw, err := json.MarshalIndent(report, "", "  ")
+		if err != nil {
+			fmt.Fprintf(stderr, "error: marshal report: %v\n", err)
+			return 1
+		}
+		if err := os.WriteFile(*jsonOut, append(raw, '\n'), 0o644); err != nil {
+			fmt.Fprintf(stderr, "error: write json-out %q: %v\n", *jsonOut, err)
+			return 1
+		}
+	}
+
+	if *asJSON {
+		raw, err := json.MarshalIndent(report, "", "  ")
+		if err != nil {
+			fmt.Fprintf(stderr, "error: marshal report: %v\n", err)
+			return 1
+		}
+		fmt.Fprintln(stdout, string(raw))
+	} else {
+		fmt.Fprintf(stdout, "device=%s abi=v%d chip=H%d mode=%s runs=%d",
+			report.Device, report.ABIVersion, report.ChipFamily, report.Mode, report.Runs)
+		if report.Warmup > 0 {
+			fmt.Fprintf(stdout, " warmup=%d", report.Warmup)
+		}
+		fmt.Fprintf(stdout, " min_ms=%.3f median_ms=%.3f p95_ms=%.3f mean_ms=%.3f sha256=%s",
+			report.MinMS, report.MedianMS, report.P95MS, report.MeanMS, report.OutputSHA256)
+		if report.AltOutputSHA256 != "" {
+			fmt.Fprintf(stdout, " alt_sha256=%s", report.AltOutputSHA256)
+		}
+		fmt.Fprintln(stdout)
+		if report.Comparison != nil {
+			c := report.Comparison
+			fmt.Fprintf(stdout, "reference: passed=%t max_abs=%.6g max_rel=%.6g rmse=%.6g max_ulp=%d exact=%d/%d\n",
+				c.Passed, c.MaxAbsErr, c.MaxRelErr, c.RMSE, c.MaxULPErr, c.ExactFP16Count, c.TotalElements)
+		}
+	}
+
+	if report.Comparison != nil && !report.Comparison.Passed {
+		return 1
+	}
+	return 0
+}
+
+func cmdRunAnec(args []string, tr ane.Transport, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("run-anec", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	anecPath := fs.String("anec", "", "Path to ABI v1 .anec program file")
+	var inputPaths stringSliceFlag
+	fs.Var(&inputPaths, "input", "Input binary file (repeatable in .anec input surface order)")
+	var altInputPaths stringSliceFlag
+	fs.Var(&altInputPaths, "alt-input", "Alternate input binary file used on odd runs when --runs > 1 (repeatable)")
+	outputOut := fs.String("output-out", "", "Write output surface bytes to this path")
+	expectedPath := fs.String("expected", "", "Expected output fp16 binary for direct byte comparison")
+	runs := fs.Int("runs", 1, "Number of consecutive timed runs for repeatability verification")
+	warmup := fs.Int("warmup", 0, "Number of unmeasured warmup runs before timed --runs (checked for determinism)")
+	atol := fs.Float64("atol", 1e-3, "Absolute tolerance for reference comparison")
+	rtol := fs.Float64("rtol", 1e-3, "Relative tolerance for reference comparison")
+	maxULPVal := fs.Int("max-ulp", -1, "Maximum allowed fp16 ULP error (negative disables)")
+	device := fs.String("device", "", "Explicit /dev/accel/accel* device path")
+	asJSON := fs.Bool("json", false, "Emit JSON report to stdout")
+	jsonOut := fs.String("json-out", "", "Write JSON report to this path")
+
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	if *anecPath == "" {
+		fmt.Fprintln(stderr, "error: --anec PATH is required")
+		return 1
+	}
+	if *runs < 1 {
+		fmt.Fprintf(stderr, "error: --runs must be >= 1, got %d\n", *runs)
+		return 1
+	}
+	if *warmup < 0 {
+		fmt.Fprintf(stderr, "error: --warmup must be >= 0, got %d\n", *warmup)
+		return 1
+	}
+
+	anecBytes, err := os.ReadFile(*anecPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: read .anec %q: %v\n", *anecPath, err)
+		return 1
+	}
+	prog, err := ane.ParseAnec(anecBytes)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: parse .anec %q: %v\n", *anecPath, err)
+		return 1
+	}
+
+	var inputPayloads [][]byte
+	for _, p := range inputPaths {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			fmt.Fprintf(stderr, "error: read input %q: %v\n", p, err)
+			return 1
+		}
+		inputPayloads = append(inputPayloads, b)
+	}
+
+	var altInputPayloads [][]byte
+	for _, p := range altInputPaths {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			fmt.Fprintf(stderr, "error: read alt-input %q: %v\n", p, err)
+			return 1
+		}
+		altInputPayloads = append(altInputPayloads, b)
+	}
+
+	var expectedBytes []byte
+	if *expectedPath != "" {
+		expectedBytes, err = os.ReadFile(*expectedPath)
+		if err != nil {
+			fmt.Fprintf(stderr, "error: read expected %q: %v\n", *expectedPath, err)
+			return 1
+		}
+	}
+
+	var maxULP *int
+	if *maxULPVal >= 0 {
+		v := *maxULPVal
+		maxULP = &v
+	}
+
+	fd, caps, err := ane.DiscoverDeviceABI(tr, *device, ane.ABIV1, ane.ChipH13)
+	if err != nil {
+		if errors.Is(err, ane.ErrNoMatchingDevice) {
+			fmt.Fprintf(stderr, "skip: %v\n", err)
+			return ane.ExitSkip
+		}
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	defer tr.Close(fd)
+
+	outBytes, report, err := ane.ExecuteAnec(tr, fd, caps, prog, inputPayloads, ane.ExecOptions{
+		Runs:      *runs,
+		Warmup:    *warmup,
 		AltInputs: altInputPayloads,
 		Expected:  expectedBytes,
 		Atol:      *atol,

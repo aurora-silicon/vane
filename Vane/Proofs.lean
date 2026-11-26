@@ -1889,4 +1889,55 @@ theorem peReduceAxes_product (c h : Nat) (rc rh : Bool) :
     · simp only [Nat.one_mul]
       exact Nat.mul_comm h c
 
+-- ============================================================================
+-- 12. Milestone 6A declarative TargetProfile universal invariants
+-- ============================================================================
+
+theorem target_profile_cpuSubtype_roundtrip (t : Target) :
+    Target.ofCpuSubtype? t.profile.cpuSubtype = some t := by
+  cases t <;> rfl
+
+theorem target_profile_name_roundtrip (t : Target) :
+    Target.parse? t.profile.name = some t := by
+  cases t <;> decide
+
+theorem target_profile_defaultPrologue_valid (t : Target) :
+    t.profile.isValidPrologue t.profile.defaultPrologue = true := by
+  cases t <;> decide
+
+theorem target_profile_neCfgLayout_valid (t : Target) :
+    (validateWordLayout (neCfgLayout t)).isOk = true := by
+  cases t <;> decide
+
+theorem target_profile_neCfg_sparse_bit_clear (t : Target) :
+    (t.profile.neCfgValue &&& ((1 : UInt32) <<< 8)) = 0 := by
+  cases t <;> decide
+
+theorem target_profile_dense3x3_ocg_le_four (t : Target) :
+    t.profile.dense3x3Stride1MaxOcg ≤ 4 := by
+  cases t <;> decide
+
+theorem target_profile_poolMultiStripMinW_pos (t : Target) :
+    t.profile.poolMultiStripMinW > 0 := by
+  cases t <;> decide
+
+theorem target_profile_header4_disjoint_firstBit (t : Target) :
+    (t.profile.taskHeader4Base &&& taskHeader4FirstBit) = 0 ∧
+    (t.profile.taskHeader4EdgeBits &&& taskHeader4FirstBit) = 0 := by
+  cases t <;> decide
+
+theorem target_profile_isValidPrologue_binary (t : Target) (p : UInt32)
+    (h : t.profile.isValidPrologue p = true) : p = 0 ∨ p = 1 := by
+  cases t <;> simp [Target.profile, TargetProfile.isValidPrologue] at h
+  · right; exact h
+  · rcases h with h1 | h0
+    · right; exact h1
+    · left; exact h0
+
+theorem target_profile_conv1x1MaxCout_pos (t : Target) (f ocg : Nat) :
+    t.profile.conv1x1MaxCout f ocg > 0 := by
+  unfold TargetProfile.conv1x1MaxCout
+  rw [Nat.shiftLeft_eq, Nat.one_mul]
+  exact Nat.two_pow_pos _
+
 end Vane.Proofs

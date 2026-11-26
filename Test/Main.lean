@@ -4747,12 +4747,54 @@ private def runTargetMatrixTests : IO (Array TestResult) := do
     if Target.all.isEmpty then
       throw "Target.all is empty"
     for t in Target.all do
-      if Target.parse? t.name != some t then
-        throw s!"Target.parse? does not round-trip {t.name}"
-      if Target.ofCpuSubtype? t.cpuSubtype != some t then
-        throw s!"Target.ofCpuSubtype? does not round-trip {t.name}"
+      let p := t.profile
+      if p.name != t.name then
+        throw s!"profile.name mismatch for {t.name}"
+      if p.cpuSubtype != t.cpuSubtype then
+        throw s!"profile.cpuSubtype mismatch for {t.name}"
+      if Target.parse? p.name != some t then
+        throw s!"Target.parse? does not round-trip {p.name}"
+      if Target.ofCpuSubtype? p.cpuSubtype != some t then
+        throw s!"Target.ofCpuSubtype? does not round-trip {p.name}"
+      if !p.isValidPrologue p.defaultPrologue then
+        throw s!"defaultPrologue {p.defaultPrologue} invalid for {p.name}"
+      if !p.isValidPrologue 1 then
+        throw s!"prologue 1 must always be valid for {p.name}"
+      if p.isValidPrologue 2 then
+        throw s!"prologue 2 must be invalid for {p.name}"
+      if p.isValidPrologue 0 != p.allowZeroPrologue then
+        throw s!"isValidPrologue 0 disagrees with allowZeroPrologue for {p.name}"
+      if p.dense3x3Stride1MaxOcg > 4 then
+        throw s!"dense3x3Stride1MaxOcg {p.dense3x3Stride1MaxOcg} > 4 for {p.name}"
+      if p.poolMultiStripMinW == 0 then
+        throw s!"poolMultiStripMinW must be > 0 for {p.name}"
+      if p.abiVersion == 0 || p.chipFamily == 0 then
+        throw s!"invalid abiVersion/chipFamily for {p.name}"
+      if (p.neCfgValue &&& ((1 : UInt32) <<< 8)) != 0 then
+        throw s!"neCfgValue bit 8 (sparse) must be 0 for {p.name}"
+      if (p.taskHeader4Base &&& taskHeader4FirstBit) != 0 || (p.taskHeader4EdgeBits &&& taskHeader4FirstBit) != 0 then
+        throw s!"taskHeader4 base/edge overlaps firstBit for {p.name}"
     if (Target.all.map Target.name).eraseDups.length != Target.all.length then
       throw "duplicate target names in Target.all"
+    -- Concrete H16 vs H17 profile helper checks
+    let p16 := Target.h16.profile
+    let p17 := Target.h17.profile
+    if p16.chipFamily != 16 || p16.abiVersion != 3 || p16.cpuSubtype != 7 then
+      throw "H16 identity metadata mismatch"
+    if p17.chipFamily != 17 || p17.abiVersion != 3 || p17.cpuSubtype != 9 then
+      throw "H17 identity metadata mismatch"
+    if p16.directThreshold 1 2 != 32 || p17.directThreshold 1 2 != 64 then
+      throw s!"directThreshold mismatch: h16={p16.directThreshold 1 2}, h17={p17.directThreshold 1 2}"
+    if p16.conv1x1MaxCout 4 4 != 256 || p17.conv1x1MaxCout 4 4 != 512 then
+      throw s!"conv1x1MaxCout mismatch: h16={p16.conv1x1MaxCout 4 4}, h17={p17.conv1x1MaxCout 4 4}"
+    if p16.supportsWide3x3 || !p17.supportsWide3x3 then
+      throw "supportsWide3x3 mismatch"
+    if !p16.replicateKernelChunkSlots || p17.replicateKernelChunkSlots then
+      throw "replicateKernelChunkSlots mismatch"
+    if !p16.peForbidK5LastStrip24 || p17.peForbidK5LastStrip24 then
+      throw "peForbidK5LastStrip24 mismatch"
+    if p16.poolMultiStripMinW != 64 || p17.poolMultiStripMinW != 32 then
+      throw "poolMultiStripMinW mismatch"
   ))
 
   for tgt in Target.all do

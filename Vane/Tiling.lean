@@ -344,10 +344,7 @@ def inRowsConv (sh : ConvSpec) (th : Nat) : Nat :=
 
 /-- Whether result staging operates in direct mode (`!staged`), evaluated on `Wo`. -/
 def isDirectConv (target : Target) (sh : ConvSpec) (t : Tiling) : Bool :=
-  let lhs := match target with
-    | .h17 => (128 <<< t.fat) >>> t.shMax
-    | .h16 => 128 >>> t.shMax
-  lhs >= min 32 sh.outW
+  target.profile.directThreshold t.fat t.shMax >= min 32 sh.outW
 
 /-- Bytes per channel row in L2 result staging (`dchs = 2 * min(align_up(Wo, 8), max(T, 32))`). -/
 def dchsBytesConv (sh : ConvSpec) (t : Tiling) : Nat :=
@@ -475,12 +472,13 @@ def validateConvOcgSafety (target : Target) (sh : ConvSpec) (t : Tiling) : Excep
       .error s!"illegal tiling: depthwise mode requires ocg=0, got ocg={t.ocg}"
     else .ok ()
   | .dense =>
-    if target == .h17 && sh.kernelSize == 3 && sh.stride == 1 then
-      if t.ocg > 3 then
-        .error s!"illegal tiling: h17 stride-1 dense 3x3 ocg={t.ocg} exceeds maximum 3"
-      else .ok ()
-    else if t.ocg > 4 then
-      .error s!"illegal tiling: ocg={t.ocg} exceeds maximum 4"
+    let maxOcg :=
+      if sh.kernelSize == 3 && sh.stride == 1 then
+        target.profile.dense3x3Stride1MaxOcg
+      else
+        4
+    if t.ocg > maxOcg then
+      .error s!"illegal tiling: {target.name} ocg={t.ocg} exceeds maximum {maxOcg}"
     else .ok ()
 
 /-- Hardware output channel coverage bounds for single-task NE conv. -/
@@ -488,12 +486,11 @@ def validateConvCoverageSafety (target : Target) (sh : ConvSpec) (t : Tiling) : 
   match sh.effMode with
   | .depthwise => .ok ()
   | .dense =>
+    let prof := target.profile
     if sh.kernelSize == 1 then
-      let maxCout := match target with
-        | .h16 => (1 : Nat) <<< (t.f + t.ocg)
-        | .h17 => (1 : Nat) <<< (t.f + t.ocg + 1)
+      let maxCout := prof.conv1x1MaxCout t.f t.ocg
       if sh.cout > maxCout then
-        .error s!"illegal tiling: Cout={sh.cout} exceeds {target.name} coverage {maxCout} (F={t.f}, ocg={t.ocg})"
+        .error s!"illegal tiling: Cout={sh.cout} exceeds {prof.name} coverage {maxCout} (F={t.f}, ocg={t.ocg})"
       else .ok ()
     else
       let singleCap := (1 : Nat) <<< (t.f + t.ocg)
@@ -502,16 +499,10 @@ def validateConvCoverageSafety (target : Target) (sh : ConvSpec) (t : Tiling) : 
           .error s!"illegal tiling: stride-2 dense Cout={sh.cout} exceeds single-round coverage {singleCap} (F={t.f}, ocg={t.ocg})"
         else .ok ()
       else
-        match target with
-        | .h16 =>
-          if sh.cout > singleCap then
-            .error s!"illegal tiling: h16 dense Cout={sh.cout} exceeds single-round coverage {singleCap} (F={t.f}, ocg={t.ocg})"
-          else .ok ()
-        | .h17 =>
-          let multiRoundOk := t.f == 4 && t.ocg == 3
-          if sh.cout > singleCap && !multiRoundOk then
-            .error s!"illegal tiling: h17 stride-1 dense Cout={sh.cout} exceeds coverage {singleCap} (F={t.f}, ocg={t.ocg}); Cout > 128 requires F=4, ocg=3"
-          else .ok ()
+        let multiRoundOk := prof.dense3x3Stride1MultiRoundF4Ocg3 && t.f == 4 && t.ocg == 3
+        if sh.cout > singleCap && !multiRoundOk then
+          .error s!"illegal tiling: {prof.name} stride-1 dense Cout={sh.cout} exceeds coverage {singleCap} (F={t.f}, ocg={t.ocg})"
+        else .ok ()
 
 /-- Hard silicon safety validator for single-task fp16 NE convolutions (1x1 and 3x3).
     Enforces only hardware-required invariants (register field limits, WU <= 3, ocg bounds,
@@ -588,20 +579,20 @@ def chooseConvOcg? (target : Target) (sh : ConvSpec) (f : Nat) : Option Nat :=
   match sh.effMode with
   | .depthwise => some 0
   | .dense =>
+    let prof := target.profile
     let need := ceilDiv sh.cout ((1 : Nat) <<< f)
     let ocg1 := ceilLog2 need
     if sh.kernelSize == 1 then
       if ocg1 <= 4 then
         some ocg1
+      else if sh.cout <= prof.conv1x1MaxCout f 4 then
+        some 4
       else
-        match target with
-        | .h16 => none
-        | .h17 =>
-          if sh.cout <= ((1 : Nat) <<< (f + 4 + 1)) then some 4 else none
-    else if target == .h17 && sh.stride == 1 then
-      if ocg1 <= 3 then
+        none
+    else if sh.stride == 1 then
+      if ocg1 <= prof.dense3x3Stride1MaxOcg then
         some ocg1
-      else if f == 4 then
+      else if prof.dense3x3Stride1MultiRoundF4Ocg3 && f == 4 then
         some 3
       else
         none
