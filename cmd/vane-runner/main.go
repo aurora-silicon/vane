@@ -63,6 +63,7 @@ func usage(w io.Writer) {
 	fmt.Fprintln(w, "  vane-runner run-anec --anec PATH [--input PATH]... [--alt-input PATH]... [--output-out PATH]")
 	fmt.Fprintln(w, "                       [--expected PATH] [--runs N] [--warmup N] [--atol F] [--rtol F]")
 	fmt.Fprintln(w, "                       [--max-ulp N] [--device PATH] [--json] [--json-out PATH]")
+	fmt.Fprintln(w, "  vane-runner run-v2 --bundle PATH [--input PATH]... [--alt-input PATH]... [--output-out PATH] [--expected PATH] [--priority N] [--timeout-ms N] [--runs N] [--warmup N] [--atol F] [--rtol F] [--max-ulp N] [--device PATH] [--json] [--json-out PATH]")
 	fmt.Fprintln(w, "  vane-runner gen-conv1x1 --h H --w W --cin C --cout O [--bias] [--relu | --act NAME [act flags]] [--lut-bin PATH] [--seed N] --out-dir DIR [--json]")
 	fmt.Fprintln(w, "  vane-runner gen-conv3x3 --mode <dense|depthwise> --h H --w W --cin C --cout O --stride <1|2> --pad <same|valid> [--bias] [--relu | --act NAME [act flags]] [--lut-bin PATH] [--seed N] --out-dir DIR [--json]")
 	fmt.Fprintln(w, "  vane-runner gen-pe --op <abs|square|linear|chain|sadd|ssub|srsub|smul|sdiv|add|sub|rsub|mul|max|min> --h H --w W --c C [--z-h ZH --z-w ZW --z-c ZC] [--alpha F] [--beta F] [--in-scale F] [--bias F] [--scale F] [--scalar F] [--edge-values] [--seed N] --out-dir DIR [--json]")
@@ -88,6 +89,8 @@ func runCLI(args []string, tr ane.Transport, stdout, stderr io.Writer) int {
 		return cmdRun(args[1:], tr, stdout, stderr)
 	case "run-anec":
 		return cmdRunAnec(args[1:], tr, stdout, stderr)
+	case "run-v2":
+		return cmdRunV2(args[1:], tr, stdout, stderr)
 	case "gen-conv1x1":
 		return cmdGenConv1x1(args[1:], stdout, stderr)
 	case "gen-conv3x3":
