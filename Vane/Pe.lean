@@ -190,13 +190,12 @@ def peIsDirect (target : Target) (outW k : Nat) : Bool :=
   let stripW := peStripWidth k
   if outW > stripW && stripW % 32 != 0 then
     false
+  else if target.profile.peForbidK5LastStrip24 then
+    let r := alignUp outW 8
+    let lastStrip := if r == 0 then 0 else r - 32 * ((r - 1) / 32)
+    !(k == 5 && r > 32 && lastStrip == 24)
   else
-    match target with
-    | .h17 => true
-    | .h16 =>
-      let r := alignUp outW 8
-      let lastStrip := if r == 0 then 0 else r - 32 * ((r - 1) / 32)
-      !(k == 5 && r > 32 && lastStrip == 24)
+    true
 
 /-- Direct-mode L2 output ring buffer reservation in bytes for PE tasks:
     `alignUp(max(2048, min(outC * drow * th, 4 * drow * th)), 64)`. -/

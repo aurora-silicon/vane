@@ -443,10 +443,7 @@ def NeActTiling.stripWidth (t : NeActTiling) : Nat :=
 
 /-- Whether a standalone NE activation runs in direct result mode. -/
 def neActIsDirect (target : Target) (w : Nat) (t : NeActTiling) : Bool :=
-  let lhs := match target with
-    | .h17 => (128 <<< t.fat) >>> t.shMax
-    | .h16 => 128 >>> t.shMax
-  lhs >= min 32 w
+  target.profile.directThreshold t.fat t.shMax >= min 32 w
 
 /-- Direct-mode L2 output ring buffer reservation in bytes for standalone NE activation (`ocg = 0`). -/
 def neActDirectResBytes (f fat : Nat) : Nat :=

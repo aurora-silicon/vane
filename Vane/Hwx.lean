@@ -380,15 +380,16 @@ private def encodeNoteCommand (version : UInt32) : Except String ByteArray := do
 /-- Emit a complete valid HWX container binary from a high-level `HwxProgram`. -/
 def emitHwx (prog : HwxProgram) : Except String ByteArray := do
   -- Basic target & metadata checks
-  if prog.noteVersion.isSome && prog.target != .h17 then
-    throw "LC_NOTE is only supported on H17"
+  let prof := prog.target.profile
+  if prog.noteVersion.isSome && !prof.allowNoteVersion then
+    throw s!"LC_NOTE is not supported on {prof.name}"
   let barTableOffset ← match prog.barTableSlot with
     | 6 => pure 0x70
     | 5 =>
-      if prog.target != .h17 then
-        throw "BAR table slot 5 (+0x60) is only valid on H17"
+      if !prof.allowSlot5BarTable then
+        throw s!"BAR table slot 5 (+0x60) is not valid on {prof.name}"
       pure 0x60
-    | s => throw s!"unsupported barTableSlot {s}; expected 6 (H16/H17) or 5 (H17)"
+    | s => throw s!"unsupported barTableSlot {s}; expected 6 or 5 (when allowed by target)"
 
   if prog.constants.isEmpty then
     throw "__TEXT,__const payload must be non-empty"
@@ -784,6 +785,7 @@ def validateHwx (bs : ByteArray) : Except String HwxInfo := do
   let target ← match Target.ofCpuSubtype? cpuSubtype with
     | some t => pure t
     | none => throw s!"unsupported CPU subtype {cpuSubtype} (expected 7 for H16 or 9 for H17)"
+  let prof := target.profile
   let fileType ← readU32LE bs 0x0c
   if fileType != hwxFileType then
     throw s!"bad file type: got {fileType}, expected {hwxFileType}"
@@ -1108,8 +1110,8 @@ def validateHwx (bs : ByteArray) : Except String HwxInfo := do
       ident? := some s
 
     else if cmd == lcNote then
-      if target != .h17 then
-        throw "LC_NOTE is only allowed on H17"
+      if !prof.allowNoteVersion then
+        throw s!"LC_NOTE is not allowed on {prof.name}"
       if noteVer?.isSome then throw "duplicate LC_NOTE command"
       if cmdsize != 48 then throw s!"LC_NOTE cmdsize {cmdsize} != 48"
       let noteName ← readFixedAscii bs (cursor + 8) 16 "LC_NOTE name"
@@ -1138,13 +1140,8 @@ def validateHwx (bs : ByteArray) : Except String HwxInfo := do
   -- Check __TEXT flags against presence of __DATA scratch
   let hasScratch := scratchSection?.isSome
   if hasScratch then
-    match target with
-    | .h16 =>
-      if textSegFlags != 4 then
-        throw s!"H16 __TEXT flags must be 4 when __DATA scratch is present, got {textSegFlags}"
-    | .h17 =>
-      if textSegFlags != 0 && textSegFlags != 4 then
-        throw s!"H17 __TEXT flags must be 0 or 4 when __DATA scratch is present, got {textSegFlags}"
+    if textSegFlags != 4 && !(prof.allowZeroScratchTextFlags && textSegFlags == 0) then
+      throw s!"{prof.name} __TEXT flags {textSegFlags} invalid when __DATA scratch is present"
   else
     if textSegFlags != 0 then
       throw s!"__TEXT flags must be 0 when no __DATA scratch is present, got {textSegFlags}"
@@ -1274,14 +1271,16 @@ def validateHwx (bs : ByteArray) : Except String HwxInfo := do
         throw s!"symbol '{name}': n_sect {nSect} out of range 1..{allSections.size}"
       let sec := allSections[nSect.toNat - 1]!
       let secEnd ← addU64 sec.addr sec.size s!"symbol '{name}' section end"
-      let inRange := match target with
-        | .h16 => sec.addr <= nValue && nValue < secEnd
-        | .h17 => sec.addr <= nValue && nValue <= secEnd
+      let inRange :=
+        if prof.allowEndSymbolValue then
+          sec.addr <= nValue && nValue <= secEnd
+        else
+          sec.addr <= nValue && nValue < secEnd
       if !inRange then
         throw s!"symbol '{name}': n_value {toHex nValue.toNat} outside section {nSect}"
-    else if target == .h17 && (nType == 0x20 || nType == 0x80) then
+    else if prof.allowStabSymbols && (nType == 0x20 || nType == 0x80) then
       if nSect != 0 || nValue != 0 then
-        throw s!"H17 stab symbol '{name}' must have n_sect=0 and n_value=0"
+        throw s!"{prof.name} stab symbol '{name}' must have n_sect=0 and n_value=0"
     else
       throw s!"symbol '{name}': invalid n_type {toHex nType.toNat}"
 
@@ -1308,7 +1307,7 @@ def validateHwx (bs : ByteArray) : Except String HwxInfo := do
     throw s!"linear HWX must use 0x8a0 program descriptor, got {toHex pdSize}"
   let pdActual ← readSlice bs pdOff pdSize
   let barTableOff ←
-    if target == .h17 then
+    if prof.allowSlot5BarTable then
       let slot5 ← readU64LE pdActual 0x60
       pure (if slot5 != 0 then 0x60 else 0x70)
     else

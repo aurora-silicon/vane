@@ -10,26 +10,138 @@ inductive Target where
   | h17
   deriving Repr, BEq, DecidableEq
 
+/-- Declarative hardware target profile capturing container rules, register constants,
+    and execution/tiling capabilities for an ANE generation. -/
+structure TargetProfile where
+  -- Identity & metadata
+  name : String
+  chipFamily : Nat
+  abiVersion : Nat
+  cpuSubtype : UInt32
+  -- Task stream & HWX container rules
+  defaultPrologue : UInt32
+  allowZeroPrologue : Bool
+  requireTightEnd : Bool
+  allowNoteVersion : Bool
+  allowSlot5BarTable : Bool
+  allowZeroScratchTextFlags : Bool
+  allowEndSymbolValue : Bool
+  allowStabSymbols : Bool
+  fvmlibUseSpanSize : Bool
+  -- Task header & register constants
+  taskHeader4Base : UInt32
+  taskHeader4EdgeBits : UInt32
+  targetCfgValue : UInt32
+  neCfgValue : UInt32
+  resDepCode : UInt32
+  -- Execution & tiling capabilities
+  directModeUsesFat : Bool
+  conv1x1CoutShiftBonus : Nat
+  dense3x3Stride1MaxOcg : Nat
+  dense3x3Stride1MultiRoundF4Ocg3 : Bool
+  supportsWide3x3 : Bool
+  replicateKernelChunkSlots : Bool
+  peForbidK5LastStrip24 : Bool
+  poolMultiStripMinW : Nat
+  deriving Repr, BEq, DecidableEq
+
+namespace TargetProfile
+
+/-- Return `true` iff `prologue` is legal for this target (`1` is always legal; `0` when `allowZeroPrologue`). -/
+def isValidPrologue (p : TargetProfile) (prologue : UInt32) : Bool :=
+  prologue == 1 || (p.allowZeroPrologue && prologue == 0)
+
+/-- Direct result mode width threshold `(if directModeUsesFat then 128 <<< fat else 128) >>> shMax`. -/
+def directThreshold (p : TargetProfile) (fat shMax : Nat) : Nat :=
+  (if p.directModeUsesFat then (128 : Nat) <<< fat else 128) >>> shMax
+
+/-- Maximum legal output channels for dense 1x1 convolution at `(f, ocg)`. -/
+def conv1x1MaxCout (p : TargetProfile) (f ocg : Nat) : Nat :=
+  (1 : Nat) <<< (f + ocg + p.conv1x1CoutShiftBonus)
+
+end TargetProfile
+
 namespace Target
 
-def cpuSubtype : Target → UInt32
-  | .h16 => 7
-  | .h17 => 9
+/-- Declarative hardware profile for each supported ANE target. -/
+def profile : Target → TargetProfile
+  | .h16 => {
+      name := "h16"
+      chipFamily := 16
+      abiVersion := 3
+      cpuSubtype := 7
+      defaultPrologue := 1
+      allowZeroPrologue := false
+      requireTightEnd := true
+      allowNoteVersion := false
+      allowSlot5BarTable := false
+      allowZeroScratchTextFlags := false
+      allowEndSymbolValue := false
+      allowStabSymbols := false
+      fvmlibUseSpanSize := false
+      taskHeader4Base := 0x00fff820
+      taskHeader4EdgeBits := 0x00000040
+      targetCfgValue := 0x00100000
+      neCfgValue := 0x00000082
+      resDepCode := 0x31
+      directModeUsesFat := false
+      conv1x1CoutShiftBonus := 0
+      dense3x3Stride1MaxOcg := 4
+      dense3x3Stride1MultiRoundF4Ocg3 := false
+      supportsWide3x3 := false
+      replicateKernelChunkSlots := true
+      peForbidK5LastStrip24 := true
+      poolMultiStripMinW := 64
+    }
+  | .h17 => {
+      name := "h17"
+      chipFamily := 17
+      abiVersion := 3
+      cpuSubtype := 9
+      defaultPrologue := 0
+      allowZeroPrologue := true
+      requireTightEnd := false
+      allowNoteVersion := true
+      allowSlot5BarTable := true
+      allowZeroScratchTextFlags := true
+      allowEndSymbolValue := true
+      allowStabSymbols := true
+      fvmlibUseSpanSize := true
+      taskHeader4Base := 0x00fff800
+      taskHeader4EdgeBits := 0x00000060
+      targetCfgValue := 0x00200000
+      neCfgValue := 0x10000082
+      resDepCode := 0x21
+      directModeUsesFat := true
+      conv1x1CoutShiftBonus := 1
+      dense3x3Stride1MaxOcg := 3
+      dense3x3Stride1MultiRoundF4Ocg3 := true
+      supportsWide3x3 := true
+      replicateKernelChunkSlots := false
+      peForbidK5LastStrip24 := false
+      poolMultiStripMinW := 32
+    }
+
+def cpuSubtype (t : Target) : UInt32 :=
+  t.profile.cpuSubtype
 
 def ofCpuSubtype? : UInt32 → Option Target
   | 7 => some .h16
   | 9 => some .h17
   | _ => none
 
-def name : Target → String
-  | .h16 => "h16"
-  | .h17 => "h17"
+def name (t : Target) : String :=
+  t.profile.name
 
 def parse? (s : String) : Option Target :=
-  match s.toLower with
+  match s with
   | "h16" => some .h16
   | "h17" => some .h17
-  | _ => none
+  | _ =>
+    match s.toLower with
+    | "h16" => some .h16
+    | "h17" => some .h17
+    | _ => none
 
 /-- Every supported target, in a fixed order. Tests iterate this list, so a new
     constructor is exercised by CI once it is added here. -/
@@ -201,15 +313,11 @@ def encodeRegRecord (rec : RegRecord) : Except String (UInt32 × Array UInt32) :
 
 /-- Encode a `TaskStream` into raw `__TEXT,__text` bytes. -/
 def encodeTaskStream (target : Target) (stream : TaskStream) : Except String EncodedTaskStream := do
-  match target with
-  | .h16 =>
-    if stream.prologue != 1 then
-      throw s!"H16 task stream prologue must be 1, got {stream.prologue}"
-    if stream.trailingZeroBlocks != 0 then
-      throw s!"H16 task stream forbids trailing zero blocks after final task"
-  | .h17 =>
-    if stream.prologue != 0 && stream.prologue != 1 then
-      throw s!"H17 task stream prologue must be 0 or 1, got {stream.prologue}"
+  let prof := target.profile
+  if !prof.isValidPrologue stream.prologue then
+    throw s!"{prof.name} task stream prologue {stream.prologue} is invalid"
+  if prof.requireTightEnd && stream.trailingZeroBlocks != 0 then
+    throw s!"{prof.name} task stream forbids trailing zero blocks after final task"
 
   if stream.tasks.isEmpty then
     throw "task stream must contain at least 1 task"
@@ -294,14 +402,10 @@ def validateTaskStream (target : Target) (bs : ByteArray) : Except String TaskSt
   if bs.size % 4 != 0 then
     throw s!"task stream size {bs.size} is not a multiple of 4"
 
+  let prof := target.profile
   let prologue ← readU32LE bs 0
-  match target with
-  | .h16 =>
-    if prologue != 1 then
-      throw s!"H16 task stream prologue must be 1, got {prologue}"
-  | .h17 =>
-    if prologue != 0 && prologue != 1 then
-      throw s!"H17 task stream prologue must be 0 or 1, got {prologue}"
+  if !prof.isValidPrologue prologue then
+    throw s!"{prof.name} task stream prologue {prologue} is invalid"
   checkAllZero bs 4 (prologueFrameBytes - 4) "task stream opening frame"
 
   let mut cursor := prologueFrameBytes
@@ -391,8 +495,8 @@ def validateTaskStream (target : Target) (bs : ByteArray) : Except String TaskSt
   if taskCount == 0 then
     throw "task stream contains 0 tasks"
 
-  if target == .h16 && finalTaskEnd != bs.size then
-    throw s!"H16 task stream forbids trailing zero padding/blocks after final task (final_task_end={toHex finalTaskEnd}, text.size={toHex bs.size})"
+  if prof.requireTightEnd && finalTaskEnd != bs.size then
+    throw s!"{prof.name} task stream forbids trailing zero padding/blocks after final task (final_task_end={toHex finalTaskEnd}, text.size={toHex bs.size})"
 
   pure {
     prologue := prologue

@@ -32,13 +32,12 @@ private def vPeIsDirect (target : Target) (outW k : Nat) : Bool :=
   let stripW := (1 : Nat) <<< k
   if outW > stripW && stripW % 32 != 0 then
     false
+  else if target.profile.peForbidK5LastStrip24 then
+    let r := alignUp outW 8
+    let lastStrip := if r == 0 then 0 else r - 32 * ((r - 1) / 32)
+    !(k == 5 && r > 32 && lastStrip == 24)
   else
-    match target with
-    | .h17 => true
-    | .h16 =>
-      let r := alignUp outW 8
-      let lastStrip := if r == 0 then 0 else r - 32 * ((r - 1) / 32)
-      !(k == 5 && r > 32 && lastStrip == 24)
+    true
 
 private def vPeDirectResBytes (outC drow th : Nat) : Nat :=
   alignUp (max 2048 (min (outC * drow * th) (4 * drow * th))) vDmaLineBytes
@@ -46,9 +45,7 @@ private def vPeDirectResBytes (outC drow th : Nat) : Nat :=
 private def vPePoolDirect (target : Target) (ow k : Nat) : Bool :=
   let stripW := (1 : Nat) <<< k
   let multi := ow > stripW
-  match target with
-  | .h17 => !multi || stripW >= 32
-  | .h16 => !multi || stripW >= 64
+  !multi || stripW >= target.profile.poolMultiStripMinW
 
 private def vPoolInRows (usedH kh sh pt oh th : Nat) (isNe : Bool) : Nat := Id.run do
   if th == 0 || oh == 0 then
@@ -176,10 +173,7 @@ private def vDchs (wout stripW : Nat) : Nat :=
   2 * min (alignUp wout 8) (max stripW 32)
 
 private def vIsDirect (target : Target) (fat shMax wout : Nat) : Bool :=
-  let lhs := match target with
-    | .h17 => (128 <<< fat) >>> shMax
-    | .h16 => 128 >>> shMax
-  lhs >= min 32 wout
+  target.profile.directThreshold fat shMax >= min 32 wout
 
 /-- Independent linear tile scan for maximum input rows buffered per output row tile. -/
 private def vInRows (kernelSize h stride pt hout th : Nat) : Nat := Id.run do
@@ -1070,9 +1064,7 @@ def verifyConvTaskMulti
         throw s!"{prefixMsg}: dwGroups (0x0030) must not be written for 1x1 conv"
       if ocg > 4 then
         throw s!"{prefixMsg}: ocg={ocg} exceeds maximum 4"
-      let maxCout := match target with
-        | .h16 => (1 : Nat) <<< (f + ocg)
-        | .h17 => (1 : Nat) <<< (f + ocg + 1)
+      let maxCout := target.profile.conv1x1MaxCout f ocg
       if cout > maxCout then
         throw s!"{prefixMsg}: 1x1 Cout={cout} exceeds {target.name} coverage {maxCout} (F={f}, ocg={ocg})"
       pure (1, 1, false)
@@ -1100,18 +1092,14 @@ def verifyConvTaskMulti
         if ocg != 0 then
           throw s!"{prefixMsg}: dwGroups (0x0030) depthwise mode requires ocg=0, got ocg={ocg}"
       else
-        if target == .h17 && s == 1 then
-          if ocg > 3 then
-            throw s!"{prefixMsg}: h17 stride-1 dense ocg={ocg} exceeds maximum 3"
-          let singleCap := (1 : Nat) <<< (f + ocg)
-          if cout > singleCap && !(f == 4 && ocg == 3) then
-            throw s!"{prefixMsg}: h17 stride-1 dense Cout={cout} exceeds coverage {singleCap} (F={f}, ocg={ocg})"
-        else
-          if ocg > 4 then
-            throw s!"{prefixMsg}: ocg={ocg} exceeds maximum 4"
-          let singleCap := (1 : Nat) <<< (f + ocg)
-          if cout > singleCap then
-            throw s!"{prefixMsg}: dense 3x3 Cout={cout} exceeds single-round coverage {singleCap} (F={f}, ocg={ocg})"
+        let prof := target.profile
+        let maxOcg := if s == 1 then prof.dense3x3Stride1MaxOcg else 4
+        if ocg > maxOcg then
+          throw s!"{prefixMsg}: {prof.name} dense 3x3 stride-{s} ocg={ocg} exceeds maximum {maxOcg}"
+        let singleCap := (1 : Nat) <<< (f + ocg)
+        let multiRoundOk := s == 1 && prof.dense3x3Stride1MultiRoundF4Ocg3 && f == 4 && ocg == 3
+        if cout > singleCap && !multiRoundOk then
+          throw s!"{prefixMsg}: {prof.name} dense 3x3 stride-{s} Cout={cout} exceeds coverage {singleCap} (F={f}, ocg={ocg})"
       pure (3, s, isDw)
     else
       throw s!"{prefixMsg}: unsupported conv kernel size kh={kh}, kw={kw} (expected 1x1 or 3x3)"
@@ -1120,7 +1108,7 @@ def verifyConvTaskMulti
   let isSparse := kernelSize == 3 && stride == 2
 
   if kernelSize == 3 && wide3x3Bit == 1 then
-    if target != .h17 then
+    if !target.profile.supportsWide3x3 then
       throw s!"{prefixMsg}: neCommon wide3x3=1 is illegal on {target.name}"
     if isDepthwise then
       throw s!"{prefixMsg}: neCommon wide3x3=1 is illegal for depthwise 3x3 conv"
@@ -1259,18 +1247,17 @@ def verifyConvTaskMulti
   for g in [:groups] do
     let blocks := vGroupBlocks isDepthwise cout f effOcg g
     if !blocks.isEmpty then
-      match target with
-      | .h17 =>
-        let s := g * rep
-        if s >= 16 then
-          throw s!"{prefixMsg}: expected chunk slot {s} exceeds 0..15"
-        expectedSlotMap := expectedSlotMap.set! s (some blocks)
-      | .h16 =>
+      if target.profile.replicateKernelChunkSlots then
         for j in [:rep] do
           let s := g * rep + j
           if s >= 16 then
             throw s!"{prefixMsg}: expected chunk slot {s} exceeds 0..15"
           expectedSlotMap := expectedSlotMap.set! s (some blocks)
+      else
+        let s := g * rep
+        if s >= 16 then
+          throw s!"{prefixMsg}: expected chunk slot {s} exceeds 0..15"
+        expectedSlotMap := expectedSlotMap.set! s (some blocks)
 
   let cinW := if isDepthwise then 1 else cin
   let taps := kernelSize * kernelSize

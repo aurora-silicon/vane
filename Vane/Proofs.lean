@@ -1889,4 +1889,41 @@ theorem peReduceAxes_product (c h : Nat) (rc rh : Bool) :
     · simp only [Nat.one_mul]
       exact Nat.mul_comm h c
 
+-- ============================================================================
+-- 12. Milestone 6A declarative TargetProfile universal invariants
+-- ============================================================================
+
+theorem target_profile_cpuSubtype_roundtrip (t : Target) :
+    Target.ofCpuSubtype? t.profile.cpuSubtype = some t := by
+  cases t <;> rfl
+
+theorem target_profile_name_roundtrip (t : Target) :
+    Target.parse? t.profile.name = some t := by
+  cases t <;> decide
+
+theorem target_profile_defaultPrologue_valid (t : Target) :
+    t.profile.isValidPrologue t.profile.defaultPrologue = true := by
+  cases t <;> decide
+
+theorem target_profile_neCfgLayout_valid (t : Target) :
+    (validateWordLayout (neCfgLayout t)).isOk = true := by
+  cases t <;> decide
+
+theorem target_profile_neCfg_sparse_bit_clear (t : Target) :
+    (t.profile.neCfgValue &&& ((1 : UInt32) <<< 8)) = 0 := by
+  cases t <;> decide
+
+theorem target_profile_dense3x3_ocg_le_four (t : Target) :
+    t.profile.dense3x3Stride1MaxOcg ≤ 4 := by
+  cases t <;> decide
+
+theorem target_profile_poolMultiStripMinW_pos (t : Target) :
+    t.profile.poolMultiStripMinW > 0 := by
+  cases t <;> decide
+
+theorem target_profile_header4_disjoint_firstBit (t : Target) :
+    (t.profile.taskHeader4Base &&& taskHeader4FirstBit) = 0 ∧
+    (t.profile.taskHeader4EdgeBits &&& taskHeader4FirstBit) = 0 := by
+  cases t <;> decide
+
 end Vane.Proofs

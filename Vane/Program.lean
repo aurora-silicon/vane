@@ -77,9 +77,7 @@ def makeFp16Surface
   let planeStrideU64 ← natToU64Checked planeStride s!"surface '{shortName}' planeStride"
   let spanU64 ← natToU64Checked span s!"surface '{shortName}' span"
   let allocU64 ← natToU64Checked alloc s!"surface '{shortName}' allocSize"
-  let sectSize : UInt64 := match target with
-    | .h16 => allocU64
-    | .h17 => spanU64
+  let sectSize : UInt64 := if target.profile.fvmlibUseSpanSize then spanU64 else allocU64
   pure {
     shortName := shortName
     symbolName := symbolName
@@ -131,9 +129,7 @@ def emitProgram (spec : ProgramSpec) : Except String EmittedProgram := do
         throw s!"emitProgram: task {ti} relocation barRecIndex {rel.barRecIndex} >= {td.barWrites.size}"
       relocTargets := relocTargets.push (ti, plainRecs.size + rel.barRecIndex, rel.payloadWordIndex)
 
-  let prologue : UInt32 := match spec.target with
-    | .h16 => 1
-    | .h17 => 0
+  let prologue : UInt32 := spec.target.profile.defaultPrologue
   let stream : TaskStream := {
     prologue := prologue
     tasks := tasks
