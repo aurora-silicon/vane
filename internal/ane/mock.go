@@ -14,32 +14,55 @@ import (
 
 // MockDeviceSpec configures one virtual /dev/accel/accel* node for MockTransport.
 type MockDeviceSpec struct {
-	ABIVersion uint32
-	ChipFamily uint32
-	OpenErr    error
-	GetCapsErr error
+	ABIVersion  uint32
+	ChipFamily  uint32
+	SectionSize uint32
+	BindSize    uint32
+	ExecIOSize  uint32
+	OpenErr     error
+	GetCapsErr  error
+}
+
+type mockBO struct {
+	handle uint32
+	size   uint64
+	offset uint64
+	data   []byte
 }
 
 type mockFDState struct {
-	path     string
-	spec     MockDeviceSpec
-	loaded   *LoadedProgram
-	surfaces [][]byte
+	path         string
+	spec         MockDeviceSpec
+	loaded       *LoadedProgram
+	surfaces     [][]byte
+	nextBOHandle uint32
+	bos          map[uint32]*mockBO
+	boByOffset   map[uint64]*mockBO
 }
 
-// MockTransport implements Transport in memory against the Linux accel/ane ABI v3 contract.
+// MockTransport implements Transport in memory against Linux accel/ane ABI v1/v2/v3 contracts.
 type MockTransport struct {
 	Devices                map[string]MockDeviceSpec
 	ComputeFn              func(inputs [][]byte, call int) []byte
 	HostPageSize           int
+	SubmitDstCount         int
+	BoInitFailAt           int // If > 0, fail the Nth BoInit call with ENOMEM (for leak testing).
+	SubmitErr              error
 	nextFD                 int
 	openFDs                map[int]*mockFDState
 	ObservedOutputPoisonOK []bool
 	LoadedSections         map[uint32][]byte
 	ExecCalls              int
+	SubmitCalls            int
+	LastSubmitArgs         *SubmitArgs
+	LastBtspData           []byte
+	TotalAllocatedBOs      int
+	TotalFreedBOs          int
+	FreedBOHandles         []uint32
+	boInitCount            int
 }
 
-// NewMockTransport creates an in-memory ABI v3 accel/ane transport with 16 KiB default pages.
+// NewMockTransport creates an in-memory accel/ane transport with 16 KiB default pages.
 func NewMockTransport(devices map[string]MockDeviceSpec, compute func([][]byte, int) []byte) *MockTransport {
 	return &MockTransport{
 		Devices:        devices,
@@ -49,6 +72,15 @@ func NewMockTransport(devices map[string]MockDeviceSpec, compute func([][]byte, 
 		openFDs:        map[int]*mockFDState{},
 		LoadedSections: map[uint32][]byte{},
 	}
+}
+
+// ActiveBOCount returns the number of currently unfreed BO handles across all open fds.
+func (m *MockTransport) ActiveBOCount() int {
+	n := 0
+	for _, st := range m.openFDs {
+		n += len(st.bos)
+	}
+	return n
 }
 
 func (m *MockTransport) ListDevices() ([]string, error) {
@@ -70,7 +102,12 @@ func (m *MockTransport) Open(path string) (int, error) {
 	}
 	fd := m.nextFD
 	m.nextFD++
-	m.openFDs[fd] = &mockFDState{path: path, spec: spec}
+	m.openFDs[fd] = &mockFDState{
+		path:       path,
+		spec:       spec,
+		bos:        map[uint32]*mockBO{},
+		boByOffset: map[uint64]*mockBO{},
+	}
 	return fd, nil
 }
 
@@ -85,7 +122,17 @@ func (m *MockTransport) PageSize() int {
 
 func (m *MockTransport) Mmap(fd int, offset int64, length int, prot int, _ int) ([]byte, error) {
 	st, ok := m.openFDs[fd]
-	if !ok || st.loaded == nil {
+	if !ok {
+		return nil, syscall.EINVAL
+	}
+	if st.spec.ABIVersion == ABIV1 {
+		bo, ok := st.boByOffset[uint64(offset)]
+		if !ok || length <= 0 || length > len(bo.data) {
+			return nil, syscall.EINVAL
+		}
+		return bo.data[:length], nil
+	}
+	if st.loaded == nil {
 		return nil, syscall.EINVAL
 	}
 	idx := int((offset >> 32) - 1)
@@ -161,10 +208,177 @@ func (m *MockTransport) GetCaps(fd int) (GetCapsArgs, error) {
 		return GetCapsArgs{}, st.spec.GetCapsErr
 	}
 	return GetCapsArgs{
-		Size:       uint32(unsafe.Sizeof(GetCapsArgs{})),
-		ABIVersion: st.spec.ABIVersion,
-		ChipFamily: st.spec.ChipFamily,
+		Size:        uint32(unsafe.Sizeof(GetCapsArgs{})),
+		ABIVersion:  st.spec.ABIVersion,
+		ChipFamily:  st.spec.ChipFamily,
+		SectionSize: st.spec.SectionSize,
+		BindSize:    st.spec.BindSize,
+		ExecIOSize:  st.spec.ExecIOSize,
 	}, nil
+}
+
+func (m *MockTransport) BoInit(fd int, size uint64) (BoInitArgs, error) {
+	st, ok := m.openFDs[fd]
+	if !ok {
+		return BoInitArgs{}, syscall.EBADF
+	}
+	if st.spec.ABIVersion != ABIV1 && st.spec.ABIVersion != ABIV2 {
+		return BoInitArgs{}, syscall.EOPNOTSUPP
+	}
+	if size == 0 {
+		return BoInitArgs{}, syscall.EINVAL
+	}
+	m.boInitCount++
+	if m.BoInitFailAt > 0 && m.boInitCount == m.BoInitFailAt {
+		return BoInitArgs{}, syscall.ENOMEM
+	}
+	align := uint64(PageSize16K)
+	if m.HostPageSize > PageSize16K {
+		align = uint64(m.HostPageSize)
+	}
+	allocSize, ok := alignUpU64(size, align)
+	if !ok {
+		return BoInitArgs{}, syscall.EINVAL
+	}
+	st.nextBOHandle++
+	handle := st.nextBOHandle
+	offset := uint64(handle) << 32
+	bo := &mockBO{
+		handle: handle,
+		size:   size,
+		offset: offset,
+		data:   make([]byte, allocSize),
+	}
+	st.bos[handle] = bo
+	st.boByOffset[offset] = bo
+	m.TotalAllocatedBOs++
+	return BoInitArgs{
+		Handle: handle,
+		Size:   size,
+		Offset: offset,
+	}, nil
+}
+
+func (m *MockTransport) BoFree(fd int, handle uint32) error {
+	st, ok := m.openFDs[fd]
+	if !ok {
+		return syscall.EBADF
+	}
+	if st.spec.ABIVersion != ABIV1 && st.spec.ABIVersion != ABIV2 {
+		return syscall.EOPNOTSUPP
+	}
+	bo, ok := st.bos[handle]
+	if !ok {
+		return syscall.EINVAL
+	}
+	delete(st.bos, handle)
+	delete(st.boByOffset, bo.offset)
+	m.TotalFreedBOs++
+	m.FreedBOHandles = append(m.FreedBOHandles, handle)
+	return nil
+}
+
+func (m *MockTransport) Submit(fd int, args SubmitArgs) error {
+	st, ok := m.openFDs[fd]
+	if !ok {
+		return syscall.EBADF
+	}
+	if st.spec.ABIVersion != ABIV1 {
+		return syscall.EOPNOTSUPP
+	}
+	if m.SubmitErr != nil {
+		return m.SubmitErr
+	}
+	if args.Pad != 0 {
+		return syscall.EINVAL
+	}
+	if args.TskSize == 0 {
+		return syscall.EINVAL
+	}
+	if args.TDCount == 0 || args.TDCount > MaxTDCount {
+		return syscall.EINVAL
+	}
+	if args.TDSize < MinTDSize || args.TDSize > MaxTDSize || args.TDSize%4 != 0 {
+		return syscall.EINVAL
+	}
+	if uint64(args.TDCount)*uint64(args.TDSize) > args.TskSize {
+		return syscall.EINVAL
+	}
+	if args.Handles[0] == 0 || args.Handles[1] != 0 || args.BtspHandle == 0 {
+		return syscall.EINVAL
+	}
+
+	var tileBOs [TileCount]*mockBO
+	for i, h := range args.Handles {
+		if h == 0 {
+			continue
+		}
+		bo, exists := st.bos[h]
+		if !exists {
+			return syscall.EINVAL
+		}
+		tileBOs[i] = bo
+	}
+	btspBO, exists := st.bos[args.BtspHandle]
+	if !exists {
+		return syscall.EINVAL
+	}
+	cmdBO := tileBOs[0]
+	if args.TskSize >= uint64(len(cmdBO.data)) {
+		return syscall.EINVAL
+	}
+	if uint64(args.TDSize) > uint64(len(btspBO.data)) {
+		return syscall.EINVAL
+	}
+	hdr0 := binary.LittleEndian.Uint32(btspBO.data[0:4])
+	if uint8((hdr0>>16)&0xff) != FifoNID {
+		return syscall.EINVAL
+	}
+
+	m.ExecCalls++
+	m.SubmitCalls++
+	cpArgs := args
+	m.LastSubmitArgs = &cpArgs
+	m.LastBtspData = make([]byte, args.TDSize)
+	copy(m.LastBtspData, btspBO.data[:args.TDSize])
+
+	dstCount := m.SubmitDstCount
+	if dstCount <= 0 {
+		dstCount = 1
+	}
+	var inputs [][]byte
+	for slot := 4 + dstCount; slot < TileCount; slot++ {
+		if tileBOs[slot] != nil {
+			cp := make([]byte, tileBOs[slot].size)
+			copy(cp, tileBOs[slot].data[:tileBOs[slot].size])
+			inputs = append(inputs, cp)
+		}
+	}
+
+	poisonOK := true
+	hasDst := false
+	for i := 0; i < dstCount && 4+i < TileCount; i++ {
+		dstBO := tileBOs[4+i]
+		if dstBO == nil {
+			continue
+		}
+		hasDst = true
+		for _, v := range dstBO.data[:dstBO.size] {
+			if v != 0xff {
+				poisonOK = false
+				break
+			}
+		}
+	}
+	if hasDst {
+		m.ObservedOutputPoisonOK = append(m.ObservedOutputPoisonOK, poisonOK)
+	}
+	if tileBOs[4] != nil {
+		outSz := int(tileBOs[4].size)
+		outData := m.runCompute(inputs, outSz)
+		copy(tileBOs[4].data[:outSz], outData)
+	}
+	return nil
 }
 
 func (m *MockTransport) H16Load(fd int, hwx []byte, sections [4]struct {

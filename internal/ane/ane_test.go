@@ -2,6 +2,7 @@ package ane
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"math"
 	"syscall"
@@ -12,6 +13,15 @@ import (
 func TestUapiLayoutAndIoctlNumbers(t *testing.T) {
 	if got := unsafe.Sizeof(GetCapsArgs{}); got != 32 {
 		t.Fatalf("sizeof(GetCapsArgs) = %d, want 32", got)
+	}
+	if got := unsafe.Sizeof(BoInitArgs{}); got != 24 {
+		t.Fatalf("sizeof(BoInitArgs) = %d, want 24", got)
+	}
+	if got := unsafe.Sizeof(BoFreeArgs{}); got != 8 {
+		t.Fatalf("sizeof(BoFreeArgs) = %d, want 8", got)
+	}
+	if got := unsafe.Sizeof(SubmitArgs{}); got != 152 {
+		t.Fatalf("sizeof(SubmitArgs) = %d, want 152", got)
 	}
 	if got := unsafe.Sizeof(H16Section{}); got != 16 {
 		t.Fatalf("sizeof(H16Section) = %d, want 16", got)
@@ -27,10 +37,22 @@ func TestUapiLayoutAndIoctlNumbers(t *testing.T) {
 	}
 
 	wantGetCaps := uintptr((3 << 30) | (32 << 16) | (0x64 << 8) | (0x40 + 0x00))
+	wantBoInit := uintptr((3 << 30) | (24 << 16) | (0x64 << 8) | (0x40 + 0x01))
+	wantBoFree := uintptr((3 << 30) | (8 << 16) | (0x64 << 8) | (0x40 + 0x02))
+	wantSubmit := uintptr((3 << 30) | (152 << 16) | (0x64 << 8) | (0x40 + 0x03))
 	wantLoad := uintptr((3 << 30) | (88 << 16) | (0x64 << 8) | (0x40 + 0x07))
 	wantExec := uintptr((1 << 30) | (16 << 16) | (0x64 << 8) | (0x40 + 0x08))
 	if IoctlGetCaps != wantGetCaps {
 		t.Fatalf("IoctlGetCaps = 0x%x, want 0x%x", IoctlGetCaps, wantGetCaps)
+	}
+	if IoctlBoInit != wantBoInit {
+		t.Fatalf("IoctlBoInit = 0x%x, want 0x%x", IoctlBoInit, wantBoInit)
+	}
+	if IoctlBoFree != wantBoFree {
+		t.Fatalf("IoctlBoFree = 0x%x, want 0x%x", IoctlBoFree, wantBoFree)
+	}
+	if IoctlSubmit != wantSubmit {
+		t.Fatalf("IoctlSubmit = 0x%x, want 0x%x", IoctlSubmit, wantSubmit)
 	}
 	if IoctlH16Load != wantLoad {
 		t.Fatalf("IoctlH16Load = 0x%x, want 0x%x", IoctlH16Load, wantLoad)
@@ -253,5 +275,300 @@ func TestComputeLatencyStatsAndWarmup(t *testing.T) {
 	// Negative warmup rejected
 	if _, _, err := ExecuteProgram(tr, fd, caps, loaded, [][]byte{inData}, ExecOptions{Runs: 1, Warmup: -1}); err == nil {
 		t.Fatalf("expected negative warmup to be rejected")
+	}
+}
+
+func makeSyntheticAnec(hdr AnecHeader, payload []byte) []byte {
+	buf := make([]byte, AnecHeaderSize+len(payload))
+	binary.LittleEndian.PutUint64(buf[0x000:0x008], hdr.Size)
+	binary.LittleEndian.PutUint32(buf[0x008:0x00c], hdr.TDSize)
+	binary.LittleEndian.PutUint32(buf[0x00c:0x010], hdr.TDCount)
+	binary.LittleEndian.PutUint64(buf[0x010:0x018], hdr.TskSize)
+	binary.LittleEndian.PutUint64(buf[0x018:0x020], hdr.KrnSize)
+	binary.LittleEndian.PutUint32(buf[0x020:0x024], hdr.SrcCount)
+	binary.LittleEndian.PutUint32(buf[0x024:0x028], hdr.DstCount)
+	for i := 0; i < TileCount; i++ {
+		binary.LittleEndian.PutUint32(buf[0x028+4*i:], hdr.Tiles[i])
+	}
+	for i := 0; i < TileCount; i++ {
+		for j := 0; j < 6; j++ {
+			binary.LittleEndian.PutUint64(buf[0x0a8+(i*6+j)*8:], hdr.NCHW[i][j])
+		}
+	}
+	copy(buf[AnecHeaderSize:], payload)
+	return buf
+}
+
+func validSyntheticAnecHeader() (AnecHeader, []byte) {
+	payload := make([]byte, 0x200)
+	// TD0 word 0 with arbitrary high/low nibbles + non-FifoNID byte [23:16] to test PatchBootstrapNID.
+	binary.LittleEndian.PutUint32(payload[0:4], 0xfa123456)
+	var h AnecHeader
+	h.Size = uint64(len(payload))
+	h.TDSize = 0x100
+	h.TDCount = 1
+	h.TskSize = 0x100
+	h.KrnSize = 0x100
+	h.SrcCount = 1
+	h.DstCount = 1
+	h.Tiles[0] = 1 // 16 KiB cmd+weights
+	h.Tiles[2] = 1 // optional scratch slot
+	h.Tiles[4] = 1 // dst0 = 16 KiB
+	h.Tiles[5] = 1 // src0 = 16 KiB
+	h.NCHW[4] = [6]uint64{1, 4, 8, 16, 1024, 64}
+	h.NCHW[5] = [6]uint64{1, 4, 8, 16, 1024, 64}
+	return h, payload
+}
+
+func TestMultiABIProbeAndFilter(t *testing.T) {
+	tr := NewMockTransport(map[string]MockDeviceSpec{
+		"/dev/accel/accel0": {GetCapsErr: syscall.ENOTTY},
+		"/dev/accel/accel1": {ABIVersion: ABIV1, ChipFamily: ChipH13},
+		"/dev/accel/accel2": {ABIVersion: ABIV2, ChipFamily: ChipH14, SectionSize: 24, BindSize: 24, ExecIOSize: 32},
+		"/dev/accel/accel3": {ABIVersion: ABIV3, ChipFamily: ChipH16},
+		"/dev/accel/accel4": {ABIVersion: ABIV3, ChipFamily: ChipH17},
+	}, nil)
+
+	all, err := ProbeDevices(tr, "")
+	if err != nil {
+		t.Fatalf("ProbeDevices failed: %v", err)
+	}
+	if len(all) != 4 {
+		t.Fatalf("ProbeDevices returned %d devices, want 4: %+v", len(all), all)
+	}
+	if all[0].ABIVersion != ABIV1 || all[0].ChipFamily != ChipH13 {
+		t.Fatalf("unexpected dev[0]: %+v", all[0])
+	}
+	if all[1].ABIVersion != ABIV2 || all[1].ChipFamily != ChipH14 || all[1].SectionSize != 24 || all[1].BindSize != 24 || all[1].ExecIOSize != 32 {
+		t.Fatalf("unexpected dev[1]: %+v", all[1])
+	}
+	if all[2].ABIVersion != ABIV3 || all[2].ChipFamily != ChipH16 {
+		t.Fatalf("unexpected dev[2]: %+v", all[2])
+	}
+	if all[3].ABIVersion != ABIV3 || all[3].ChipFamily != ChipH17 {
+		t.Fatalf("unexpected dev[3]: %+v", all[3])
+	}
+
+	v1Devs, err := ProbeDevicesFilter(tr, "", ABIV1)
+	if err != nil || len(v1Devs) != 1 || v1Devs[0].ChipFamily != ChipH13 {
+		t.Fatalf("ProbeDevicesFilter(v1) = %+v, err=%v", v1Devs, err)
+	}
+	v2Devs, err := ProbeDevicesFilter(tr, "", ABIV2)
+	if err != nil || len(v2Devs) != 1 || v2Devs[0].ChipFamily != ChipH14 {
+		t.Fatalf("ProbeDevicesFilter(v2) = %+v, err=%v", v2Devs, err)
+	}
+	v3Devs, err := ProbeDevicesFilter(tr, "", ABIV3)
+	if err != nil || len(v3Devs) != 2 {
+		t.Fatalf("ProbeDevicesFilter(v3) = %+v, err=%v", v3Devs, err)
+	}
+
+	fd, caps, err := DiscoverDeviceABI(tr, "", ABIV1, ChipH13)
+	if err != nil || caps.ABIVersion != ABIV1 || caps.ChipFamily != ChipH13 || caps.Path != "/dev/accel/accel1" {
+		t.Fatalf("DiscoverDeviceABI(v1, H13) = (%d, %+v, %v)", fd, caps, err)
+	}
+	_ = tr.Close(fd)
+}
+
+func TestParseAnecValidation(t *testing.T) {
+	baseHdr, basePayload := validSyntheticAnecHeader()
+	validBytes := makeSyntheticAnec(baseHdr, basePayload)
+	prog, err := ParseAnec(validBytes)
+	if err != nil {
+		t.Fatalf("ParseAnec valid failed: %v", err)
+	}
+	if prog.Header.TDCount != 1 || prog.Header.TDSize != 0x100 || prog.Header.TileBytes(4) != PageSize16K || len(prog.Payload) != len(basePayload) {
+		t.Fatalf("unexpected parsed AnecProgram: %+v", prog.Header)
+	}
+
+	// PatchBootstrapNID preserves low 16 bits and bits [27:24], clears bits [31:28], and sets [23:16] = nid.
+	td0 := []byte{0x56, 0x34, 0x12, 0xfa}
+	if err := PatchBootstrapNID(td0, FifoNID); err != nil {
+		t.Fatalf("PatchBootstrapNID failed: %v", err)
+	}
+	if got := binary.LittleEndian.Uint32(td0); got != 0x0a403456 {
+		t.Fatalf("PatchBootstrapNID got 0x%08x, want 0x0a403456", got)
+	}
+	if err := PatchBootstrapNID([]byte{1, 2}, FifoNID); err == nil {
+		t.Fatalf("expected PatchBootstrapNID error on < 4 bytes")
+	}
+
+	// Malformed header cases
+	if _, err := ParseAnec(validBytes[:AnecHeaderSize-1]); err == nil {
+		t.Fatalf("expected truncated header rejection")
+	}
+	badCases := []struct {
+		name   string
+		mutate func(h *AnecHeader, p *[]byte)
+	}{
+		{"zero_size", func(h *AnecHeader, p *[]byte) { h.Size = 0; *p = nil }},
+		{"payload_len_mismatch", func(h *AnecHeader, p *[]byte) { *p = (*p)[:len(*p)-4] }},
+		{"td_count_zero", func(h *AnecHeader, _ *[]byte) { h.TDCount = 0 }},
+		{"td_count_overflow", func(h *AnecHeader, _ *[]byte) { h.TDCount = MaxTDCount + 1 }},
+		{"td_size_too_small", func(h *AnecHeader, _ *[]byte) { h.TDSize = 2 }},
+		{"td_size_unaligned", func(h *AnecHeader, _ *[]byte) { h.TDSize = 6 }},
+		{"td_size_too_large", func(h *AnecHeader, _ *[]byte) { h.TDSize = MaxTDSize + 4 }},
+		{"td_size_gt_payload", func(h *AnecHeader, _ *[]byte) { h.TDSize = 0x300; h.TskSize = 0x300 }},
+		{"tsk_size_zero", func(h *AnecHeader, _ *[]byte) { h.TskSize = 0 }},
+		{"td_bytes_gt_tsk_size", func(h *AnecHeader, _ *[]byte) { h.TDCount = 2; h.TskSize = 0x100 }},
+		{"tiles0_zero", func(h *AnecHeader, _ *[]byte) { h.Tiles[0] = 0 }},
+		{"tiles1_nonzero", func(h *AnecHeader, _ *[]byte) { h.Tiles[1] = 1 }},
+		{"tsk_size_ge_tile0", func(h *AnecHeader, p *[]byte) {
+			*p = make([]byte, PageSize16K)
+			h.Size = PageSize16K
+			h.TskSize = PageSize16K
+			h.KrnSize = 0
+		}},
+		{"size_gt_tile0", func(h *AnecHeader, p *[]byte) {
+			*p = make([]byte, PageSize16K+16)
+			h.Size = uint64(len(*p))
+		}},
+		{"krn_size_overflow", func(h *AnecHeader, _ *[]byte) { h.KrnSize = 0x200 }},
+		{"dst_count_zero", func(h *AnecHeader, _ *[]byte) { h.DstCount = 0 }},
+		{"slots_overflow_32", func(h *AnecHeader, _ *[]byte) { h.DstCount = 20; h.SrcCount = 10 }},
+		{"dst_slot_zero_tile", func(h *AnecHeader, _ *[]byte) { h.Tiles[4] = 0 }},
+		{"src_slot_zero_tile", func(h *AnecHeader, _ *[]byte) { h.Tiles[5] = 0 }},
+	}
+
+	for _, tc := range badCases {
+		t.Run(tc.name, func(t *testing.T) {
+			h, p := validSyntheticAnecHeader()
+			tc.mutate(&h, &p)
+			raw := makeSyntheticAnec(h, p)
+			if _, err := ParseAnec(raw); err == nil {
+				t.Fatalf("ParseAnec unexpectedly accepted %s", tc.name)
+			}
+		})
+	}
+}
+
+func TestExecuteAnecLifecycleAndCleanup(t *testing.T) {
+	hdr, payload := validSyntheticAnecHeader()
+	prog, err := ParseAnec(makeSyntheticAnec(hdr, payload))
+	if err != nil {
+		t.Fatalf("ParseAnec: %v", err)
+	}
+
+	tr := NewMockTransport(map[string]MockDeviceSpec{
+		"/dev/accel/accel0": {ABIVersion: ABIV1, ChipFamily: ChipH13},
+	}, func(inputs [][]byte, _ int) []byte {
+		out := make([]byte, len(inputs[0]))
+		for i, b := range inputs[0] {
+			out[i] = b ^ 0x5a
+		}
+		return out
+	})
+
+	fd, caps, err := DiscoverDeviceABI(tr, "", ABIV1, ChipH13)
+	if err != nil {
+		t.Fatalf("DiscoverDeviceABI: %v", err)
+	}
+	defer tr.Close(fd)
+
+	in1 := make([]byte, PageSize16K)
+	in2 := make([]byte, PageSize16K)
+	for i := range in1 {
+		in1[i] = byte(i & 0xff)
+		in2[i] = byte((i + 17) & 0xff)
+	}
+
+	// Reject --in-place on ABI v1
+	if _, _, err := ExecuteAnec(tr, fd, caps, prog, [][]byte{in1}, ExecOptions{Runs: 1, InPlace: true}); err == nil {
+		t.Fatalf("expected --in-place rejection for ABI v1")
+	}
+
+	// Full run with warmup=2, runs=4, AltInputs
+	outBytes, rep, err := ExecuteAnec(tr, fd, caps, prog, [][]byte{in1}, ExecOptions{
+		Warmup:    2,
+		Runs:      4,
+		AltInputs: [][]byte{in2},
+	})
+	if err != nil {
+		t.Fatalf("ExecuteAnec failed: %v", err)
+	}
+	if rep.Mode != "abi-v1" || rep.ABIVersion != ABIV1 || rep.ChipFamily != ChipH13 {
+		t.Fatalf("unexpected report header: %+v", rep)
+	}
+	if rep.Warmup != 2 || rep.Runs != 4 || len(rep.LatenciesMS) != 4 || !rep.Repeatable {
+		t.Fatalf("unexpected report timings/repeatability: %+v", rep)
+	}
+	if rep.AltOutputSHA256 == "" || rep.AltOutputSHA256 == rep.OutputSHA256 {
+		t.Fatalf("expected distinct AltOutputSHA256, got main=%s alt=%s", rep.OutputSHA256, rep.AltOutputSHA256)
+	}
+	if tr.SubmitCalls != 6 {
+		t.Fatalf("expected 6 SUBMIT calls (2 warmup + 4 timed), got %d", tr.SubmitCalls)
+	}
+	if len(tr.ObservedOutputPoisonOK) != 6 {
+		t.Fatalf("expected 6 poison checks, got %d", len(tr.ObservedOutputPoisonOK))
+	}
+	for i, ok := range tr.ObservedOutputPoisonOK {
+		if !ok {
+			t.Fatalf("output BO was not poisoned with 0xff on run %d", i+1)
+		}
+	}
+	// Verify FifoNID was patched into btsp TD0 word 0
+	if gotNID := uint8((binary.LittleEndian.Uint32(tr.LastBtspData[0:4]) >> 16) & 0xff); gotNID != FifoNID {
+		t.Fatalf("btsp TD0 nid = 0x%02x, want 0x%02x", gotNID, FifoNID)
+	}
+	// Verify output bytes match ComputeFn(in1)
+	for i := range outBytes {
+		if outBytes[i] != in1[i]^0x5a {
+			t.Fatalf("output byte[%d] = 0x%02x, want 0x%02x", i, outBytes[i], in1[i]^0x5a)
+		}
+	}
+	// Verify zero leaked BO handles
+	if tr.ActiveBOCount() != 0 || tr.TotalAllocatedBOs != tr.TotalFreedBOs || tr.TotalAllocatedBOs != 5 {
+		t.Fatalf("BO leak check failed: active=%d alloc=%d freed=%d", tr.ActiveBOCount(), tr.TotalAllocatedBOs, tr.TotalFreedBOs)
+	}
+
+	// Non-determinism detection
+	tr.ComputeFn = func(inputs [][]byte, call int) []byte {
+		out := make([]byte, len(inputs[0]))
+		copy(out, inputs[0])
+		if call%2 == 0 {
+			out[0] ^= 0xff
+		}
+		return out
+	}
+	if _, _, err := ExecuteAnec(tr, fd, caps, prog, [][]byte{in1}, ExecOptions{Runs: 2}); err == nil {
+		t.Fatalf("expected non-determinism error")
+	}
+	if tr.ActiveBOCount() != 0 || tr.TotalAllocatedBOs != tr.TotalFreedBOs {
+		t.Fatalf("BO leak after non-determinism error: active=%d alloc=%d freed=%d", tr.ActiveBOCount(), tr.TotalAllocatedBOs, tr.TotalFreedBOs)
+	}
+
+	// Mid-setup BoInit failure must free all previously allocated BOs (zero leaks!)
+	trFail := NewMockTransport(map[string]MockDeviceSpec{
+		"/dev/accel/accel0": {ABIVersion: ABIV1, ChipFamily: ChipH13},
+	}, nil)
+	trFail.BoInitFailAt = 3
+	fdFail, capsFail, err := DiscoverDeviceABI(trFail, "", ABIV1, ChipH13)
+	if err != nil {
+		t.Fatalf("DiscoverDeviceABI: %v", err)
+	}
+	defer trFail.Close(fdFail)
+	if _, _, err := ExecuteAnec(trFail, fdFail, capsFail, prog, [][]byte{in1}, ExecOptions{Runs: 1}); err == nil {
+		t.Fatalf("expected mid-setup BoInit ENOMEM failure")
+	}
+	if trFail.ActiveBOCount() != 0 || trFail.TotalAllocatedBOs != 2 || trFail.TotalFreedBOs != 2 {
+		t.Fatalf("BO leak after mid-setup BoInit failure: active=%d alloc=%d freed=%d",
+			trFail.ActiveBOCount(), trFail.TotalAllocatedBOs, trFail.TotalFreedBOs)
+	}
+
+	// SUBMIT failure must also free all BOs cleanly
+	trSubErr := NewMockTransport(map[string]MockDeviceSpec{
+		"/dev/accel/accel0": {ABIVersion: ABIV1, ChipFamily: ChipH13},
+	}, nil)
+	trSubErr.SubmitErr = syscall.ETIMEDOUT
+	fdSub, capsSub, err := DiscoverDeviceABI(trSubErr, "", ABIV1, ChipH13)
+	if err != nil {
+		t.Fatalf("DiscoverDeviceABI: %v", err)
+	}
+	defer trSubErr.Close(fdSub)
+	if _, _, err := ExecuteAnec(trSubErr, fdSub, capsSub, prog, [][]byte{in1}, ExecOptions{Runs: 1}); err == nil {
+		t.Fatalf("expected SUBMIT ETIMEDOUT failure")
+	}
+	if trSubErr.ActiveBOCount() != 0 || trSubErr.TotalAllocatedBOs != trSubErr.TotalFreedBOs {
+		t.Fatalf("BO leak after SUBMIT error: active=%d alloc=%d freed=%d",
+			trSubErr.ActiveBOCount(), trSubErr.TotalAllocatedBOs, trSubErr.TotalFreedBOs)
 	}
 }

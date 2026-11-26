@@ -138,8 +138,8 @@ var SectionFilenames = map[uint32]string{
 	SectionTextProperties: "text-properties.bin",
 }
 
-// ErrNoMatchingDevice indicates no matching ABI v3 accel/ane device is present (exit code 4).
-var ErrNoMatchingDevice = errors.New("no matching accel/ane ABI v3 device found")
+// ErrNoMatchingDevice indicates no matching accel/ane device is present (exit code 4).
+var ErrNoMatchingDevice = errors.New("no matching accel/ane device found")
 
 // ---------------------------------------------------------------------------
 // Pure-Go host-built LOAD section builder from HWX bytes
@@ -483,10 +483,28 @@ func LoadSectionsFromDir(dir string) (map[uint32][]byte, error) {
 
 // DeviceCaps describes capabilities returned by DRM_IOCTL_ANE_GET_CAPS.
 type DeviceCaps struct {
-	Path       string `json:"path"`
-	Size       uint32 `json:"size"`
-	ABIVersion uint32 `json:"abi_version"`
-	ChipFamily uint32 `json:"chip_family"`
+	Path        string `json:"path"`
+	Size        uint32 `json:"size"`
+	ABIVersion  uint32 `json:"abi_version"`
+	ChipFamily  uint32 `json:"chip_family"`
+	SectionSize uint32 `json:"section_size"`
+	BindSize    uint32 `json:"bind_size"`
+	ExecIOSize  uint32 `json:"exec_io_size"`
+}
+
+// IsKnownANE reports whether caps identifies a recognized Linux accel/ane ABI and chip family.
+func IsKnownANE(caps DeviceCaps) bool {
+	switch caps.ABIVersion {
+	case ABIV1, ABIV2, ABIV3:
+	default:
+		return false
+	}
+	switch caps.ChipFamily {
+	case ChipH13, ChipH14, ChipH16, ChipH17:
+		return true
+	default:
+		return false
+	}
 }
 
 // LoadedProgram describes surface metadata returned by DRM_IOCTL_ANE_H16_LOAD.
@@ -502,6 +520,9 @@ type Transport interface {
 	Open(path string) (int, error)
 	Close(fd int) error
 	GetCaps(fd int) (GetCapsArgs, error)
+	BoInit(fd int, size uint64) (BoInitArgs, error)
+	BoFree(fd int, handle uint32) error
+	Submit(fd int, args SubmitArgs) error
 	H16Load(fd int, hwx []byte, sections [4]struct {
 		Kind uint32
 		Data []byte
@@ -625,15 +646,19 @@ func QueryCaps(tr Transport, fd int, path string) (DeviceCaps, error) {
 		return DeviceCaps{}, err
 	}
 	return DeviceCaps{
-		Path:       path,
-		Size:       args.Size,
-		ABIVersion: args.ABIVersion,
-		ChipFamily: args.ChipFamily,
+		Path:        path,
+		Size:        args.Size,
+		ABIVersion:  args.ABIVersion,
+		ChipFamily:  args.ChipFamily,
+		SectionSize: args.SectionSize,
+		BindSize:    args.BindSize,
+		ExecIOSize:  args.ExecIOSize,
 	}, nil
 }
 
-// ProbeDevices enumerates accel nodes and returns all matching ABI v3 ANE devices.
-func ProbeDevices(tr Transport, devicePath string) ([]DeviceCaps, error) {
+// ProbeDevicesFilter enumerates accel nodes and returns all known ANE devices across
+// ABI v1, v2, and v3 (or only those matching abiFilter when abiFilter != 0).
+func ProbeDevicesFilter(tr Transport, devicePath string, abiFilter uint32) ([]DeviceCaps, error) {
 	var candidates []string
 	if devicePath != "" {
 		candidates = []string{devicePath}
@@ -662,16 +687,25 @@ func ProbeDevices(tr Transport, devicePath string) ([]DeviceCaps, error) {
 		if err != nil {
 			continue
 		}
-		if caps.ABIVersion == ABIV3 && (caps.ChipFamily == ChipH16 || caps.ChipFamily == ChipH17) {
-			found = append(found, caps)
+		if !IsKnownANE(caps) {
+			continue
 		}
+		if abiFilter != 0 && caps.ABIVersion != abiFilter {
+			continue
+		}
+		found = append(found, caps)
 	}
 	return found, nil
 }
 
-// DiscoverDevice opens and returns (fd, DeviceCaps) for the first matching ABI v3 accel/ane node.
-// expectedChip == 0 accepts either H16 or H17.
-func DiscoverDevice(tr Transport, devicePath string, expectedChip uint32) (int, DeviceCaps, error) {
+// ProbeDevices enumerates accel nodes and returns all known ANE devices across ABI v1, v2, and v3.
+func ProbeDevices(tr Transport, devicePath string) ([]DeviceCaps, error) {
+	return ProbeDevicesFilter(tr, devicePath, 0)
+}
+
+// DiscoverDeviceABI opens and returns (fd, DeviceCaps) for the first matching accel/ane node.
+// expectedABI == 0 accepts any known ABI; expectedChip == 0 accepts any known chip family.
+func DiscoverDeviceABI(tr Transport, devicePath string, expectedABI uint32, expectedChip uint32) (int, DeviceCaps, error) {
 	var candidates []string
 	if devicePath != "" {
 		candidates = []string{devicePath}
@@ -703,7 +737,11 @@ func DiscoverDevice(tr Transport, devicePath string, expectedChip uint32) (int, 
 			_ = tr.Close(fd)
 			continue
 		}
-		if caps.ABIVersion != ABIV3 {
+		if !IsKnownANE(caps) {
+			_ = tr.Close(fd)
+			continue
+		}
+		if expectedABI != 0 && caps.ABIVersion != expectedABI {
 			_ = tr.Close(fd)
 			continue
 		}
@@ -711,13 +749,15 @@ func DiscoverDevice(tr Transport, devicePath string, expectedChip uint32) (int, 
 			_ = tr.Close(fd)
 			continue
 		}
-		if caps.ChipFamily != ChipH16 && caps.ChipFamily != ChipH17 {
-			_ = tr.Close(fd)
-			continue
-		}
 		return fd, caps, nil
 	}
 	return -1, DeviceCaps{}, ErrNoMatchingDevice
+}
+
+// DiscoverDevice opens and returns (fd, DeviceCaps) for the first matching ABI v3 accel/ane node.
+// expectedChip == 0 accepts either H16 or H17.
+func DiscoverDevice(tr Transport, devicePath string, expectedChip uint32) (int, DeviceCaps, error) {
+	return DiscoverDeviceABI(tr, devicePath, ABIV3, expectedChip)
 }
 
 // LoadProgram issues DRM_IOCTL_ANE_H16_LOAD with the HWX and 4 host-built LOAD sections.
