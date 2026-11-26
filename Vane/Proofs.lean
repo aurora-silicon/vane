@@ -9,6 +9,7 @@ import Vane.Lut
 import Vane.Pool
 import Vane.Verify
 import Vane.View
+import Vane.Matmul
 
 namespace Vane.Proofs
 
@@ -23,6 +24,7 @@ open Vane.Lut
 open Vane.Pool
 open Vane.Verify
 open Vane.View
+open Vane.Matmul
 
 -- ============================================================================
 -- 1. Alignment soundness (alignUp_ge, alignUp_dvd)
@@ -2229,5 +2231,251 @@ theorem periodicGroupCovered_sound
       intervalsCover_sound innerIvs 0 outerStride (d % outerStride) hcov (Nat.zero_le _) hrLt
     refine ⟨d / outerStride, hjLt, iv, hivMem, ?_, ?_⟩ <;> omega
   · cases h
+
+-- ============================================================================
+-- 15. Milestone 5D: Dynamic MatMul Bitfields, Multi-Head Stride Identity,
+--     and Kernel Slot Bounds
+-- ============================================================================
+
+theorem taskHeader8ExtLayout_valid : (validateWordLayout taskHeader8ExtLayout).isOk = true := by decide
+theorem neMatmulCommonLayout_valid : (validateWordLayout neMatmulCommonLayout).isOk = true := by decide
+theorem neMatmulCfgLayout_h16_valid : (validateWordLayout (neMatmulCfgLayout .h16)).isOk = true := by decide
+theorem neMatmulCfgLayout_h17_valid : (validateWordLayout (neMatmulCfgLayout .h17)).isOk = true := by decide
+theorem kernelStageDynLayout_valid : (validateWordLayout kernelStageDynLayout).isOk = true := by decide
+theorem chunkSlotDynLayout_valid : (validateWordLayout chunkSlotDynLayout).isOk = true := by decide
+
+theorem taskHeader8Ext_roundTrip (active hasExtHdr isLast ene : UInt32)
+    (ha : active < 2) (hext : hasExtHdr < 2) (hl : isLast < 2) (he : ene < 8) :
+    ∃ w, encodeWord taskHeader8ExtLayout #[
+            ("active", active), ("hasExtHdr", hasExtHdr), ("isLast", isLast), ("ene", ene)
+          ] = .ok w ∧
+         decodeFieldChecked taskHeader8ExtLayout w "active" = .ok active ∧
+         decodeFieldChecked taskHeader8ExtLayout w "hasExtHdr" = .ok hasExtHdr ∧
+         decodeFieldChecked taskHeader8ExtLayout w "isLast" = .ok isLast ∧
+         decodeFieldChecked taskHeader8ExtLayout w "ene" = .ok ene := by
+  have h1 : ¬ active.toNat ≥ 2 := u32_not_ge_of_lt ha
+  have h2 : ¬ hasExtHdr.toNat ≥ 2 := u32_not_ge_of_lt hext
+  have h3 : ¬ isLast.toNat ≥ 2 := u32_not_ge_of_lt hl
+  have h4 : ¬ ene.toNat ≥ 8 := u32_not_ge_of_lt he
+  have henc : encodeWord taskHeader8ExtLayout #[
+      ("active", active), ("hasExtHdr", hasExtHdr), ("isLast", isLast), ("ene", ene)
+    ] = .ok (((((0 : UInt32) ||| (active <<< 0)) ||| (hasExtHdr <<< 1)) ||| (isLast <<< 3)) ||| (ene <<< 16)) := by
+    change (if active.toNat ≥ 2 then _ else if hasExtHdr.toNat ≥ 2 then _ else
+            if isLast.toNat ≥ 2 then _ else if ene.toNat ≥ 8 then _ else _) = _
+    simp only [h1, h2, h3, h4, ↓reduceIte]
+    rfl
+  exact ⟨_, henc,
+    encodeWord_decodeFieldChecked _ _ _ "active" active henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "hasExtHdr" hasExtHdr henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "isLast" isLast henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "ene" ene henc rfl⟩
+
+/-- Any extended 10-word task header (`active = 1`, `hasExtHdr = 1`) satisfies `(w &&& 3) = 3`,
+    so `encodeTaskStream`, `validateTaskStream`, and `decodeTaskStream` always classify it as 10 words. -/
+theorem taskHeader8Ext_is_10word (isLast ene : UInt32)
+    (hl : isLast < 2) (he : ene < 8) :
+    ∃ w, encodeWord taskHeader8ExtLayout #[
+            ("active", 1), ("hasExtHdr", 1), ("isLast", isLast), ("ene", ene)
+          ] = .ok w ∧
+         (w &&& 3) = 3 := by
+  have h3 : ¬ isLast.toNat ≥ 2 := u32_not_ge_of_lt hl
+  have h4 : ¬ ene.toNat ≥ 8 := u32_not_ge_of_lt he
+  have henc : encodeWord taskHeader8ExtLayout #[
+      ("active", 1), ("hasExtHdr", 1), ("isLast", isLast), ("ene", ene)
+    ] = .ok (((((0 : UInt32) ||| ((1 : UInt32) <<< 0)) ||| ((1 : UInt32) <<< 1)) |||
+              (isLast <<< 3)) ||| (ene <<< 16)) := by
+    change (if isLast.toNat ≥ 2 then _ else if ene.toNat ≥ 8 then _ else _) = _
+    simp only [h3, h4, ↓reduceIte]
+    rfl
+  refine ⟨_, henc, ?_⟩
+  apply u32_eq_of_bit_eq
+  intro i hi
+  rw [u32_bit_and _ _ i hi, u32_bit_or _ _ i hi, u32_bit_or _ _ i hi,
+      u32_bit_or _ _ i hi, u32_bit_or _ _ i hi]
+  by_cases hi2 : i < 2
+  · have hcase : i = 0 ∨ i = 1 := by omega
+    rcases hcase with rfl | rfl
+    · simp
+    · simp
+  · have h3_i : (3#32 : BitVec 32)[i] = false := by
+      rw [BitVec.getElem_eq_testBit_toNat]
+      change (3 : Nat).testBit i = false
+      exact Nat.testBit_lt_two_pow (by
+        have hpow : 4 ≤ 2 ^ i := by
+          have : 2 ^ 2 ≤ 2 ^ i := Nat.pow_le_pow_right (by omega) (by omega)
+          simpa using this
+        omega)
+    simp [h3_i]
+
+theorem neMatmulCommon_roundTrip (lo2 shPref shMin shMax f dynKern : UInt32)
+    (hlo : lo2 < 2) (hsp : shPref < 8) (hsm : shMin < 8) (hsx : shMax < 8) (hf : f < 8) (hd : dynKern < 2) :
+    ∃ w, encodeWord neMatmulCommonLayout #[
+            ("lo2", lo2), ("shPref", shPref), ("shMin", shMin),
+            ("shMax", shMax), ("F", f), ("dynKern", dynKern)
+          ] = .ok w ∧
+         decodeFieldChecked neMatmulCommonLayout w "lo2" = .ok lo2 ∧
+         decodeFieldChecked neMatmulCommonLayout w "shPref" = .ok shPref ∧
+         decodeFieldChecked neMatmulCommonLayout w "shMin" = .ok shMin ∧
+         decodeFieldChecked neMatmulCommonLayout w "shMax" = .ok shMax ∧
+         decodeFieldChecked neMatmulCommonLayout w "F" = .ok f ∧
+         decodeFieldChecked neMatmulCommonLayout w "dynKern" = .ok dynKern := by
+  have h1 : ¬ lo2.toNat ≥ 2 := u32_not_ge_of_lt hlo
+  have h2 : ¬ shPref.toNat ≥ 8 := u32_not_ge_of_lt hsp
+  have h3 : ¬ shMin.toNat ≥ 8 := u32_not_ge_of_lt hsm
+  have h4 : ¬ shMax.toNat ≥ 8 := u32_not_ge_of_lt hsx
+  have h5 : ¬ f.toNat ≥ 8 := u32_not_ge_of_lt hf
+  have h6 : ¬ dynKern.toNat ≥ 2 := u32_not_ge_of_lt hd
+  have henc : encodeWord neMatmulCommonLayout #[
+      ("lo2", lo2), ("shPref", shPref), ("shMin", shMin),
+      ("shMax", shMax), ("F", f), ("dynKern", dynKern)
+    ] = .ok (((((((0 : UInt32) ||| (lo2 <<< 2)) ||| (shPref <<< 8)) ||| (shMin <<< 12)) |||
+               (shMax <<< 16)) ||| (f <<< 19)) ||| (dynKern <<< 29)) := by
+    change (if lo2.toNat ≥ 2 then _ else if shPref.toNat ≥ 8 then _ else
+            if shMin.toNat ≥ 8 then _ else if shMax.toNat ≥ 8 then _ else
+            if f.toNat ≥ 8 then _ else if dynKern.toNat ≥ 2 then _ else _) = _
+    simp only [h1, h2, h3, h4, h5, h6, ↓reduceIte]
+    rfl
+  exact ⟨_, henc,
+    encodeWord_decodeFieldChecked _ _ _ "lo2" lo2 henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "shPref" shPref henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "shMin" shMin henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "shMax" shMax henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "F" f henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "dynKern" dynKern henc rfl⟩
+
+theorem neMatmulCfg_roundTrip (target : Target) (dynKern : UInt32) (hd : dynKern < 2) :
+    ∃ w, encodeWord (neMatmulCfgLayout target) #[("dynKern", dynKern)] = .ok w ∧
+         decodeFieldChecked (neMatmulCfgLayout target) w "dynKern" = .ok dynKern := by
+  have h1 : ¬ dynKern.toNat ≥ 2 := u32_not_ge_of_lt hd
+  cases target with
+  | h16 =>
+    have henc : encodeWord (neMatmulCfgLayout .h16) #[("dynKern", dynKern)] =
+        .ok ((neCfgValue .h16) ||| (dynKern <<< 16)) := by
+      change (if dynKern.toNat ≥ 2 then _ else _) = _
+      simp only [h1, ↓reduceIte]
+      rfl
+    exact ⟨_, henc, encodeWord_decodeFieldChecked _ _ _ "dynKern" dynKern henc rfl⟩
+  | h17 =>
+    have henc : encodeWord (neMatmulCfgLayout .h17) #[("dynKern", dynKern)] =
+        .ok ((neCfgValue .h17) ||| (dynKern <<< 16)) := by
+      change (if dynKern.toNat ≥ 2 then _ else _) = _
+      simp only [h1, ↓reduceIte]
+      rfl
+    exact ⟨_, henc, encodeWord_decodeFieldChecked _ _ _ "dynKern" dynKern henc rfl⟩
+
+theorem kernelStageDyn_roundTrip (sparse kernEn isLast kernCfg h17Dyn stage : UInt32)
+    (hsp : sparse < 2) (hke : kernEn < 2) (hil : isLast < 2)
+    (hkc : kernCfg < 2) (hd : h17Dyn < 2) (hst : stage < 256) :
+    ∃ w, encodeWord kernelStageDynLayout #[
+            ("sparse", sparse), ("kernEn", kernEn), ("isLast", isLast),
+            ("kernCfg", kernCfg), ("h17Dyn", h17Dyn), ("stage", stage)
+          ] = .ok w ∧
+         decodeFieldChecked kernelStageDynLayout w "sparse" = .ok sparse ∧
+         decodeFieldChecked kernelStageDynLayout w "kernEn" = .ok kernEn ∧
+         decodeFieldChecked kernelStageDynLayout w "isLast" = .ok isLast ∧
+         decodeFieldChecked kernelStageDynLayout w "kernCfg" = .ok kernCfg ∧
+         decodeFieldChecked kernelStageDynLayout w "h17Dyn" = .ok h17Dyn ∧
+         decodeFieldChecked kernelStageDynLayout w "stage" = .ok stage := by
+  have h1 : ¬ sparse.toNat ≥ 2 := u32_not_ge_of_lt hsp
+  have h2 : ¬ kernEn.toNat ≥ 2 := u32_not_ge_of_lt hke
+  have h3 : ¬ isLast.toNat ≥ 2 := u32_not_ge_of_lt hil
+  have h4 : ¬ kernCfg.toNat ≥ 2 := u32_not_ge_of_lt hkc
+  have h5 : ¬ h17Dyn.toNat ≥ 2 := u32_not_ge_of_lt hd
+  have h6 : ¬ stage.toNat ≥ 256 := u32_not_ge_of_lt hst
+  have henc : encodeWord kernelStageDynLayout #[
+      ("sparse", sparse), ("kernEn", kernEn), ("isLast", isLast),
+      ("kernCfg", kernCfg), ("h17Dyn", h17Dyn), ("stage", stage)
+    ] = .ok (((((((0 : UInt32) ||| (sparse <<< 5)) ||| (kernEn <<< 6)) ||| (isLast <<< 7)) |||
+               (kernCfg <<< 9)) ||| (h17Dyn <<< 10)) ||| (stage <<< 16)) := by
+    change (if sparse.toNat ≥ 2 then _ else if kernEn.toNat ≥ 2 then _ else
+            if isLast.toNat ≥ 2 then _ else if kernCfg.toNat ≥ 2 then _ else
+            if h17Dyn.toNat ≥ 2 then _ else if stage.toNat ≥ 256 then _ else _) = _
+    simp only [h1, h2, h3, h4, h5, h6, ↓reduceIte]
+    rfl
+  exact ⟨_, henc,
+    encodeWord_decodeFieldChecked _ _ _ "sparse" sparse henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "kernEn" kernEn henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "isLast" isLast henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "kernCfg" kernCfg henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "h17Dyn" h17Dyn henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "stage" stage henc rfl⟩
+
+theorem chunkSlotDyn_roundTrip (en on20 prod keepLive task : UInt32)
+    (he : en < 2) (ho : on20 < 2) (hp : prod < 2) (hk : keepLive < 2) (ht : task < 256) :
+    ∃ w, encodeWord chunkSlotDynLayout #[
+            ("enable", en), ("on20", on20), ("produced", prod), ("keepLive", keepLive), ("task", task)
+          ] = .ok w ∧
+         decodeFieldChecked chunkSlotDynLayout w "enable" = .ok en ∧
+         decodeFieldChecked chunkSlotDynLayout w "on20" = .ok on20 ∧
+         decodeFieldChecked chunkSlotDynLayout w "produced" = .ok prod ∧
+         decodeFieldChecked chunkSlotDynLayout w "keepLive" = .ok keepLive ∧
+         decodeFieldChecked chunkSlotDynLayout w "task" = .ok task := by
+  have h1 : ¬ en.toNat ≥ 2 := u32_not_ge_of_lt he
+  have h2 : ¬ on20.toNat ≥ 2 := u32_not_ge_of_lt ho
+  have h3 : ¬ prod.toNat ≥ 2 := u32_not_ge_of_lt hp
+  have h4 : ¬ keepLive.toNat ≥ 2 := u32_not_ge_of_lt hk
+  have h5 : ¬ task.toNat ≥ 256 := u32_not_ge_of_lt ht
+  have henc : encodeWord chunkSlotDynLayout #[
+      ("enable", en), ("on20", on20), ("produced", prod), ("keepLive", keepLive), ("task", task)
+    ] = .ok ((((((0 : UInt32) ||| (en <<< 0)) ||| (on20 <<< 5)) ||| (prod <<< 6)) |||
+              (keepLive <<< 7)) ||| (task <<< 16)) := by
+    change (if en.toNat ≥ 2 then _ else if on20.toNat ≥ 2 then _ else
+            if prod.toNat ≥ 2 then _ else if keepLive.toNat ≥ 2 then _ else
+            if task.toNat ≥ 256 then _ else _) = _
+    simp only [h1, h2, h3, h4, h5, ↓reduceIte]
+    rfl
+  exact ⟨_, henc,
+    encodeWord_decodeFieldChecked _ _ _ "enable" en henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "on20" on20 henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "produced" prod henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "keepLive" keepLive henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "task" task henc rfl⟩
+
+/-- Exact byte-address identity between graph-IR stacked multi-head layout `[1, heads * M, 1, K]`
+    and hardware batched layout `[heads, M, 1, K]`: element `(h, m, k)` lies at the exact same
+    DRAM byte offset in both layouts under 64-byte row alignment. -/
+theorem multiHead_stacked_offset_eq (m k h i j : Nat) :
+    let rowStride := alignUp (2 * k) 64
+    (h * m + i) * rowStride + 2 * j = h * (m * rowStride) + i * rowStride + 2 * j := by
+  intro rowStride
+  rw [Nat.add_mul, Nat.mul_assoc]
+
+/-- Exact total DRAM span identity between `[1, heads * M, 1, K]` and `[heads, M, 1, K]`. -/
+theorem multiHead_stacked_span_eq (heads m k : Nat) :
+    Shape4D.span { n := 1, c := heads * m, h := 1, w := k } =
+    Shape4D.span { n := heads, c := m, h := 1, w := k } := by
+  simp [Shape4D.span, Shape4D.batchStride, Shape4D.planeStride, Shape4D.rowStride, Nat.mul_assoc]
+
+/-- Every active dynamic-kernel chunk slot `s < min 16 m` fits inside one per-batch kernel slice
+    `[0, m * chunkSize)`. -/
+theorem dynKernelSlot_end_le_round (s m chunkSize : Nat) (hs : s < min 16 m) :
+    s * chunkSize + chunkSize ≤ m * chunkSize := by
+  have hsm : s + 1 ≤ m := by omega
+  have hmul : (s + 1) * chunkSize ≤ m * chunkSize := Nat.mul_le_mul_right chunkSize hsm
+  simpa [Nat.add_mul, Nat.one_mul] using hmul
+
+/-- Every dynamic-kernel chunk slot offset `s * matmulChunkSize k` is 64-byte aligned. -/
+theorem dynKernelSlot_aligned (s k : Nat) :
+    (s * matmulChunkSize k) % 64 = 0 := by
+  have hcs : matmulChunkSize k % 64 = 0 := alignUp_dvd (2 * k) 64 (by omega)
+  rw [Nat.mul_mod, hcs, Nat.mul_zero, Nat.zero_mod]
+
+/-- The dynamic kernel round stride `(if m > 1 then m else b) * chunkSize` never exceeds
+    the total runtime kernel span `b * m * chunkSize`. -/
+theorem dynKernelRound_le_total (b m chunkSize : Nat) (hb : 1 ≤ b) (hm : 1 ≤ m) :
+    (if m > 1 then m else b) * chunkSize ≤ b * m * chunkSize := by
+  apply Nat.mul_le_mul_right
+  split
+  · have h1 : 1 * m ≤ b * m := Nat.mul_le_mul_right m hb
+    simpa using h1
+  · have h1 : b * 1 ≤ b * m := Nat.mul_le_mul_left b hm
+    simpa using h1
+
+/-- Every batch slice `h < b` of size `m * chunkSize` fits inside the total kernel span `b * m * chunkSize`. -/
+theorem dynKernelBatch_end_le_total (h b m chunkSize : Nat) (hh : h < b) :
+    h * (m * chunkSize) + m * chunkSize ≤ b * (m * chunkSize) := by
+  have hhb : h + 1 ≤ b := by omega
+  have hmul : (h + 1) * (m * chunkSize) ≤ b * (m * chunkSize) := Nat.mul_le_mul_right _ hhb
+  simpa [Nat.add_mul, Nat.one_mul] using hmul
 
 end Vane.Proofs
