@@ -16,6 +16,7 @@ open Vane.Conv
 open Vane.Conv1x1
 open Vane.Conv3x3
 open Vane.View
+open Vane.Matmul
 open Vane.Graph
 
 private def usage : String :=
@@ -45,6 +46,7 @@ private def usage : String :=
   "  vane compile-reduce --target <h16|h17> --op <sum|mean|max|min|l1|sum_square|l2|inv_sum|rsqrt_sum_square|rsqrt_mean_square>\n" ++
   "                      --h <H> --w <W> --c <C> --axes <w|h|c|hw|cw|ch|chw> [--eps F] --out-dir <dir>\n" ++
   "  vane compile-view --target <h16|h17> --op <transpose|slice|concat|split|reshape> [op flags] --out-dir <dir>\n" ++
+  "  vane compile-matmul --target <h16|h17> [--b <B>] --m <M> --k <K> --n <N> [--transpose-a] [--transpose-b] [--scale <F>] --out-dir <dir>\n" ++
   "  vane compile-graph --spec <graph.json> [--strip-height <off|auto|N>] --out-dir <dir>\n"
 
 private def requireArgValue (flag : String) (rest : List String) : Except String (String × List String) :=
@@ -548,7 +550,7 @@ private def cmdValidate (args : List String) : IO UInt32 := do
   IO.println s!"surfaces ({info.surfaces.size}): {String.intercalate ", " surfDesc}"
   IO.println s!"tasks: {info.taskStream.taskCount} (records={info.records}, text={info.textSection.size}B, relocs={info.relocCount})"
   if summary.total > 0 then
-    IO.println s!"verified_tasks: {summary.total} (conv={summary.neConv}, ne_act={summary.neAct}, pe={summary.peOp}, pe_pool={summary.pePool}, pe_reduce={summary.peReduce}, ne_pool={summary.nePool}, ne_chan_reduce={summary.neChannelReduce}, ne_view={summary.neView})"
+    IO.println s!"verified_tasks: {summary.total} (conv={summary.neConv}, ne_act={summary.neAct}, pe={summary.peOp}, pe_pool={summary.pePool}, pe_reduce={summary.peReduce}, ne_pool={summary.nePool}, ne_chan_reduce={summary.neChannelReduce}, ne_view={summary.neView}, ne_matmul={summary.neMatmul})"
     if summary.neConv > 0 then
       IO.println s!"verified_conv_tasks: {summary.neConv}"
   IO.println s!"bar_refs: {formatBarSlots info.taskStream.barSlots}"
@@ -2122,6 +2124,148 @@ private def cmdCompileView (args : List String) : IO UInt32 := do
   )
   return 0
 
+private def renderMatmulManifestJson (compiled : CompiledMatmul) : String :=
+  let info := compiled.info
+  let secs := compiled.sections
+  let sp := compiled.spec
+  "{\n" ++
+  "  \"op\": \"matmul\",\n" ++
+  s!"  \"target\": \"{compiled.target.name}\",\n" ++
+  "  \"hwx\": \"program.hwx\",\n" ++
+  "  \"sections\": {\n" ++
+  "    \"generic\": {\"file\": \"generic.bin\", \"size\": " ++ toString secs.generic.size ++ "},\n" ++
+  "    \"operation\": {\"file\": \"operation.bin\", \"size\": " ++ toString secs.operation.size ++ "},\n" ++
+  "    \"procedure\": {\"file\": \"procedure.bin\", \"size\": " ++ toString secs.procedure.size ++ "},\n" ++
+  "    \"text_properties\": {\"file\": \"text-properties.bin\", \"size\": " ++ toString secs.textProperties.size ++ "}\n" ++
+  "  },\n" ++
+  "  \"matmul\": {\n" ++
+  s!"    \"b\": {sp.b}, \"m\": {sp.m}, \"k\": {sp.k}, \"n\": {sp.n},\n" ++
+  s!"    \"transpose_a\": {if sp.transposeA then "true" else "false"},\n" ++
+  s!"    \"transpose_b\": {if sp.transposeB then "true" else "false"},\n" ++
+  s!"    \"scale_f16\": {sp.scaleBits.toNat}\n" ++
+  "  },\n" ++
+  s!"  \"direct\": {if compiled.direct then "true" else "false"},\n" ++
+  s!"  \"l2_peak_bytes\": {compiled.l2PeakBytes},\n" ++
+  s!"  \"scratch_bytes\": {compiled.scratchBytes},\n" ++
+  s!"  \"task_count\": {compiled.taskCount},\n" ++
+  s!"  \"record_count\": {info.records},\n" ++
+  s!"  \"relocation_count\": {info.relocCount},\n" ++
+  s!"  \"has_kernel\": {if info.kernelSection.isSome then "true" else "false"},\n" ++
+  s!"  \"has_scratch\": {if info.scratchSection.isSome then "true" else "false"},\n" ++
+  "  \"surfaces\": [\n" ++
+  renderSurfacesJson info.surfaces ++ "\n" ++
+  "  ]\n" ++
+  "}\n"
+
+private def cmdCompileMatmul (args : List String) : IO UInt32 := do
+  let mut targetStr : Option String := none
+  let mut bStr : Option String := none
+  let mut mStr : Option String := none
+  let mut kStr : Option String := none
+  let mut nStr : Option String := none
+  let mut transposeA := false
+  let mut transposeB := false
+  let mut scaleStr : Option String := none
+  let mut outDir : Option String := none
+  let mut rest := args
+
+  while !rest.isEmpty do
+    match rest with
+    | "--target" :: tl =>
+      match requireArgValue "--target" tl with
+      | .ok (v, tl') => targetStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--b" :: tl =>
+      match requireArgValue "--b" tl with
+      | .ok (v, tl') => bStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--m" :: tl =>
+      match requireArgValue "--m" tl with
+      | .ok (v, tl') => mStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--k" :: tl =>
+      match requireArgValue "--k" tl with
+      | .ok (v, tl') => kStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--n" :: tl =>
+      match requireArgValue "--n" tl with
+      | .ok (v, tl') => nStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--transpose-a" :: tl =>
+      transposeA := true; rest := tl
+    | "--transpose-b" :: tl =>
+      transposeB := true; rest := tl
+    | "--scale" :: tl =>
+      match requireArgValue "--scale" tl with
+      | .ok (v, tl') => scaleStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--out-dir" :: tl | "--out" :: tl =>
+      match requireArgValue "--out-dir" tl with
+      | .ok (v, tl') => outDir := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | flag :: _ =>
+      IO.eprintln s!"error: unknown argument '{flag}' for compile-matmul"
+      IO.eprintln usage
+      return 1
+    | [] => break
+
+  let some tStr := targetStr
+    | do IO.eprintln "error: --target <h16|h17> is required"; return 1
+  let some target := Target.parse? tStr
+    | do IO.eprintln s!"error: unknown target '{tStr}' (expected h16 or h17)"; return 1
+  let some mRaw := mStr
+    | do IO.eprintln "error: --m <M> is required"; return 1
+  let some kRaw := kStr
+    | do IO.eprintln "error: --k <K> is required"; return 1
+  let some nRaw := nStr
+    | do IO.eprintln "error: --n <N> is required"; return 1
+  let some dirStr := outDir
+    | do IO.eprintln "error: --out-dir <dir> is required"; return 1
+
+  let spec ← match (do
+      let b ← match bStr with | some s => parsePosNat "--b" s | none => pure 1
+      let m ← parsePosNat "--m" mRaw
+      let k ← parsePosNat "--k" kRaw
+      let n ← parsePosNat "--n" nRaw
+      let scaleBits ← match scaleStr with
+        | none => pure f16PosOne
+        | some s =>
+          let bits ← parseF16Arg "--scale" s
+          if !f16IsFinite bits then
+            throw s!"--scale '{s}' overflows finite fp16 range"
+          pure bits
+      pure ({
+        b := b, m := m, k := k, n := n,
+        transposeA := transposeA, transposeB := transposeB, scaleBits := scaleBits
+      } : MatmulSpec)) with
+    | .ok s => pure s
+    | .error e => IO.eprintln s!"error: {e}"; return 1
+
+  let compiled ← match compileMatmul target spec with
+    | .ok c => pure c
+    | .error e => IO.eprintln s!"error: compile-matmul failed: {e}"; return 1
+
+  let manifest := renderMatmulManifestJson compiled
+  let dir := System.FilePath.mk dirStr
+  try
+    IO.FS.createDirAll dir
+    IO.FS.writeBinFile (dir / "program.hwx") compiled.hwx
+    IO.FS.writeBinFile (dir / "generic.bin") compiled.sections.generic
+    IO.FS.writeBinFile (dir / "operation.bin") compiled.sections.operation
+    IO.FS.writeBinFile (dir / "procedure.bin") compiled.sections.procedure
+    IO.FS.writeBinFile (dir / "text-properties.bin") compiled.sections.textProperties
+    IO.FS.writeFile (dir / "manifest.json") manifest
+  catch e =>
+    IO.eprintln s!"error: failed to write matmul outputs to '{dirStr}': {e}"
+    return 1
+
+  IO.println (
+    s!"compiled {target.name} matmul (B={spec.b}, M={spec.m}, K={spec.k}, N={spec.n}, " ++
+    s!"trA={spec.transposeA}, trB={spec.transposeB}, tasks={compiled.taskCount}) to {dirStr}: " ++
+    s!"hwx={compiled.hwx.size}B scratch={compiled.scratchBytes}B l2_peak={compiled.l2PeakBytes}B"
+  )
+  return 0
+
 private def jsonObjField? (j : Json) (key : String) : Option Json :=
   match j.getObjVal? key with
   | .ok v => if v.isNull then none else some v
@@ -2706,8 +2850,42 @@ private def cmdCompileGraph (args : List String) : IO UInt32 := do
           | .error e => IO.eprintln s!"error: {e}"; return 1
         pure parsed
 
+      | "matmul" =>
+        let parsed ← match (do
+            if ndInputs.size != 2 then throw s!"{ctx} (matmul): expected 2 inputs [a, b]"
+            let some da := lookupShape ndInputs[0]!
+              | throw s!"{ctx} (matmul): unknown input '{ndInputs[0]!}'"
+            let some db := lookupShape ndInputs[1]!
+              | throw s!"{ctx} (matmul): unknown input '{ndInputs[1]!}'"
+            let heads := (← jsonOptPosNat nj "heads" ctx).getD 1
+            let trA ← jsonOptBool nj "transpose_a" ctx
+            let trB ← jsonOptBool nj "transpose_b" ctx
+            let scaleBits ← match ← jsonOptFloat nj "scale" ctx with
+              | none => pure f16PosOne
+              | some f =>
+                let bits := floatToF16CanonicalZero f
+                if !f16IsFinite bits then
+                  throw s!"{ctx} (matmul): scale value {f} overflows finite fp16 range"
+                pure bits
+            if da.h != 1 || db.h != 1 then
+              throw s!"{ctx} (matmul): requires H=1 for both inputs (got A.h={da.h}, B.h={db.h})"
+            if da.c % heads != 0 || db.c % heads != 0 then
+              throw s!"{ctx} (matmul): input channels ({da.c}, {db.c}) not divisible by heads={heads}"
+            let (m, ka) := if trA then (da.w, da.c / heads) else (da.c / heads, da.w)
+            let (kb, n) := if trB then (db.w, db.c / heads) else (db.c / heads, db.w)
+            if ka != kb then
+              throw s!"{ctx} (matmul): inner dimension mismatch A.K={ka} != B.K={kb}"
+            validateMatmulSpec {
+              b := heads, m := m, k := ka, n := n,
+              transposeA := trA, transposeB := trB, scaleBits := scaleBits
+            }
+            pure (NodeOp.matmul heads trA trB scaleBits, { c := heads * m, h := 1, w := n : TensorDims })) with
+          | .ok v => pure v
+          | .error e => IO.eprintln s!"error: {e}"; return 1
+        pure parsed
+
       | other =>
-        IO.eprintln s!"error: {ctx}: unsupported node op '{other}' (expected conv1x1, linear, conv3x3, pe, lut, max_pool, avg_pool, reduce, transpose, slice, concat, or reshape)"
+        IO.eprintln s!"error: {ctx}: unsupported node op '{other}' (expected conv1x1, linear, conv3x3, pe, lut, max_pool, avg_pool, reduce, transpose, slice, concat, reshape, or matmul)"
         return 1
 
     graphNodes := graphNodes.push {
@@ -2768,6 +2946,7 @@ def main (args : List String) : IO UInt32 := do
   | "compile-pool" :: rest => cmdCompilePool rest
   | "compile-reduce" :: rest => cmdCompileReduce rest
   | "compile-view" :: rest => cmdCompileView rest
+  | "compile-matmul" :: rest => cmdCompileMatmul rest
   | "compile-graph" :: rest => cmdCompileGraph rest
   | "--help" :: _ | "-h" :: _ | [] =>
     IO.println usage

@@ -41,6 +41,7 @@ structure TargetProfile where
   dense3x3Stride1MultiRoundF4Ocg3 : Bool
   supportsWide3x3 : Bool
   replicateKernelChunkSlots : Bool
+  dynKernelStageBit : Bool
   peForbidK5LastStrip24 : Bool
   poolMultiStripMinW : Nat
   deriving Repr, BEq, DecidableEq
@@ -90,6 +91,7 @@ def profile : Target → TargetProfile
       dense3x3Stride1MultiRoundF4Ocg3 := false
       supportsWide3x3 := false
       replicateKernelChunkSlots := true
+      dynKernelStageBit := false
       peForbidK5LastStrip24 := true
       poolMultiStripMinW := 64
     }
@@ -118,6 +120,7 @@ def profile : Target → TargetProfile
       dense3x3Stride1MultiRoundF4Ocg3 := true
       supportsWide3x3 := true
       replicateKernelChunkSlots := false
+      dynKernelStageBit := true
       peForbidK5LastStrip24 := false
       poolMultiStripMinW := 32
     }

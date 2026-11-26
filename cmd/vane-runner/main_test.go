@@ -1904,3 +1904,241 @@ func TestM5cViewLinearAndGraphCLI(t *testing.T) {
 		}
 	}
 }
+
+func TestM5dMatmulAndAttentionCLI(t *testing.T) {
+	vaneBin := findVaneBin(t)
+	tmp := t.TempDir()
+	var stdout, stderr bytes.Buffer
+
+	// 1. Standalone gen-matmul + vane compile-matmul + vane validate --check-tasks + section parity + compare-surface
+	matmulCases := []struct {
+		name      string
+		target    string
+		b         int
+		m         int
+		k         int
+		n         int
+		trA       bool
+		trB       bool
+		scale     string
+		expMatmul int
+	}{
+		{"h17_plain", "h17", 1, 16, 32, 32, false, false, "1.0", 1},
+		{"h16_batched_scale", "h16", 4, 16, 32, 32, false, false, "0.176776695", 1},
+		{"h17_trB_batched", "h17", 4, 16, 32, 32, false, true, "0.176776695", 1},
+		{"h16_trA", "h16", 1, 16, 32, 32, true, false, "0.5", 1},
+		{"h17_trAB_batched", "h17", 2, 16, 32, 32, true, true, "0.25", 1},
+		{"h17_sliced_m32_trB_batched", "h17", 4, 32, 32, 32, false, true, "0.176776695", 2},
+		{"h16_sliced_m20_trAB", "h16", 2, 20, 32, 32, true, true, "0.25", 2},
+	}
+
+	for idx, tc := range matmulCases {
+		t.Run("standalone_"+tc.name, func(t *testing.T) {
+			vecDir := filepath.Join(tmp, "mm_vec_"+tc.name)
+			compDir := filepath.Join(tmp, "mm_comp_"+tc.name)
+
+			genArgs := []string{
+				"gen-matmul",
+				"--b", itoa(tc.b),
+				"--m", itoa(tc.m),
+				"--k", itoa(tc.k),
+				"--n", itoa(tc.n),
+				"--scale", tc.scale,
+				"--seed", itoa(idx + 600),
+				"--out-dir", vecDir,
+				"--json",
+			}
+			compArgs := []string{
+				"compile-matmul",
+				"--target", tc.target,
+				"--b", itoa(tc.b),
+				"--m", itoa(tc.m),
+				"--k", itoa(tc.k),
+				"--n", itoa(tc.n),
+				"--scale", tc.scale,
+				"--out-dir", compDir,
+			}
+			if tc.trA {
+				genArgs = append(genArgs, "--transpose-a")
+				compArgs = append(compArgs, "--transpose-a")
+			}
+			if tc.trB {
+				genArgs = append(genArgs, "--transpose-b")
+				compArgs = append(compArgs, "--transpose-b")
+			}
+
+			var outBuf, errBuf bytes.Buffer
+			if rc := runCLI(genArgs, nil, &outBuf, &errBuf); rc != 0 {
+				t.Fatalf("gen-matmul %s failed rc=%d stderr=%s", tc.name, rc, errBuf.String())
+			}
+
+			runVane(t, vaneBin, compArgs...)
+			valOut := runVane(t, vaneBin, "validate",
+				"--hwx", filepath.Join(compDir, "program.hwx"),
+				"--sections", compDir,
+				"--check-tasks",
+			)
+			wantTag := fmt.Sprintf("ne_matmul=%d", tc.expMatmul)
+			if !strings.Contains(valOut, "status: ok") || !strings.Contains(valOut, wantTag) {
+				t.Fatalf("validate compile-matmul %s unexpected output (want %s):\n%s", tc.name, wantTag, valOut)
+			}
+
+			// Verify Go BuildSectionsFromHWX matches Lean sections byte-for-byte
+			hwxBytes, err := os.ReadFile(filepath.Join(compDir, "program.hwx"))
+			if err != nil {
+				t.Fatalf("read hwx: %v", err)
+			}
+			goSecs, err := ane.BuildSectionsFromHWX(hwxBytes)
+			if err != nil {
+				t.Fatalf("BuildSectionsFromHWX: %v", err)
+			}
+			for kind, fname := range ane.SectionFilenames {
+				leanBytes, err := os.ReadFile(filepath.Join(compDir, fname))
+				if err != nil {
+					t.Fatalf("read %s: %v", fname, err)
+				}
+				if !bytes.Equal(goSecs[kind], leanBytes) {
+					t.Fatalf("matmul section %s mismatch between Go and Lean", fname)
+				}
+			}
+
+			// Verify compare-surface passes for Q15.16 vs F64
+			outBuf.Reset()
+			errBuf.Reset()
+			if rc := runCLI([]string{
+				"compare-surface",
+				"--manifest", filepath.Join(compDir, "manifest.json"),
+				"--actual", filepath.Join(vecDir, "expected_q1516.bin"),
+				"--expected", filepath.Join(vecDir, "expected_f64.bin"),
+				"--atol", "1e-2", "--rtol", "1e-2", "--json",
+			}, nil, &outBuf, &errBuf); rc != 0 {
+				t.Fatalf("compare-surface %s failed rc=%d out=%s err=%s", tc.name, rc, outBuf.String(), errBuf.String())
+			}
+		})
+	}
+
+	// 2. Multi-Head SDPA graph (H=4, L=32, S=32, D=32) via gen-graph + compile-graph + validate
+	sdpaSpec := filepath.Join(tmp, "sdpa.json")
+	sdpaVec := filepath.Join(tmp, "sdpa_vec")
+	sdpaComp := filepath.Join(tmp, "sdpa_comp")
+	sdpaJSON := `{
+		"target": "h17",
+		"placement": "auto",
+		"inputs": [
+			{"name": "q", "c": 128, "h": 1, "w": 32},
+			{"name": "k", "c": 128, "h": 1, "w": 32},
+			{"name": "v", "c": 128, "h": 1, "w": 32}
+		],
+		"nodes": [
+			{"id": "scores", "op": "matmul", "heads": 4, "transpose_b": true, "scale": 0.176776695, "inputs": ["q", "k"]},
+			{"id": "rmax",   "op": "reduce", "reduce_op": "max", "axes": "w", "inputs": ["scores"]},
+			{"id": "shift",  "op": "pe", "pe_op": "sub", "inputs": ["scores", "rmax"]},
+			{"id": "exps",   "op": "lut", "act": "exp", "inputs": ["shift"]},
+			{"id": "invsum", "op": "reduce", "reduce_op": "inv_sum", "axes": "w", "inputs": ["exps"]},
+			{"id": "probs",  "op": "pe", "pe_op": "mul", "inputs": ["exps", "invsum"]},
+			{"id": "out",    "op": "matmul", "heads": 4, "inputs": ["probs", "v"]}
+		]
+	}`
+	if err := os.WriteFile(sdpaSpec, []byte(sdpaJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if rc := runCLI([]string{"gen-graph", "--spec", sdpaSpec, "--out-dir", sdpaVec, "--json"}, nil, &stdout, &stderr); rc != 0 {
+		t.Fatalf("gen-graph sdpa failed rc=%d stderr=%s", rc, stderr.String())
+	}
+	runVane(t, vaneBin, "compile-graph", "--spec", filepath.Join(sdpaVec, "graph_resolved.json"), "--out-dir", sdpaComp)
+	if out := runVane(t, vaneBin, "validate", "--hwx", filepath.Join(sdpaComp, "program.hwx"), "--sections", sdpaComp, "--check-tasks"); !strings.Contains(out, "status: ok") || !strings.Contains(out, "ne_matmul=4") {
+		t.Fatalf("validate sdpa graph failed:\n%s", out)
+	}
+
+	// 3. Full Transformer Block graph (RMSNorm + QKV + Multi-Head SDPA + O + Residual + RMSNorm + Wide FFN GELU + Residual)
+	tbSpec := filepath.Join(tmp, "transformer_block.json")
+	tbVec := filepath.Join(tmp, "tb_vec")
+	tbComp := filepath.Join(tmp, "tb_comp")
+	tbJSON := `{
+		"target": "h16",
+		"placement": "auto",
+		"inputs": [{"name": "x", "c": 64, "h": 1, "w": 32}],
+		"nodes": [
+			{"id": "sq1",    "op": "pe", "pe_op": "square", "inputs": ["x"]},
+			{"id": "ms1",    "op": "reduce", "reduce_op": "mean", "axes": "c", "inputs": ["sq1"]},
+			{"id": "ms1_e",  "op": "pe", "pe_op": "sadd", "scalar": 0.001, "inputs": ["ms1"]},
+			{"id": "rms1",   "op": "lut", "act": "rsqrt", "inputs": ["ms1_e"]},
+			{"id": "norm1",  "op": "pe", "pe_op": "mul", "inputs": ["x", "rms1"]},
+			{"id": "q_proj", "op": "linear", "k": 64, "n": 64, "inputs": ["norm1"]},
+			{"id": "k_proj", "op": "linear", "k": 64, "n": 64, "inputs": ["norm1"]},
+			{"id": "v_proj", "op": "linear", "k": 64, "n": 64, "inputs": ["norm1"]},
+			{"id": "q_h0",   "op": "slice", "begin": [0, 0, 0, 0], "end": [1, 32, 1, 32], "inputs": ["q_proj"]},
+			{"id": "q_h1",   "op": "slice", "begin": [0, 32, 0, 0], "end": [1, 64, 1, 32], "inputs": ["q_proj"]},
+			{"id": "q_h0_t", "op": "transpose", "perm": [0, 3, 2, 1], "inputs": ["q_h0"]},
+			{"id": "q_h1_t", "op": "transpose", "perm": [0, 3, 2, 1], "inputs": ["q_h1"]},
+			{"id": "q_mh",   "op": "concat", "axis": 1, "inputs": ["q_h0_t", "q_h1_t"]},
+			{"id": "k_h0",   "op": "slice", "begin": [0, 0, 0, 0], "end": [1, 32, 1, 32], "inputs": ["k_proj"]},
+			{"id": "k_h1",   "op": "slice", "begin": [0, 32, 0, 0], "end": [1, 64, 1, 32], "inputs": ["k_proj"]},
+			{"id": "k_h0_t", "op": "transpose", "perm": [0, 3, 2, 1], "inputs": ["k_h0"]},
+			{"id": "k_h1_t", "op": "transpose", "perm": [0, 3, 2, 1], "inputs": ["k_h1"]},
+			{"id": "k_mh",   "op": "concat", "axis": 1, "inputs": ["k_h0_t", "k_h1_t"]},
+			{"id": "v_h0",   "op": "slice", "begin": [0, 0, 0, 0], "end": [1, 32, 1, 32], "inputs": ["v_proj"]},
+			{"id": "v_h1",   "op": "slice", "begin": [0, 32, 0, 0], "end": [1, 64, 1, 32], "inputs": ["v_proj"]},
+			{"id": "v_h0_t", "op": "transpose", "perm": [0, 3, 2, 1], "inputs": ["v_h0"]},
+			{"id": "v_h1_t", "op": "transpose", "perm": [0, 3, 2, 1], "inputs": ["v_h1"]},
+			{"id": "v_mh",   "op": "concat", "axis": 1, "inputs": ["v_h0_t", "v_h1_t"]},
+			{"id": "scores", "op": "matmul", "heads": 2, "transpose_b": true, "scale": 0.176776695, "inputs": ["q_mh", "k_mh"]},
+			{"id": "rmax",   "op": "reduce", "reduce_op": "max", "axes": "w", "inputs": ["scores"]},
+			{"id": "shift",  "op": "pe", "pe_op": "sub", "inputs": ["scores", "rmax"]},
+			{"id": "exps",   "op": "lut", "act": "exp", "inputs": ["shift"]},
+			{"id": "invsum", "op": "reduce", "reduce_op": "inv_sum", "axes": "w", "inputs": ["exps"]},
+			{"id": "probs",  "op": "pe", "pe_op": "mul", "inputs": ["exps", "invsum"]},
+			{"id": "attn",   "op": "matmul", "heads": 2, "inputs": ["probs", "v_mh"]},
+			{"id": "a_h0",   "op": "slice", "begin": [0, 0, 0, 0], "end": [1, 32, 1, 32], "inputs": ["attn"]},
+			{"id": "a_h1",   "op": "slice", "begin": [0, 32, 0, 0], "end": [1, 64, 1, 32], "inputs": ["attn"]},
+			{"id": "a_h0_t", "op": "transpose", "perm": [0, 3, 2, 1], "inputs": ["a_h0"]},
+			{"id": "a_h1_t", "op": "transpose", "perm": [0, 3, 2, 1], "inputs": ["a_h1"]},
+			{"id": "a_cat",  "op": "concat", "axis": 1, "inputs": ["a_h0_t", "a_h1_t"]},
+			{"id": "o_proj", "op": "linear", "k": 64, "n": 64, "inputs": ["a_cat"]},
+			{"id": "res1",   "op": "pe", "pe_op": "add", "inputs": ["x", "o_proj"]},
+			{"id": "sq2",    "op": "pe", "pe_op": "square", "inputs": ["res1"]},
+			{"id": "ms2",    "op": "reduce", "reduce_op": "mean", "axes": "c", "inputs": ["sq2"]},
+			{"id": "ms2_e",  "op": "pe", "pe_op": "sadd", "scalar": 0.001, "inputs": ["ms2"]},
+			{"id": "rms2",   "op": "lut", "act": "rsqrt", "inputs": ["ms2_e"]},
+			{"id": "norm2",  "op": "pe", "pe_op": "mul", "inputs": ["res1", "rms2"]},
+			{"id": "ffn1",   "op": "linear", "k": 64, "n": 256, "has_bias": true, "act": "gelu", "inputs": ["norm2"]},
+			{"id": "ffn2",   "op": "linear", "k": 256, "n": 64, "has_bias": true, "inputs": ["ffn1"]},
+			{"id": "out",    "op": "pe", "pe_op": "add", "inputs": ["res1", "ffn2"]}
+		]
+	}`
+	if err := os.WriteFile(tbSpec, []byte(tbJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if rc := runCLI([]string{"gen-graph", "--spec", tbSpec, "--out-dir", tbVec, "--json"}, nil, &stdout, &stderr); rc != 0 {
+		t.Fatalf("gen-graph transformer_block failed rc=%d stderr=%s", rc, stderr.String())
+	}
+	runVane(t, vaneBin, "compile-graph", "--spec", filepath.Join(tbVec, "graph_resolved.json"), "--out-dir", tbComp)
+	if out := runVane(t, vaneBin, "validate", "--hwx", filepath.Join(tbComp, "program.hwx"), "--sections", tbComp, "--check-tasks"); !strings.Contains(out, "status: ok") || !strings.Contains(out, "ne_matmul=4") {
+		t.Fatalf("validate transformer_block graph failed:\n%s", out)
+	}
+
+	// 4. Negative CLI tests for gen-matmul and gen-graph matmul
+	stdout.Reset()
+	stderr.Reset()
+	if rc := runCLI([]string{"gen-matmul", "--m", "16", "--k", "16", "--n", "16", "--scale", "1e9", "--out-dir", filepath.Join(tmp, "bad_scale")}, nil, &stdout, &stderr); rc == 0 {
+		t.Fatal("expected gen-matmul to reject fp16-overflowing scale")
+	}
+
+	badMM := filepath.Join(tmp, "bad_mm.json")
+	if err := os.WriteFile(badMM, []byte(`{
+		"target": "h17",
+		"inputs": [{"name": "a", "c": 8, "h": 1, "w": 16}, {"name": "b", "c": 12, "h": 1, "w": 8}],
+		"nodes": [{"id": "mm", "op": "matmul", "inputs": ["a", "b"]}]
+	}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if rc := runCLI([]string{"gen-graph", "--spec", badMM, "--out-dir", filepath.Join(tmp, "bad_mm_out")}, nil, &stdout, &stderr); rc == 0 || !strings.Contains(stderr.String(), "inner dimension mismatch") {
+		t.Fatalf("expected gen-graph matmul K mismatch error, rc=%d stderr=%s", rc, stderr.String())
+	}
+}
