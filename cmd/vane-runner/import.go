@@ -22,9 +22,14 @@ func cmdImportONNX(args []string, stdout, stderr io.Writer) int {
 	fs.Var(&inputShapeFlags, "input-shape", "Static input shape override NAME=C,H,W (repeatable)")
 	sfPath := fs.String("safetensors", "", "Optional .safetensors archive supplying/overriding initializer weights")
 	noFuse := fs.Bool("no-fuse", false, "Disable Conv+BN folding and Conv+Activation/Silu fusion")
+	allowViewOps := fs.Bool("allow-view-ops", false, "Allow emitting non-no-op view ops (transpose/concat/reshape/slice)")
 	asJSON := fs.Bool("json", false, "Emit JSON summary")
 
 	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	if fs.NArg() > 0 {
+		fmt.Fprintf(stderr, "error: unexpected positional arguments: %s\n", strings.Join(fs.Args(), " "))
 		return 1
 	}
 	if *modelPath == "" {
@@ -63,11 +68,12 @@ func cmdImportONNX(args []string, stdout, stderr io.Writer) int {
 	}
 
 	res, err := frontend.LowerONNX(model, frontend.LowerOptions{
-		Target:      *target,
-		Placement:   *placement,
-		InputShapes: inputShapes,
-		SafeTensors: sf,
-		NoFuse:      *noFuse,
+		Target:       *target,
+		Placement:    *placement,
+		InputShapes:  inputShapes,
+		SafeTensors:  sf,
+		NoFuse:       *noFuse,
+		AllowViewOps: *allowViewOps,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "error: %v\n", err)
@@ -104,10 +110,10 @@ func cmdImportONNX(args []string, stdout, stderr io.Writer) int {
 	for i, inp := range res.Summary.Inputs {
 		inDesc[i] = fmt.Sprintf("%s=[1,%d,%d,%d]", inp.Name, inp.C, inp.H, inp.W)
 	}
-	os := res.Summary.OutputShape
+	outShape := res.Summary.OutputShape
 	fmt.Fprintf(stdout, "imported onnx -> %s (target=%s inputs=%s output=%s[%d,%d,%d,%d] nodes=%d fused_bn=%d fused_act=%d elided=%d weights=%d/%dB)\n",
 		rep.GraphFile, res.Summary.Target, strings.Join(inDesc, ","),
-		res.Summary.Output, os[0], os[1], os[2], os[3],
+		res.Summary.Output, outShape[0], outShape[1], outShape[2], outShape[3],
 		res.Summary.NodeCount, res.Summary.FusedBNCount, res.Summary.FusedActCount,
 		res.Summary.ElidedCount, res.Summary.WeightFiles, res.Summary.WeightBytes)
 	return 0
@@ -122,6 +128,10 @@ func cmdInspectSafeTensors(args []string, stdout, stderr io.Writer) int {
 	asJSON := fs.Bool("json", false, "Emit JSON report")
 
 	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	if fs.NArg() > 0 {
+		fmt.Fprintf(stderr, "error: unexpected positional arguments: %s\n", strings.Join(fs.Args(), " "))
 		return 1
 	}
 	if *filePath == "" {

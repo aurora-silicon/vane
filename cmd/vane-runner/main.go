@@ -74,7 +74,7 @@ func usage(w io.Writer) {
 	fmt.Fprintln(w, "  vane-runner compare-conv --manifest PATH --actual PATH --expected PATH [--atol F] [--rtol F] [--max-ulp N] [--json]")
 	fmt.Fprintln(w, "  vane-runner compare-conv1x1 --manifest PATH --actual PATH --expected PATH [--atol F] [--rtol F] [--max-ulp N] [--json]")
 	fmt.Fprintln(w, "  vane-runner compare-surface --manifest PATH --actual PATH --expected PATH [--atol F] [--rtol F] [--max-ulp N] [--json]")
-	fmt.Fprintln(w, "  vane-runner import-onnx --model PATH --out DIR [--target h16|h17] [--input-shape NAME=C,H,W]... [--safetensors PATH] [--no-fuse] [--json]")
+	fmt.Fprintln(w, "  vane-runner import-onnx --model PATH --out DIR [--target h16|h17] [--placement auto|l2|dram] [--input-shape NAME=C,H,W]... [--safetensors PATH] [--no-fuse] [--allow-view-ops] [--json]")
 	fmt.Fprintln(w, "  vane-runner inspect-safetensors --file PATH [--export-dir DIR] [--strict] [--json]")
 }
 
