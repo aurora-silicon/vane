@@ -353,6 +353,62 @@ private def vVerifySparseChunkBytes
     bi := bi + 1
   pure ()
 
+/-- Independently verify quantized decode/palette table bytes, per-lane scale fp16 validity,
+    64-byte table zero-padding, and trailing chunk zero-padding in `__KERN_0`. -/
+private def vVerifyQuantChunkBytes
+    (kBytes : ByteArray)
+    (chunkStart chunkSize unpaddedBytes : Nat)
+    (wKind : UInt32) (wWidth cin taps : Nat)
+    (perLaneScale biasInKernel hasZeroPoint : Bool)
+    (blocks : Array (Nat × Nat))
+    (label : String) : Except String Unit := do
+  if chunkStart + chunkSize > kBytes.size then
+    throw s!"{label}: quantized chunk range [{chunkStart}, {chunkStart + chunkSize}) exceeds __KERN_0 size {kBytes.size}"
+  if wKind == wKindInt4 || wKind == wKindUint4 then
+    let expectedTbl := if wKind == wKindInt4 then int4DecodeTable else uint4DecodeTable
+    let tblName := if wKind == wKindInt4 then "int4" else "uint4"
+    if chunkSize < 64 then
+      throw s!"{label}: {tblName} chunk size {chunkSize}B < 64B decode table"
+    for i in [:16] do
+      let b ← readU8 kBytes (chunkStart + i)
+      let exp := expectedTbl[i]!
+      if b != exp then
+        throw s!"{label}: corrupted {tblName} decode table byte[{i}]={b.toNat} != expected {exp.toNat}"
+    for i in [16 : 64] do
+      let b ← readU8 kBytes (chunkStart + i)
+      if b != 0 then
+        throw s!"{label}: non-zero {tblName} decode table padding byte[{i}]={b.toNat}"
+  else if wKind == wKindPal then
+    let numEntries := (1 : Nat) <<< wWidth
+    let rawTableBytes := 2 * numEntries
+    let paddedTableBytes := alignUp rawTableBytes vDmaLineBytes
+    if chunkSize < paddedTableBytes then
+      throw s!"{label}: pal{wWidth} chunk size {chunkSize}B < {paddedTableBytes}B palette table"
+    for ei in [:numEntries] do
+      let h ← readU16LE kBytes (chunkStart + 2 * ei)
+      if (h &&& 0x7c00) == 0x7c00 then
+        throw s!"{label}: pal{wWidth} palette entry[{ei}] ({toHex h.toNat}) is non-finite (NaN/Inf)"
+    for pi in [rawTableBytes : paddedTableBytes] do
+      let b ← readU8 kBytes (chunkStart + pi)
+      if b != 0 then
+        throw s!"{label}: non-zero pal{wWidth} table padding byte[{pi}]={b.toNat}"
+  if perLaneScale then
+    let mut pos := chunkStart + quantTableBytes wKind wWidth
+    let mut bi := 0
+    for (_, n) in blocks do
+      for k in [:n] do
+        let h ← readU16LE kBytes (pos + 2 * k)
+        let isFinPos := (h &&& 0x7c00) != 0x7c00 && (h &&& 0x8000) == 0 && h != 0
+        if !isFinPos then
+          throw s!"{label}: block {bi} per-lane scale[{k}] ({toHex h.toNat}) must be a finite positive fp16 value"
+      pos := pos + quantBlockBytes wWidth cin taps perLaneScale biasInKernel hasZeroPoint n
+      bi := bi + 1
+  for pi in [unpaddedBytes : chunkSize] do
+    let b ← readU8 kBytes (chunkStart + pi)
+    if b != 0 then
+      throw s!"{label}: non-zero quantized chunk tail padding byte[{pi}]={b.toNat}"
+  pure ()
+
 -- ============================================================================
 -- Public task classification, BAR resolution, and multi-task footprint types
 -- ============================================================================
@@ -1227,7 +1283,40 @@ def verifyConvTaskMulti
       | _ =>
         throw s!"{prefixMsg}: resBase BAR slot {outBarSlot} does not reference an output surface or scratch"
 
-  -- 6. Kernel-specific geometry, dwGroups, ocg/coverage safety, and wide3x3 precondition
+  -- 5b. Decode `0x4900` (`neCfg`) early so weight format rules govern geometry, bit 27, and chunk checks
+  let wNeCfg ← requireDecodedWrite task.writes regNeCfg "neCfg"
+  let wKind ← decodeFieldChecked neCfgQuantLayout wNeCfg.value "wKind"
+  let wWidth ← decodeFieldChecked neCfgQuantLayout wNeCfg.value "wWidth"
+  let neCfgSparse ← decodeFieldChecked neCfgQuantLayout wNeCfg.value "sparse"
+  let neCfgDynKern ← decodeFieldChecked neCfgQuantLayout wNeCfg.value "dynKern"
+  let hasZPBit ← decodeFieldChecked neCfgQuantLayout wNeCfg.value "hasZP"
+  let h17FlagBit ← decodeFieldChecked neCfgQuantLayout wNeCfg.value "h17Flag"
+  if !isLegalNeWeightFormat wKind wWidth.toNat then
+    throw s!"{prefixMsg}: illegal weight format in neCfg (wKind={wKind}, wWidth={wWidth})"
+  if neCfgDynKern != 0 then
+    throw s!"{prefixMsg}: neCfg dynKern={neCfgDynKern} must be 0 for static conv task"
+  let isFp16 := wKind == wKindFp16
+  let isPal := wKind == wKindPal
+  let isInt := isIntegerWeightKind wKind
+  let hasZeroPoint := hasZPBit == 1
+  if !isFp16 && neCfgSparse != 0 then
+    throw s!"{prefixMsg}: neCfg sparse=1 is forbidden for quantized weights (wKind={wKind})"
+  if (isFp16 || isPal) && hasZeroPoint then
+    throw s!"{prefixMsg}: neCfg hasZeroPoint=1 is forbidden for fp16 and palette weights (wKind={wKind})"
+  match target with
+  | .h16 =>
+    if h17FlagBit != 0 then
+      throw s!"{prefixMsg}: H16 neCfg bit 28 (h17Flag) must be 0, got {h17FlagBit}"
+  | .h17 =>
+    if isFp16 then
+      if h17FlagBit != 1 then
+        throw s!"{prefixMsg}: H17 fp16 neCfg bit 28 (h17Flag) must be 1, got {h17FlagBit}"
+    else
+      let expH17 : UInt32 := if neCfgSparse == 0 && !hasZeroPoint then 1 else 0
+      if h17FlagBit != expH17 then
+        throw s!"{prefixMsg}: H17 quantized neCfg bit 28 (h17Flag={h17FlagBit}) != expected {expH17} (must be 0 when hasZeroPoint=1)"
+
+  -- 6. Kernel-specific geometry, dwGroups, ocg/coverage safety, and wide3x3 / bit 27 precondition
   let (kernelSize, stride, isDepthwise) ←
     if kw == 1 && kh == 1 then
       if sx != 1 || sy != 1 || pl != 0 || pt != 0 || hx != 1 || vy != 1 then
@@ -1283,6 +1372,13 @@ def verifyConvTaskMulti
   let effOcg := if isDepthwise then 0 else ocg
   let isSparse := kernelSize == 3 && stride == 2
 
+  if !isFp16 then
+    if isDepthwise then
+      throw s!"{prefixMsg}: quantized weights (wKind={wKind}) are only supported for dense convolutions"
+    if isSparse then
+      throw s!"{prefixMsg}: quantized weights (wKind={wKind}) are not supported for stride-2 sparse convolutions"
+    if (hasZeroPoint || isUnsignedWeightKind wKind) && wide3x3Bit != 0 then
+      throw s!"{prefixMsg}: neCommon bit 27 must be 0 when hasZeroPoint={hasZeroPoint} or unsigned weight kind (wKind={wKind})"
   if kernelSize == 3 && wide3x3Bit == 1 then
     if !target.profile.supportsWide3x3 then
       throw s!"{prefixMsg}: neCommon wide3x3=1 is illegal on {target.name}"
@@ -1374,36 +1470,98 @@ def verifyConvTaskMulti
 
   vCheckTaskL2Accesses l2Accs prefixMsg
 
-  -- 8. Verify NE block, neScale, sparse consistency across 0x4900 and 0x5500, and scalarBias rules
+  -- 8. Verify NE block, neOp, neScale, sparse consistency across 0x4900 and 0x5500, and scalarBias/biasShift rules
   let expectedSparse : UInt32 := if isSparse then 1 else 0
-  let wNeCfg ← requireDecodedWrite task.writes regNeCfg "neCfg"
-  let neCfgSparse ← decodeFieldChecked (neCfgLayout target) wNeCfg.value "sparse"
   if neCfgSparse != expectedSparse then
     throw s!"{prefixMsg}: sparse flag {neCfgSparse} disagrees with stride {stride} (expected {expectedSparse})"
   vVerifyKernelStageMulti task.writes taskId isLast true isSparse prefixMsg
 
   let wNeOp ← requireDecodedWrite task.writes regNeOp "neOp"
-  let biasInKernelBit ← decodeFieldChecked neOpLayout wNeOp.value "biasInKernel"
-  let reluBit ← decodeFieldChecked neOpLayout wNeOp.value "relu"
-  let lutBit ← decodeFieldChecked neOpLayout wNeOp.value "lut"
+  let biasInKernelBit ← decodeFieldChecked neOpQuantLayout wNeOp.value "biasInKernel"
+  let unscaledBits ← decodeFieldChecked neOpQuantLayout wNeOp.value "unscaled"
+  let perLaneScaleBit ← decodeFieldChecked neOpQuantLayout wNeOp.value "perLaneScale"
+  let reluBit ← decodeFieldChecked neOpQuantLayout wNeOp.value "relu"
+  let lutBit ← decodeFieldChecked neOpQuantLayout wNeOp.value "lut"
+  let base20Bit ← decodeFieldChecked neOpQuantLayout wNeOp.value "base20"
+  if base20Bit != 1 then
+    throw s!"{prefixMsg}: neOp base20 (bit 20) must be 1 ({toHex wNeOp.value.toNat})"
   if reluBit == 1 && lutBit == 1 then
     throw s!"{prefixMsg}: neOp cannot enable both relu (bit 16) and lut (bit 17)"
   let biasInKernel := biasInKernelBit == 1
+  let perLaneScale := perLaneScaleBit == 1
   let hasLut := lutBit == 1
-  let scalarBiasMode := !isDepthwise && cout == 1
-  if scalarBiasMode then
-    let wScalarBias ← requireDecodedWrite task.writes regScalarBias "scalarBias"
-    validateWordBits scalarBiasLayout wScalarBias.value
-    if biasInKernel then
-      throw s!"{prefixMsg}: dense Cout=1 uses scalarBias (0x490c) and must have biasInKernel=0"
+  if !isFp16 && hasLut then
+    throw s!"{prefixMsg}: fused LUT activation (0x4904 bit 17) is not supported for quantized weights"
+  if isFp16 || isPal then
+    if perLaneScale then
+      throw s!"{prefixMsg}: neOp perLaneScale (bit 14) must be 0 for fp16 and palette weights"
+    if unscaledBits != neOpUnscaledBits then
+      throw s!"{prefixMsg}: neOp unscaledBits ({toHex unscaledBits.toNat}) must be 0xf (0x3c00) for fp16 and palette weights"
   else
-    if (findDecodedWrite task.writes regScalarBias).isSome then
-      throw s!"{prefixMsg}: scalarBias (0x490c) must only be written when effMode == dense && Cout == 1"
+    if unscaledBits != 0 then
+      throw s!"{prefixMsg}: neOp unscaledBits ({toHex unscaledBits.toNat}) must be 0 for scaled integer weights (wKind={wKind})"
+
+  let scalarBiasMode := isFp16 && !isDepthwise && cout == 1
+  if isFp16 then
+    if scalarBiasMode then
+      let wScalarBias ← requireDecodedWrite task.writes regScalarBias "scalarBias"
+      validateWordBits scalarBiasLayout wScalarBias.value
+      if biasInKernel then
+        throw s!"{prefixMsg}: dense Cout=1 uses scalarBias (0x490c) and must have biasInKernel=0"
+    else
+      if (findDecodedWrite task.writes regScalarBias).isSome then
+        throw s!"{prefixMsg}: scalarBias (0x490c) must only be written when effMode == dense && Cout == 1"
+  else if isPal then
+    -- Palette format: require explicit 0x490c (with biasShift=0) to prevent carry-over across tasks
+    let wScalarBias ← requireDecodedWrite task.writes regScalarBias "scalarBias"
+    let sbVal ← decodeFieldChecked scalarBiasExtLayout wScalarBias.value "val"
+    let sbShift ← decodeFieldChecked scalarBiasExtLayout wScalarBias.value "biasShift"
+    if sbShift != 0 then
+      throw s!"{prefixMsg}: scalarBias biasShift ({sbShift}) must be 0 for palette weights"
+    if sbVal != 0 then
+      if biasInKernel || cout != 1 then
+        throw s!"{prefixMsg}: scalarBias low 16 bits ({toHex sbVal.toNat}) invalid for palette weights when biasInKernel={biasInKernel} or Cout={cout}"
+      if (sbVal.toUInt16 &&& 0x7c00) == 0x7c00 then
+        throw s!"{prefixMsg}: scalarBias low 16 bits ({toHex sbVal.toNat}) must be finite fp16"
+  else
+    -- Scaled integer format: require explicit 0x490c (with biasShift in [0, 15]) to prevent carry-over across tasks
+    let wScalarBias ← requireDecodedWrite task.writes regScalarBias "scalarBias"
+    let sbVal ← decodeFieldChecked scalarBiasExtLayout wScalarBias.value "val"
+    let sbShift ← decodeFieldChecked scalarBiasExtLayout wScalarBias.value "biasShift"
+    if sbShift.toNat > maxQuantBiasShift then
+      throw s!"{prefixMsg}: scalarBias biasShift ({sbShift}) exceeds maximum {maxQuantBiasShift}"
+    if biasInKernel && sbVal != 0 then
+      throw s!"{prefixMsg}: scalarBias low 16 bits ({toHex sbVal.toNat}) must be 0 when biasInKernel=1"
+    if !biasInKernel && sbVal != 0 then
+      if cout != 1 then
+        throw s!"{prefixMsg}: scalarBias low 16 bits only allowed for Cout=1 when biasInKernel=0"
+      if (sbVal.toUInt16 &&& 0x7c00) == 0x7c00 then
+        throw s!"{prefixMsg}: scalarBias low 16 bits ({toHex sbVal.toNat}) must be finite fp16"
 
   let wNeScale ← requireDecodedWrite task.writes regNeScale "neScale"
-  let neScaleVal ← decodeFieldChecked neScaleLayout wNeScale.value "val"
-  if !hasLut && neScaleVal != fp16OneBits then
-    throw s!"{prefixMsg}: neScale {toHex neScaleVal.toNat} != expected fp16 1.0 ({toHex fp16OneBits.toNat})"
+  let neScaleVal ← decodeFieldChecked neScaleExtLayout wNeScale.value "val"
+  let neScalePexp ← decodeFieldChecked neScaleExtLayout wNeScale.value "pexp"
+  if isFp16 then
+    if neScalePexp != 0 then
+      throw s!"{prefixMsg}: neScale pexp ({neScalePexp}) must be 0 for fp16 weights"
+    if !hasLut && neScaleVal != fp16OneBits then
+      throw s!"{prefixMsg}: neScale {toHex neScaleVal.toNat} != expected fp16 1.0 ({toHex fp16OneBits.toNat})"
+  else if isPal then
+    if neScalePexp != 0 then
+      throw s!"{prefixMsg}: neScale pexp ({neScalePexp}) must be 0 for palette weights"
+    if neScaleVal != fp16OneBits then
+      throw s!"{prefixMsg}: neScale {toHex neScaleVal.toNat} != expected fp16 1.0 ({toHex fp16OneBits.toNat}) for palette weights"
+  else if isInt then
+    if neScalePexp.toNat > maxQuantScalePexp then
+      throw s!"{prefixMsg}: neScale pexp ({neScalePexp}) exceeds maximum {maxQuantScalePexp}"
+    if perLaneScale then
+      if neScaleVal != 0 then
+        throw s!"{prefixMsg}: neScale low 16 bits ({toHex neScaleVal.toNat}) must be 0 when perLaneScale=1"
+    else
+      let h := neScaleVal.toUInt16
+      let isFinPos := (h &&& 0x7c00) != 0x7c00 && (h &&& 0x8000) == 0 && h != 0
+      if !isFinPos then
+        throw s!"{prefixMsg}: per-tensor neScale ({toHex h.toNat}) must be a finite positive fp16 value"
 
   -- 9. Verify kernel BaseLo/Hi, relocation, active & disabled chunk slots (S1 carry-over on taskId > 0)
   let (kSlot, kTarget, kernBaseOff, kLoPayloadOff) ←
@@ -1480,25 +1638,37 @@ def verifyConvTaskMulti
       if kernBaseOff + cOff + cSz > kSec.size.toNat then
         throw s!"{prefixMsg}: chunk slot {s} range [{kernBaseOff + cOff}, {kernBaseOff + cOff + cSz}) exceeds kernel size {kSec.size}"
 
-      let lutOverhead := if hasLut then vLutBytes else 0
-      if hasLut && cSz < vLutBytes then
-        throw s!"{prefixMsg}: chunk slot {s} size {cSz}B < {vLutBytes}B required for fused LUT"
-      if hasLut then
+      if !isFp16 then
+        let unpaddedBytes := blocks.foldl
+          (fun acc (_, n) => acc + quantBlockBytes wWidth.toNat cinW taps perLaneScale biasInKernel hasZeroPoint n)
+          (quantTableBytes wKind wWidth.toNat)
+        let expBytes := alignUp unpaddedBytes vDmaLineBytes
+        if cSz != expBytes then
+          throw s!"{prefixMsg}: chunk slot {s} quantized size {cSz}B != expected {expBytes}B"
         if let some kBytes := kernelBytes? then
-          vVerifyLutBytes kBytes (kernBaseOff + cOff) s!"{prefixMsg} chunk slot {s} fused LUT"
-
-      let groupOuts := vGroupOuts blocks
-      if !isSparse then
-        let minBytes := alignUp (lutOverhead + 2 * groupOuts * (cinW * taps + (if biasInKernel then 1 else 0))) vDmaLineBytes
-        if cSz < minBytes then
-          throw s!"{prefixMsg}: chunk slot {s} size {cSz}B < minimum required {minBytes}B for stride-1 kernel"
+          vVerifyQuantChunkBytes kBytes (kernBaseOff + cOff) cSz unpaddedBytes wKind wWidth.toNat
+            cinW taps perLaneScale biasInKernel hasZeroPoint blocks
+            s!"{prefixMsg} chunk slot {s}"
       else
-        let minBytes := alignUp (lutOverhead + 2 * (if biasInKernel then groupOuts else 0) + 3 * blocks.size) vDmaLineBytes
-        if cSz < minBytes then
-          throw s!"{prefixMsg}: chunk slot {s} size {cSz}B < minimum required {minBytes}B for stride-2 sparse kernel"
-        if let some kBytes := kernelBytes? then
-          vVerifySparseChunkBytes kBytes (kernBaseOff + cOff + lutOverhead) (kernBaseOff + cOff + cSz)
-            blocks biasInKernel s!"{prefixMsg} chunk slot {s}"
+        let lutOverhead := if hasLut then vLutBytes else 0
+        if hasLut && cSz < vLutBytes then
+          throw s!"{prefixMsg}: chunk slot {s} size {cSz}B < {vLutBytes}B required for fused LUT"
+        if hasLut then
+          if let some kBytes := kernelBytes? then
+            vVerifyLutBytes kBytes (kernBaseOff + cOff) s!"{prefixMsg} chunk slot {s} fused LUT"
+
+        let groupOuts := vGroupOuts blocks
+        if !isSparse then
+          let minBytes := alignUp (lutOverhead + 2 * groupOuts * (cinW * taps + (if biasInKernel then 1 else 0))) vDmaLineBytes
+          if cSz < minBytes then
+            throw s!"{prefixMsg}: chunk slot {s} size {cSz}B < minimum required {minBytes}B for stride-1 kernel"
+        else
+          let minBytes := alignUp (lutOverhead + 2 * (if biasInKernel then groupOuts else 0) + 3 * blocks.size) vDmaLineBytes
+          if cSz < minBytes then
+            throw s!"{prefixMsg}: chunk slot {s} size {cSz}B < minimum required {minBytes}B for stride-2 sparse kernel"
+          if let some kBytes := kernelBytes? then
+            vVerifySparseChunkBytes kBytes (kernBaseOff + cOff + lutOverhead) (kernBaseOff + cOff + cSz)
+              blocks biasInKernel s!"{prefixMsg} chunk slot {s}"
 
       dramAccs := dramAccs.push {
         resource := .kernel
@@ -1600,7 +1770,7 @@ def verifyConvTaskMulti
     allowedConvRegs := allowedConvRegs ++ #[regOut0, regOut1, regOut2, regOut3, regOut4, regOut5]
   if isDepthwise then
     allowedConvRegs := allowedConvRegs.push regDwGroups
-  if scalarBiasMode then
+  if scalarBiasMode || !isFp16 then
     allowedConvRegs := allowedConvRegs.push regScalarBias
   for s in [:16] do
     if h : s < expectedSlotMap.size then

@@ -7,6 +7,7 @@ import Vane.Register
 import Vane.Reach
 import Vane.Alloc
 import Vane.Tiling
+import Vane.Quant
 import Vane.Program
 import Vane.Verify
 import Vane.Pe
@@ -27,6 +28,7 @@ open Vane.Register
 open Vane.Reach
 open Vane.Alloc
 open Vane.Tiling
+open Vane.Quant
 open Vane.Program
 open Vane.Verify
 open Vane.Pe
@@ -97,9 +99,9 @@ end StripMode
 
 /-- Supported node operations in a multi-task ANE DAG. -/
 inductive NodeOp where
-  | conv1x1 (cin cout : Nat) (weights : ByteArray) (bias : Option ByteArray := none) (act : ConvActivation := .none)
-  | conv3x3 (mode : Conv3x3Mode) (cin cout stride : Nat) (padding : PadMode) (weights : ByteArray) (bias : Option ByteArray := none) (act : ConvActivation := .none)
-  | linear (cin cout : Nat) (weights : ByteArray) (bias : Option ByteArray := none) (act : ConvActivation := .none)
+  | conv1x1 (cin cout : Nat) (weights : ByteArray) (bias : Option ByteArray := none) (act : ConvActivation := .none) (quant : Option QuantWeightSpec := none)
+  | conv3x3 (mode : Conv3x3Mode) (cin cout stride : Nat) (padding : PadMode) (weights : ByteArray) (bias : Option ByteArray := none) (act : ConvActivation := .none) (quant : Option QuantWeightSpec := none)
+  | linear (cin cout : Nat) (weights : ByteArray) (bias : Option ByteArray := none) (act : ConvActivation := .none) (quant : Option QuantWeightSpec := none)
   | pe1 (op : PeOp)
   | pe2 (op : PeBinOp) (rev : Bool := false)
   | lut (act : NeActSpec)
@@ -296,7 +298,8 @@ private def maxConvThForOccupied
 private def chooseConvTilingForGraph
     (target : Target) (sh : ConvSpec)
     (extraLutBytes : Nat) (hasBiasInKernel : Bool)
-    (srcIsL2 resIsL2 : Bool) (occupied : List Range) : Except String ConvTaskPlan := do
+    (srcIsL2 resIsL2 : Bool) (occupied : List Range)
+    (quantParams? : Option QuantChunkParams := none) : Except String ConvTaskPlan := do
   validateConvShape sh
   let eff := sh.effMode
   let wo := sh.outW
@@ -335,7 +338,9 @@ private def chooseConvTilingForGraph
                       shMax := shMax
                       tileHeight := 1
                     }
-                    let chunkOk := (checkConvDenseChunks64K sh probe extraLutBytes hasBiasInKernel).isOk
+                    let chunkOk := match quantParams? with
+                      | some qp => (checkConvQuantChunks64K sh probe qp).isOk
+                      | none => (checkConvDenseChunks64K sh probe extraLutBytes hasBiasInKernel).isOk
                     let ocgOk := (validateConvOcgSafety target sh probe).isOk
                     let covOk := (validateConvCoverageSafety target sh probe).isOk
                     if chunkOk && ocgOk && covOk then
@@ -569,7 +574,7 @@ private inductive TensorRef where
   deriving Repr, BEq, DecidableEq, Inhabited
 
 private inductive PlannedOp where
-  | conv (shape : ConvSpec) (weights : ByteArray) (bias : Option ByteArray) (act : ConvActivation) (lutPayload? : Option LutPayload) (biasInKernel : Bool)
+  | conv (shape : ConvSpec) (weights : ByteArray) (bias : Option ByteArray) (act : ConvActivation) (lutPayload? : Option LutPayload) (biasInKernel : Bool) (quant? : Option QuantWeightSpec := none)
   | pe1 (op : PeOp) (dims : TensorDims)
   | pe2 (op : PeBinOp) (rev : Bool) (outDims hwSrc1 hwSrc2 : TensorDims) (hwSrc1Ref hwSrc2Ref : TensorRef)
   | lut (act : NeActSpec) (dims : TensorDims) (lutPayload? : Option LutPayload)
@@ -725,93 +730,158 @@ private def validateGraph (spec : GraphSpec) :
     let repIdx := vNodes.size
 
     let pushExpandedConv1x1 := fun (opLabel : String) (cin cout : Nat) (weights : ByteArray)
-        (bias : Option ByteArray) (act : ConvActivation) (d : TensorDims) => do
+        (bias : Option ByteArray) (act : ConvActivation) (quant? : Option QuantWeightSpec) (d : TensorDims) => do
       if d.c != cin then
         throw s!"node '{nd.id}' ({opLabel}): input C={d.c} != cin={cin}"
       let fullSh : ConvSpec := { kernelSize := 1, mode := .dense, h := d.h, w := d.w, cin := cin, cout := cout }
       validateConvShape fullSh
-      let lutPayload? ← match act with
-        | .lut lspec => some <$> buildLutTable lspec
-        | _ => pure none
-      let shiftBits? := lutPayload?.bind (fun lp => lp.inputShiftBits)
-      let hasEffBias := bias.isSome || shiftBits?.isSome
-      let extraLutBytes := if lutPayload?.isSome then lutTableBytes else 0
-      let slices ← chooseConv1x1OutputSlices spec.target d.h d.w cin cout extraLutBytes hasEffBias
       let fullOutDims : TensorDims := { c := cout, h := d.h, w := d.w }
-      if slices.size == 1 then
-        let scalarBiasMode := cout == 1
-        let biasInKernel := hasEffBias && !scalarBiasMode
-        let tIdx := vNodes.size
-        if tIdx >= 255 then
-          throw s!"node '{nd.id}' (taskId={tIdx}) uses __KERN_0, which requires taskId < 255"
-        pure (#[{
-          id := nd.id
-          logicalId := nd.id
-          nodeIdx := tIdx
-          origNodeIdx := tIdx
-          inputs := inRefs
-          op := PlannedOp.conv fullSh weights bias act lutPayload? biasInKernel
-          outDims := fullOutDims
-          groupOutDims := fullOutDims
-          outByteOffset := 0
-          sharedOutGroup := none
-          isFinalGroup := isLastLogical
-          outPlacement := nd.outPlacement
-          engine := Engine.ne
-          isNeCompute := true
-          usesKernel := true
-          opKind := opLabel
-        }], fullOutDims)
-      else
-        if weights.size != 2 * cout * cin then
-          throw s!"node '{nd.id}' ({opLabel}): weights byte size {weights.size} != expected {2 * cout * cin}"
-        if let some b := bias then
-          if b.size != 2 * cout then
-            throw s!"node '{nd.id}' ({opLabel}): bias byte size {b.size} != expected {2 * cout}"
-        let starts := prefixStarts slices.toList
-        let outRowStride := alignUp (2 * d.w) dmaLineBytes
-        let outPlaneStride := d.h * outRowStride
-        let mut sliceNodes : Array ValidatedNode := Array.mkEmpty slices.size
-        for si in [:slices.size] do
-          let tIdx := repIdx + si
+      match quant? with
+      | some q =>
+        if let .lut lspec := act then
+          throw s!"node '{nd.id}' ({opLabel}): fused LUT activation '{lspec.name}' is not supported with quantized weights"
+        validateQuantWeightSpec q cout cin 1
+        let slices ← chooseConv1x1OutputSlicesQuant spec.target d.h d.w cin cout q bias.isSome
+        if slices.size == 1 then
+          let tIdx := vNodes.size
           if tIdx >= 255 then
-            throw s!"node '{nd.id}' slice {si} (taskId={tIdx}) uses __KERN_0, which requires taskId < 255"
-          let c0 := starts[si]!
-          let dc := slices[si]!
-          let wSlice := weights.extract (2 * c0 * cin) (2 * (c0 + dc) * cin)
-          let bSlice? := bias.map (fun b => b.extract (2 * c0) (2 * (c0 + dc)))
-          let sh_i : ConvSpec := { kernelSize := 1, mode := .dense, h := d.h, w := d.w, cin := cin, cout := dc }
-          let biasInKernel_i := hasEffBias && dc > 1
-          sliceNodes := sliceNodes.push {
-            id := s!"{nd.id}_s{si}"
+            throw s!"node '{nd.id}' (taskId={tIdx}) uses __KERN_0, which requires taskId < 255"
+          pure (#[{
+            id := nd.id
             logicalId := nd.id
             nodeIdx := tIdx
             origNodeIdx := tIdx
             inputs := inRefs
-            op := PlannedOp.conv sh_i wSlice bSlice? act lutPayload? biasInKernel_i
-            outDims := { c := dc, h := d.h, w := d.w }
+            op := PlannedOp.conv fullSh ByteArray.empty bias act none bias.isSome (some q)
+            outDims := fullOutDims
             groupOutDims := fullOutDims
-            outByteOffset := c0 * outPlaneStride
-            sharedOutGroup := some repIdx
+            outByteOffset := 0
+            sharedOutGroup := none
             isFinalGroup := isLastLogical
             outPlacement := nd.outPlacement
             engine := Engine.ne
             isNeCompute := true
             usesKernel := true
             opKind := opLabel
-          }
-        pure (sliceNodes, fullOutDims)
+          }], fullOutDims)
+        else
+          if let some b := bias then
+            if b.size != 2 * cout then
+              throw s!"node '{nd.id}' ({opLabel}): bias byte size {b.size} != expected {2 * cout}"
+          let starts := prefixStarts slices.toList
+          let outRowStride := alignUp (2 * d.w) dmaLineBytes
+          let outPlaneStride := d.h * outRowStride
+          let mut sliceNodes : Array ValidatedNode := Array.mkEmpty slices.size
+          for si in [:slices.size] do
+            let tIdx := repIdx + si
+            if tIdx >= 255 then
+              throw s!"node '{nd.id}' slice {si} (taskId={tIdx}) uses __KERN_0, which requires taskId < 255"
+            let c0 := starts[si]!
+            let dc := slices[si]!
+            let qSlice ← sliceQuantWeightSpec q c0 dc cin 1
+            let bSlice? := bias.map (fun b => b.extract (2 * c0) (2 * (c0 + dc)))
+            let sh_i : ConvSpec := { kernelSize := 1, mode := .dense, h := d.h, w := d.w, cin := cin, cout := dc }
+            sliceNodes := sliceNodes.push {
+              id := s!"{nd.id}_s{si}"
+              logicalId := nd.id
+              nodeIdx := tIdx
+              origNodeIdx := tIdx
+              inputs := inRefs
+              op := PlannedOp.conv sh_i ByteArray.empty bSlice? act none bias.isSome (some qSlice)
+              outDims := { c := dc, h := d.h, w := d.w }
+              groupOutDims := fullOutDims
+              outByteOffset := c0 * outPlaneStride
+              sharedOutGroup := some repIdx
+              isFinalGroup := isLastLogical
+              outPlacement := nd.outPlacement
+              engine := Engine.ne
+              isNeCompute := true
+              usesKernel := true
+              opKind := opLabel
+            }
+          pure (sliceNodes, fullOutDims)
+      | none =>
+        let lutPayload? ← match act with
+          | .lut lspec => some <$> buildLutTable lspec
+          | _ => pure none
+        let shiftBits? := lutPayload?.bind (fun lp => lp.inputShiftBits)
+        let hasEffBias := bias.isSome || shiftBits?.isSome
+        let extraLutBytes := if lutPayload?.isSome then lutTableBytes else 0
+        let slices ← chooseConv1x1OutputSlices spec.target d.h d.w cin cout extraLutBytes hasEffBias
+        if slices.size == 1 then
+          let scalarBiasMode := cout == 1
+          let biasInKernel := hasEffBias && !scalarBiasMode
+          let tIdx := vNodes.size
+          if tIdx >= 255 then
+            throw s!"node '{nd.id}' (taskId={tIdx}) uses __KERN_0, which requires taskId < 255"
+          pure (#[{
+            id := nd.id
+            logicalId := nd.id
+            nodeIdx := tIdx
+            origNodeIdx := tIdx
+            inputs := inRefs
+            op := PlannedOp.conv fullSh weights bias act lutPayload? biasInKernel none
+            outDims := fullOutDims
+            groupOutDims := fullOutDims
+            outByteOffset := 0
+            sharedOutGroup := none
+            isFinalGroup := isLastLogical
+            outPlacement := nd.outPlacement
+            engine := Engine.ne
+            isNeCompute := true
+            usesKernel := true
+            opKind := opLabel
+          }], fullOutDims)
+        else
+          if weights.size != 2 * cout * cin then
+            throw s!"node '{nd.id}' ({opLabel}): weights byte size {weights.size} != expected {2 * cout * cin}"
+          if let some b := bias then
+            if b.size != 2 * cout then
+              throw s!"node '{nd.id}' ({opLabel}): bias byte size {b.size} != expected {2 * cout}"
+          let starts := prefixStarts slices.toList
+          let outRowStride := alignUp (2 * d.w) dmaLineBytes
+          let outPlaneStride := d.h * outRowStride
+          let mut sliceNodes : Array ValidatedNode := Array.mkEmpty slices.size
+          for si in [:slices.size] do
+            let tIdx := repIdx + si
+            if tIdx >= 255 then
+              throw s!"node '{nd.id}' slice {si} (taskId={tIdx}) uses __KERN_0, which requires taskId < 255"
+            let c0 := starts[si]!
+            let dc := slices[si]!
+            let wSlice := weights.extract (2 * c0 * cin) (2 * (c0 + dc) * cin)
+            let bSlice? := bias.map (fun b => b.extract (2 * c0) (2 * (c0 + dc)))
+            let sh_i : ConvSpec := { kernelSize := 1, mode := .dense, h := d.h, w := d.w, cin := cin, cout := dc }
+            let biasInKernel_i := hasEffBias && dc > 1
+            sliceNodes := sliceNodes.push {
+              id := s!"{nd.id}_s{si}"
+              logicalId := nd.id
+              nodeIdx := tIdx
+              origNodeIdx := tIdx
+              inputs := inRefs
+              op := PlannedOp.conv sh_i wSlice bSlice? act lutPayload? biasInKernel_i none
+              outDims := { c := dc, h := d.h, w := d.w }
+              groupOutDims := fullOutDims
+              outByteOffset := c0 * outPlaneStride
+              sharedOutGroup := some repIdx
+              isFinalGroup := isLastLogical
+              outPlacement := nd.outPlacement
+              engine := Engine.ne
+              isNeCompute := true
+              usesKernel := true
+              opKind := opLabel
+            }
+          pure (sliceNodes, fullOutDims)
 
     let (expandedNodes, fullOutDims) : Array ValidatedNode × TensorDims ← match nd.op with
-      | .conv1x1 cin cout weights bias act =>
+      | .conv1x1 cin cout weights bias act quant? =>
         if inRefs.size != 1 then
           throw s!"node '{nd.id}' (conv1x1): expected 1 input, got {inRefs.size}"
-        pushExpandedConv1x1 "conv1x1" cin cout weights bias act inDims[0]!
-      | .linear cin cout weights bias act =>
+        pushExpandedConv1x1 "conv1x1" cin cout weights bias act quant? inDims[0]!
+      | .linear cin cout weights bias act quant? =>
         if inRefs.size != 1 then
           throw s!"node '{nd.id}' (linear): expected 1 input, got {inRefs.size}"
-        pushExpandedConv1x1 "linear" cin cout weights bias act inDims[0]!
-      | .conv3x3 mode cin cout stride padding weights bias act =>
+        pushExpandedConv1x1 "linear" cin cout weights bias act quant? inDims[0]!
+      | .conv3x3 mode cin cout stride padding weights bias act quant? =>
         if inRefs.size != 1 then
           throw s!"node '{nd.id}' (conv3x3): expected 1 input, got {inRefs.size}"
         let d := inDims[0]!
@@ -822,23 +892,40 @@ private def validateGraph (spec : GraphSpec) :
           stride := stride, pad := padding
         }
         validateConvShape sh
-        let lutPayload? ← match act with
-          | .lut lspec => some <$> buildLutTable lspec
-          | _ => pure none
-        let shiftBits? := lutPayload?.bind (fun lp => lp.inputShiftBits)
-        let scalarBiasMode := sh.effMode == .dense && sh.cout == 1
-        let hasEffBias := bias.isSome || shiftBits?.isSome
-        let biasInKernel := hasEffBias && !scalarBiasMode
         let od : TensorDims := { c := cout, h := sh.outH, w := sh.outW }
         if repIdx >= 255 then
           throw s!"node '{nd.id}' (taskId={repIdx}) uses __KERN_0, which requires taskId < 255"
-        pure (#[{
-          id := nd.id, logicalId := nd.id, nodeIdx := repIdx, origNodeIdx := repIdx,
-          inputs := inRefs, op := PlannedOp.conv sh weights bias act lutPayload? biasInKernel,
-          outDims := od, groupOutDims := od, outByteOffset := 0, sharedOutGroup := none,
-          isFinalGroup := isLastLogical, outPlacement := nd.outPlacement,
-          engine := Engine.ne, isNeCompute := true, usesKernel := true, opKind := "conv3x3"
-        }], od)
+        match quant? with
+        | some q =>
+          if mode != .dense then
+            throw s!"node '{nd.id}' (conv3x3): quantized 3x3 convolution only supports dense mode"
+          if stride != 1 then
+            throw s!"node '{nd.id}' (conv3x3): quantized 3x3 convolution only supports stride=1"
+          if let .lut lspec := act then
+            throw s!"node '{nd.id}' (conv3x3): fused LUT activation '{lspec.name}' is not supported with quantized weights"
+          validateQuantWeightSpec q cout cin 9
+          pure (#[{
+            id := nd.id, logicalId := nd.id, nodeIdx := repIdx, origNodeIdx := repIdx,
+            inputs := inRefs, op := PlannedOp.conv sh ByteArray.empty bias act none bias.isSome (some q),
+            outDims := od, groupOutDims := od, outByteOffset := 0, sharedOutGroup := none,
+            isFinalGroup := isLastLogical, outPlacement := nd.outPlacement,
+            engine := Engine.ne, isNeCompute := true, usesKernel := true, opKind := "conv3x3"
+          }], od)
+        | none =>
+          let lutPayload? ← match act with
+            | .lut lspec => some <$> buildLutTable lspec
+            | _ => pure none
+          let shiftBits? := lutPayload?.bind (fun lp => lp.inputShiftBits)
+          let scalarBiasMode := sh.effMode == .dense && sh.cout == 1
+          let hasEffBias := bias.isSome || shiftBits?.isSome
+          let biasInKernel := hasEffBias && !scalarBiasMode
+          pure (#[{
+            id := nd.id, logicalId := nd.id, nodeIdx := repIdx, origNodeIdx := repIdx,
+            inputs := inRefs, op := PlannedOp.conv sh weights bias act lutPayload? biasInKernel none,
+            outDims := od, groupOutDims := od, outByteOffset := 0, sharedOutGroup := none,
+            isFinalGroup := isLastLogical, outPlacement := nd.outPlacement,
+            engine := Engine.ne, isNeCompute := true, usesKernel := true, opKind := "conv3x3"
+          }], od)
       | .pe1 op =>
         if inRefs.size != 1 then
           throw s!"node '{nd.id}' (pe1): expected 1 input, got {inRefs.size}"
@@ -1154,7 +1241,7 @@ private def isNodeL2Eligible (vNodes : Array ValidatedNode) (i : Nat) : Bool := 
   for j in [i + 1 : vNodes.size] do
     let cons := vNodes[j]!
     match cons.op with
-    | .conv sh _ _ _ _ _ =>
+    | .conv sh _ _ _ _ _ _ =>
       if cons.inputs[0]! == .node i && sh.kernelSize == 3 && sh.stride == 2 then
         if sh.winReg != sh.w || sh.hinReg != sh.h then
           return false
@@ -1189,10 +1276,11 @@ private def tryPlanAllTasks
     let resIsL2 := (lookupPlaced placedL2 t).isSome
     let planRes : Except String TaskPlanKind :=
       match nd.op with
-      | .conv sh _ _ _ lutPayload? biasInKernel =>
+      | .conv sh _ bias _ lutPayload? biasInKernel quant? =>
         let srcIsL2 := isNodeL2 nd.inputs[0]!
         let extraLut := if lutPayload?.isSome then lutTableBytes else 0
-        TaskPlanKind.conv <$> chooseConvTilingForGraph target sh extraLut biasInKernel srcIsL2 resIsL2 liveRanges
+        let qp? := quant?.map (fun q => quantChunkParamsFor q sh.cout bias.isSome)
+        TaskPlanKind.conv <$> chooseConvTilingForGraph target sh extraLut biasInKernel srcIsL2 resIsL2 liveRanges qp?
       | .pe1 _ dims =>
         let srcIsL2 := isNodeL2 nd.inputs[0]!
         TaskPlanKind.pe <$> choosePeTilingForGraph target dims dims none srcIsL2 false resIsL2 liveRanges
@@ -1309,6 +1397,7 @@ private structure PreLoweredTask where
   hasSrc1Dma : Bool
   hasSrc2Dma : Bool
   packedKernel? : Option PackedKernel
+  packedQuantKernel? : Option PackedQuantKernel := none
   kernelBaseOff : Nat
   src1Producer? : Option Nat
   kernLoc? : Option TensorLocation := none
@@ -1345,6 +1434,7 @@ private def buildPreLoweredTasks
   let outSurfIdx := spec.inputs.size
   let mut kernBuf := ByteArray.empty
   let mut convKernCache : Array (ConvKernCacheKey × Nat × PackedKernel) := #[]
+  let mut quantKernCache : Array (ConvKernCacheKey × Nat × PackedQuantKernel) := #[]
   let mut lutKernCache : Array (Nat × Nat) := #[]
   let mut out : Array PreLoweredTask := Array.mkEmpty n
 
@@ -1373,6 +1463,7 @@ private def buildPreLoweredTasks
     let mut l2Accs : Array VerifiedL2Access := #[]
     let mut dramAccs : Array VerifiedDramAccess := #[]
     let mut packedKern? : Option PackedKernel := none
+    let mut packedQuantKern? : Option PackedQuantKernel := none
     let mut kernBaseOff : Nat := 0
     let mut src1Loc : TensorLocation := resolveRefLoc nd.inputs[0]!
     let mut src2Loc? : Option TensorLocation := none
@@ -1381,8 +1472,8 @@ private def buildPreLoweredTasks
     let mut extProd? : Option Nat := none
 
     match nd.op, plan with
-    | .conv sh weights bias _ lutPayload? _, .conv cp =>
-      -- Pack weights/bias/LUT into shared __KERN_0, deduplicating identical per-node payloads across strips
+    | .conv sh weights bias _ lutPayload? _ quant?, .conv cp =>
+      -- Pack weights/bias/LUT (or quantized weights) into shared __KERN_0, deduplicating across strips
       let cKey : ConvKernCacheKey := {
         origNodeIdx := nd.origNodeIdx
         logNE := cp.tiling.logNE
@@ -1390,25 +1481,47 @@ private def buildPreLoweredTasks
         fat := cp.tiling.fat
         ocg := cp.tiling.ocg
       }
-      let (kOff, packed) ← match convKernCache.find? (fun (k, _, _) => k == cKey) with
-        | some (_, cachedOff, cachedPacked) => pure (cachedOff, cachedPacked)
-        | none =>
-          kernBuf := padToAlign kernBuf dmaLineBytes
-          let newOff := kernBuf.size
-          let p ← packConvKernelChunks spec.target sh cp.tiling weights bias lutPayload?
-          kernBuf := kernBuf ++ p.bytes
-          convKernCache := convKernCache.push (cKey, newOff, p)
-          pure (newOff, p)
-      kernBaseOff := kOff
-      packedKern? := some packed
-      for cs in packed.slots do
-        dramAccs := dramAccs.push {
-          resource := .kernel
-          lo := kernBaseOff + cs.offset
-          hi := kernBaseOff + cs.offset + cs.size
-          isWrite := false
-          port := .kernel
-        }
+      match quant? with
+      | some q =>
+        let (kOff, packed) ← match quantKernCache.find? (fun (k, _, _) => k == cKey) with
+          | some (_, cachedOff, cachedPacked) => pure (cachedOff, cachedPacked)
+          | none =>
+            kernBuf := padToAlign kernBuf dmaLineBytes
+            let newOff := kernBuf.size
+            let p ← packQuantKernel spec.target sh cp.tiling q bias
+            kernBuf := kernBuf ++ p.bytes
+            quantKernCache := quantKernCache.push (cKey, newOff, p)
+            pure (newOff, p)
+        kernBaseOff := kOff
+        packedQuantKern? := some packed
+        for cs in packed.slots do
+          dramAccs := dramAccs.push {
+            resource := .kernel
+            lo := kernBaseOff + cs.offset
+            hi := kernBaseOff + cs.offset + cs.size
+            isWrite := false
+            port := .kernel
+          }
+      | none =>
+        let (kOff, packed) ← match convKernCache.find? (fun (k, _, _) => k == cKey) with
+          | some (_, cachedOff, cachedPacked) => pure (cachedOff, cachedPacked)
+          | none =>
+            kernBuf := padToAlign kernBuf dmaLineBytes
+            let newOff := kernBuf.size
+            let p ← packConvKernelChunks spec.target sh cp.tiling weights bias lutPayload?
+            kernBuf := kernBuf ++ p.bytes
+            convKernCache := convKernCache.push (cKey, newOff, p)
+            pure (newOff, p)
+        kernBaseOff := kOff
+        packedKern? := some packed
+        for cs in packed.slots do
+          dramAccs := dramAccs.push {
+            resource := .kernel
+            lo := kernBaseOff + cs.offset
+            hi := kernBaseOff + cs.offset + cs.size
+            isWrite := false
+            port := .kernel
+          }
       match src1Loc with
       | .l2 base bytes =>
         l2Accs := l2Accs.push { lo := base, hi := base + bytes, isWrite := false, role := .src1L2 }
@@ -1837,6 +1950,7 @@ private def buildPreLoweredTasks
       hasSrc1Dma := hasSrc1Dma
       hasSrc2Dma := hasSrc2Dma
       packedKernel? := packedKern?
+      packedQuantKernel? := packedQuantKern?
       kernelBaseOff := kernBaseOff
       src1Producer? := src1Prod?
       kernLoc? := kernLoc?
@@ -2170,11 +2284,8 @@ private def emitTaskDesc
     sync.src1WaitNe5 sync.src1WaitPe22 sync.src1HandoffNe sync.src1HandoffPe
 
   match nd.op, pt.plan with
-  | .conv sh _ _ act _ _, .conv cp =>
-    let some packed := pt.packedKernel?
-      | throw s!"internal error: missing packed kernel on conv node '{nd.id}'"
+  | .conv sh _ _ act _ _ _, .conv cp =>
     let sparse := sh.isSparse
-    let wide3x3 := computeWide3x3Conv target sh cp.tiling
     let ho := sh.outH
     let wo := sh.outW
     let chs := chsBytesConv sh cp.tiling
@@ -2195,13 +2306,64 @@ private def emitTaskDesc
       ("hx", 1), ("vy", 1)
     ]
     let wTH ← encodeWord (dim16Layout "TH") #[("val", ← natToU32Checked cp.tiling.tileHeight "TH")]
+    let (bit27Val, wNeCfg, wNeOp, wNeScale, scalarBiasReg?, chunkSlots) ←
+      match pt.packedQuantKernel? with
+      | some pq =>
+        let wide3x3 := computeWide3x3Conv target sh cp.tiling
+        let b27 := neCommonQuantBit27 wide3x3 pq.hasZeroPoint pq.format.wKind
+        let wCfg ← encodeWord neCfgQuantLayout #[
+          ("wKind", pq.format.wKind),
+          ("wWidth", ← natToU32Checked pq.format.wWidth "wWidth"),
+          ("sparse", 0),
+          ("dynKern", 0),
+          ("hasZP", if pq.hasZeroPoint then 1 else 0),
+          ("h17Flag", if target == .h17 && !pq.hasZeroPoint then 1 else 0)
+        ]
+        let wOp ← encodeWord neOpQuantLayout #[
+          ("biasInKernel", if pq.biasInKernel then 1 else 0),
+          ("unscaled", if pq.format.isPalette then neOpUnscaledBits else 0),
+          ("perLaneScale", if pq.perLaneScale then 1 else 0),
+          ("relu", if act.isRelu then 1 else 0),
+          ("lut", 0),
+          ("base20", 1)
+        ]
+        let wSc ← encodeWord neScaleExtLayout #[
+          ("val", pq.tensorScaleFp16.toUInt32),
+          ("pexp", ← natToU32Checked pq.scalePexp "scalePexp")
+        ]
+        -- Always write `0x490c` on quantized tasks to prevent `biasShift` carry-over across tasks.
+        let sb? ← some <$> encodeWord scalarBiasExtLayout #[
+          ("val", 0),
+          ("biasShift", ← natToU32Checked pq.biasShift "biasShift")
+        ]
+        pure (b27, wCfg, wOp, wSc, sb?, pq.slots)
+      | none =>
+        let some packed := pt.packedKernel?
+          | throw s!"internal error: missing packed kernel on conv node '{nd.id}'"
+        let wide3x3 := computeWide3x3Conv target sh cp.tiling
+        let hasLut := packed.lutPayload.isSome
+        let neScaleVal : UInt32 := match packed.lutPayload with
+          | some lp => lp.preScaleBits.toUInt32
+          | none => fp16OneBits
+        let wCfg ← encodeWord (neCfgLayout target) #[("sparse", if sparse then 1 else 0)]
+        let wOp ← encodeWord neOpLayout #[
+          ("biasInKernel", if packed.biasInKernel then 1 else 0),
+          ("relu", if act.isRelu && !hasLut then 1 else 0),
+          ("lut", if hasLut then 1 else 0)
+        ]
+        let wSc ← encodeWord neScaleLayout #[("val", neScaleVal)]
+        let sb? ←
+          if sh.effMode == .dense && sh.cout == 1 then
+            some <$> encodeWord scalarBiasLayout #[("val", packed.scalarBiasBits.toUInt32)]
+          else pure none
+        pure (if wide3x3 then 1 else 0, wCfg, wOp, wSc, sb?, packed.slots)
     let wNeCommon ← encodeWord neCommonLayout #[
       ("kind", 0),
       ("shPref", ← natToU32Checked cp.tiling.shPref "shPref"),
       ("shMin", ← natToU32Checked cp.tiling.shPref "shMin"),
       ("shMax", ← natToU32Checked cp.tiling.shMax "shMax"),
       ("F", ← natToU32Checked cp.tiling.f "F"),
-      ("wide3x3", if wide3x3 then 1 else 0)
+      ("wide3x3", bit27Val)
     ]
     let wNeTile ← encodeWord neTileLayout #[
       ("ocg", ← natToU32Checked (effOcgConv sh cp.tiling) "ocg"),
@@ -2209,17 +2371,6 @@ private def emitTaskDesc
       ("WU", ← natToU32Checked cp.tiling.wu "WU")
     ]
     let wResCfg ← encodeResPortCfgMulti isFirst resIsL2 cp.direct
-    let hasLut := packed.lutPayload.isSome
-    let neScaleVal : UInt32 := match packed.lutPayload with
-      | some lp => lp.preScaleBits.toUInt32
-      | none => fp16OneBits
-    let wNeCfg ← encodeWord (neCfgLayout target) #[("sparse", if sparse then 1 else 0)]
-    let wNeOp ← encodeWord neOpLayout #[
-      ("biasInKernel", if packed.biasInKernel then 1 else 0),
-      ("relu", if act.isRelu && !hasLut then 1 else 0),
-      ("lut", if hasLut then 1 else 0)
-    ]
-    let wNeScale ← encodeWord neScaleLayout #[("val", neScaleVal)]
     let wKernStage ← encodeKernelStageMulti taskId isLast sparse
 
     let mut plain : Array RegWrite := #[
@@ -2245,8 +2396,8 @@ private def emitTaskDesc
       plain := plain.push { byteAddr := regSrc2Cfg, value := src2CfgValue }
     if sh.effMode == .depthwise then
       plain := plain.push { byteAddr := regDwGroups, value := ← encodeWord dwGroupsLayout #[("perGroupIn", 1)] }
-    if sh.effMode == .dense && sh.cout == 1 then
-      plain := plain.push { byteAddr := regScalarBias, value := ← encodeWord scalarBiasLayout #[("val", packed.scalarBiasBits.toUInt32)] }
+    if let some wSb := scalarBiasReg? then
+      plain := plain.push { byteAddr := regScalarBias, value := wSb }
 
     let mut barRecs : Array BarRegWrite := #[
       { baseByteAddr := regKernelBaseLo, barSlot := kernelBarSlot, values := #[← natToU32Checked pt.kernelBaseOff "kernelBaseLo", 0] }
@@ -2335,7 +2486,7 @@ private def emitTaskDesc
     let wSlotOn ← encodeWord chunkSlotLayout #[("enable", 1), ("on20", 1), ("task", taskIdU32)]
     let wSlotOff ← encodeWord chunkSlotLayout #[("enable", 0), ("on20", 1), ("task", taskIdU32)]
     for s in [:16] do
-      match packed.slots.find? (fun cs => cs.slot == s) with
+      match chunkSlots.find? (fun cs => cs.slot == s) with
       | some cs =>
         plain := plain ++ #[
           { byteAddr := regChunkSlot s, value := wSlotOn },
@@ -3078,7 +3229,7 @@ private def checkStripEligible
     if nd.sharedOutGroup.isSome then
       throw s!"spatial strip fusion ineligible: node '{nd.logicalId}' uses multi-task shared output"
     let rad ← match nd.op with
-      | .conv sh _ _ _ _ _ =>
+      | .conv sh _ _ _ _ _ _ =>
         if sh.kernelSize == 1 then
           if sh.w != wFull then
             throw s!"spatial strip fusion ineligible: node '{nd.id}' width {sh.w} != {wFull}"
@@ -3135,7 +3286,7 @@ private def buildStripNodes
     let outH := outHi - outLo
     let inH := inHi - inLo
     let (newOp, s1Ref, s2Ref?) := match nd.op with
-      | .conv sh w b act lp bk =>
+      | .conv sh w b act lp bk q? =>
         let sh' : ConvSpec :=
           if sh.kernelSize == 1 then
             { sh with h := inH }
@@ -3143,7 +3294,7 @@ private def buildStripNodes
             let pt := if outLo == 0 then 1 else 0
             let pb := if outHi == hFull then 1 else 0
             { sh with h := inH, pad := .strip pt pb }
-        (PlannedOp.conv sh' w b act lp bk, nd.inputs[0]!, none)
+        (PlannedOp.conv sh' w b act lp bk q?, nd.inputs[0]!, none)
       | .pe1 op dims =>
         (PlannedOp.pe1 op { dims with h := outH }, nd.inputs[0]!, none)
       | .pe2 binOp rev outDims hw1 hw2 r1 r2 =>

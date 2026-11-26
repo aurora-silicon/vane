@@ -633,8 +633,137 @@ def neActOpLayout : WordLayout := {
 /-- `0x490c` scalarBias: IEEE fp16 bits in `[15:0]`. -/
 def scalarBiasLayout : WordLayout := dim16Layout "scalarBias"
 
+/-- `0x490c` scalarBiasExt: IEEE fp16 scalar bias in `[15:0]`, unsigned `biasShift` in `[31:16]`. -/
+def scalarBiasExtLayout : WordLayout := {
+  name := "scalarBiasExt"
+  fields := #[
+    { name := "val", lo := 0, width := 16 },
+    { name := "biasShift", lo := 16, width := 16 }
+  ]
+}
+
 /-- `0x4910` neScale: IEEE fp16 bits in `[15:0]`. -/
 def neScaleLayout : WordLayout := dim16Layout "neScale"
+
+/-- `0x4910` neScaleExt: IEEE fp16 tensor scale in `[15:0]`, power-of-two scale exponent `pexp` in `[31:16]`. -/
+def neScaleExtLayout : WordLayout := {
+  name := "neScaleExt"
+  fields := #[
+    { name := "val", lo := 0, width := 16 },
+    { name := "pexp", lo := 16, width := 16 }
+  ]
+}
+
+/-- `0x4900` neCfgQuant: `wKind[3:0]`, `wWidth[7:4]`, `sparse[8:8]`, `dynKern[16:16]`,
+    `hasZP[24:24]`, `h17Flag[28:28]` (all other bits must be 0). -/
+def neCfgQuantLayout : WordLayout := {
+  name := "neCfgQuant"
+  fields := #[
+    { name := "wKind", lo := 0, width := 4 },
+    { name := "wWidth", lo := 4, width := 4 },
+    { name := "sparse", lo := 8, width := 1 },
+    { name := "dynKern", lo := 16, width := 1 },
+    { name := "hasZP", lo := 24, width := 1 },
+    { name := "h17Flag", lo := 28, width := 1 }
+  ]
+}
+
+/-- `0x4904` neOpQuant: `biasInKernel[4:4]`, `unscaled[13:10]`, `perLaneScale[14:14]`,
+    `relu[16:16]`, `lut[17:17]`, `base20[20:20]` (all other bits must be 0). -/
+def neOpQuantLayout : WordLayout := {
+  name := "neOpQuant"
+  fields := #[
+    { name := "biasInKernel", lo := 4, width := 1 },
+    { name := "unscaled", lo := 10, width := 4 },
+    { name := "perLaneScale", lo := 14, width := 1 },
+    { name := "relu", lo := 16, width := 1 },
+    { name := "lut", lo := 17, width := 1 },
+    { name := "base20", lo := 20, width := 1 }
+  ]
+}
+
+-- Named quantized weight kind & control constants
+def wKindUint8 : UInt32 := 0
+def wKindInt8 : UInt32 := 1
+def wKindFp16 : UInt32 := 2
+def wKindUint4 : UInt32 := 4
+def wKindInt4 : UInt32 := 5
+def wKindPal : UInt32 := 6
+
+/-- `0x4904[13:10]` unscaled-format nibble (`0xf`, i.e., `0x3c00`) for `fp16` and `pal*`. -/
+def neOpUnscaledBits : UInt32 := 0xf
+
+/-- Maximum legal `0x4910[31:16]` scale power-of-two exponent `pexp`. -/
+def maxQuantScalePexp : Nat := 30
+
+/-- Maximum legal `0x490c[31:16]` folded-bias shift `biasShift`. -/
+def maxQuantBiasShift : Nat := 15
+
+/-- Return `true` iff `(wKind, wWidth)` is a hardware-legal NE weight format. -/
+def isLegalNeWeightFormat (wKind : UInt32) (wWidth : Nat) : Bool :=
+  (wKind == wKindFp16 && wWidth == 8) ||
+  (wKind == wKindInt8 && wWidth == 8) ||
+  (wKind == wKindUint8 && wWidth == 8) ||
+  (wKind == wKindInt4 && wWidth == 4) ||
+  (wKind == wKindUint4 && wWidth == 4) ||
+  (wKind == wKindPal && (wWidth == 1 || wWidth == 2 || wWidth == 4 || wWidth == 6 || wWidth == 8))
+
+/-- Return `true` iff `wKind` is a scaled integer weight format (`uint8`, `int8`, `uint4`, `int4`). -/
+def isIntegerWeightKind (wKind : UInt32) : Bool :=
+  wKind == wKindUint8 || wKind == wKindInt8 || wKind == wKindUint4 || wKind == wKindInt4
+
+/-- Return `true` iff `wKind` is an unsigned integer weight format (`uint8` or `uint4`). -/
+def isUnsignedWeightKind (wKind : UInt32) : Bool :=
+  wKind == wKindUint8 || wKind == wKindUint4
+
+/-- `0x003c` (`neCommon`) bit 27 (`wide3x3`) control for quantized NE convolutions:
+    `1` iff `wide3x3` is true (H17 dense 3x3 stride-1 within `maxBlockSlots`),
+    `hasZP` is false, and `wKind` is not unsigned (`uint8` / `uint4`); `0` otherwise. -/
+def neCommonQuantBit27 (wide3x3 hasZP : Bool) (wKind : UInt32) : UInt32 :=
+  if wide3x3 && !hasZP && !isUnsignedWeightKind wKind then 1 else 0
+
+/-- Canonical 16-byte signed 4-bit two's-complement decode table for `int4` (`wKind = 5`). -/
+def int4DecodeTable : Array UInt8 := #[
+  0, 1, 2, 3, 4, 5, 6, 7, 248, 249, 250, 251, 252, 253, 254, 255
+]
+
+/-- Canonical 16-byte unsigned 4-bit decode table for `uint4` (`wKind = 4`). -/
+def uint4DecodeTable : Array UInt8 := #[
+  0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
+]
+
+/-- Byte count required to LSB-first bit-pack `count` codes of bit-width `width`. -/
+def packedByteCount (width count : Nat) : Nat :=
+  (count * width + 7) / 8
+
+/-- 64-byte-padded decode/palette table byte size at offset 0 of each quantized kernel chunk. -/
+def quantTableBytes (wKind : UInt32) (wWidth : Nat) : Nat :=
+  if wKind == wKindInt4 || wKind == wKindUint4 then
+    64
+  else if wKind == wKindPal then
+    alignUp (2 * ((1 : Nat) <<< wWidth)) 64
+  else
+    0
+
+/-- Unpadded byte size of one output-channel block of `n` lanes inside a quantized kernel chunk. -/
+def quantBlockBytes
+    (wWidth cin taps : Nat)
+    (perLaneScale biasInKernel hasZeroPoint : Bool)
+    (n : Nat) : Nat :=
+  (if perLaneScale then 2 * n else 0) +
+  (if biasInKernel then 2 * n else 0) +
+  (if hasZeroPoint then n else 0) +
+  packedByteCount wWidth (cin * taps * n)
+
+/-- Exact 64-byte-padded byte size of a quantized kernel chunk for a group's output-channel blocks. -/
+def expectedQuantChunkSize
+    (wKind : UInt32) (wWidth cin taps : Nat)
+    (perLaneScale biasInKernel hasZeroPoint : Bool)
+    (blocks : Array (Nat × Nat)) : Nat :=
+  let body := blocks.foldl
+    (fun acc (_, n) => acc + quantBlockBytes wWidth cin taps perLaneScale biasInKernel hasZeroPoint n)
+    (quantTableBytes wKind wWidth)
+  alignUp body 64
 
 /-- `0x4d00` src1Dep (single-task): `code[7:0]`, `task[23:16]`. -/
 def src1DepLayout : WordLayout := {

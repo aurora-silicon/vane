@@ -2752,7 +2752,9 @@ def emitGraphDir (outDir : System.FilePath) (res : LowerResult) : IO (Except Str
       | none => []
 
     let opFields : List (String × Json) ← match nd.op with
-      | .conv1x1 cin cout weights bias? act | .linear cin cout weights bias? act =>
+      | .conv1x1 cin cout weights bias? act quant? | .linear cin cout weights bias? act quant? =>
+        if quant?.isSome then
+          return .error s!"emitGraphDir: quantized node '{nd.id}' is not supported by fp16 graph export"
         let opNm := match nd.op with | .linear .. => "linear" | _ => "conv1x1"
         let wFile := s!"{nd.id}_weights.bin"
         try IO.FS.writeBinFile (outDir / wFile) weights
@@ -2770,7 +2772,9 @@ def emitGraphDir (outDir : System.FilePath) (res : LowerResult) : IO (Except Str
           ("cout", Json.num cout),
           ("weights", Json.str wFile)
         ] ++ bFields ++ convActFields act)
-      | .conv3x3 mode cin cout stride pad weights bias? act =>
+      | .conv3x3 mode cin cout stride pad weights bias? act quant? =>
+        if quant?.isSome then
+          return .error s!"emitGraphDir: quantized node '{nd.id}' is not supported by fp16 graph export"
         let wFile := s!"{nd.id}_weights.bin"
         try IO.FS.writeBinFile (outDir / wFile) weights
         catch e => return .error s!"write '{wFile}': {e}"
