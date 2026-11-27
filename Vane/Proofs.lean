@@ -15,6 +15,14 @@ import Vane.Conv3x3
 import Vane.Frontend.SafeTensors
 import Vane.Frontend.Lower
 import Vane.Quant
+import Vane.IR.Ops
+import Vane.IR.Graph
+import Vane.IR.Validate
+import Vane.IR.Semantics
+import Vane.IR.Rewrite
+import Vane.IR.Passes.DCE
+import Vane.IR.Passes.ViewSimplify
+import Vane.IR.Pipeline
 
 namespace Vane.Proofs
 
@@ -35,6 +43,7 @@ open Vane.Conv3x3
 open Vane.Frontend.SafeTensors
 open Vane.Frontend.Lower
 open Vane.Quant
+open Vane.IR
 
 -- ============================================================================
 -- 1. Alignment soundness (alignUp_ge, alignUp_dvd)
@@ -6781,5 +6790,2785 @@ theorem packQuantChunk_size_eq_expected
     (fun p : Nat × Nat => quantBlockBytes format.wWidth cin taps perLaneScale biasInKernel hasZeroPoint p.2)
     hstep blocks.toList (encodeQuantTable format palette)]
   rw [encodeQuantTable_size format palette]
+
+-- ============================================================================
+-- 23. Parameterized SSA TensorIR, Rewriter & Polymorphic evalCore Proofs (C1)
+-- ============================================================================
+
+private theorem arr_getD_eq {α : Type} (a : Array α) (i : Nat) (d : α) (h : i < a.size) :
+    a.getD i d = a[i] := by
+  simp [Array.getD, h]
+
+private theorem list_getD_eq {α : Type} (l : List α) (i : Nat) (d : α) (h : i < l.length) :
+    l.getD i d = l[i] := by
+  simp [List.getD, h]
+
+private theorem list_nodup_getElem_inj {α : Type} {l : List α} (hnd : l.Nodup)
+    {i j : Nat} (hi : i < l.length) (hj : j < l.length) (heq : l[i] = l[j]) : i = j := by
+  induction l generalizing i j with
+  | nil => simp at hi
+  | cons x xs ih =>
+    rw [List.nodup_cons] at hnd
+    cases i with
+    | zero =>
+      cases j with
+      | zero => rfl
+      | succ j' =>
+        simp only [List.getElem_cons_zero, List.getElem_cons_succ] at heq
+        have hj' : j' < xs.length := by simpa using hj
+        exact absurd (heq ▸ List.getElem_mem hj') hnd.1
+    | succ i' =>
+      cases j with
+      | zero =>
+        simp only [List.getElem_cons_zero, List.getElem_cons_succ] at heq
+        have hi' : i' < xs.length := by simpa using hi
+        exact absurd (heq.symm ▸ List.getElem_mem hi') hnd.1
+      | succ j' =>
+        simp only [List.getElem_cons_succ] at heq
+        have hi' : i' < xs.length := by simpa using hi
+        have hj' : j' < xs.length := by simpa using hj
+        exact congrArg Nat.succ (ih hnd.2 hi' hj' heq)
+
+private theorem list_nodup_of_getElem_inj {α : Type} {l : List α}
+    (hinj : ∀ i j (hi : i < l.length) (hj : j < l.length), l[i] = l[j] → i = j) : l.Nodup := by
+  induction l with
+  | nil => exact List.nodup_nil
+  | cons x xs ih =>
+    rw [List.nodup_cons]
+    refine ⟨?_, ?_⟩
+    · intro hmem
+      obtain ⟨j, hj, hjeq⟩ := List.mem_iff_getElem.mp hmem
+      have h0 := hinj 0 (j + 1) (by simp) (by simp; omega) (by simpa using hjeq.symm)
+      omega
+    · apply ih
+      intro i j hi hj heq
+      have h := hinj (i + 1) (j + 1) (by simp; omega) (by simp; omega) (by simpa using heq)
+      omega
+
+private theorem list_nodup_map_on {α β : Type} {f : α → β} {l : List α}
+    (hinj : ∀ x ∈ l, ∀ y ∈ l, f x = f y → x = y) (hnd : l.Nodup) : (l.map f).Nodup := by
+  induction l with
+  | nil => exact List.nodup_nil
+  | cons x xs ih =>
+    rw [List.nodup_cons] at hnd
+    rw [List.map_cons, List.nodup_cons]
+    refine ⟨?_, ih (fun a ha b hb => hinj a (List.mem_cons_of_mem _ ha) b (List.mem_cons_of_mem _ hb)) hnd.2⟩
+    intro hmem
+    obtain ⟨y, hy, hfy⟩ := List.mem_map.mp hmem
+    have hxy := hinj y (List.mem_cons_of_mem _ hy) x (List.mem_cons_self ..) hfy
+    exact hnd.1 (hxy ▸ hy)
+
+-- 23.1 Validator soundness (`validateGraph_ok_implies_wellFormed`) & SSA acyclicity
+
+private theorem checkList_ok {α : Type} {p : α → Bool} {err : α → String} {xs : List α}
+    (h : checkList p err xs = .ok ()) : ∀ x ∈ xs, p x = true := by
+  induction xs with
+  | nil => intro x hx; cases hx
+  | cons a rest ih =>
+    unfold checkList at h
+    split at h
+    · rename_i hpa
+      intro x hx
+      rcases List.mem_cons.mp hx with rfl | hmem
+      · exact hpa
+      · exact ih h x hmem
+    · cases h
+
+private theorem checkIdxRange_ok {lo hi : Nat} {f : Nat → Except String Unit}
+    (h : checkIdxRange lo hi f = .ok ()) :
+    ∀ i, lo ≤ i → i < hi → f i = .ok () := by
+  intro i hlo hhi
+  have haux : ∀ d lo, d = hi - lo → checkIdxRange lo hi f = .ok () → lo ≤ i → i < hi → f i = .ok () := by
+    intro d
+    induction d with
+    | zero => intro lo hd _ _ _; omega
+    | succ r ih =>
+      intro lo hd hchk hlo' hhi'
+      have hlt : lo < hi := by omega
+      unfold checkIdxRange at hchk
+      simp only [hlt, ↓reduceDIte] at hchk
+      cases hflo : f lo with
+      | error e => simp [hflo] at hchk
+      | ok u =>
+        cases u
+        simp only [hflo] at hchk
+        by_cases heq : i = lo
+        · subst heq; exact hflo
+        · exact ih (lo + 1) (by omega) hchk (by omega) hhi'
+  exact haux (hi - lo) lo rfl h hlo hhi
+
+private theorem validateUniqueIds_nodup {ids : List ValueId}
+    (h : validateUniqueIds ids = .ok ()) : ids.Nodup := by
+  induction ids with
+  | nil => exact List.nodup_nil
+  | cons x xs ih =>
+    unfold validateUniqueIds at h
+    split at h
+    · cases h
+    · rename_i hne
+      rw [List.nodup_cons]
+      refine ⟨?_, ih h⟩
+      intro hmem
+      have helem : xs.elem x = true := List.elem_eq_true_of_mem hmem
+      exact hne helem
+
+private theorem hasPositiveDims_iff (ty : TensorType) :
+    ty.hasPositiveDims = true ↔ ∀ d ∈ ty.shape.toList, d > 0 := by
+  unfold TensorType.hasPositiveDims
+  rw [Array.all_eq_true_iff_forall_mem]
+  constructor
+  · intro h d hd
+    have hdArr : d ∈ ty.shape := Array.mem_def.mpr hd
+    simpa using h d hdArr
+  · intro h d hd
+    have hdList : d ∈ ty.shape.toList := Array.mem_def.mp hd
+    simpa using h d hdList
+
+/-- Executable `validateGraph` soundness: any graph accepted by `validateGraph` satisfies
+    every Prop-level invariant of `WellFormed`. -/
+theorem validateGraph_ok_implies_wellFormed {Op : Type} (g : SSAGraph Op)
+    (hok : validateGraph g = .ok ()) : WellFormed g := by
+  unfold validateGraph at hok
+  obtain ⟨⟨⟩, hIn, hok⟩ := except_bind_ok hok
+  obtain ⟨⟨⟩, hUniq, hok⟩ := except_bind_ok hok
+  obtain ⟨⟨⟩, hNodes, hOuts⟩ := except_bind_ok hok
+  constructor
+  · -- inputsDense
+    intro i hi
+    have hiOk := checkIdxRange_ok hIn i (Nat.zero_le i) hi
+    simp only [hi, ↓reduceDIte] at hiOk
+    split at hiOk
+    · cases hiOk
+    · rename_i hne
+      simp only [bne_iff_ne, ne_eq, Decidable.not_not] at hne
+      exact hne
+  · -- inputsPositive
+    intro i hi d hd
+    have hiOk := checkIdxRange_ok hIn i (Nat.zero_le i) hi
+    simp only [hi, ↓reduceDIte] at hiOk
+    split at hiOk
+    · cases hiOk
+    · split at hiOk
+      · cases hiOk
+      · rename_i hpos
+        simp only [Bool.not_eq_true'] at hpos
+        have htr : g.inputs[i].2.2.hasPositiveDims = true := by
+          cases hb : g.inputs[i].2.2.hasPositiveDims <;> simp_all
+        exact (hasPositiveDims_iff _).mp htr d hd
+  · -- uniqueIds
+    exact validateUniqueIds_nodup hUniq
+  · -- defBeforeUse
+    intro i hi v hv
+    unfold validateGraphNodes at hNodes
+    have hiOk := checkIdxRange_ok hNodes i (Nat.zero_le i) hi
+    dsimp only at hiOk
+    simp only [hi, ↓reduceDIte] at hiOk
+    split at hiOk
+    · cases hiOk
+    · rename_i hchk
+      have hel := checkList_ok hchk v hv
+      exact List.mem_of_elem_eq_true hel
+  · -- nodeOutputsPositive
+    intro i hi o ho d hd
+    unfold validateGraphNodes at hNodes
+    have hiOk := checkIdxRange_ok hNodes i (Nat.zero_le i) hi
+    dsimp only at hiOk
+    simp only [hi, ↓reduceDIte] at hiOk
+    split at hiOk
+    · cases hiOk
+    · have hpos := checkList_ok hiOk o ho
+      exact (hasPositiveDims_iff _).mp hpos d hd
+  · -- outputsValid
+    intro v hv
+    have hel := checkList_ok hOuts v hv
+    exact List.mem_of_elem_eq_true hel
+
+private theorem nodup_append_disjoint {α : Type} {l1 l2 : List α}
+    (h : (l1 ++ l2).Nodup) : ∀ x, x ∈ l1 → x ∉ l2 := by
+  intro x hx1 hx2
+  rw [List.nodup_append] at h
+  exact h.2.2 x hx1 x hx2 rfl
+
+private theorem allDefinedIds_split {Op : Type} (g : SSAGraph Op) (k : Nat) :
+    g.allDefinedIds = g.allDefinedIdsBefore k ++ (g.nodes.toList.drop k).flatMap IRNode.outputIds := by
+  unfold SSAGraph.allDefinedIds SSAGraph.allDefinedIdsBefore
+  rw [List.append_assoc, ← List.flatMap_append, List.take_append_drop]
+
+/-- Strict SSA acyclicity: in any `WellFormed` graph, if node `i` consumes a value `v`
+    produced by node `j`, then strictly `j < i`. -/
+theorem wellFormed_acyclic {Op : Type} {g : SSAGraph Op} (hwf : WellFormed g)
+    {i j : Nat} (hi : i < g.nodes.size) (hj : j < g.nodes.size)
+    {v : ValueId} (huse : v ∈ g.nodes[i].inputs.toList) (hdef : v ∈ g.nodes[j].outputIds) :
+    j < i := by
+  have hvBefore : v ∈ g.allDefinedIdsBefore i := hwf.defBeforeUse i hi v huse
+  by_cases hlt : j < i
+  · exact hlt
+  · have hge : i ≤ j := by omega
+    have hmemDrop : g.nodes[j] ∈ g.nodes.toList.drop i := by
+      have hget : (g.nodes.toList.drop i)[j - i]'(by simp; omega) = g.nodes[j] := by
+        simp [List.getElem_drop, Nat.add_sub_cancel' hge]
+      rw [← hget]
+      exact List.getElem_mem _
+    have hvAfter : v ∈ (g.nodes.toList.drop i).flatMap IRNode.outputIds :=
+      List.mem_flatMap.mpr ⟨g.nodes[j], hmemDrop, hdef⟩
+    have hnodup := hwf.uniqueIds
+    rw [allDefinedIds_split g i] at hnodup
+    exact absurd hvAfter (nodup_append_disjoint hnodup v hvBefore)
+
+-- 23.2 Permutation algebra: identity, composition, associativity, bijectivity & inverses
+
+/-- `isIdentityPerm p = true` iff `p = idPerm p.size`. -/
+theorem isIdentityPerm_iff (p : Array Nat) :
+    isIdentityPerm p = true ↔ p = idPerm p.size := by
+  unfold isIdentityPerm
+  exact beq_iff_eq
+
+/-- Element-wise characterization of `isIdentityPerm`. -/
+theorem isIdentityPerm_iff_get (p : Array Nat) :
+    isIdentityPerm p = true ↔ ∀ i (hi : i < p.size), p[i] = i := by
+  rw [isIdentityPerm_iff]
+  constructor
+  · intro h i hi
+    have hget := congrArg (fun a : Array Nat => a[i]?) h
+    rw [Array.getElem?_eq_getElem hi, idPerm, Array.getElem?_eq_getElem (by simp [hi])] at hget
+    simpa using hget
+  · intro h
+    apply Array.ext
+    · simp [idPerm]
+    · intro i hi1 hi2
+      simp only [idPerm, Array.getElem_ofFn]
+      exact h i hi1
+
+private theorem listNodupB_iff {α : Type} [BEq α] [LawfulBEq α] (l : List α) :
+    listNodupB l = true ↔ l.Nodup := by
+  induction l with
+  | nil => simp [listNodupB]
+  | cons x xs ih =>
+    simp only [listNodupB, Bool.and_eq_true, Bool.not_eq_true', List.nodup_cons, ih]
+    constructor
+    · intro ⟨hne, hnd⟩
+      refine ⟨?_, hnd⟩
+      intro hmem
+      have : xs.elem x = true := List.elem_eq_true_of_mem hmem
+      rw [this] at hne; cases hne
+    · intro ⟨hnot, hnd⟩
+      refine ⟨?_, hnd⟩
+      cases hc : xs.elem x with
+      | false => rfl
+      | true => exact absurd (List.mem_of_elem_eq_true hc) hnot
+
+/-- Executable `isValidPerm` matches Prop-level `ValidPerm`. -/
+theorem isValidPerm_iff (p : Array Nat) :
+    isValidPerm p = true ↔ ValidPerm p := by
+  unfold isValidPerm ValidPerm
+  simp only [Bool.and_eq_true, listNodupB_iff]
+  constructor
+  · intro ⟨hall, hnd⟩
+    refine ⟨?_, hnd⟩
+    intro i hi
+    have hmem : p[i] ∈ p := Array.getElem_mem hi
+    have hlt := Array.all_eq_true_iff_forall_mem.mp hall p[i] hmem
+    simpa using hlt
+  · intro ⟨hlt, hnd⟩
+    refine ⟨?_, hnd⟩
+    rw [Array.all_eq_true_iff_forall_mem]
+    intro x hx
+    obtain ⟨i, hi, rfl⟩ := Array.mem_iff_getElem.mp hx
+    simpa using hlt i hi
+
+/-- `idPerm n` is always a valid permutation. -/
+theorem validPerm_idPerm (n : Nat) : ValidPerm (idPerm n) := by
+  constructor
+  · intro i hi
+    simp only [idPerm, Array.size_ofFn] at hi ⊢
+    simp [hi]
+  · have hlist : (idPerm n).toList = List.range n := by
+      apply List.ext_getElem
+      · simp [idPerm]
+      · intro i h1 h2
+        simp [idPerm]
+    rw [hlist]
+    exact List.nodup_range
+
+/-- Left identity law for `composePerm`. -/
+theorem composePerm_id_left (p : Array Nat) (hp : ValidPerm p) :
+    composePerm (idPerm p.size) p = p := by
+  apply Array.ext
+  · simp [composePerm]
+  · intro i hi1 hi2
+    simp only [composePerm, Array.getElem_map]
+    have hlt : p[i] < (idPerm p.size).size := by
+      simp only [idPerm, Array.size_ofFn]
+      exact hp.1 i hi2
+    rw [arr_getD_eq _ _ _ hlt]
+    simp [idPerm]
+
+/-- Right identity law for `composePerm`. -/
+theorem composePerm_id_right (p : Array Nat) :
+    composePerm p (idPerm p.size) = p := by
+  apply Array.ext
+  · simp [composePerm, idPerm]
+  · intro i hi1 hi2
+    simp only [composePerm, idPerm, Array.getElem_map, Array.getElem_ofFn]
+    rw [arr_getD_eq _ _ _ hi2]
+
+/-- Associativity of `composePerm` on equal-length valid permutations. -/
+theorem composePerm_assoc (p1 p2 p3 : Array Nat)
+    (_hp2 : ValidPerm p2) (hp3 : ValidPerm p3)
+    (_h12 : p1.size = p2.size) (h23 : p2.size = p3.size) :
+    composePerm (composePerm p1 p2) p3 = composePerm p1 (composePerm p2 p3) := by
+  apply Array.ext
+  · simp [composePerm]
+  · intro i hi1 hi2
+    have hi3 : i < p3.size := by simpa [composePerm] using hi1
+    simp only [composePerm, Array.getElem_map]
+    have h3lt : p3[i] < p2.size := by rw [h23]; exact hp3.1 i hi3
+    have h3lt' : p3[i] < (p2.map fun idx => p1.getD idx 0).size := by simp [h3lt]
+    rw [arr_getD_eq _ _ _ h3lt', Array.getElem_map]
+    rw [arr_getD_eq _ _ _ h3lt]
+
+/-- Bijectivity preservation: composing two valid equal-length permutations yields a valid permutation. -/
+theorem validPerm_composePerm (p1 p2 : Array Nat)
+    (hp1 : ValidPerm p1) (hp2 : ValidPerm p2) (hsz : p1.size = p2.size) :
+    ValidPerm (composePerm p1 p2) := by
+  have hcompSz : (composePerm p1 p2).size = p2.size := by simp [composePerm]
+  constructor
+  · intro i hi
+    have hi2 : i < p2.size := by omega
+    simp only [composePerm, Array.getElem_map, Array.size_map]
+    have hp2i : p2[i] < p1.size := by rw [hsz]; exact hp2.1 i hi2
+    rw [arr_getD_eq _ _ _ hp2i]
+    rw [← hsz]
+    exact hp1.1 _ hp2i
+  · apply list_nodup_of_getElem_inj
+    intro i j hi hj heq
+    have hi2 : i < p2.size := by simpa [composePerm] using hi
+    have hj2 : j < p2.size := by simpa [composePerm] using hj
+    have hp2i : p2[i] < p1.size := by rw [hsz]; exact hp2.1 i hi2
+    have hp2j : p2[j] < p1.size := by rw [hsz]; exact hp2.1 j hj2
+    have heq' : p1.toList[p2[i]]'(by simpa using hp2i) = p1.toList[p2[j]]'(by simpa using hp2j) := by
+      have heq1 : (composePerm p1 p2)[i]'(by omega) = (composePerm p1 p2)[j]'(by omega) := heq
+      simp only [composePerm, Array.getElem_map] at heq1
+      rw [arr_getD_eq _ _ _ hp2i, arr_getD_eq _ _ _ hp2j] at heq1
+      exact heq1
+    have hp2eq : p2.toList[i]'(by simpa using hi2) = p2.toList[j]'(by simpa using hj2) :=
+      list_nodup_getElem_inj hp1.2 (by simpa using hp2i) (by simpa using hp2j) heq'
+    exact list_nodup_getElem_inj hp2.2 (by simpa using hi2) (by simpa using hj2) hp2eq
+
+-- Pigeonhole surjectivity for valid permutations (needed for `invPerm` and `evalTranspose`)
+
+private theorem list_filter_length_le {α : Type} (p : α → Bool) (l : List α) :
+    (l.filter p).length ≤ l.length :=
+  List.length_filter_le p l
+
+private theorem nodup_subset_range_perm (l : List Nat) (hnd : l.Nodup)
+    (hlt : ∀ x ∈ l, x < l.length) : ∀ a < l.length, a ∈ l := by
+  -- Prove by induction on `n = l.length` using erase/subset cardinality
+  have hsub : ∀ (n : Nat) (xs : List Nat), xs.Nodup → xs.length = n → (∀ x ∈ xs, x < n) →
+      ∀ a < n, a ∈ xs := by
+    intro n
+    induction n with
+    | zero => intro xs _ _ _ a ha; omega
+    | succ m ih =>
+      intro xs hnd' hlen hlt' a ha
+      by_cases haMem : a ∈ xs
+      · exact haMem
+      · -- If `a ∉ xs`, every element of `xs` is in `{0,..,m} \ {a}`, which has size `m` — contradiction!
+        -- Map each element `x` of `xs` to `f x = if x < a then x else x - 1 < m`, injective on `xs`!
+        let f : Nat → Nat := fun x => if x < a then x else x - 1
+        let ys := xs.map f
+        have hysLen : ys.length = m + 1 := by simp [ys, hlen]
+        have hysLt : ∀ y ∈ ys, y < m := by
+          intro y hy
+          obtain ⟨x, hx, rfl⟩ := List.mem_map.mp hy
+          have hxLt : x < m + 1 := hlt' x hx
+          have hxNe : x ≠ a := fun heq => haMem (heq ▸ hx)
+          dsimp only [f]
+          split <;> omega
+        have hysNd : ys.Nodup := by
+          apply list_nodup_map_on _ hnd'
+          intro x1 hx1 x2 hx2 hfeq
+          have hne1 : x1 ≠ a := fun heq => haMem (heq ▸ hx1)
+          have hne2 : x2 ≠ a := fun heq => haMem (heq ▸ hx2)
+          dsimp only [f] at hfeq
+          split at hfeq <;> split at hfeq <;> omega
+        -- `ys` has length `m + 1`, `Nodup`, all elements `< m`: split off head `y0`, tail has length `m`!
+        cases hysEq : ys with
+        | nil => rw [hysEq] at hysLen; simp at hysLen
+        | cons y0 yrest =>
+          rw [hysEq] at hysLen hysNd hysLt
+          rw [List.nodup_cons] at hysNd
+          have hy0Lt : y0 < m := hysLt y0 (List.mem_cons_self ..)
+          have hyrLen : yrest.length = m := by simp at hysLen; exact hysLen
+          have hyrLt : ∀ y ∈ yrest, y < m := fun y hy => hysLt y (List.mem_cons_of_mem _ hy)
+          have hy0InRest : y0 ∈ yrest := ih yrest hysNd.2 hyrLen hyrLt y0 hy0Lt
+          exact absurd hy0InRest hysNd.1
+  exact hsub l.length l hnd rfl hlt
+
+private theorem findIdxNat_lt_and_get (l : List Nat) (target : Nat) (hmem : target ∈ l) :
+    findIdxNat l target < l.length ∧
+    l[findIdxNat l target]'(by
+      induction l with
+      | nil => cases hmem
+      | cons x xs ih =>
+        unfold findIdxNat
+        split
+        · simp
+        · rename_i hne
+          rcases List.mem_cons.mp hmem with rfl | hm
+          · simp at hne
+          · have := ih hm; simp; omega) = target := by
+  induction l with
+  | nil => cases hmem
+  | cons x xs ih =>
+    unfold findIdxNat
+    split
+    · rename_i heq
+      have hx : x = target := beq_iff_eq.mp heq
+      exact ⟨by simp, by simp [hx]⟩
+    · rename_i hne
+      rcases List.mem_cons.mp hmem with rfl | hm
+      · simp at hne
+      · obtain ⟨hlt, hget⟩ := ih hm
+        refine ⟨by simp; omega, ?_⟩
+        have hidx : 1 + findIdxNat xs target = findIdxNat xs target + 1 := Nat.add_comm 1 _
+        simp only [hidx, List.getElem_cons_succ]
+        exact hget
+
+private theorem findIdxNat_getElem (l : List Nat) (hnd : l.Nodup) (k : Nat) (hk : k < l.length) :
+    findIdxNat l l[k] = k := by
+  induction l generalizing k with
+  | nil => simp at hk
+  | cons x xs ih =>
+    rw [List.nodup_cons] at hnd
+    cases k with
+    | zero => simp [findIdxNat]
+    | succ k' =>
+      have hk' : k' < xs.length := by simpa using hk
+      have hmem : xs[k'] ∈ xs := List.getElem_mem hk'
+      have hne : (x == xs[k']) = false := by
+        cases hc : (x == xs[k']) with
+        | false => rfl
+        | true =>
+          have heq : x = xs[k'] := beq_iff_eq.mp hc
+          exact absurd (heq ▸ hmem) hnd.1
+      simp only [List.getElem_cons_succ, findIdxNat, hne, Bool.false_eq_true, ↓reduceIte]
+      rw [ih hnd.2 k' hk']
+      omega
+
+/-- For any valid permutation `p` and `a < p.size`, `invPerm p` satisfies `(invPerm p)[a] < p.size`
+    and `p[(invPerm p)[a]] = a`. -/
+theorem invPerm_right (p : Array Nat) (hp : ValidPerm p) (a : Nat) (ha : a < p.size) :
+    (invPerm p)[a]'(by simp [invPerm, ha]) < p.size ∧
+    p[(invPerm p)[a]'(by simp [invPerm, ha])]'(by
+      simp only [invPerm, Array.getElem_ofFn]
+      have hmem : a ∈ p.toList := nodup_subset_range_perm p.toList hp.2
+        (fun x hx => by
+          obtain ⟨i, hi, rfl⟩ := List.mem_iff_getElem.mp hx
+          have hi' : i < p.size := by simpa using hi
+          simpa using hp.1 i hi') a (by simpa using ha)
+      have := (findIdxNat_lt_and_get p.toList a hmem).1
+      simpa using this) = a := by
+  have hmem : a ∈ p.toList := nodup_subset_range_perm p.toList hp.2
+    (fun x hx => by
+      obtain ⟨i, hi, rfl⟩ := List.mem_iff_getElem.mp hx
+      have hi' : i < p.size := by simpa using hi
+      simpa using hp.1 i hi') a (by simpa using ha)
+  obtain ⟨hlt, hget⟩ := findIdxNat_lt_and_get p.toList a hmem
+  refine ⟨by simpa [invPerm] using hlt, ?_⟩
+  simpa [invPerm] using hget
+
+/-- For any valid permutation `p` and `k < p.size`, `(invPerm p)[p[k]] = k`. -/
+theorem invPerm_left (p : Array Nat) (hp : ValidPerm p) (k : Nat) (hk : k < p.size) :
+    (invPerm p)[p[k]]'(by simp [invPerm]; exact hp.1 k hk) = k := by
+  simp only [invPerm, Array.getElem_ofFn]
+  have hk' : k < p.toList.length := by simpa using hk
+  have h := findIdxNat_getElem p.toList hp.2 k hk'
+  simpa using h
+
+/-- `invPerm (idPerm n) = idPerm n`. -/
+theorem invPerm_idPerm (n : Nat) : invPerm (idPerm n) = idPerm n := by
+  apply Array.ext
+  · simp [invPerm, idPerm]
+  · intro i hi1 hi2
+    have hi : i < n := by simpa [idPerm] using hi2
+    have h := invPerm_left (idPerm n) (validPerm_idPerm n) i (by simpa [idPerm] using hi)
+    simpa [idPerm] using h
+
+/-- For valid equal-length permutations `p1, p2`, `invPerm (composePerm p1 p2)` matches
+    `composePerm (invPerm p2) (invPerm p1)`. -/
+theorem invPerm_composePerm (p1 p2 : Array Nat) (hp1 : ValidPerm p1) (hp2 : ValidPerm p2)
+    (hsz : p1.size = p2.size) :
+    invPerm (composePerm p1 p2) = composePerm (invPerm p2) (invPerm p1) := by
+  have hcomp := validPerm_composePerm p1 p2 hp1 hp2 hsz
+  apply Array.ext
+  · simp [invPerm, composePerm, hsz]
+  · intro a ha1 ha2
+    have ha : a < p1.size := by simpa [composePerm, invPerm] using ha2
+    have haInv1 : a < (invPerm p1).size := by simp [invPerm, ha]
+    let b := (invPerm p1)[a]'haInv1
+    have hbLt1 : b < p1.size := (invPerm_right p1 hp1 a ha).1
+    have hbLt2 : b < p2.size := by omega
+    have hget1 : p1[b]'hbLt1 = a := (invPerm_right p1 hp1 a ha).2
+    have hbInv2 : b < (invPerm p2).size := by simp [invPerm, hbLt2]
+    let k := (invPerm p2)[b]'hbInv2
+    have hkLt2 : k < p2.size := (invPerm_right p2 hp2 b hbLt2).1
+    have hget2 : p2[k]'hkLt2 = b := (invPerm_right p2 hp2 b hbLt2).2
+    have hkComp : (composePerm p1 p2)[k]'(by simp [composePerm, hkLt2]) = a := by
+      simp only [composePerm, Array.getElem_map]
+      have hp2k : p2[k]'hkLt2 < p1.size := by rw [hsz]; exact hp2.1 k hkLt2
+      rw [arr_getD_eq _ _ _ hp2k]
+      simpa [hget2] using hget1
+    have hleft := invPerm_left (composePerm p1 p2) hcomp k (by simp [composePerm, hkLt2])
+    have hEq : (invPerm (composePerm p1 p2))[a]'ha1 = k := by
+      simpa [hkComp] using hleft
+    rw [hEq]
+    simp only [composePerm, Array.getElem_map]
+    rw [arr_getD_eq _ _ _ hbInv2]
+
+-- 23.3 Row-major index bijection & exact polymorphic tensor view equivalence
+
+/-- `shapeProd s > 0` whenever every dimension in `s` is strictly positive. -/
+theorem shapeProd_pos (s : List Nat) (h : ∀ d ∈ s, d > 0) : shapeProd s > 0 := by
+  induction s with
+  | nil => simp [shapeProd]
+  | cons d ds ih =>
+    simp only [shapeProd]
+    have hd : d > 0 := h d (List.mem_cons_self ..)
+    have hds : shapeProd ds > 0 := ih (fun x hx => h x (List.mem_cons_of_mem _ hx))
+    exact Nat.mul_pos hd hds
+
+/-- `unflatten s idx` always has length `s.length`. -/
+theorem unflatten_length (s : List Nat) (idx : Nat) : (unflatten s idx).length = s.length := by
+  induction s generalizing idx with
+  | nil => rfl
+  | cons _ ds ih => simp [unflatten, ih]
+
+/-- Every coordinate produced by `unflatten s idx` (for `idx < shapeProd s`) is in-bounds `< s[i]`. -/
+theorem unflatten_lt (s : List Nat) (hpos : ∀ d ∈ s, d > 0) (idx : Nat) (hidx : idx < shapeProd s) :
+    ∀ i (hi : i < s.length), (unflatten s idx)[i]'(by rw [unflatten_length]; exact hi) < s[i] := by
+  induction s generalizing idx with
+  | nil => intro i hi; simp at hi
+  | cons d ds ih =>
+    intro i hi
+    have hdsPos : shapeProd ds > 0 := shapeProd_pos ds (fun x hx => hpos x (List.mem_cons_of_mem _ hx))
+    cases i with
+    | zero =>
+      simp only [unflatten, List.getElem_cons_zero]
+      simp only [shapeProd] at hidx
+      exact Nat.div_lt_of_lt_mul (by rw [Nat.mul_comm]; exact hidx)
+    | succ i' =>
+      simp only [unflatten, List.getElem_cons_succ]
+      exact ih (fun x hx => hpos x (List.mem_cons_of_mem _ hx)) (idx % shapeProd ds)
+        (Nat.mod_lt idx hdsPos) i' (by simpa using hi)
+
+/-- `flatIndex s cs < shapeProd s` whenever `cs` has length `s.length` and every `cs[i] < s[i]`. -/
+theorem flatIndex_lt (s cs : List Nat) (hlen : cs.length = s.length)
+    (hlt : ∀ i (hi : i < s.length), cs[i]'(by rw [hlen]; exact hi) < s[i]) :
+    flatIndex s cs < shapeProd s := by
+  induction s generalizing cs with
+  | nil => simp [flatIndex, shapeProd]
+  | cons d ds ih =>
+    cases cs with
+    | nil => simp at hlen
+    | cons c rest =>
+      simp only [flatIndex, shapeProd]
+      have hc : c < d := hlt 0 (by simp)
+      have hrest : flatIndex ds rest < shapeProd ds :=
+        ih rest (by simpa using hlen) (fun i hi => by
+          have h := hlt (i + 1) (by simp; omega)
+          simpa [List.getElem_cons_succ] using h)
+      have hmul : (c + 1) * shapeProd ds ≤ d * shapeProd ds :=
+        Nat.mul_le_mul_right (shapeProd ds) hc
+      rw [Nat.add_mul, Nat.one_mul] at hmul
+      omega
+
+/-- Left inverse: `flatIndex s (unflatten s idx) = idx` for all `idx < shapeProd s`. -/
+theorem flatIndex_unflatten (s : List Nat) (hpos : ∀ d ∈ s, d > 0) (idx : Nat) (hidx : idx < shapeProd s) :
+    flatIndex s (unflatten s idx) = idx := by
+  induction s generalizing idx with
+  | nil =>
+    simp [shapeProd] at hidx
+    simp [flatIndex, hidx]
+  | cons d ds ih =>
+    have hdsPos : shapeProd ds > 0 := shapeProd_pos ds (fun x hx => hpos x (List.mem_cons_of_mem _ hx))
+    simp only [unflatten, flatIndex]
+    rw [ih (fun x hx => hpos x (List.mem_cons_of_mem _ hx)) (idx % shapeProd ds) (Nat.mod_lt idx hdsPos)]
+    have hdm := Nat.div_add_mod idx (shapeProd ds)
+    rw [Nat.mul_comm] at hdm
+    exact hdm
+
+/-- Right inverse: `unflatten s (flatIndex s cs) = cs` for all in-bounds coordinates `cs`. -/
+theorem unflatten_flatIndex (s cs : List Nat) (hpos : ∀ d ∈ s, d > 0)
+    (hlen : cs.length = s.length)
+    (hlt : ∀ i (hi : i < s.length), cs[i]'(by rw [hlen]; exact hi) < s[i]) :
+    unflatten s (flatIndex s cs) = cs := by
+  induction s generalizing cs with
+  | nil =>
+    cases cs with
+    | nil => rfl
+    | cons _ _ => simp at hlen
+  | cons d ds ih =>
+    cases cs with
+    | nil => simp at hlen
+    | cons c rest =>
+      have hdsPos : shapeProd ds > 0 := shapeProd_pos ds (fun x hx => hpos x (List.mem_cons_of_mem _ hx))
+      have hrestLt : flatIndex ds rest < shapeProd ds :=
+        flatIndex_lt ds rest (by simpa using hlen)
+          (fun i hi => by
+            have h := hlt (i + 1) (by simp; omega)
+            simpa [List.getElem_cons_succ] using h)
+      simp only [flatIndex, unflatten]
+      have hdiv : (c * shapeProd ds + flatIndex ds rest) / shapeProd ds = c := by
+        rw [Nat.mul_comm c (shapeProd ds), Nat.mul_add_div hdsPos,
+            Nat.div_eq_of_lt hrestLt, Nat.add_zero]
+      have hmod : (c * shapeProd ds + flatIndex ds rest) % shapeProd ds = flatIndex ds rest := by
+        rw [Nat.mul_comm c (shapeProd ds), Nat.mul_add_mod, Nat.mod_eq_of_lt hrestLt]
+      rw [hdiv, hmod]
+      congr 1
+      exact ih rest (fun x hx => hpos x (List.mem_cons_of_mem _ hx)) (by simpa using hlen)
+        (fun i hi => by
+          have h := hlt (i + 1) (by simp; omega)
+          simpa [List.getElem_cons_succ] using h)
+
+private theorem list_all_pos_iff (s : List Nat) :
+    s.all (· > 0) = true ↔ ∀ d ∈ s, d > 0 := by
+  rw [List.all_eq_true]
+  constructor
+  · intro h d hd; simpa using h d hd
+  · intro h d hd; simpa using h d hd
+
+private theorem tensorVal_ext {α : Type} {t1 t2 : TensorVal α}
+    (hsh : t1.shape = t2.shape)
+    (hdata : ∀ (i : Nat) (h1 : i < shapeProd t1.shape) (h2 : i < shapeProd t2.shape),
+      t1.data ⟨i, h1⟩ = t2.data ⟨i, h2⟩) : t1 = t2 := by
+  cases t1 with
+  | mk s1 d1 =>
+    cases t2 with
+    | mk s2 d2 =>
+      dsimp only at hsh hdata
+      subst hsh
+      congr 1
+      funext idx
+      exact hdata idx.val idx.isLt idx.isLt
+
+/-- Exact element-for-element identity transpose equivalence over arbitrary scalar type `α`. -/
+theorem evalTranspose_id {α : Type} (t : TensorVal α) (hpos : ∀ d ∈ t.shape, d > 0) :
+    evalTranspose (idPerm t.shape.length) t = some t := by
+  unfold evalTranspose
+  have hv : isValidPerm (idPerm t.shape.length) = true :=
+    (isValidPerm_iff _).mpr (validPerm_idPerm t.shape.length)
+  have hsz : (idPerm t.shape.length).size = t.shape.length := by simp [idPerm]
+  have hall : t.shape.all (· > 0) = true := (list_all_pos_iff t.shape).mpr hpos
+  have hn : 0 < shapeProd t.shape := shapeProd_pos t.shape hpos
+  simp only [hv, hsz, beq_self_eq_true, hall, Bool.and_self, ↓reduceIte, hn, ↓reduceDIte]
+  congr 1
+  have houtSh : transposeShape t.shape (idPerm t.shape.length) = t.shape := by
+    unfold transposeShape
+    apply List.ext_getElem
+    · simp [idPerm]
+    · intro i h1 h2
+      simp only [List.getElem_map, idPerm, Array.toList_ofFn, List.getElem_ofFn]
+      exact list_getD_eq t.shape i 0 h2
+  apply tensorVal_ext houtSh
+  intro i h1 h2
+  have hcoords :
+      ((List.range t.shape.length).map fun a =>
+        (unflatten (transposeShape t.shape (idPerm t.shape.length)) i).getD
+          ((invPerm (idPerm t.shape.length)).getD a 0) 0) =
+      unflatten t.shape i := by
+    rw [houtSh, invPerm_idPerm]
+    apply List.ext_getElem
+    · simp [unflatten_length]
+    · intro k hk1 hk2
+      have hk : k < t.shape.length := by simpa using hk1
+      simp only [List.getElem_map, List.getElem_range]
+      have hid : (idPerm t.shape.length).getD k 0 = k := by
+        rw [arr_getD_eq _ _ _ (by simp [idPerm, hk])]
+        simp [idPerm]
+      rw [hid, list_getD_eq _ _ _ (by rw [unflatten_length]; exact hk)]
+  dsimp only
+  rw [hcoords, flatIndex_unflatten t.shape hpos i h2]
+  simp [h2]
+
+private theorem transposeShape_compose (s : List Nat) (p1 p2 : Array Nat)
+    (hp2 : ValidPerm p2) (hsz12 : p1.size = p2.size) :
+    transposeShape (transposeShape s p1) p2 = transposeShape s (composePerm p1 p2) := by
+  unfold transposeShape composePerm
+  apply List.ext_getElem
+  · simp
+  · intro k hk1 hk2
+    have hk : k < p2.size := by simpa using hk1
+    have hp2k : p2[k] < p1.size := by rw [hsz12]; exact hp2.1 k hk
+    simp only [List.getElem_map, Array.getElem_toList, Array.toList_map]
+    rw [list_getD_eq _ _ _ (by simp; omega)]
+    rw [arr_getD_eq _ _ _ hp2k]
+    simp
+
+private theorem transposeShape_pos (s : List Nat) (p : Array Nat)
+    (hp : ValidPerm p) (hsz : p.size = s.length) (hpos : ∀ d ∈ s, d > 0) :
+    ∀ d ∈ transposeShape s p, d > 0 := by
+  intro d hd
+  unfold transposeShape at hd
+  obtain ⟨a, ha, rfl⟩ := List.mem_map.mp hd
+  obtain ⟨k, hk, rfl⟩ := List.mem_iff_getElem.mp ha
+  have hk' : k < p.size := by simpa using hk
+  have hlt : p[k] < s.length := by rw [← hsz]; exact hp.1 k hk'
+  have hEq : s.getD p.toList[k] 0 = s[p[k]] := by
+    simpa using list_getD_eq s p[k] 0 hlt
+  rw [hEq]
+  exact hpos _ (List.getElem_mem hlt)
+
+/-- Exact element-for-element composed transpose equivalence:
+    `evalTranspose p2 (evalTranspose p1 t) = evalTranspose (composePerm p1 p2) t`. -/
+theorem evalTranspose_compose {α : Type} (p1 p2 : Array Nat) (t t1 : TensorVal α)
+    (hp1 : ValidPerm p1) (hp2 : ValidPerm p2) (hsz : p1.size = p2.size)
+    (ht1 : evalTranspose p1 t = some t1) :
+    evalTranspose p2 t1 = evalTranspose (composePerm p1 p2) t := by
+  unfold evalTranspose at ht1
+  have hv1 : isValidPerm p1 = true := (isValidPerm_iff p1).mpr hp1
+  simp only [hv1, Bool.true_and] at ht1
+  split at ht1
+  · rename_i hcond1
+    simp only [Bool.and_eq_true, beq_iff_eq] at hcond1
+    obtain ⟨hp1Len, hallPos⟩ := hcond1
+    have hpos : ∀ d ∈ t.shape, d > 0 := (list_all_pos_iff t.shape).mp hallPos
+    have hn : 0 < shapeProd t.shape := shapeProd_pos t.shape hpos
+    simp only [hn, ↓reduceDIte, Option.some.injEq] at ht1
+    subst ht1
+    have hpos1 : ∀ d ∈ transposeShape t.shape p1, d > 0 := transposeShape_pos t.shape p1 hp1 hp1Len hpos
+    have hall1 : (transposeShape t.shape p1).all (· > 0) = true := (list_all_pos_iff _).mpr hpos1
+    have hlen1 : (transposeShape t.shape p1).length = p2.size := by simp [transposeShape, hsz]
+    have hn1 : 0 < shapeProd (transposeShape t.shape p1) := shapeProd_pos _ hpos1
+    have hv2 : isValidPerm p2 = true := (isValidPerm_iff p2).mpr hp2
+    have hcompValid : ValidPerm (composePerm p1 p2) := validPerm_composePerm p1 p2 hp1 hp2 hsz
+    have hvC : isValidPerm (composePerm p1 p2) = true := (isValidPerm_iff _).mpr hcompValid
+    have hcompLen : (composePerm p1 p2).size = t.shape.length := by simp [composePerm, ← hsz, hp1Len]
+    unfold evalTranspose
+    simp only [hv2, hlen1, beq_self_eq_true, hall1, Bool.and_self, ↓reduceIte, hn1, ↓reduceDIte,
+               hvC, hcompLen, hallPos, hn]
+    congr 1
+    have hshEq : transposeShape (transposeShape t.shape p1) p2 =
+        transposeShape t.shape (composePerm p1 p2) :=
+      transposeShape_compose t.shape p1 p2 hp2 hsz
+    apply tensorVal_ext hshEq
+    intro i hi1 hi2
+    dsimp only
+    -- Show `inCoords1` is in-bounds for `transposeShape t.shape p1`, so `unflatten (flatIndex inCoords1) = inCoords1`!
+    let outCoords1 := unflatten (transposeShape (transposeShape t.shape p1) p2) i
+    let inCoords1 := (List.range (transposeShape t.shape p1).length).map fun b =>
+      outCoords1.getD ((invPerm p2).getD b 0) 0
+    have hin1Len : inCoords1.length = (transposeShape t.shape p1).length := by simp [inCoords1]
+    have hin1Lt : ∀ b (hb : b < (transposeShape t.shape p1).length),
+        inCoords1[b]'(by rw [hin1Len]; exact hb) < (transposeShape t.shape p1)[b] := by
+      intro b hb
+      have hb2 : b < p2.size := by omega
+      simp only [inCoords1, List.getElem_map, List.getElem_range]
+      have hinvLt : (invPerm p2)[b]'(by simp [invPerm, hb2]) < p2.size := (invPerm_right p2 hp2 b hb2).1
+      have hinvGet : p2[(invPerm p2)[b]'(by simp [invPerm, hb2])]'hinvLt = b := (invPerm_right p2 hp2 b hb2).2
+      rw [arr_getD_eq _ _ _ (by simp [invPerm, hb2])]
+      have houtLen : outCoords1.length = p2.size := by simp [outCoords1, unflatten_length, transposeShape]
+      rw [list_getD_eq _ _ _ (by omega)]
+      have hltOut := unflatten_lt (transposeShape (transposeShape t.shape p1) p2)
+        (transposeShape_pos _ p2 hp2 (by omega) hpos1) i hi1
+        ((invPerm p2)[b]'(by simp [invPerm, hb2])) (by simp [transposeShape, hinvLt])
+      have hdimEq : (transposeShape (transposeShape t.shape p1) p2)[(invPerm p2)[b]'(by simp [invPerm, hb2])]'(by simp [transposeShape, hinvLt]) =
+          (transposeShape t.shape p1)[b] := by
+        simp only [transposeShape, List.getElem_map, Array.getElem_toList]
+        rw [hinvGet, list_getD_eq (List.map (fun a => t.shape.getD a 0) p1.toList) b 0 (by simpa [transposeShape] using hb)]
+        simp
+      simpa [outCoords1, hdimEq] using hltOut
+    have hf1Lt : flatIndex (transposeShape t.shape p1) inCoords1 < shapeProd (transposeShape t.shape p1) :=
+      flatIndex_lt _ inCoords1 hin1Len hin1Lt
+    have hf1Lt' :
+        flatIndex (transposeShape t.shape p1)
+          ((List.range p2.size).map fun a =>
+            (unflatten (transposeShape (transposeShape t.shape p1) p2) i).getD ((invPerm p2).getD a 0) 0) <
+        shapeProd (transposeShape t.shape p1) := by
+      simpa [inCoords1, outCoords1, hlen1] using hf1Lt
+    rw [dite_eq_left_of_eq_true (eq_true hf1Lt')]
+    have hunf1 :
+        unflatten (transposeShape t.shape p1)
+          (flatIndex (transposeShape t.shape p1)
+            ((List.range p2.size).map fun a =>
+              (unflatten (transposeShape (transposeShape t.shape p1) p2) i).getD ((invPerm p2).getD a 0) 0)) =
+        inCoords1 := by
+      have h0 := unflatten_flatIndex _ inCoords1 hpos1 hin1Len hin1Lt
+      simpa [inCoords1, outCoords1, hlen1] using h0
+    -- Now show the final coordinates into `t.shape` are identical on LHS and RHS!
+    have hfinalCoords :
+        ((List.range t.shape.length).map fun a =>
+          (unflatten (transposeShape t.shape p1)
+            (flatIndex (transposeShape t.shape p1)
+              ((List.range p2.size).map fun a =>
+                (unflatten (transposeShape (transposeShape t.shape p1) p2) i).getD ((invPerm p2).getD a 0) 0))).getD
+            ((invPerm p1).getD a 0) 0) =
+        ((List.range t.shape.length).map fun a =>
+          (unflatten (transposeShape t.shape (composePerm p1 p2)) i).getD
+            ((invPerm (composePerm p1 p2)).getD a 0) 0) := by
+      rw [hunf1]
+      apply List.ext_getElem
+      · simp
+      · intro a ha1 ha2
+        have ha : a < t.shape.length := by simpa using ha1
+        have ha1' : a < p1.size := by omega
+        simp only [List.getElem_map, List.getElem_range]
+        have hinv1Lt : (invPerm p1)[a]'(by simp [invPerm, ha1']) < p1.size := (invPerm_right p1 hp1 a ha1').1
+        rw [arr_getD_eq _ _ _ (by simp [invPerm, ha1'])]
+        have hinv1Lt' : (invPerm p1)[a]'(by simp [invPerm, ha1']) < inCoords1.length := by
+          rw [hin1Len, hlen1, ← hsz]; exact hinv1Lt
+        rw [list_getD_eq _ _ _ hinv1Lt']
+        simp only [inCoords1, List.getElem_map, List.getElem_range]
+        rw [invPerm_composePerm p1 p2 hp1 hp2 hsz]
+        have hcompIdx : (composePerm (invPerm p2) (invPerm p1)).getD a 0 =
+            (invPerm p2).getD ((invPerm p1)[a]'(by simp [invPerm, ha1'])) 0 := by
+          rw [arr_getD_eq _ _ _ (by simp [composePerm, invPerm, ha1'])]
+          simp [composePerm]
+        rw [hcompIdx]
+        simp only [outCoords1, hshEq]
+    have hditeCongr : ∀ (c1 c2 : List Nat), c1 = c2 →
+        (if hlt : flatIndex t.shape c1 < shapeProd t.shape then t.data ⟨flatIndex t.shape c1, hlt⟩ else t.data ⟨0, hn⟩) =
+        (if hlt : flatIndex t.shape c2 < shapeProd t.shape then t.data ⟨flatIndex t.shape c2, hlt⟩ else t.data ⟨0, hn⟩) := by
+      intro c1 c2 hc; subst hc; rfl
+    exact hditeCongr _ _ hfinalCoords
+  · cases ht1
+
+/-- Exact identity `Reshape` equivalence over arbitrary scalar type `α`. -/
+theorem evalReshape_id {α : Type} (t : TensorVal α) (hpos : ∀ d ∈ t.shape, d > 0) :
+    evalReshape t.shape.toArray t = some t := by
+  unfold evalReshape
+  have hall : t.shape.toArray.all (· > 0) = true := by
+    rw [Array.all_eq_true_iff_forall_mem]
+    intro d hd
+    have hdL : d ∈ t.shape := by simpa [Array.mem_def] using hd
+    simpa using hpos d hdL
+  simp only [List.toList_toArray, ↓reduceDIte, hall, ↓reduceIte]
+
+/-- Exact composed `Reshape` equivalence: `evalReshape s2 (evalReshape s1 t) = evalReshape s2 t`. -/
+theorem evalReshape_compose {α : Type} (s1 s2 : Array Nat) (t t1 : TensorVal α)
+    (ht1 : evalReshape s1 t = some t1) :
+    evalReshape s2 t1 = evalReshape s2 t := by
+  unfold evalReshape at ht1 ⊢
+  split at ht1
+  · rename_i h1
+    split at ht1
+    · simp only [Option.some.injEq] at ht1
+      subst ht1
+      dsimp only
+      by_cases h2 : shapeProd s2.toList = shapeProd s1.toList
+      · have h2t : shapeProd s2.toList = shapeProd t.shape := h2.trans h1
+        rw [dite_eq_left_of_eq_true (eq_true h2), dite_eq_left_of_eq_true (eq_true h2t)]
+      · have h2t : shapeProd s2.toList ≠ shapeProd t.shape := fun hc => h2 (hc.trans h1.symm)
+        rw [dite_eq_right_of_eq_false (eq_false h2), dite_eq_right_of_eq_false (eq_false h2t)]
+    · cases ht1
+  · cases ht1
+
+/-- Exact full-span identity `Slice` equivalence over arbitrary scalar type `α`. -/
+theorem evalSlice_id {α : Type} (t : TensorVal α) (hpos : ∀ d ∈ t.shape, d > 0) :
+    evalSlice (Array.replicate t.shape.length 0) t.shape.toArray
+      (Array.replicate t.shape.length 1) t = some t := by
+  unfold evalSlice
+  have hv : validSliceParams t.shape (Array.replicate t.shape.length 0) t.shape.toArray
+      (Array.replicate t.shape.length 1) = true := by
+    unfold validSliceParams
+    simp only [Array.size_replicate, List.size_toArray, beq_self_eq_true, Bool.true_and,
+               List.all_eq_true, List.mem_range, Bool.and_eq_true, decide_eq_true_eq]
+    intro i hi
+    have hdi : t.shape.getD i 0 = t.shape[i] := list_getD_eq t.shape i 0 hi
+    have hgt : t.shape[i] > 0 := hpos _ (List.getElem_mem hi)
+    have hb : (Array.replicate t.shape.length 0).getD i 0 = 0 := by
+      rw [arr_getD_eq _ _ _ (by simp [hi])]; simp
+    have he : t.shape.toArray.getD i 0 = t.shape[i] := by
+      rw [arr_getD_eq _ _ _ (by simp [hi])]; simp
+    have hs : (Array.replicate t.shape.length 1).getD i 0 = 1 := by
+      rw [arr_getD_eq _ _ _ (by simp [hi])]; simp
+    rw [hb, he, hs, hdi]
+    exact ⟨⟨by omega, hgt⟩, Nat.le_refl _⟩
+  have hall : t.shape.all (· > 0) = true := (list_all_pos_iff t.shape).mpr hpos
+  have hn : 0 < shapeProd t.shape := shapeProd_pos t.shape hpos
+  simp only [hv, hall, Bool.and_self, ↓reduceIte, hn, ↓reduceDIte]
+  congr 1
+  have houtSh : sliceShape t.shape (Array.replicate t.shape.length 0) t.shape.toArray
+      (Array.replicate t.shape.length 1) = t.shape := by
+    unfold sliceShape sliceAxisDim
+    apply List.ext_getElem
+    · simp
+    · intro i h1 h2
+      have hb : (Array.replicate t.shape.length 0).getD i 0 = 0 := by
+        rw [arr_getD_eq _ _ _ (by simp [h2])]; simp
+      have he : t.shape.toArray.getD i 0 = t.shape[i] := by
+        rw [arr_getD_eq _ _ _ (by simp [h2])]; simp
+      have hs : (Array.replicate t.shape.length 1).getD i 0 = 1 := by
+        rw [arr_getD_eq _ _ _ (by simp [h2])]; simp
+      have hgt : t.shape[i] > 0 := hpos _ (List.getElem_mem h2)
+      simp only [List.getElem_map, List.getElem_range, hb, he, hs]
+      have hcond : (1 == 0 || decide (t.shape[i] ≤ 0)) = false := by
+        simp; omega
+      simp only [hcond, Bool.false_eq_true, ↓reduceIte]
+      omega
+  apply tensorVal_ext houtSh
+  intro i h1 h2
+  dsimp only
+  have hcoords :
+      ((List.range t.shape.length).map fun k =>
+        (Array.replicate t.shape.length 0).getD k 0 +
+        (unflatten (sliceShape t.shape (Array.replicate t.shape.length 0) t.shape.toArray
+          (Array.replicate t.shape.length 1)) i).getD k 0 *
+        (Array.replicate t.shape.length 1).getD k 0) =
+      unflatten t.shape i := by
+    rw [houtSh]
+    apply List.ext_getElem
+    · simp [unflatten_length]
+    · intro k hk1 hk2
+      have hk : k < t.shape.length := by simpa using hk1
+      have hb : (Array.replicate t.shape.length 0).getD k 0 = 0 := by
+        rw [arr_getD_eq _ _ _ (by simp [hk])]; simp
+      have hs : (Array.replicate t.shape.length 1).getD k 0 = 1 := by
+        rw [arr_getD_eq _ _ _ (by simp [hk])]; simp
+      simp only [List.getElem_map, List.getElem_range, hb, hs, Nat.zero_add, Nat.mul_one]
+      exact list_getD_eq _ _ _ (by rw [unflatten_length]; exact hk)
+  rw [hcoords, flatIndex_unflatten t.shape hpos i h2]
+  simp only [h2, ↓reduceDIte]
+
+-- 23.4 Generic `applyRewrites` and `runPasses` compositionality theorems
+
+private theorem applyFirstRule_mem {Op : Type} {rules : List (RewriteRule Op)} {g g' : SSAGraph Op}
+    (h : applyFirstRule rules g = some g') :
+    ∃ r ∈ rules, r.apply g = some g' := by
+  induction rules with
+  | nil => cases h
+  | cons r rest ih =>
+    unfold applyFirstRule at h
+    cases hr : r.apply g with
+    | some g1 =>
+      simp only [hr, Option.some.injEq] at h
+      subst h
+      exact ⟨r, List.mem_cons_self .., hr⟩
+    | none =>
+      simp only [hr] at h
+      obtain ⟨r', hmem, happ⟩ := ih h
+      exact ⟨r', List.mem_cons_of_mem _ hmem, happ⟩
+
+/-- Generic `applyRewrites` soundness combinator: if every rule in `rules` preserves
+    `WellFormed` and `SemRefines sem`, then `applyRewrites fuel rules` preserves both
+    `WellFormed` and `SemRefines sem` for any fuel bound `fuel`. -/
+theorem evalGraph_applyRewrites {Op α : Type} (sem : OpSemantics Op α)
+    (fuel : Nat) (rules : List (RewriteRule Op))
+    (hrules : ∀ r ∈ rules, r.PreservesWF ∧ r.PreservesSem sem) :
+    PreservesWF (applyRewrites fuel rules) ∧ PreservesSem sem (applyRewrites fuel rules) := by
+  induction fuel with
+  | zero =>
+    constructor
+    · intro g hwf; exact hwf
+    · intro g _ env outs h; exact h
+  | succ f ih =>
+    constructor
+    · intro g hwf
+      unfold applyRewrites
+      cases hstep : applyFirstRule rules g with
+      | none => exact hwf
+      | some g' =>
+        obtain ⟨r, hmem, happ⟩ := applyFirstRule_mem hstep
+        have hwf' := (hrules r hmem).1 g g' hwf happ
+        exact ih.1 g' hwf'
+    · intro g hwf env outs hout
+      unfold applyRewrites
+      cases hstep : applyFirstRule rules g with
+      | none => exact hout
+      | some g' =>
+        obtain ⟨r, hmem, happ⟩ := applyFirstRule_mem hstep
+        have hwf' := (hrules r hmem).1 g g' hwf happ
+        have hout' := (hrules r hmem).2 g g' hwf happ env outs hout
+        exact ih.2 g' hwf' env outs hout'
+
+/-- `runPasses` compositionality for `WellFormed` preservation. -/
+theorem runPasses_preservesWF {Op : Type} (passes : List (SSAGraph Op → SSAGraph Op))
+    (hpasses : ∀ p ∈ passes, PreservesWF p) :
+    PreservesWF (runPasses passes) := by
+  induction passes with
+  | nil => intro g hwf; exact hwf
+  | cons p ps ih =>
+    intro g hwf
+    unfold runPasses
+    have hwf1 := hpasses p (List.mem_cons_self ..) g hwf
+    exact ih (fun q hq => hpasses q (List.mem_cons_of_mem _ hq)) (p g) hwf1
+
+/-- `runPasses` compositionality for semantic preservation (`PreservesSem`). -/
+theorem runPasses_preservesSem {Op α : Type} (sem : OpSemantics Op α)
+    (passes : List (SSAGraph Op → SSAGraph Op))
+    (hpasses : ∀ p ∈ passes, PreservesWF p ∧ PreservesSem sem p) :
+    PreservesSem sem (runPasses passes) := by
+  induction passes with
+  | nil => intro g _ env outs h; exact h
+  | cons p ps ih =>
+    intro g hwf env outs hout
+    unfold runPasses
+    have hp := hpasses p (List.mem_cons_self ..)
+    have hwf1 := hp.1 g hwf
+    have hout1 := hp.2 g hwf env outs hout
+    exact ih (fun q hq => hpasses q (List.mem_cons_of_mem _ hq)) (p g) hwf1 env outs hout1
+
+-- 23.5 Functional Equivalence of `DCE` (`wellFormed_dce`, `evalGraph_dce`)
+
+private theorem lookupAll_congr {α : Type} {env1 env2 : Env α} {ids : List ValueId}
+    (h : ∀ v ∈ ids, env2 v = env1 v) :
+    lookupAll env2 ids = lookupAll env1 ids := by
+  induction ids with
+  | nil => rfl
+  | cons v vs ih =>
+    simp only [lookupAll]
+    rw [h v (List.mem_cons_self ..), ih (fun x hx => h x (List.mem_cons_of_mem _ hx))]
+
+private theorem bindOutputs_not_mem {α : Type} (env : Env α)
+    (os : List (ValueId × TensorType)) (ts : List (TensorVal α))
+    (v : ValueId) (hnot : ∀ o ∈ os, o.1 ≠ v) :
+    bindOutputs env os ts v = env v := by
+  induction os generalizing env ts with
+  | nil => rfl
+  | cons o rest ih =>
+    cases ts with
+    | nil => rfl
+    | cons t ts' =>
+      simp only [bindOutputs]
+      rw [ih (Env.set env o.1 t) ts' (fun x hx => hnot x (List.mem_cons_of_mem _ hx))]
+      have hne : (v == o.1) = false := by
+        cases hc : (v == o.1) with
+        | false => rfl
+        | true => exact absurd (beq_iff_eq.mp hc).symm (hnot o (List.mem_cons_self ..))
+      simp [Env.set, hne]
+
+private theorem bindOutputs_agree {α : Type} (env1 env2 : Env α)
+    (os : List (ValueId × TensorType)) (ts : List (TensorVal α))
+    (v : ValueId) (hagree : env2 v = env1 v) :
+    bindOutputs env2 os ts v = bindOutputs env1 os ts v := by
+  induction os generalizing env1 env2 ts with
+  | nil => exact hagree
+  | cons o rest ih =>
+    cases ts with
+    | nil => exact hagree
+    | cons t ts' =>
+      simp only [bindOutputs]
+      apply ih
+      simp only [Env.set]
+      split
+      · rfl
+      · exact hagree
+
+private theorem evalNodes_dceNodes {Op α : Type} (sem : OpSemantics Op α)
+    (nodes : List (IRNode Op)) (needed : List ValueId)
+    (env1 env2 final1 : Env α)
+    (hagree : ∀ v ∈ (dceNodes nodes needed).2, env2 v = env1 v)
+    (heval : evalNodes sem env1 nodes = some final1) :
+    ∃ final2, evalNodes sem env2 (dceNodes nodes needed).1 = some final2 ∧
+      ∀ v ∈ needed, final2 v = final1 v := by
+  induction nodes generalizing env1 env2 with
+  | nil =>
+    simp only [dceNodes, evalNodes, Option.some.injEq] at heval ⊢
+    subst heval
+    exact ⟨env2, rfl, hagree⟩
+  | cons nd rest ih =>
+    simp only [evalNodes] at heval
+    cases hnd : evalNode sem env1 nd with
+    | none => simp [hnd] at heval
+    | some env1' =>
+      simp only [hnd] at heval
+      unfold dceNodes
+      dsimp only
+      split
+      · -- Node `nd` is KEPT
+        rename_i hlive
+        have hagreeIn : ∀ v ∈ nd.inputs.toList, env2 v = env1 v := by
+          intro v hv
+          apply hagree
+          simp only [dceNodes, hlive, ↓reduceIte, List.mem_append]
+          exact Or.inl hv
+        have hagreeAfter : ∀ v ∈ (dceNodes rest needed).2, env2 v = env1 v := by
+          intro v hv
+          apply hagree
+          simp only [dceNodes, hlive, ↓reduceIte, List.mem_append]
+          exact Or.inr hv
+        -- Evaluate `nd` under `env2`
+        unfold evalNode at hnd
+        cases hlu : lookupAll env1 nd.inputs.toList with
+        | none => simp [hlu] at hnd
+        | some inVals =>
+          simp only [hlu] at hnd
+          cases hop : sem.evalOp nd.op inVals (nd.outputs.toList.map Prod.snd) with
+          | none => simp [hop] at hnd
+          | some outVals =>
+            simp only [hop] at hnd
+            split at hnd
+            · rename_i hsm
+              simp only [Option.some.injEq] at hnd
+              subst hnd
+              have hnd2 : evalNode sem env2 nd = some (bindOutputs env2 nd.outputs.toList outVals) := by
+                unfold evalNode
+                rw [lookupAll_congr hagreeIn, hlu]
+                dsimp only
+                rw [hop]
+                dsimp only
+                rw [hsm]
+                rfl
+              simp only [evalNodes, hnd2]
+              exact ih (bindOutputs env1 nd.outputs.toList outVals)
+                (bindOutputs env2 nd.outputs.toList outVals)
+                (fun v hv => bindOutputs_agree env1 env2 nd.outputs.toList outVals v (hagreeAfter v hv))
+                heval
+            · cases hnd
+      · -- Node `nd` is DROPPED (none of its outputs is in `(dceNodes rest needed).2`)
+        rename_i hdead
+        have hagreeAfter : ∀ v ∈ (dceNodes rest needed).2, env2 v = env1 v := by
+          intro v hv
+          apply hagree
+          simp only [dceNodes, hdead, Bool.false_eq_true, ↓reduceIte]
+          exact hv
+        unfold evalNode at hnd
+        cases hlu : lookupAll env1 nd.inputs.toList with
+        | none => simp [hlu] at hnd
+        | some inVals =>
+          simp only [hlu] at hnd
+          cases hop : sem.evalOp nd.op inVals (nd.outputs.toList.map Prod.snd) with
+          | none => simp [hop] at hnd
+          | some outVals =>
+            simp only [hop] at hnd
+            split at hnd
+            · simp only [Option.some.injEq] at hnd
+              subst hnd
+              apply ih (bindOutputs env1 nd.outputs.toList outVals) env2 _ heval
+              intro v hv
+              have hnot : ∀ o ∈ nd.outputs.toList, o.1 ≠ v := by
+                intro o ho heq
+                subst heq
+                have hany : nd.outputs.toList.any (fun o => (dceNodes rest needed).2.elem o.1) = true :=
+                  List.any_eq_true.mpr ⟨o, ho, List.elem_eq_true_of_mem hv⟩
+                exact hdead hany
+              rw [bindOutputs_not_mem env1 nd.outputs.toList outVals v hnot]
+              exact hagreeAfter v hv
+            · cases hnd
+
+private theorem dceNodes_sublist {Op : Type} (nodes : List (IRNode Op)) (needed : List ValueId) :
+    (dceNodes nodes needed).1.Sublist nodes := by
+  induction nodes with
+  | nil => simp [dceNodes]
+  | cons nd rest ih =>
+    unfold dceNodes
+    dsimp only
+    split
+    · exact List.Sublist.cons_cons nd ih
+    · exact List.Sublist.cons nd ih
+
+private theorem dceNodes_needed_sub {Op : Type} (nodes : List (IRNode Op)) (needed : List ValueId) :
+    ∀ v ∈ needed, v ∈ (dceNodes nodes needed).2 := by
+  induction nodes with
+  | nil => intro v hv; exact hv
+  | cons nd rest ih =>
+    intro v hv
+    unfold dceNodes
+    dsimp only
+    split
+    · exact List.mem_append_right _ (ih v hv)
+    · exact ih v hv
+
+private theorem dceNodes_kept_inputs_in_needed {Op : Type} (nodes : List (IRNode Op)) (needed : List ValueId) :
+    ∀ nd ∈ (dceNodes nodes needed).1, ∀ v ∈ nd.inputs.toList, v ∈ (dceNodes nodes needed).2 := by
+  induction nodes with
+  | nil => intro nd hnd; simp [dceNodes] at hnd
+  | cons a rest ih =>
+    intro nd hnd v hv
+    unfold dceNodes at hnd ⊢
+    dsimp only at hnd ⊢
+    split at hnd
+    · rename_i hlive
+      simp only [hlive, ↓reduceIte, List.mem_append]
+      rcases List.mem_cons.mp hnd with rfl | hmem
+      · exact Or.inl hv
+      · exact Or.inr (ih nd hmem v hv)
+    · rename_i hdead
+      simp only [hdead, Bool.false_eq_true, ↓reduceIte]
+      exact ih nd hnd v hv
+
+private theorem dceNodes_covers_needed {Op : Type} (nodes : List (IRNode Op)) (needed : List ValueId)
+    (avail : List ValueId)
+    (hdef : ∀ i (hi : i < nodes.length), ∀ v ∈ nodes[i].inputs.toList,
+      v ∈ avail ++ (nodes.take i).flatMap IRNode.outputIds)
+    (hroot : ∀ v ∈ needed, v ∈ avail ++ nodes.flatMap IRNode.outputIds) :
+    (∀ v ∈ (dceNodes nodes needed).2, v ∈ avail ++ (dceNodes nodes needed).1.flatMap IRNode.outputIds) ∧
+    (∀ i (hi : i < (dceNodes nodes needed).1.length), ∀ v ∈ (dceNodes nodes needed).1[i].inputs.toList,
+      v ∈ avail ++ ((dceNodes nodes needed).1.take i).flatMap IRNode.outputIds) := by
+  induction nodes generalizing avail with
+  | nil =>
+    simp only [dceNodes, List.flatMap_nil, List.append_nil] at hroot ⊢
+    exact ⟨hroot, fun i hi => by simp at hi⟩
+  | cons nd rest ih =>
+    have hdefRest : ∀ i (hi : i < rest.length), ∀ v ∈ rest[i].inputs.toList,
+        v ∈ (avail ++ nd.outputIds) ++ (rest.take i).flatMap IRNode.outputIds := by
+      intro i hi v hv
+      have h := hdef (i + 1) (by simp; omega) v (by simpa using hv)
+      simpa [List.take_succ_cons, List.flatMap_cons, List.append_assoc] using h
+    have hrootRest : ∀ v ∈ needed, v ∈ (avail ++ nd.outputIds) ++ rest.flatMap IRNode.outputIds := by
+      intro v hv
+      simpa [List.flatMap_cons, List.append_assoc] using hroot v hv
+    obtain ⟨hNeedR, hDefR⟩ := ih (avail ++ nd.outputIds) hdefRest hrootRest
+    have hndIn : ∀ v ∈ nd.inputs.toList, v ∈ avail := by
+      intro v hv
+      have h := hdef 0 (by simp) v (by simpa using hv)
+      simpa using h
+    unfold dceNodes
+    dsimp only
+    split
+    · -- Node `nd` is kept
+      refine ⟨?_, ?_⟩
+      · intro v hv
+        simp only [List.flatMap_cons, ← List.append_assoc]
+        rcases List.mem_append.mp hv with hvIn | hvAfter
+        · exact List.mem_append_left _ (List.mem_append_left _ (hndIn v hvIn))
+        · exact hNeedR v hvAfter
+      · intro i hi v hv
+        cases i with
+        | zero =>
+          simp only [List.getElem_cons_zero] at hv
+          simpa using hndIn v hv
+        | succ i' =>
+          simp only [List.getElem_cons_succ] at hv
+          have hi' : i' < (dceNodes rest needed).1.length := by simpa using hi
+          have h := hDefR i' hi' v hv
+          simpa [List.take_succ_cons, List.flatMap_cons, List.append_assoc] using h
+    · -- Node `nd` is dropped: none of `nd.outputIds` is in `(dceNodes rest needed).2`
+      rename_i hdead
+      have hnotOut : ∀ v ∈ (dceNodes rest needed).2, v ∉ nd.outputIds := by
+        intro v hv hvOut
+        unfold IRNode.outputIds at hvOut
+        obtain ⟨o, ho, rfl⟩ := List.mem_map.mp hvOut
+        have hany : nd.outputs.toList.any (fun o => (dceNodes rest needed).2.elem o.1) = true :=
+          List.any_eq_true.mpr ⟨o, ho, List.elem_eq_true_of_mem hv⟩
+        exact hdead hany
+      refine ⟨?_, ?_⟩
+      · intro v hv
+        have h := hNeedR v hv
+        simp only [List.mem_append] at h ⊢
+        rcases h with (hAv | hNd) | hRest
+        · exact Or.inl hAv
+        · exact absurd hNd (hnotOut v hv)
+        · exact Or.inr hRest
+      · intro i hi v hv
+        have h := hDefR i hi v hv
+        have hvNeed : v ∈ (dceNodes rest needed).2 :=
+          dceNodes_kept_inputs_in_needed rest needed _ (List.getElem_mem hi) v hv
+        simp only [List.mem_append] at h ⊢
+        rcases h with (hAv | hNd) | hRest
+        · exact Or.inl hAv
+        · exact absurd hNd (hnotOut v hvNeed)
+        · exact Or.inr hRest
+
+private theorem sublist_flatMap {α β : Type} (f : α → List β) {l1 l2 : List α}
+    (h : l1.Sublist l2) : (l1.flatMap f).Sublist (l2.flatMap f) := by
+  induction h with
+  | slnil => exact List.Sublist.slnil
+  | cons a _ ih =>
+    simp only [List.flatMap_cons]
+    exact List.Sublist.trans ih (List.sublist_append_right _ _)
+  | cons_cons a _ ih =>
+    simp only [List.flatMap_cons]
+    exact List.Sublist.append (List.Sublist.refl _) ih
+
+/-- `DCE` preserves `WellFormed` for every `SSAGraph Op`. -/
+theorem wellFormed_dce {Op : Type} : PreservesWF (dce (Op := Op)) := by
+  intro g hwf
+  have hcov := dceNodes_covers_needed g.nodes.toList g.outputs.toList g.inputIds
+    (fun i hi v hv => hwf.defBeforeUse i (by simpa using hi) v (by simpa using hv))
+    (fun v hv => hwf.outputsValid v hv)
+  have hsubNodes : (dceNodes g.nodes.toList g.outputs.toList).1.Sublist g.nodes.toList :=
+    dceNodes_sublist g.nodes.toList g.outputs.toList
+  constructor
+  · exact hwf.inputsDense
+  · exact hwf.inputsPositive
+  · -- uniqueIds: sublist of `g.allDefinedIds`
+    unfold SSAGraph.allDefinedIds SSAGraph.inputIds dce
+    have hsubAll :
+        (g.inputIds ++ (dceNodes g.nodes.toList g.outputs.toList).1.flatMap IRNode.outputIds).Sublist
+        g.allDefinedIds :=
+      List.Sublist.append (List.Sublist.refl _) (sublist_flatMap IRNode.outputIds hsubNodes)
+    simpa [SSAGraph.inputIds] using List.Nodup.sublist hsubAll hwf.uniqueIds
+  · -- defBeforeUse
+    intro i hi v hv
+    unfold SSAGraph.allDefinedIdsBefore dce at hi hv ⊢
+    unfold SSAGraph.inputIds
+    simp only [List.size_toArray] at hi
+    simpa [SSAGraph.inputIds] using hcov.2 i hi v (by simpa using hv)
+  · -- nodeOutputsPositive
+    intro i hi o ho d hd
+    have hmem : (dce g).nodes[i] ∈ g.nodes.toList :=
+      hsubNodes.subset (by simp [dce])
+    obtain ⟨j, hj, hjeq⟩ := List.mem_iff_getElem.mp hmem
+    have hj' : j < g.nodes.size := by simpa using hj
+    have ho' : o ∈ g.nodes[j].outputs.toList := by
+      have : g.nodes[j] = (dce g).nodes[i] := by simpa using hjeq
+      rw [this]; exact ho
+    exact hwf.nodeOutputsPositive j hj' o ho' d hd
+  · -- outputsValid
+    intro v hv
+    unfold SSAGraph.allDefinedIds SSAGraph.inputIds dce
+    simpa [SSAGraph.inputIds] using hcov.1 v (dceNodes_needed_sub g.nodes.toList g.outputs.toList v hv)
+
+/-- Forward semantic refinement (`SemRefines`) of `DCE`: for every `WellFormed` graph `g` and every
+    input environment `env`, if `evalGraphOutputs sem g env = some outs`, then
+    `evalGraphOutputs sem (dce g) env = some outs`. -/
+theorem evalGraph_dce {Op α : Type} (sem : OpSemantics Op α) :
+    PreservesSem sem (dce (Op := Op)) := by
+  intro g _ env outs hout
+  unfold evalGraphOutputs evalGraph at hout ⊢
+  dsimp only [dce]
+  by_cases hInMatch : inputShapesMatch env g.inputs.toList = true
+  · simp only [hInMatch, ↓reduceIte] at hout ⊢
+    cases hev : evalNodes sem env g.nodes.toList with
+    | none => simp [hev] at hout
+    | some final1 =>
+      simp only [hev] at hout
+      obtain ⟨final2, hev2, hagree⟩ := evalNodes_dceNodes sem g.nodes.toList g.outputs.toList env env final1
+        (fun _ _ => rfl) hev
+      simp only [hev2]
+      rw [lookupAll_congr hagree]
+      exact hout
+  · simp [hInMatch] at hout
+
+-- 23.6 Functional Equivalence of `ViewSimplify` Rules & Full `viewSimplify` Pass
+
+private theorem evalNodes_append {Op α : Type} (sem : OpSemantics Op α)
+    (env : Env α) (l1 l2 : List (IRNode Op)) :
+    evalNodes sem env (l1 ++ l2) =
+    match evalNodes sem env l1 with
+    | none => none
+    | some env1 => evalNodes sem env1 l2 := by
+  induction l1 generalizing env with
+  | nil => rfl
+  | cons nd rest ih =>
+    simp only [List.cons_append, evalNodes]
+    cases evalNode sem env nd with
+    | none => rfl
+    | some env' => exact ih env'
+
+private theorem evalNodes_not_mem_preserved {Op α : Type} (sem : OpSemantics Op α)
+    (nodes : List (IRNode Op)) (env final : Env α) (v : ValueId)
+    (hnot : v ∉ nodes.flatMap IRNode.outputIds)
+    (hev : evalNodes sem env nodes = some final) :
+    final v = env v := by
+  induction nodes generalizing env with
+  | nil =>
+    simp only [evalNodes, Option.some.injEq] at hev
+    rw [hev]
+  | cons nd rest ih =>
+    simp only [List.flatMap_cons, List.mem_append, not_or] at hnot
+    simp only [evalNodes] at hev
+    cases hnd : evalNode sem env nd with
+    | none => simp [hnd] at hev
+    | some env' =>
+      simp only [hnd] at hev
+      rw [ih env' hnot.2 hev]
+      unfold evalNode at hnd
+      cases hlu : lookupAll env nd.inputs.toList with
+      | none => simp [hlu] at hnd
+      | some inVals =>
+        simp only [hlu] at hnd
+        cases hop : sem.evalOp nd.op inVals (nd.outputs.toList.map Prod.snd) with
+        | none => simp [hop] at hnd
+        | some outVals =>
+          simp only [hop] at hnd
+          split at hnd
+          · simp only [Option.some.injEq] at hnd
+            subst hnd
+            apply bindOutputs_not_mem
+            intro o ho heq
+            exact hnot.1 (List.mem_map.mpr ⟨o, ho, heq⟩)
+          · cases hnd
+
+private theorem findFirstNodeMatch_some {Op β : Type} {f : Nat → IRNode Op → Option β}
+    {base : Nat} {xs : List (IRNode Op)} {y : β}
+    (h : findFirstNodeMatch f base xs = some y) :
+    ∃ k, ∃ (hk : k < xs.length), f (base + k) xs[k] = some y := by
+  induction xs generalizing base with
+  | nil => cases h
+  | cons nd rest ih =>
+    unfold findFirstNodeMatch at h
+    cases hf : f base nd with
+    | some z =>
+      simp only [hf, Option.some.injEq] at h
+      subst h
+      exact ⟨0, by simp, by simpa using hf⟩
+    | none =>
+      simp only [hf] at h
+      obtain ⟨k, hk, hfk⟩ := ih h
+      exact ⟨k + 1, by simp; omega, by simpa [Nat.add_assoc, Nat.add_comm 1 k] using hfk⟩
+
+private theorem findSoleProducerBefore_some {Op : Type} {nodes : List (IRNode Op)}
+    {limit : Nat} {targetId : ValueId} {pnd : IRNode Op}
+    (h : findSoleProducerBefore nodes limit targetId = some pnd) :
+    ∃ j, ∃ (_ : j < limit), ∃ (hjLen : j < nodes.length), ∃ ty : TensorType,
+      nodes[j] = pnd ∧ pnd.outputs.toList = [(targetId, ty)] := by
+  unfold findSoleProducerBefore at h
+  have hmem : pnd ∈ nodes.take limit := List.mem_of_find?_eq_some h
+  have hpred := List.find?_some h
+  obtain ⟨j, hjTake, hget⟩ := List.mem_iff_getElem.mp hmem
+  have hjLim : j < limit := by simp at hjTake; omega
+  have hjLen : j < nodes.length := by simp at hjTake; omega
+  have hgetN : nodes[j] = pnd := by simpa [List.getElem_take] using hget
+  cases hout : pnd.outputs.toList with
+  | nil => simp [hout] at hpred
+  | cons o rest =>
+    cases rest with
+    | nil =>
+      simp only [hout, beq_iff_eq] at hpred
+      cases o with
+      | mk vid ty =>
+        dsimp only at hpred
+        subst hpred
+        exact ⟨j, hjLim, hjLen, ty, hgetN, rfl⟩
+    | cons _ _ => simp [hout] at hpred
+
+private theorem inputShapesMatch_get {α : Type} {env : Env α}
+    {inps : List (ValueId × String × TensorType)}
+    (hm : inputShapesMatch env inps = true) :
+    ∀ e ∈ inps, ∃ t, env e.1 = some t ∧ t.shape = e.2.2.shape.toList := by
+  induction inps with
+  | nil => intro e he; cases he
+  | cons hd tl ih =>
+    unfold inputShapesMatch at hm
+    cases henv : env hd.1 with
+    | none => simp [henv] at hm
+    | some t =>
+      simp only [henv, Bool.and_eq_true, beq_iff_eq] at hm
+      intro e he
+      rcases List.mem_cons.mp he with rfl | htl
+      · exact ⟨t, henv, hm.1⟩
+      · exact ih hm.2 e htl
+
+private theorem shapesMatch_bind_spec {α : Type} (env : Env α)
+    (os : List (ValueId × TensorType)) (ts : List (TensorVal α))
+    (hsm : shapesMatch os ts = true) (hnd : (os.map Prod.fst).Nodup) :
+    ∀ o ∈ os, ∃ t, bindOutputs env os ts o.1 = some t ∧ t.shape = o.2.shape.toList := by
+  induction os generalizing env ts with
+  | nil => intro o ho; cases ho
+  | cons hd tl ih =>
+    cases ts with
+    | nil => simp [shapesMatch] at hsm
+    | cons t rest =>
+      simp only [shapesMatch, Bool.and_eq_true, beq_iff_eq] at hsm
+      simp only [List.map_cons, List.nodup_cons] at hnd
+      intro o ho
+      rcases List.mem_cons.mp ho with rfl | htl
+      · refine ⟨t, ?_, hsm.1⟩
+        simp only [bindOutputs]
+        rw [bindOutputs_not_mem (Env.set env o.1 t) tl rest o.1 (fun x hx heq => hnd.1 (List.mem_map.mpr ⟨x, hx, heq⟩))]
+        simp [Env.set]
+      · exact ih (Env.set env hd.1 t) rest hsm.2 hnd.2 o htl
+
+private theorem valueType_unique_inputs {Op : Type} {g : SSAGraph Op}
+    {v : ValueId} {ty : TensorType}
+    (h : g.valueType? v = some ty) :
+    (∃ e ∈ g.inputs.toList, e.1 = v ∧ e.2.2 = ty) ∨
+    (∃ nd ∈ g.nodes.toList, ∃ o ∈ nd.outputs.toList, o.1 = v ∧ o.2 = ty) := by
+  unfold SSAGraph.valueType? at h
+  cases hfind : g.inputs.find? (fun e => e.1 == v) with
+  | some e =>
+    simp only [hfind, Option.some.injEq] at h
+    have hmem : e ∈ g.inputs.toList := by
+      have := Array.mem_of_find?_eq_some hfind
+      exact Array.mem_def.mp this
+    have hp := Array.find?_some hfind
+    exact Or.inl ⟨e, hmem, beq_iff_eq.mp hp, h⟩
+  | none =>
+    simp only [hfind] at h
+    have hfs : ∃ nd ∈ g.nodes.toList, ((nd.outputs.find? fun o => o.1 == v).map Prod.snd) = some ty := by
+      have : ∃ nd ∈ g.nodes, ((nd.outputs.find? fun o => o.1 == v).map Prod.snd) = some ty := by
+        rw [← Array.findSome?_toList] at h
+        obtain ⟨nd, hnd, hval⟩ := List.exists_of_findSome?_eq_some h
+        exact ⟨nd, Array.mem_def.mpr hnd, hval⟩
+      obtain ⟨nd, hnd, hval⟩ := this
+      exact ⟨nd, Array.mem_def.mp hnd, hval⟩
+    obtain ⟨nd, hnd, hmap⟩ := hfs
+    simp only [Option.map_eq_some_iff] at hmap
+    obtain ⟨o, hofind, rfl⟩ := hmap
+    have hom := Array.mem_def.mp (Array.mem_of_find?_eq_some hofind)
+    have hop0 : (o.1 == v) = true := Array.find?_some (p := fun x : ValueId × TensorType => x.1 == v) hofind
+    have hop := beq_iff_eq.mp hop0
+    exact Or.inr ⟨nd, hnd, o, hom, hop, rfl⟩
+
+private theorem evalNodes_value_shape {Op α : Type} (sem : OpSemantics Op α)
+    {g : SSAGraph Op} (hwf : WellFormed g) {env envK : Env α} {k : Nat} (hk : k ≤ g.nodes.size)
+    (hInMatch : inputShapesMatch env g.inputs.toList = true)
+    (hev : evalNodes sem env (g.nodes.toList.take k) = some envK)
+    {v : ValueId} {ty : TensorType} {t : TensorVal α}
+    (hvDef : v ∈ g.allDefinedIdsBefore k)
+    (hvTy : g.valueType? v = some ty)
+    (hvVal : envK v = some t) :
+    t.shape = ty.shape.toList ∧ ∀ d ∈ t.shape, d > 0 := by
+  -- Extract the unique defining site of `v` inside `g.inputs` or `g.nodes.take k`
+  have hnodup := hwf.uniqueIds
+  rw [allDefinedIds_split g k] at hnodup
+  have hnodupBefore : (g.allDefinedIdsBefore k).Nodup := (List.nodup_append.mp hnodup).1
+  unfold SSAGraph.allDefinedIdsBefore at hvDef hnodupBefore
+  rcases List.mem_append.mp hvDef with hvIn | hvNode
+  · -- `v` is a graph input
+    obtain ⟨e, heMem, rfl⟩ := List.mem_map.mp hvIn
+    have hnotNodes : e.1 ∉ (g.nodes.toList.take k).flatMap IRNode.outputIds :=
+      nodup_append_disjoint hnodupBefore e.1 hvIn
+    have hpres := evalNodes_not_mem_preserved sem (g.nodes.toList.take k) env envK e.1 hnotNodes hev
+    rw [hpres] at hvVal
+    obtain ⟨t0, ht0, ht0Sh⟩ := inputShapesMatch_get hInMatch e heMem
+    rw [ht0, Option.some.injEq] at hvVal
+    subst hvVal
+    -- Show `ty = e.2.2` using `valueType_unique_inputs` and `uniqueIds`
+    have htyEq : ty = e.2.2 := by
+      rcases valueType_unique_inputs hvTy with ⟨e', he'Mem, he'Id, rfl⟩ | ⟨nd, hndMem, o, hoMem, hoId, _⟩
+      · obtain ⟨i1, hi1, hi1Eq⟩ := List.mem_iff_getElem.mp heMem
+        obtain ⟨i2, hi2, hi2Eq⟩ := List.mem_iff_getElem.mp he'Mem
+        have h1 : i1 < g.inputs.size := by simpa using hi1
+        have h2 : i2 < g.inputs.size := by simpa using hi2
+        have hd1 := hwf.inputsDense i1 h1
+        have hd2 := hwf.inputsDense i2 h2
+        have hEqIdx : i1 = i2 := by
+          have he1 : g.inputs[i1].1 = e.1 := by simpa using congrArg Prod.fst hi1Eq
+          have he2 : g.inputs[i2].1 = e'.1 := by simpa using congrArg Prod.fst hi2Eq
+          have : i1 = e.1 := hd1.symm.trans he1
+          have : i2 = e.1 := (hd2.symm.trans he2).trans he'Id
+          omega
+        subst hEqIdx
+        have : e = e' := by rw [← hi1Eq, ← hi2Eq]
+        rw [this]
+      · have hvNodes : e.1 ∈ g.nodes.toList.flatMap IRNode.outputIds :=
+          List.mem_flatMap.mpr ⟨nd, hndMem, List.mem_map.mpr ⟨o, hoMem, hoId⟩⟩
+        exact absurd hvNodes (nodup_append_disjoint hwf.uniqueIds e.1 hvIn)
+    subst htyEq
+    refine ⟨ht0Sh, ?_⟩
+    rw [ht0Sh]
+    obtain ⟨i, hi, hiEq⟩ := List.mem_iff_getElem.mp heMem
+    have hi' : i < g.inputs.size := by simpa using hi
+    have hposI := hwf.inputsPositive i hi'
+    have heqI : g.inputs[i] = e := by simpa using hiEq
+    rw [← heqI]
+    exact hposI
+  · -- `v` is produced by some node `j < k`
+    obtain ⟨nd, hndMem, hvOut⟩ := List.mem_flatMap.mp hvNode
+    obtain ⟨j, hjTake, hjEq⟩ := List.mem_iff_getElem.mp hndMem
+    have hjK : j < k := by simp at hjTake; omega
+    have hjSz : j < g.nodes.size := by omega
+    have hjNode : g.nodes.toList[j]'(by simpa using hjSz) = nd := by
+      simpa [List.getElem_take] using hjEq
+    obtain ⟨o, hoMem, hoId⟩ := List.mem_map.mp hvOut
+    -- Split `g.nodes.toList.take k` at `j`
+    have hsplitTake : g.nodes.toList.take k =
+        g.nodes.toList.take j ++ [nd] ++ (g.nodes.toList.take k).drop (j + 1) := by
+      have h2 : (g.nodes.toList.take k).drop j = nd :: (g.nodes.toList.take k).drop (j + 1) := by
+        rw [List.drop_eq_getElem_cons hjTake, hjEq]
+      calc g.nodes.toList.take k
+          = (g.nodes.toList.take k).take j ++ (g.nodes.toList.take k).drop j := (List.take_append_drop j _).symm
+        _ = g.nodes.toList.take j ++ (nd :: (g.nodes.toList.take k).drop (j + 1)) := by
+            rw [List.take_take, Nat.min_eq_left (by omega), h2]
+        _ = g.nodes.toList.take j ++ [nd] ++ (g.nodes.toList.take k).drop (j + 1) := by
+            simp [List.append_assoc]
+    rw [hsplitTake, evalNodes_append, evalNodes_append] at hev
+    cases hevPre : evalNodes sem env (g.nodes.toList.take j) with
+    | none => simp [hevPre] at hev
+    | some envJ =>
+      simp only [hevPre] at hev
+      cases hevNd : evalNode sem envJ nd with
+      | none => simp [evalNodes, hevNd] at hev
+      | some envAfterJ =>
+        simp only [evalNodes, hevNd] at hev
+        -- `v` is not overwritten by `(g.nodes.toList.take k).drop (j + 1)`
+        have hnotPost : v ∉ ((g.nodes.toList.take k).drop (j + 1)).flatMap IRNode.outputIds := by
+          have hndFlat : ((g.nodes.toList.take k).flatMap IRNode.outputIds).Nodup :=
+            (List.nodup_append.mp hnodupBefore).2.1
+          rw [hsplitTake, List.flatMap_append, List.flatMap_append] at hndFlat
+          have hmemMid : v ∈ (g.nodes.toList.take j).flatMap IRNode.outputIds ++ [nd].flatMap IRNode.outputIds :=
+            List.mem_append_right _ (by simpa using hvOut)
+          exact nodup_append_disjoint hndFlat v hmemMid
+        have hpres := evalNodes_not_mem_preserved sem ((g.nodes.toList.take k).drop (j + 1)) envAfterJ envK v hnotPost hev
+        rw [hpres] at hvVal
+        -- Extract output shape from `evalNode sem envJ nd = some envAfterJ`
+        unfold evalNode at hevNd
+        cases hlu : lookupAll envJ nd.inputs.toList with
+        | none => simp [hlu] at hevNd
+        | some inVals =>
+          simp only [hlu] at hevNd
+          cases hop : sem.evalOp nd.op inVals (nd.outputs.toList.map Prod.snd) with
+          | none => simp [hop] at hevNd
+          | some outVals =>
+            simp only [hop] at hevNd
+            split at hevNd
+            · rename_i hsm
+              simp only [Option.some.injEq] at hevNd
+              subst hevNd
+              have hndOut : (nd.outputs.toList.map Prod.fst).Nodup := by
+                have hndFlat : ((g.nodes.toList.take k).flatMap IRNode.outputIds).Nodup :=
+                  (List.nodup_append.mp hnodupBefore).2.1
+                rw [hsplitTake, List.flatMap_append, List.flatMap_append] at hndFlat
+                have h1 := (List.nodup_append.mp hndFlat).1
+                have h2 := (List.nodup_append.mp h1).2.1
+                simpa [IRNode.outputIds] using h2
+              obtain ⟨t0, ht0, ht0Sh⟩ := shapesMatch_bind_spec envJ nd.outputs.toList outVals hsm hndOut o hoMem
+              rw [hoId] at ht0
+              rw [ht0, Option.some.injEq] at hvVal
+              subst hvVal
+              -- Show `ty = o.2` by uniqueness of `v` in `g.allDefinedIds`
+              have htyEq : ty = o.2 := by
+                rcases valueType_unique_inputs hvTy with ⟨e', he'Mem, he'Id, _⟩ | ⟨nd', hnd'Mem, o', ho'Mem, ho'Id, rfl⟩
+                · have hvIn' : v ∈ g.inputIds := List.mem_map.mpr ⟨e', he'Mem, he'Id⟩
+                  exact absurd hvNode (nodup_append_disjoint hnodupBefore v hvIn')
+                · -- Both `(nd, o)` and `(nd', o')` define `v`, so by `uniqueIds` they are the same node & output!
+                  obtain ⟨j', hj', hj'Eq⟩ := List.mem_iff_getElem.mp hnd'Mem
+                  have hjEqJ' : j = j' := by
+                    have hndAllNodes : (g.nodes.toList.flatMap IRNode.outputIds).Nodup :=
+                      (List.nodup_append.mp hwf.uniqueIds).2.1
+                    rcases Nat.lt_trichotomy j j' with hlt | heq | hgt
+                    · exfalso
+                      have hsplit := (List.take_append_drop j' g.nodes.toList).symm
+                      rw [hsplit, List.flatMap_append] at hndAllNodes
+                      have hInL : v ∈ (g.nodes.toList.take j').flatMap IRNode.outputIds :=
+                        List.mem_flatMap.mpr ⟨nd, by
+                          have : (g.nodes.toList.take j')[j]'(by simp [Array.length_toList]; omega) = nd := by
+                            simpa [List.getElem_take] using hjNode
+                          rw [← this]; exact List.getElem_mem _, hvOut⟩
+                      have hInR : v ∈ (g.nodes.toList.drop j').flatMap IRNode.outputIds :=
+                        List.mem_flatMap.mpr ⟨nd', by
+                          have : (g.nodes.toList.drop j')[0]'(by simp only [List.length_drop]; omega) = nd' := by
+                            simpa [List.getElem_drop] using hj'Eq
+                          rw [← this]; exact List.getElem_mem _, List.mem_map.mpr ⟨o', ho'Mem, ho'Id⟩⟩
+                      exact nodup_append_disjoint hndAllNodes v hInL hInR
+                    · exact heq
+                    · exfalso
+                      have hsplit := (List.take_append_drop j g.nodes.toList).symm
+                      rw [hsplit, List.flatMap_append] at hndAllNodes
+                      have hInL : v ∈ (g.nodes.toList.take j).flatMap IRNode.outputIds :=
+                        List.mem_flatMap.mpr ⟨nd', by
+                          have : (g.nodes.toList.take j)[j']'(by simp only [List.length_take]; omega) = nd' := by
+                            simpa [List.getElem_take] using hj'Eq
+                          rw [← this]; exact List.getElem_mem _, List.mem_map.mpr ⟨o', ho'Mem, ho'Id⟩⟩
+                      have hInR : v ∈ (g.nodes.toList.drop j).flatMap IRNode.outputIds :=
+                        List.mem_flatMap.mpr ⟨nd, by
+                          have : (g.nodes.toList.drop j)[0]'(by simp only [List.length_drop, Array.length_toList]; omega) = nd := by
+                            simpa [List.getElem_drop] using hjNode
+                          rw [← this]; exact List.getElem_mem _, hvOut⟩
+                      exact nodup_append_disjoint hndAllNodes v hInL hInR
+                  subst hjEqJ'
+                  have hndEq : nd' = nd := by rw [← hj'Eq, hjNode]
+                  subst hndEq
+                  obtain ⟨m1, hm1, hm1Eq⟩ := List.mem_iff_getElem.mp hoMem
+                  obtain ⟨m2, hm2, hm2Eq⟩ := List.mem_iff_getElem.mp ho'Mem
+                  have hmEq : m1 = m2 := by
+                    apply list_nodup_getElem_inj hndOut (by simpa using hm1) (by simpa using hm2)
+                    simp only [List.getElem_map]
+                    rw [hm1Eq, hm2Eq, hoId, ho'Id]
+                  subst hmEq
+                  have : o' = o := by rw [← hm2Eq, ← hm1Eq]
+                  rw [this]
+              subst htyEq
+              refine ⟨ht0Sh, ?_⟩
+              rw [ht0Sh]
+              have hoNode : o ∈ g.nodes[j].outputs.toList := by
+                have : g.nodes[j] = nd := by simpa using hjNode
+                rw [this]; exact hoMem
+              exact hwf.nodeOutputsPositive j hjSz o hoNode
+            · cases hevNd
+
+-- General well-formedness & semantic preservation for `eliminateUnaryIdentityNode`
+
+private theorem eliminateUnaryIdentityNode_preservesWF {Op : Type}
+    {g : SSAGraph Op} (hwf : WellFormed g) {idx : Nat} (hidx : idx < g.nodes.size)
+    {inId outId : ValueId} {outTy : TensorType}
+    (hIn : g.nodes[idx].inputs.toList = [inId])
+    (hOut : g.nodes[idx].outputs.toList = [(outId, outTy)]) :
+    WellFormed (eliminateUnaryIdentityNode g idx inId outId) := by
+  let g' := eliminateUnaryIdentityNode g idx inId outId
+  let subst : ValueId → ValueId := fun v => if v == outId then inId else v
+  have hinDef : inId ∈ g.allDefinedIdsBefore idx :=
+    hwf.defBeforeUse idx hidx inId (by rw [hIn]; exact List.mem_cons_self ..)
+  have houtDefIdx : g.nodes[idx].outputIds = [outId] := by
+    unfold IRNode.outputIds; rw [hOut]; rfl
+  have hsubErase : (g.nodes.toList.eraseIdx idx).Sublist g.nodes.toList :=
+    List.eraseIdx_sublist g.nodes.toList idx
+  have houtIdsMap : ∀ (f : ValueId → ValueId) (l : List (IRNode Op)),
+      (l.map fun nd => { nd with inputs := nd.inputs.map f }).flatMap IRNode.outputIds =
+      l.flatMap IRNode.outputIds := by
+    intro f l
+    induction l with
+    | nil => rfl
+    | cons a tl ih => simp [IRNode.outputIds, ih]
+  have htakeErase : ∀ k : Nat, k ≤ idx →
+      (g.nodes.toList.eraseIdx idx).take k = g.nodes.toList.take k := by
+    intro k hk
+    rw [List.eraseIdx_eq_take_drop_succ, List.take_append_of_le_length (by simp; omega),
+        List.take_take, Nat.min_eq_left hk]
+  have htakeEraseGe : ∀ k : Nat, idx ≤ k →
+      ((g.nodes.toList.eraseIdx idx).take k).flatMap IRNode.outputIds =
+      (g.nodes.toList.take idx).flatMap IRNode.outputIds ++
+      ((g.nodes.toList.drop (idx + 1)).take (k - idx)).flatMap IRNode.outputIds := by
+    intro k hk
+    rw [List.eraseIdx_eq_take_drop_succ, List.take_append, List.length_take]
+    have hmin : min idx g.nodes.toList.length = idx := Nat.min_eq_left (by simp; omega)
+    rw [hmin, List.take_take, Nat.min_eq_right hk, List.flatMap_append]
+  have hAllIdsBeforeGe : ∀ k : Nat, idx ≤ k → ∀ v,
+      v ∈ g.allDefinedIdsBefore (k + 1) → v ≠ outId → v ∈ g'.allDefinedIdsBefore k := by
+    intro k hk v hv hne
+    unfold SSAGraph.allDefinedIdsBefore SSAGraph.inputIds at hv ⊢
+    dsimp only [g', eliminateUnaryIdentityNode]
+    rw [List.toList_toArray, ← List.map_take, houtIdsMap]
+    rw [htakeEraseGe k hk]
+    have hsplitK : g.nodes.toList.take (k + 1) =
+        g.nodes.toList.take idx ++ [g.nodes[idx]] ++ (g.nodes.toList.drop (idx + 1)).take (k - idx) := by
+      have h1 : g.nodes.toList.take (k + 1) =
+          g.nodes.toList.take idx ++ (g.nodes.toList.drop idx).take (k + 1 - idx) := by
+        rw [← List.take_append_drop idx (g.nodes.toList.take (k + 1)), List.take_take,
+            Nat.min_eq_left (by omega), List.drop_take]
+      rw [h1]
+      have hdrop : g.nodes.toList.drop idx = g.nodes[idx] :: g.nodes.toList.drop (idx + 1) := by
+        have hidxL : idx < g.nodes.toList.length := by simpa using hidx
+        rw [List.drop_eq_getElem_cons hidxL]; rfl
+      rw [hdrop]
+      have hsub : k + 1 - idx = (k - idx) + 1 := by omega
+      rw [hsub, List.take_succ_cons]
+      simp [List.append_assoc]
+    rw [hsplitK, List.flatMap_append, List.flatMap_append] at hv
+    simp only [List.mem_append, List.flatMap_singleton, houtDefIdx, List.mem_singleton] at hv ⊢
+    rcases hv with hvIn | ((hvPre | hvMid) | hvPost)
+    · exact Or.inl hvIn
+    · exact Or.inr (Or.inl hvPre)
+    · exact absurd hvMid hne
+    · exact Or.inr (Or.inr hvPost)
+
+  constructor
+  · exact hwf.inputsDense
+  · exact hwf.inputsPositive
+  · -- uniqueIds
+    unfold SSAGraph.allDefinedIds SSAGraph.inputIds
+    dsimp only [g', eliminateUnaryIdentityNode]
+    rw [List.toList_toArray, houtIdsMap]
+    have hsubAll : (g.inputIds ++ (g.nodes.toList.eraseIdx idx).flatMap IRNode.outputIds).Sublist g.allDefinedIds :=
+      List.Sublist.append (List.Sublist.refl _) (sublist_flatMap IRNode.outputIds hsubErase)
+    exact List.Nodup.sublist hsubAll hwf.uniqueIds
+  · -- defBeforeUse
+    intro k hk v hv
+    have hkLen : k < (g.nodes.toList.eraseIdx idx).length := by
+      simpa [g', eliminateUnaryIdentityNode] using hk
+    have hndEq : g'.nodes[k] = { (g.nodes.toList.eraseIdx idx)[k] with
+        inputs := (g.nodes.toList.eraseIdx idx)[k].inputs.map subst } := by
+      simp [g', eliminateUnaryIdentityNode, subst]
+    rw [hndEq] at hv
+    simp only [Array.toList_map, List.mem_map] at hv
+    obtain ⟨w, hwIn, rfl⟩ := hv
+    by_cases hlt : k < idx
+    · have heraseGet : (g.nodes.toList.eraseIdx idx)[k] = g.nodes[k]'(by omega) := by
+        rw [List.getElem_eraseIdx_of_lt _ hlt]; rfl
+      rw [heraseGet] at hwIn
+      have hwBefore : w ∈ g.allDefinedIdsBefore k := hwf.defBeforeUse k (by omega) w hwIn
+      -- `w ≠ outId` because `outId` is defined at `idx ≥ k` and `uniqueIds` holds!
+      have hwNe : w ≠ outId := by
+        intro heq
+        have hnodup := hwf.uniqueIds
+        rw [allDefinedIds_split g idx] at hnodup
+        have houtBefore : outId ∈ g.allDefinedIdsBefore idx := by
+          rw [← heq]
+          unfold SSAGraph.allDefinedIdsBefore at hwBefore ⊢
+          rcases List.mem_append.mp hwBefore with h1 | h2
+          · exact List.mem_append_left _ h1
+          · refine List.mem_append_right _ ?_
+            have hsubT : (g.nodes.toList.take k).Sublist (g.nodes.toList.take idx) := by
+              have : g.nodes.toList.take k = (g.nodes.toList.take idx).take k := by
+                rw [List.take_take, Nat.min_eq_left (by omega)]
+              rw [this]; exact List.take_sublist _ _
+            exact (sublist_flatMap IRNode.outputIds hsubT).subset h2
+        have houtDrop : outId ∈ (g.nodes.toList.drop idx).flatMap IRNode.outputIds :=
+          List.mem_flatMap.mpr ⟨g.nodes[idx], by
+            have : (g.nodes.toList.drop idx)[0]'(by simp; omega) = g.nodes[idx] := by
+              simp [List.getElem_drop]
+            rw [← this]; exact List.getElem_mem _, by rw [houtDefIdx]; exact List.mem_cons_self ..⟩
+        exact nodup_append_disjoint hnodup outId houtBefore houtDrop
+      have hsubId : subst w = w := by simp [subst, hwNe]
+      rw [hsubId]
+      unfold SSAGraph.allDefinedIdsBefore SSAGraph.inputIds
+      dsimp only [g', eliminateUnaryIdentityNode]
+      rw [List.toList_toArray, ← List.map_take, houtIdsMap, htakeErase k (by omega)]
+      exact hwBefore
+    · have hge : idx ≤ k := by omega
+      have hk1 : k + 1 < g.nodes.size := by
+        have hlenE : (g.nodes.toList.eraseIdx idx).length = g.nodes.size - 1 := by
+          rw [List.length_eraseIdx_of_lt (by simpa using hidx)]; simp
+        omega
+      have heraseGet : (g.nodes.toList.eraseIdx idx)[k] = g.nodes[k + 1]'hk1 := by
+        rw [List.getElem_eraseIdx_of_ge _ hge]; rfl
+      rw [heraseGet] at hwIn
+      have hwBefore : w ∈ g.allDefinedIdsBefore (k + 1) := hwf.defBeforeUse (k + 1) hk1 w hwIn
+      by_cases hwEq : w = outId
+      · have hsubOut : subst w = inId := by simp [subst, hwEq]
+        rw [hsubOut]
+        unfold SSAGraph.allDefinedIdsBefore SSAGraph.inputIds at hinDef ⊢
+        dsimp only [g', eliminateUnaryIdentityNode]
+        rw [List.toList_toArray, ← List.map_take, houtIdsMap, htakeEraseGe k hge]
+        rcases List.mem_append.mp hinDef with h1 | h2
+        · exact List.mem_append_left _ h1
+        · exact List.mem_append_right _ (List.mem_append_left _ h2)
+      · have hsubW : subst w = w := by simp [subst, hwEq]
+        rw [hsubW]
+        exact hAllIdsBeforeGe k hge w hwBefore hwEq
+  · -- nodeOutputsPositive
+    intro k hk o ho d hd
+    have hkLen : k < (g.nodes.toList.eraseIdx idx).length := by
+      simpa [g', eliminateUnaryIdentityNode] using hk
+    have hndEq : g'.nodes[k] = { (g.nodes.toList.eraseIdx idx)[k] with
+        inputs := (g.nodes.toList.eraseIdx idx)[k].inputs.map subst } := by
+      simp [g', eliminateUnaryIdentityNode, subst]
+    rw [hndEq] at ho
+    have hmem : (g.nodes.toList.eraseIdx idx)[k] ∈ g.nodes.toList :=
+      hsubErase.subset (List.getElem_mem hkLen)
+    obtain ⟨j, hj, hjEq⟩ := List.mem_iff_getElem.mp hmem
+    have hj' : j < g.nodes.size := by simpa using hj
+    have ho' : o ∈ g.nodes[j].outputs.toList := by
+      have : g.nodes[j] = (g.nodes.toList.eraseIdx idx)[k] := by simpa using hjEq
+      rw [this]; exact ho
+    exact hwf.nodeOutputsPositive j hj' o ho' d hd
+  · -- outputsValid
+    intro v hv
+    dsimp only [g', eliminateUnaryIdentityNode] at hv
+    simp only [Array.toList_map, List.mem_map] at hv
+    obtain ⟨w, hwOut, rfl⟩ := hv
+    have hwAll := hwf.outputsValid w hwOut
+    have hAllBeforeSize : g.allDefinedIds = g.allDefinedIdsBefore g.nodes.size := by
+      unfold SSAGraph.allDefinedIds SSAGraph.allDefinedIdsBefore
+      rw [List.take_of_length_le (by simp)]
+    have hAllBeforeG' : g'.allDefinedIds = g'.allDefinedIdsBefore g'.nodes.size := by
+      unfold SSAGraph.allDefinedIds SSAGraph.allDefinedIdsBefore
+      rw [List.take_of_length_le (by simp)]
+    have hszG' : g'.nodes.size = g.nodes.size - 1 := by
+      dsimp only [g', eliminateUnaryIdentityNode]
+      simp only [List.size_toArray, List.length_map]
+      rw [List.length_eraseIdx_of_lt (by rw [Array.length_toList]; exact hidx), Array.length_toList]
+    by_cases hwEq : w = outId
+    · have hsubOut : (if (w == outId) = true then inId else w) = inId := by simp [hwEq]
+      rw [hsubOut]
+      change inId ∈ g'.allDefinedIds
+      rw [hAllBeforeG', hszG']
+      unfold SSAGraph.allDefinedIdsBefore SSAGraph.inputIds at hinDef ⊢
+      dsimp only [g', eliminateUnaryIdentityNode]
+      rw [List.toList_toArray, ← List.map_take, houtIdsMap, htakeEraseGe (g.nodes.size - 1) (by omega)]
+      rcases List.mem_append.mp hinDef with h1 | h2
+      · exact List.mem_append_left _ h1
+      · exact List.mem_append_right _ (List.mem_append_left _ h2)
+    · have hsubW : (if (w == outId) = true then inId else w) = w := by simp [hwEq]
+      rw [hsubW]
+      change w ∈ g'.allDefinedIds
+      rw [hAllBeforeG']
+      have hwB : w ∈ g.allDefinedIdsBefore (g'.nodes.size + 1) := by
+        rw [show g'.nodes.size + 1 = g.nodes.size by omega, ← hAllBeforeSize]
+        exact hwAll
+      exact hAllIdsBeforeGe g'.nodes.size (by omega) w hwB hwEq
+
+private theorem evalNodes_subst_equiv {Op α : Type} (sem : OpSemantics Op α)
+    (nodes : List (IRNode Op)) (inId outId : ValueId)
+    (env1 env2 final1 : Env α)
+    (hnotIn : inId ∉ nodes.flatMap IRNode.outputIds)
+    (hnotOut : outId ∉ nodes.flatMap IRNode.outputIds)
+    (hrel : ∀ v, env2 (if v == outId then inId else v) = env1 v)
+    (hev : evalNodes sem env1 nodes = some final1) :
+    ∃ final2,
+      evalNodes sem env2 (nodes.map fun nd =>
+        { nd with inputs := nd.inputs.map (fun v => if v == outId then inId else v) }) = some final2 ∧
+      ∀ v, final2 (if v == outId then inId else v) = final1 v := by
+  let subst : ValueId → ValueId := fun v => if v == outId then inId else v
+  induction nodes generalizing env1 env2 with
+  | nil =>
+    simp only [evalNodes, List.map_nil, Option.some.injEq] at hev ⊢
+    subst hev
+    exact ⟨env2, rfl, hrel⟩
+  | cons nd rest ih =>
+    simp only [List.flatMap_cons, List.mem_append, not_or] at hnotIn hnotOut
+    simp only [evalNodes, List.map_cons] at hev ⊢
+    cases hnd : evalNode sem env1 nd with
+    | none => simp [hnd] at hev
+    | some env1' =>
+      simp only [hnd] at hev
+      unfold evalNode at hnd
+      cases hlu : lookupAll env1 nd.inputs.toList with
+      | none => simp [hlu] at hnd
+      | some inVals =>
+        simp only [hlu] at hnd
+        cases hop : sem.evalOp nd.op inVals (nd.outputs.toList.map Prod.snd) with
+        | none => simp [hop] at hnd
+        | some outVals =>
+          simp only [hop] at hnd
+          split at hnd
+          · rename_i hsm
+            simp only [Option.some.injEq] at hnd
+            subst hnd
+            -- Show `lookupAll env2 (nd.inputs.map subst).toList = lookupAll env1 nd.inputs.toList`
+            have hlu2 : lookupAll env2 (nd.inputs.map subst).toList = lookupAll env1 nd.inputs.toList := by
+              rw [Array.toList_map]
+              induction nd.inputs.toList with
+              | nil => rfl
+              | cons x xs ihx =>
+                simp only [List.map_cons, lookupAll, ihx]
+                have hx := hrel x
+                dsimp only [subst]
+                rw [hx]
+            have hnd2 : evalNode sem env2 { nd with inputs := nd.inputs.map subst } =
+                some (bindOutputs env2 nd.outputs.toList outVals) := by
+              unfold evalNode
+              dsimp only
+              rw [hlu2, hlu]
+              dsimp only
+              rw [hop]
+              dsimp only
+              rw [hsm]
+              rfl
+            dsimp only [subst] at hnd2
+            rw [hnd2]
+            dsimp only
+            apply ih (bindOutputs env1 nd.outputs.toList outVals)
+              (bindOutputs env2 nd.outputs.toList outVals) hnotIn.2 hnotOut.2 _ hev
+            intro v
+            by_cases hvOut : v = outId
+            · have hs : subst v = inId := by dsimp only [subst]; simp [hvOut]
+              change bindOutputs env2 nd.outputs.toList outVals (subst v) =
+                     bindOutputs env1 nd.outputs.toList outVals v
+              rw [hs, hvOut]
+              rw [bindOutputs_not_mem env2 nd.outputs.toList outVals inId
+                    (fun o ho heq => hnotIn.1 (List.mem_map.mpr ⟨o, ho, heq⟩)),
+                  bindOutputs_not_mem env1 nd.outputs.toList outVals outId
+                    (fun o ho heq => hnotOut.1 (List.mem_map.mpr ⟨o, ho, heq⟩))]
+              simpa using hrel outId
+            · have hs : subst v = v := by dsimp only [subst]; simp [hvOut]
+              change bindOutputs env2 nd.outputs.toList outVals (subst v) =
+                     bindOutputs env1 nd.outputs.toList outVals v
+              rw [hs]
+              exact bindOutputs_agree env1 env2 nd.outputs.toList outVals v (by simpa [hvOut] using hrel v)
+          · cases hnd
+
+private theorem eliminateUnaryIdentityNode_preservesSem {Op α : Type} (sem : OpSemantics Op α)
+    {g : SSAGraph Op} (hwf : WellFormed g) {idx : Nat} (hidx : idx < g.nodes.size)
+    {inId outId : ValueId} {outTy : TensorType}
+    (hIn : g.nodes[idx].inputs.toList = [inId])
+    (hOut : g.nodes[idx].outputs.toList = [(outId, outTy)])
+    (hid : ∀ (envIdx : Env α) (t res : TensorVal α),
+      (∀ (ty : TensorType), g.valueType? inId = some ty → t.shape = ty.shape.toList ∧ ∀ d ∈ t.shape, d > 0) →
+      envIdx inId = some t →
+      sem.evalOp g.nodes[idx].op [t] [outTy] = some [res] →
+      res = t) :
+    SemRefines sem g (eliminateUnaryIdentityNode g idx inId outId) := by
+  intro env outs hout
+  unfold evalGraphOutputs evalGraph at hout ⊢
+  cases hInMatch : inputShapesMatch env g.inputs.toList with
+  | false => simp [hInMatch] at hout
+  | true =>
+    simp only [hInMatch, ↓reduceIte] at hout
+    simp only [eliminateUnaryIdentityNode, hInMatch, ↓reduceIte]
+    cases hev : evalNodes sem env g.nodes.toList with
+    | none => simp [hev] at hout
+    | some final1 =>
+      simp only [hev] at hout
+      -- Split `g.nodes.toList` into `pre ++ [nd] ++ post`
+      have hsplit : g.nodes.toList =
+          g.nodes.toList.take idx ++ [g.nodes[idx]] ++ g.nodes.toList.drop (idx + 1) := by
+        have hdrop : g.nodes.toList.drop idx = g.nodes[idx] :: g.nodes.toList.drop (idx + 1) := by
+          rw [List.drop_eq_getElem_cons (by simpa using hidx)]; rfl
+        calc g.nodes.toList
+            = g.nodes.toList.take idx ++ g.nodes.toList.drop idx := (List.take_append_drop idx _).symm
+          _ = g.nodes.toList.take idx ++ (g.nodes[idx] :: g.nodes.toList.drop (idx + 1)) := by rw [hdrop]
+          _ = g.nodes.toList.take idx ++ [g.nodes[idx]] ++ g.nodes.toList.drop (idx + 1) := by
+              simp [List.append_assoc]
+      rw [hsplit, evalNodes_append, evalNodes_append] at hev
+      cases hevPre : evalNodes sem env (g.nodes.toList.take idx) with
+      | none => simp [hevPre] at hev
+      | some envIdx =>
+        simp only [hevPre] at hev
+        cases hevNd : evalNode sem envIdx g.nodes[idx] with
+        | none => simp [evalNodes, hevNd] at hev
+        | some envAfter =>
+          simp only [evalNodes, hevNd] at hev
+          -- Show `envAfter = Env.set envIdx outId t` where `envIdx inId = some t`
+          unfold evalNode at hevNd
+          rw [hIn, hOut] at hevNd
+          simp only [List.map_cons, List.map_nil] at hevNd
+          cases hlu : envIdx inId with
+          | none => simp [lookupAll, hlu] at hevNd
+          | some t =>
+            simp only [lookupAll, hlu] at hevNd
+            cases hop : sem.evalOp g.nodes[idx].op [t] [outTy] with
+            | none => simp [hop] at hevNd
+            | some outVals =>
+              simp only [hop] at hevNd
+              cases outVals with
+              | nil => simp [shapesMatch] at hevNd
+              | cons res restVals =>
+                cases restVals with
+                | cons _ _ => simp [shapesMatch] at hevNd
+                | nil =>
+                  split at hevNd
+                  · simp only [Option.some.injEq] at hevNd
+                    subst hevNd
+                    have hinDef : inId ∈ g.allDefinedIdsBefore idx :=
+                      hwf.defBeforeUse idx hidx inId (by rw [hIn]; exact List.mem_cons_self ..)
+                    have hresEq : res = t := hid envIdx t res
+                      (fun ty hty => evalNodes_value_shape sem hwf (by omega) hInMatch hevPre hinDef hty hlu)
+                      hlu hop
+                    subst hresEq
+                    -- Check relation `∀ v, envIdx (subst v) = (Env.set envIdx outId res) v`!
+                    have hrel : ∀ v, envIdx (if v == outId then inId else v) =
+                        bindOutputs envIdx [(outId, outTy)] [res] v := by
+                      intro v
+                      simp only [bindOutputs, Env.set]
+                      split
+                      · rename_i heq
+                        exact hlu
+                      · rfl
+                    -- In `g'`, nodes = `(pre.map subst) ++ (post.map subst)`.
+                    -- Notice `pre.map subst = pre` because no node `< idx` uses `outId`!
+                    have hpreEq : (g.nodes.toList.take idx).map (fun nd =>
+                        { nd with inputs := nd.inputs.map (fun v => if v == outId then inId else v) }) =
+                        g.nodes.toList.take idx := by
+                      apply List.ext_getElem
+                      · simp
+                      · intro k hk1 hk2
+                        have hkIdx : k < idx := by simp at hk2; omega
+                        have hkSz : k < g.nodes.size := by omega
+                        simp only [List.getElem_map, List.getElem_take]
+                        have hgetN : g.nodes.toList[k]'(by simpa using hkSz) = g.nodes[k] := rfl
+                        rw [hgetN]
+                        cases hndK : g.nodes[k] with
+                        | mk nm op inps outs =>
+                          simp only [IRNode.mk.injEq, true_and, and_true]
+                          apply Array.ext
+                          · simp
+                          · intro m hm1 hm2
+                            simp only [Array.getElem_map]
+                            have hmemIn : inps[m] ∈ g.nodes[k].inputs.toList := by
+                              rw [hndK]; exact Array.getElem_mem_toList hm2
+                            have hbef := hwf.defBeforeUse k hkSz inps[m] hmemIn
+                            have hneOut : inps[m] ≠ outId := by
+                              intro heq
+                              have hnodup := hwf.uniqueIds
+                              rw [allDefinedIds_split g idx] at hnodup
+                              have hInBefore : outId ∈ g.allDefinedIdsBefore idx := by
+                                rw [← heq]
+                                unfold SSAGraph.allDefinedIdsBefore at hbef ⊢
+                                rcases List.mem_append.mp hbef with h1 | h2
+                                · exact List.mem_append_left _ h1
+                                · refine List.mem_append_right _ ?_
+                                  have hsubT : (g.nodes.toList.take k).Sublist (g.nodes.toList.take idx) := by
+                                    have : g.nodes.toList.take k = (g.nodes.toList.take idx).take k := by
+                                      rw [List.take_take, Nat.min_eq_left (by omega)]
+                                    rw [this]; exact List.take_sublist _ _
+                                  exact (sublist_flatMap IRNode.outputIds hsubT).subset h2
+                              have hInDrop : outId ∈ (g.nodes.toList.drop idx).flatMap IRNode.outputIds :=
+                                List.mem_flatMap.mpr ⟨g.nodes[idx], by
+                                  have : (g.nodes.toList.drop idx)[0]'(by simp; omega) = g.nodes[idx] := by
+                                    simp [List.getElem_drop]
+                                  rw [← this]; exact List.getElem_mem _, by
+                                    unfold IRNode.outputIds; rw [hOut]; exact List.mem_cons_self ..⟩
+                              exact nodup_append_disjoint hnodup outId hInBefore hInDrop
+                            simp [hneOut]
+                    -- Show `inId` and `outId` are not redefined in `post`
+                    have hnodupPost : (g.allDefinedIdsBefore (idx + 1) ++
+                        (g.nodes.toList.drop (idx + 1)).flatMap IRNode.outputIds).Nodup := by
+                      rw [← allDefinedIds_split g (idx + 1)]
+                      exact hwf.uniqueIds
+                    have hnotInPost : inId ∉ (g.nodes.toList.drop (idx + 1)).flatMap IRNode.outputIds := by
+                      apply nodup_append_disjoint hnodupPost inId
+                      unfold SSAGraph.allDefinedIdsBefore at hinDef ⊢
+                      rcases List.mem_append.mp hinDef with h1 | h2
+                      · exact List.mem_append_left _ h1
+                      · refine List.mem_append_right _ ?_
+                        have hsubT : (g.nodes.toList.take idx).Sublist (g.nodes.toList.take (idx + 1)) := by
+                          have : g.nodes.toList.take idx = (g.nodes.toList.take (idx + 1)).take idx := by
+                            rw [List.take_take, Nat.min_eq_left (by omega)]
+                          rw [this]; exact List.take_sublist _ _
+                        exact (sublist_flatMap IRNode.outputIds hsubT).subset h2
+                    have hnotOutPost : outId ∉ (g.nodes.toList.drop (idx + 1)).flatMap IRNode.outputIds := by
+                      apply nodup_append_disjoint hnodupPost outId
+                      unfold SSAGraph.allDefinedIdsBefore
+                      refine List.mem_append_right _ ?_
+                      exact List.mem_flatMap.mpr ⟨g.nodes[idx], by
+                        have : (g.nodes.toList.take (idx + 1))[idx]'(by simp; omega) = g.nodes[idx] := by
+                          simp [List.getElem_take]
+                        rw [← this]; exact List.getElem_mem _, by
+                          unfold IRNode.outputIds; rw [hOut]; exact List.mem_cons_self ..⟩
+                    -- Evaluate `g'`!
+                    obtain ⟨final2, hevPost2, hfinalRel⟩ :=
+                      evalNodes_subst_equiv sem (g.nodes.toList.drop (idx + 1)) inId outId
+                        (bindOutputs envIdx [(outId, outTy)] [res]) envIdx final1 hnotInPost hnotOutPost hrel hev
+                    rw [List.toList_toArray, List.eraseIdx_eq_take_drop_succ,
+                        List.map_append, hpreEq, evalNodes_append, hevPre]
+                    dsimp only
+                    rw [hevPost2]
+                    dsimp only
+                    rw [Array.toList_map]
+                    have hluOut : lookupAll final2 (g.outputs.toList.map fun v => if v == outId then inId else v) =
+                        lookupAll final1 g.outputs.toList := by
+                      induction g.outputs.toList with
+                      | nil => rfl
+                      | cons x xs ihx =>
+                        simp only [List.map_cons, lookupAll, ihx]
+                        rw [hfinalRel x]
+                    rw [hluOut]
+                    exact hout
+                  · cases hevNd
+
+-- General well-formedness & semantic preservation for `rewriteUnaryNodeInPlace`
+
+private theorem rewriteUnaryNodeInPlace_preservesWF {Op : Type}
+    {g : SSAGraph Op} (hwf : WellFormed g) {idx : Nat} (_hidx : idx < g.nodes.size)
+    (newOp : Op) (newInId : ValueId)
+    (hnewDef : newInId ∈ g.allDefinedIdsBefore idx) :
+    WellFormed (rewriteUnaryNodeInPlace g idx newOp newInId) := by
+  let g' := rewriteUnaryNodeInPlace g idx newOp newInId
+  have hsz : g'.nodes.size = g.nodes.size := by simp [g', rewriteUnaryNodeInPlace]
+  have houtSame : ∀ k (hk : k < g.nodes.size), (g'.nodes[k]'(by omega)).outputs = g.nodes[k].outputs := by
+    intro k hk
+    have hkMod : k < (g.nodes.modify idx fun nd => { nd with op := newOp, inputs := #[newInId] }).size := by
+      simp [hk]
+    change ((g.nodes.modify idx fun nd => { nd with op := newOp, inputs := #[newInId] })[k]'hkMod).outputs = g.nodes[k].outputs
+    rw [Array.getElem_modify]
+    split <;> rfl
+  have hallBeforeEq : ∀ k, g'.allDefinedIdsBefore k = g.allDefinedIdsBefore k := by
+    intro k
+    unfold SSAGraph.allDefinedIdsBefore SSAGraph.inputIds
+    congr 1
+    have hlen : (g'.nodes.toList.take k).length = (g.nodes.toList.take k).length := by simp [hsz]
+    have hmap : ∀ (l1 l2 : List (IRNode Op)), l1.length = l2.length →
+        (∀ i (h1 : i < l1.length) (h2 : i < l2.length), l1[i].outputs = l2[i].outputs) →
+        l1.flatMap IRNode.outputIds = l2.flatMap IRNode.outputIds := by
+      intro l1 l2 hl hall
+      induction l1 generalizing l2 with
+      | nil => cases l2 with | nil => rfl | cons _ _ => simp at hl
+      | cons a1 r1 ih =>
+        cases l2 with
+        | nil => simp at hl
+        | cons a2 r2 =>
+          simp only [List.flatMap_cons]
+          have hhd : a1.outputs = a2.outputs := hall 0 (by simp) (by simp)
+          rw [show a1.outputIds = a2.outputIds by unfold IRNode.outputIds; rw [hhd]]
+          congr 1
+          exact ih r2 (by simpa using hl) (fun i h1 h2 => hall (i + 1) (by simp; omega) (by simp; omega))
+    apply hmap _ _ hlen
+    intro i h1 h2
+    simp only [List.getElem_take]
+    have hiSz : i < g.nodes.size := by simp at h2; omega
+    exact houtSame i hiSz
+  have hallEq : g'.allDefinedIds = g.allDefinedIds := by
+    have h1 : g'.allDefinedIds = g'.allDefinedIdsBefore g.nodes.size := by
+      unfold SSAGraph.allDefinedIds SSAGraph.allDefinedIdsBefore
+      rw [List.take_of_length_le (by simp [hsz])]
+    have h2 : g.allDefinedIds = g.allDefinedIdsBefore g.nodes.size := by
+      unfold SSAGraph.allDefinedIds SSAGraph.allDefinedIdsBefore
+      rw [List.take_of_length_le (by simp)]
+    rw [h1, h2, hallBeforeEq]
+  constructor
+  · exact hwf.inputsDense
+  · exact hwf.inputsPositive
+  · rw [hallEq]; exact hwf.uniqueIds
+  · intro k hk v hv
+    have hkSz : k < g.nodes.size := by simpa [rewriteUnaryNodeInPlace] using hk
+    change v ∈ g'.allDefinedIdsBefore k
+    rw [hallBeforeEq]
+    have hkMod : k < (g.nodes.modify idx fun nd => { nd with op := newOp, inputs := #[newInId] }).size := by
+      simp [hkSz]
+    have hget : (rewriteUnaryNodeInPlace g idx newOp newInId).nodes[k]'hk =
+        if idx = k then { g.nodes[k]'hkSz with op := newOp, inputs := #[newInId] } else g.nodes[k]'hkSz := by
+      change (g.nodes.modify idx fun nd => { nd with op := newOp, inputs := #[newInId] })[k]'hkMod = _
+      rw [Array.getElem_modify]
+    rw [hget] at hv
+    by_cases hke : idx = k
+    · subst hke
+      simp only [↓reduceIte] at hv
+      have hvEq : v = newInId := by simpa using hv
+      subst hvEq
+      exact hnewDef
+    · simp only [hke, ↓reduceIte] at hv
+      exact hwf.defBeforeUse k hkSz v hv
+  · intro k hk o ho d hd
+    have hkSz : k < g.nodes.size := by simpa [rewriteUnaryNodeInPlace] using hk
+    have ho' : o ∈ (g.nodes[k]'hkSz).outputs.toList := by
+      rw [← houtSame k hkSz]; exact ho
+    exact hwf.nodeOutputsPositive k hkSz o ho' d hd
+  · intro v hv
+    change v ∈ g'.allDefinedIds
+    rw [hallEq]
+    exact hwf.outputsValid v hv
+
+private theorem rewriteUnaryNodeInPlace_preservesSem {Op α : Type} (sem : OpSemantics Op α)
+    {g : SSAGraph Op} (hwf : WellFormed g)
+    {j idx : Nat} (hj : j < idx) (hidx : idx < g.nodes.size)
+    {xId midId outId : ValueId} {midTy outTy : TensorType}
+    (hJIn : g.nodes[j].inputs.toList = [xId])
+    (hJOut : g.nodes[j].outputs.toList = [(midId, midTy)])
+    (hIIn : g.nodes[idx].inputs.toList = [midId])
+    (hIOut : g.nodes[idx].outputs.toList = [(outId, outTy)])
+    (newOp : Op)
+    (hcomp : ∀ (tx tmid tout : TensorVal α),
+      sem.evalOp g.nodes[j].op [tx] [midTy] = some [tmid] →
+      sem.evalOp g.nodes[idx].op [tmid] [outTy] = some [tout] →
+      sem.evalOp newOp [tx] [outTy] = some [tout]) :
+    SemRefines sem g (rewriteUnaryNodeInPlace g idx newOp xId) := by
+  intro env outs hout
+  unfold evalGraphOutputs evalGraph at hout ⊢
+  cases hInMatch : inputShapesMatch env g.inputs.toList with
+  | false => simp [hInMatch] at hout
+  | true =>
+    simp only [hInMatch, ↓reduceIte] at hout
+    simp only [rewriteUnaryNodeInPlace, hInMatch, ↓reduceIte]
+    cases hev : evalNodes sem env g.nodes.toList with
+    | none => simp [hev] at hout
+    | some final1 =>
+      simp only [hev] at hout
+      -- Split `g.nodes.toList` into `pre ++ [nd] ++ post` around `idx`
+      have hsplit : g.nodes.toList =
+          g.nodes.toList.take idx ++ [g.nodes[idx]] ++ g.nodes.toList.drop (idx + 1) := by
+        have hdrop : g.nodes.toList.drop idx = g.nodes[idx] :: g.nodes.toList.drop (idx + 1) := by
+          rw [List.drop_eq_getElem_cons (by simpa using hidx)]; rfl
+        calc g.nodes.toList
+            = g.nodes.toList.take idx ++ g.nodes.toList.drop idx := (List.take_append_drop idx _).symm
+          _ = g.nodes.toList.take idx ++ (g.nodes[idx] :: g.nodes.toList.drop (idx + 1)) := by rw [hdrop]
+          _ = g.nodes.toList.take idx ++ [g.nodes[idx]] ++ g.nodes.toList.drop (idx + 1) := by
+              simp [List.append_assoc]
+      have hsplit' : (g.nodes.modify idx fun nd => { nd with op := newOp, inputs := #[xId] }).toList =
+          g.nodes.toList.take idx ++ [{ g.nodes[idx] with op := newOp, inputs := #[xId] }] ++ g.nodes.toList.drop (idx + 1) := by
+        apply List.ext_getElem
+        · simp [Nat.min_eq_left (Nat.le_of_lt hidx)]; omega
+        · intro k hk1 hk2
+          have hkSz : k < g.nodes.size := by simpa using hk1
+          simp only [Array.getElem_toList, Array.getElem_modify]
+          by_cases hlt : k < idx
+          · have hne : idx ≠ k := by omega
+            simp only [hne, ↓reduceIte]
+            rw [List.getElem_append_left (by simp [Nat.min_eq_left (Nat.le_of_lt hidx)]; omega),
+                List.getElem_append_left (by simp; omega), List.getElem_take]
+            rfl
+          · by_cases heq : idx = k
+            · subst heq
+              simp only [↓reduceIte]
+              rw [List.getElem_append_left (by simp [Nat.min_eq_left (Nat.le_of_lt hidx)]),
+                  List.getElem_append_right (by simp; omega)]
+              simp [Nat.min_eq_left (Nat.le_of_lt hidx)]
+            · have hgt : idx < k := by omega
+              simp only [heq, ↓reduceIte]
+              rw [List.getElem_append_right (by simp [Nat.min_eq_left (Nat.le_of_lt hidx)]; omega)]
+              have hlenPre : (g.nodes.toList.take idx ++ [{ g.nodes[idx] with op := newOp, inputs := #[xId] }]).length = idx + 1 := by
+                simp [Nat.min_eq_left (Nat.le_of_lt hidx)]
+              simp only [hlenPre, List.getElem_drop, Nat.add_sub_cancel' (by omega : idx + 1 ≤ k)]
+              rfl
+      rw [hsplit, evalNodes_append, evalNodes_append] at hev
+      rw [hsplit', evalNodes_append, evalNodes_append]
+      cases hevPre : evalNodes sem env (g.nodes.toList.take idx) with
+      | none => simp [hevPre] at hev
+      | some envIdx =>
+        simp only [hevPre] at hev
+        -- Extract `tx` and `tmid` by splitting `g.nodes.toList.take idx` at `j < idx`!
+        have hsplitPre : g.nodes.toList.take idx =
+            g.nodes.toList.take j ++ [g.nodes[j]] ++ (g.nodes.toList.take idx).drop (j + 1) := by
+          have hjTake : j < (g.nodes.toList.take idx).length := by simp; omega
+          have hdrop : (g.nodes.toList.take idx).drop j = g.nodes[j] :: (g.nodes.toList.take idx).drop (j + 1) := by
+            rw [List.drop_eq_getElem_cons hjTake]; simp [List.getElem_take]
+          calc g.nodes.toList.take idx
+              = (g.nodes.toList.take idx).take j ++ (g.nodes.toList.take idx).drop j := (List.take_append_drop j _).symm
+            _ = g.nodes.toList.take j ++ (g.nodes[j] :: (g.nodes.toList.take idx).drop (j + 1)) := by
+                rw [List.take_take, Nat.min_eq_left (Nat.le_of_lt hj), hdrop]
+            _ = g.nodes.toList.take j ++ [g.nodes[j]] ++ (g.nodes.toList.take idx).drop (j + 1) := by
+                simp [List.append_assoc]
+        have hevPre2 := hevPre
+        rw [hsplitPre, evalNodes_append, evalNodes_append] at hevPre2
+        cases hevJPre : evalNodes sem env (g.nodes.toList.take j) with
+        | none => simp [hevJPre] at hevPre2
+        | some envJ =>
+          simp only [hevJPre] at hevPre2
+          cases hevJNd : evalNode sem envJ g.nodes[j] with
+          | none => simp [evalNodes, hevJNd] at hevPre2
+          | some envAfterJ =>
+            simp only [evalNodes, hevJNd] at hevPre2
+            unfold evalNode at hevJNd
+            rw [hJIn, hJOut] at hevJNd
+            simp only [List.map_cons, List.map_nil] at hevJNd
+            cases hluX : envJ xId with
+            | none => simp [lookupAll, hluX] at hevJNd
+            | some tx =>
+              simp only [lookupAll, hluX] at hevJNd
+              cases hopJ : sem.evalOp g.nodes[j].op [tx] [midTy] with
+              | none => simp [hopJ] at hevJNd
+              | some outJ =>
+                simp only [hopJ] at hevJNd
+                cases outJ with
+                | nil => simp [shapesMatch] at hevJNd
+                | cons tmid restJ =>
+                  cases restJ with
+                  | cons _ _ => simp [shapesMatch] at hevJNd
+                  | nil =>
+                    split at hevJNd
+                    · simp only [Option.some.injEq] at hevJNd
+                      subst hevJNd
+                      -- Neither `xId` nor `midId` is overwritten between `j` and `idx`!
+                      have hnodupJ : (g.allDefinedIdsBefore (j + 1) ++
+                          (g.nodes.toList.drop (j + 1)).flatMap IRNode.outputIds).Nodup := by
+                        rw [← allDefinedIds_split g (j + 1)]; exact hwf.uniqueIds
+                      have hsubMid : ((g.nodes.toList.take idx).drop (j + 1)).Sublist (g.nodes.toList.drop (j + 1)) := by
+                        rw [List.drop_take]; exact List.take_sublist _ _
+                      have hxBeforeJ : xId ∈ g.allDefinedIdsBefore j :=
+                        hwf.defBeforeUse j (by omega) xId (by rw [hJIn]; exact List.mem_cons_self ..)
+                      have hnotXMid : xId ∉ ((g.nodes.toList.take idx).drop (j + 1)).flatMap IRNode.outputIds := by
+                        intro hmem
+                        have hmemD := (sublist_flatMap IRNode.outputIds hsubMid).subset hmem
+                        apply nodup_append_disjoint hnodupJ xId _ hmemD
+                        unfold SSAGraph.allDefinedIdsBefore at hxBeforeJ ⊢
+                        rcases List.mem_append.mp hxBeforeJ with h1 | h2
+                        · exact List.mem_append_left _ h1
+                        · refine List.mem_append_right _ ?_
+                          have hsubT : (g.nodes.toList.take j).Sublist (g.nodes.toList.take (j + 1)) := by
+                            have : g.nodes.toList.take j = (g.nodes.toList.take (j + 1)).take j := by
+                              rw [List.take_take, Nat.min_eq_left (by omega)]
+                            rw [this]; exact List.take_sublist _ _
+                          exact (sublist_flatMap IRNode.outputIds hsubT).subset h2
+                      have hnotMidMid : midId ∉ ((g.nodes.toList.take idx).drop (j + 1)).flatMap IRNode.outputIds := by
+                        intro hmem
+                        have hmemD := (sublist_flatMap IRNode.outputIds hsubMid).subset hmem
+                        apply nodup_append_disjoint hnodupJ midId _ hmemD
+                        unfold SSAGraph.allDefinedIdsBefore
+                        refine List.mem_append_right _ ?_
+                        exact List.mem_flatMap.mpr ⟨g.nodes[j], by
+                          have : (g.nodes.toList.take (j + 1))[j]'(by simp; omega) = g.nodes[j] := by
+                            simp [List.getElem_take]
+                          rw [← this]; exact List.getElem_mem _, by
+                            unfold IRNode.outputIds; rw [hJOut]; exact List.mem_cons_self ..⟩
+                      have hxNeMid : xId ≠ midId := by
+                        intro heq
+                        have hnodupJ0 := hwf.uniqueIds
+                        rw [allDefinedIds_split g j] at hnodupJ0
+                        have hInDrop : midId ∈ (g.nodes.toList.drop j).flatMap IRNode.outputIds :=
+                          List.mem_flatMap.mpr ⟨g.nodes[j], by
+                            have : (g.nodes.toList.drop j)[0]'(by simp; omega) = g.nodes[j] := by
+                              simp [List.getElem_drop]
+                            rw [← this]; exact List.getElem_mem _, by
+                              unfold IRNode.outputIds; rw [hJOut]; exact List.mem_cons_self ..⟩
+                        exact nodup_append_disjoint hnodupJ0 xId hxBeforeJ (heq ▸ hInDrop)
+                      have hEnvX : envIdx xId = some tx := by
+                        rw [evalNodes_not_mem_preserved sem _ _ _ xId hnotXMid hevPre2]
+                        simp [bindOutputs, Env.set, hxNeMid, hluX]
+                      have hEnvMid : envIdx midId = some tmid := by
+                        rw [evalNodes_not_mem_preserved sem _ _ _ midId hnotMidMid hevPre2]
+                        simp [bindOutputs, Env.set]
+                      -- Now show node `idx` in `g'` produces the EXACT SAME `envAfter` as node `idx` in `g`!
+                      cases hevI : evalNode sem envIdx g.nodes[idx] with
+                      | none => simp [evalNodes, hevI] at hev
+                      | some envAfter =>
+                        simp only [evalNodes, hevI] at hev
+                        unfold evalNode at hevI
+                        rw [hIIn, hIOut] at hevI
+                        simp only [lookupAll, hEnvMid, List.map_cons, List.map_nil] at hevI
+                        cases hopI : sem.evalOp g.nodes[idx].op [tmid] [outTy] with
+                        | none => simp [hopI] at hevI
+                        | some outI =>
+                          simp only [hopI] at hevI
+                          cases outI with
+                          | nil => simp [shapesMatch] at hevI
+                          | cons tout restI =>
+                            cases restI with
+                            | cons _ _ => simp [shapesMatch] at hevI
+                            | nil =>
+                              split at hevI
+                              · rename_i hsmI
+                                simp only [Option.some.injEq] at hevI
+                                subst hevI
+                                have hopNew := hcomp tx tmid tout hopJ hopI
+                                have hevNew : evalNode sem envIdx { g.nodes[idx] with op := newOp, inputs := #[xId] } =
+                                    some (bindOutputs envIdx [(outId, outTy)] [tout]) := by
+                                  unfold evalNode
+                                  rw [hIOut]
+                                  simp only [lookupAll, hEnvX, List.map_cons, List.map_nil, hopNew, hsmI, ↓reduceIte]
+                                simp only [evalNodes, hevNew, hev]
+                                exact hout
+                              · cases hevI
+                    · cases hevJNd
+
+/-- Forward semantic refinement (`SemRefines`) & well-formedness of `ruleTransposeId`
+    (`Transpose(x, idPerm)` with rank matching `inTy` → `x`). -/
+theorem evalGraph_viewSimplify_transpose_id {Op α : Type} [HasCoreOps Op]
+    (sem : OpSemantics Op α) (hlaw : CoreViewLawful sem) :
+    (ruleTransposeId (Op := Op)).PreservesWF ∧ (ruleTransposeId (Op := Op)).PreservesSem sem := by
+  constructor
+  · intro g g' hwf happ
+    unfold ruleTransposeId at happ
+    obtain ⟨idx, hidx, hmatch⟩ := findFirstNodeMatch_some happ
+    have hidx' : idx < g.nodes.size := by simpa using hidx
+    simp only [Nat.zero_add] at hmatch
+    have hnd : g.nodes.toList[idx] = g.nodes[idx] := rfl
+    rw [hnd] at hmatch
+    split at hmatch
+    · rename_i perm inId outId outTy hCore hIn hOut
+      cases hty : g.valueType? inId with
+      | none => simp [hty] at hmatch
+      | some inTy =>
+        simp only [hty] at hmatch
+        split at hmatch
+        · simp only [Option.some.injEq] at hmatch
+          subst hmatch
+          exact eliminateUnaryIdentityNode_preservesWF hwf hidx' hIn hOut
+        · cases hmatch
+    · cases hmatch
+  · intro g g' hwf happ
+    unfold ruleTransposeId at happ
+    obtain ⟨idx, hidx, hmatch⟩ := findFirstNodeMatch_some happ
+    have hidx' : idx < g.nodes.size := by simpa using hidx
+    simp only [Nat.zero_add] at hmatch
+    have hnd : g.nodes.toList[idx] = g.nodes[idx] := rfl
+    rw [hnd] at hmatch
+    split at hmatch
+    · rename_i perm inId outId outTy hCore hIn hOut
+      cases hty : g.valueType? inId with
+      | none => simp [hty] at hmatch
+      | some inTy =>
+        simp only [hty] at hmatch
+        split at hmatch
+        · rename_i hCond
+          simp only [Bool.and_eq_true, beq_iff_eq] at hCond
+          obtain ⟨hIdPerm, _⟩ := hCond
+          simp only [Option.some.injEq] at hmatch
+          subst hmatch
+          apply eliminateUnaryIdentityNode_preservesSem sem hwf hidx' hIn hOut
+          intro _ t res _ _ hop
+          rw [hlaw.transpose_law g.nodes[idx].op perm t outTy hCore] at hop
+          simp only [Option.map_eq_some_iff, List.cons.injEq, and_true] at hop
+          obtain ⟨r, hr, rfl⟩ := hop
+          have hlen : perm.size = t.shape.length ∧ ∀ d ∈ t.shape, d > 0 := by
+            unfold evalTranspose at hr
+            split at hr
+            · rename_i hc
+              simp only [Bool.and_eq_true, beq_iff_eq] at hc
+              exact ⟨hc.1.2, (list_all_pos_iff t.shape).mp hc.2⟩
+            · cases hr
+          have hpEq : perm = idPerm t.shape.length := by
+            rw [← hlen.1]
+            exact (isIdentityPerm_iff perm).mp hIdPerm
+          rw [hpEq, evalTranspose_id t hlen.2, Option.some.injEq] at hr
+          exact hr.symm
+        · cases hmatch
+    · cases hmatch
+
+/-- Forward semantic refinement (`SemRefines`) & well-formedness of `ruleTransposeCompose`
+    (`Transpose(Transpose(x, p1), p2) → Transpose(x, composePerm p1 p2)`). -/
+theorem evalGraph_viewSimplify_transpose_compose {Op α : Type} [HasCoreOps Op]
+    (sem : OpSemantics Op α) (hlaw : CoreViewLawful sem) :
+    (ruleTransposeCompose (Op := Op)).PreservesWF ∧ (ruleTransposeCompose (Op := Op)).PreservesSem sem := by
+  constructor
+  · intro g g' hwf happ
+    unfold ruleTransposeCompose at happ
+    obtain ⟨idx, hidx, hmatch⟩ := findFirstNodeMatch_some happ
+    have hidx' : idx < g.nodes.size := by simpa using hidx
+    simp only [Nat.zero_add] at hmatch
+    have hnd : g.nodes.toList[idx] = g.nodes[idx] := rfl
+    rw [hnd] at hmatch
+    split at hmatch
+    · rename_i p2 midId outId outTy _ _ _
+      cases hfp : findSoleProducerBefore g.nodes.toList idx midId with
+      | none => simp [hfp] at hmatch
+      | some pnd =>
+        simp only [hfp] at hmatch
+        obtain ⟨j, hjLt, hjLen, _, hgetJ, _⟩ := findSoleProducerBefore_some hfp
+        split at hmatch
+        · rename_i p1 xId _ hJIn
+          split at hmatch
+          · simp only [Option.some.injEq] at hmatch
+            subst hmatch
+            have hxDefJ : xId ∈ g.allDefinedIdsBefore j := by
+              have hJIn' : (g.nodes[j]'(by simpa using hjLen)).inputs.toList = [xId] := by
+                have : g.nodes[j]'(by simpa using hjLen) = pnd := hgetJ
+                rw [this]; exact hJIn
+              exact hwf.defBeforeUse j (by simpa using hjLen) xId (by rw [hJIn']; exact List.mem_cons_self ..)
+            have hxDefIdx : xId ∈ g.allDefinedIdsBefore idx := by
+              unfold SSAGraph.allDefinedIdsBefore at hxDefJ ⊢
+              rcases List.mem_append.mp hxDefJ with h1 | h2
+              · exact List.mem_append_left _ h1
+              · refine List.mem_append_right _ ?_
+                have hsubT : (g.nodes.toList.take j).Sublist (g.nodes.toList.take idx) := by
+                  have : g.nodes.toList.take j = (g.nodes.toList.take idx).take j := by
+                    rw [List.take_take, Nat.min_eq_left (Nat.le_of_lt hjLt)]
+                  rw [this]; exact List.take_sublist _ _
+                exact (sublist_flatMap IRNode.outputIds hsubT).subset h2
+            exact rewriteUnaryNodeInPlace_preservesWF hwf hidx' _ xId hxDefIdx
+          · cases hmatch
+        · cases hmatch
+    · cases hmatch
+  · intro g g' hwf happ
+    unfold ruleTransposeCompose at happ
+    obtain ⟨idx, hidx, hmatch⟩ := findFirstNodeMatch_some happ
+    have hidx' : idx < g.nodes.size := by simpa using hidx
+    simp only [Nat.zero_add] at hmatch
+    have hnd : g.nodes.toList[idx] = g.nodes[idx] := rfl
+    rw [hnd] at hmatch
+    split at hmatch
+    · rename_i p2 midId outId outTy hCore2 hIIn hIOut
+      cases hfp : findSoleProducerBefore g.nodes.toList idx midId with
+      | none => simp [hfp] at hmatch
+      | some pnd =>
+        simp only [hfp] at hmatch
+        obtain ⟨j, hjLt, hjLen, midTy, hgetJ, hJOut⟩ := findSoleProducerBefore_some hfp
+        have hgetJ' : g.nodes[j]'(by simpa using hjLen) = pnd := hgetJ
+        split at hmatch
+        · rename_i p1 xId hCore1 hJIn
+          split at hmatch
+          · rename_i hcond
+            simp only [Bool.and_eq_true, beq_iff_eq] at hcond
+            obtain ⟨⟨hv1, hv2⟩, hsz⟩ := hcond
+            have hp1 : ValidPerm p1 := (isValidPerm_iff p1).mp hv1
+            have hp2 : ValidPerm p2 := (isValidPerm_iff p2).mp hv2
+            simp only [Option.some.injEq] at hmatch
+            subst hmatch
+            apply rewriteUnaryNodeInPlace_preservesSem sem hwf hjLt hidx'
+              (hgetJ'.symm ▸ hJIn) (hgetJ'.symm ▸ hJOut) hIIn hIOut
+            intro tx tmid tout hopJ hopI
+            rw [hgetJ'] at hopJ
+            rw [hlaw.transpose_law pnd.op p1 tx midTy hCore1] at hopJ
+            rw [hlaw.transpose_law g.nodes[idx].op p2 tmid outTy hCore2] at hopI
+            rw [hlaw.transpose_law _ (composePerm p1 p2) tx outTy (HasCoreOps.asCore_ofCore _)]
+            simp only [Option.map_eq_some_iff, List.cons.injEq, and_true] at hopJ hopI ⊢
+            obtain ⟨r1, hr1, rfl⟩ := hopJ
+            obtain ⟨r2, hr2, rfl⟩ := hopI
+            refine ⟨r2, ?_, rfl⟩
+            rw [← evalTranspose_compose p1 p2 tx r1 hp1 hp2 hsz hr1]
+            exact hr2
+          · cases hmatch
+        · cases hmatch
+    · cases hmatch
+
+/-- Forward semantic refinement (`SemRefines`) & well-formedness of `ruleReshapeId` (`Reshape(x, inShape) → x`). -/
+theorem evalGraph_viewSimplify_reshape_id {Op α : Type} [HasCoreOps Op]
+    (sem : OpSemantics Op α) (hlaw : CoreViewLawful sem) :
+    (ruleReshapeId (Op := Op)).PreservesWF ∧ (ruleReshapeId (Op := Op)).PreservesSem sem := by
+  constructor
+  · intro g g' hwf happ
+    unfold ruleReshapeId at happ
+    obtain ⟨idx, hidx, hmatch⟩ := findFirstNodeMatch_some happ
+    have hidx' : idx < g.nodes.size := by simpa using hidx
+    simp only [Nat.zero_add] at hmatch
+    have hnd : g.nodes.toList[idx] = g.nodes[idx] := rfl
+    rw [hnd] at hmatch
+    split at hmatch
+    · rename_i targetShape inId outId outTy _ hIn hOut
+      cases hty : g.valueType? inId with
+      | none => simp [hty] at hmatch
+      | some inTy =>
+        simp only [hty] at hmatch
+        split at hmatch
+        · simp only [Option.some.injEq] at hmatch
+          subst hmatch
+          exact eliminateUnaryIdentityNode_preservesWF hwf hidx' hIn hOut
+        · cases hmatch
+    · cases hmatch
+  · intro g g' hwf happ
+    unfold ruleReshapeId at happ
+    obtain ⟨idx, hidx, hmatch⟩ := findFirstNodeMatch_some happ
+    have hidx' : idx < g.nodes.size := by simpa using hidx
+    simp only [Nat.zero_add] at hmatch
+    have hnd : g.nodes.toList[idx] = g.nodes[idx] := rfl
+    rw [hnd] at hmatch
+    split at hmatch
+    · rename_i targetShape inId outId outTy hCore hIn hOut
+      cases hty : g.valueType? inId with
+      | none => simp [hty] at hmatch
+      | some inTy =>
+        simp only [hty] at hmatch
+        split at hmatch
+        · rename_i hshEq
+          have htsEq : targetShape = inTy.shape := beq_iff_eq.mp hshEq
+          simp only [Option.some.injEq] at hmatch
+          subst hmatch
+          apply eliminateUnaryIdentityNode_preservesSem sem hwf hidx' hIn hOut
+          intro _ t res hshape _ hop
+          obtain ⟨htSh, htPos⟩ := hshape inTy hty
+          rw [hlaw.reshape_law g.nodes[idx].op targetShape t outTy hCore] at hop
+          simp only [Option.map_eq_some_iff, List.cons.injEq, and_true] at hop
+          obtain ⟨r, hr, rfl⟩ := hop
+          have htarArr : targetShape = t.shape.toArray := by
+            rw [htsEq, htSh, Array.toArray_toList]
+          rw [htarArr, evalReshape_id t htPos, Option.some.injEq] at hr
+          exact hr.symm
+        · cases hmatch
+    · cases hmatch
+
+/-- Forward semantic refinement (`SemRefines`) & well-formedness of `ruleReshapeCompose`
+    (`Reshape(Reshape(x, s1), s2) → Reshape(x, s2)`). -/
+theorem evalGraph_viewSimplify_reshape_compose {Op α : Type} [HasCoreOps Op]
+    (sem : OpSemantics Op α) (hlaw : CoreViewLawful sem) :
+    (ruleReshapeCompose (Op := Op)).PreservesWF ∧ (ruleReshapeCompose (Op := Op)).PreservesSem sem := by
+  constructor
+  · intro g g' hwf happ
+    unfold ruleReshapeCompose at happ
+    obtain ⟨idx, hidx, hmatch⟩ := findFirstNodeMatch_some happ
+    have hidx' : idx < g.nodes.size := by simpa using hidx
+    simp only [Nat.zero_add] at hmatch
+    have hnd : g.nodes.toList[idx] = g.nodes[idx] := rfl
+    rw [hnd] at hmatch
+    split at hmatch
+    · rename_i s2 midId outId outTy _ _ _
+      cases hfp : findSoleProducerBefore g.nodes.toList idx midId with
+      | none => simp [hfp] at hmatch
+      | some pnd =>
+        simp only [hfp] at hmatch
+        obtain ⟨j, hjLt, hjLen, _, hgetJ, _⟩ := findSoleProducerBefore_some hfp
+        split at hmatch
+        · rename_i s1 xId _ hJIn
+          simp only [Option.some.injEq] at hmatch
+          subst hmatch
+          have hxDefJ : xId ∈ g.allDefinedIdsBefore j := by
+            have hJIn' : (g.nodes[j]'(by simpa using hjLen)).inputs.toList = [xId] := by
+              have : g.nodes[j]'(by simpa using hjLen) = pnd := hgetJ
+              rw [this]; exact hJIn
+            exact hwf.defBeforeUse j (by simpa using hjLen) xId (by rw [hJIn']; exact List.mem_cons_self ..)
+          have hxDefIdx : xId ∈ g.allDefinedIdsBefore idx := by
+            unfold SSAGraph.allDefinedIdsBefore at hxDefJ ⊢
+            rcases List.mem_append.mp hxDefJ with h1 | h2
+            · exact List.mem_append_left _ h1
+            · refine List.mem_append_right _ ?_
+              have hsubT : (g.nodes.toList.take j).Sublist (g.nodes.toList.take idx) := by
+                have : g.nodes.toList.take j = (g.nodes.toList.take idx).take j := by
+                  rw [List.take_take, Nat.min_eq_left (Nat.le_of_lt hjLt)]
+                rw [this]; exact List.take_sublist _ _
+              exact (sublist_flatMap IRNode.outputIds hsubT).subset h2
+          exact rewriteUnaryNodeInPlace_preservesWF hwf hidx' _ xId hxDefIdx
+        · cases hmatch
+    · cases hmatch
+  · intro g g' hwf happ
+    unfold ruleReshapeCompose at happ
+    obtain ⟨idx, hidx, hmatch⟩ := findFirstNodeMatch_some happ
+    have hidx' : idx < g.nodes.size := by simpa using hidx
+    simp only [Nat.zero_add] at hmatch
+    have hnd : g.nodes.toList[idx] = g.nodes[idx] := rfl
+    rw [hnd] at hmatch
+    split at hmatch
+    · rename_i s2 midId outId outTy hCore2 hIIn hIOut
+      cases hfp : findSoleProducerBefore g.nodes.toList idx midId with
+      | none => simp [hfp] at hmatch
+      | some pnd =>
+        simp only [hfp] at hmatch
+        obtain ⟨j, hjLt, hjLen, midTy, hgetJ, hJOut⟩ := findSoleProducerBefore_some hfp
+        have hgetJ' : g.nodes[j]'(by simpa using hjLen) = pnd := hgetJ
+        split at hmatch
+        · rename_i s1 xId hCore1 hJIn
+          simp only [Option.some.injEq] at hmatch
+          subst hmatch
+          apply rewriteUnaryNodeInPlace_preservesSem sem hwf hjLt hidx'
+            (hgetJ'.symm ▸ hJIn) (hgetJ'.symm ▸ hJOut) hIIn hIOut
+          intro tx tmid tout hopJ hopI
+          rw [hgetJ'] at hopJ
+          rw [hlaw.reshape_law pnd.op s1 tx midTy hCore1] at hopJ
+          rw [hlaw.reshape_law g.nodes[idx].op s2 tmid outTy hCore2] at hopI
+          rw [hlaw.reshape_law _ s2 tx outTy (HasCoreOps.asCore_ofCore _)]
+          simp only [Option.map_eq_some_iff, List.cons.injEq, and_true] at hopJ hopI ⊢
+          obtain ⟨r1, hr1, rfl⟩ := hopJ
+          obtain ⟨r2, hr2, rfl⟩ := hopI
+          refine ⟨r2, ?_, rfl⟩
+          rw [← evalReshape_compose s1 s2 tx r1 hr1]
+          exact hr2
+        · cases hmatch
+    · cases hmatch
+
+/-- Forward semantic refinement (`SemRefines`) & well-formedness of `ruleSliceId`
+    (`Slice(x, [0..0], inShape, [1..1]) → x`). -/
+theorem evalGraph_viewSimplify_slice_id {Op α : Type} [HasCoreOps Op]
+    (sem : OpSemantics Op α) (hlaw : CoreViewLawful sem) :
+    (ruleSliceId (Op := Op)).PreservesWF ∧ (ruleSliceId (Op := Op)).PreservesSem sem := by
+  constructor
+  · intro g g' hwf happ
+    unfold ruleSliceId at happ
+    obtain ⟨idx, hidx, hmatch⟩ := findFirstNodeMatch_some happ
+    have hidx' : idx < g.nodes.size := by simpa using hidx
+    simp only [Nat.zero_add] at hmatch
+    have hnd : g.nodes.toList[idx] = g.nodes[idx] := rfl
+    rw [hnd] at hmatch
+    split at hmatch
+    · rename_i beg en st inId outId outTy _ hIn hOut
+      cases hty : g.valueType? inId with
+      | none => simp [hty] at hmatch
+      | some inTy =>
+        simp only [hty] at hmatch
+        split at hmatch
+        · simp only [Option.some.injEq] at hmatch
+          subst hmatch
+          exact eliminateUnaryIdentityNode_preservesWF hwf hidx' hIn hOut
+        · cases hmatch
+    · cases hmatch
+  · intro g g' hwf happ
+    unfold ruleSliceId at happ
+    obtain ⟨idx, hidx, hmatch⟩ := findFirstNodeMatch_some happ
+    have hidx' : idx < g.nodes.size := by simpa using hidx
+    simp only [Nat.zero_add] at hmatch
+    have hnd : g.nodes.toList[idx] = g.nodes[idx] := rfl
+    rw [hnd] at hmatch
+    split at hmatch
+    · rename_i beg en st inId outId outTy hCore hIn hOut
+      cases hty : g.valueType? inId with
+      | none => simp [hty] at hmatch
+      | some inTy =>
+        simp only [hty] at hmatch
+        split at hmatch
+        · rename_i hcond
+          simp only [Bool.and_eq_true, beq_iff_eq] at hcond
+          obtain ⟨⟨hbeg, hen⟩, hst⟩ := hcond
+          simp only [Option.some.injEq] at hmatch
+          subst hmatch
+          apply eliminateUnaryIdentityNode_preservesSem sem hwf hidx' hIn hOut
+          intro _ t res hshape _ hop
+          obtain ⟨htSh, htPos⟩ := hshape inTy hty
+          rw [hlaw.slice_law g.nodes[idx].op beg en st t outTy hCore] at hop
+          simp only [Option.map_eq_some_iff, List.cons.injEq, and_true] at hop
+          obtain ⟨r, hr, rfl⟩ := hop
+          have hrLen : inTy.shape.size = t.shape.length := by rw [htSh, Array.length_toList]
+          have henArr : en = t.shape.toArray := by rw [hen, htSh, Array.toArray_toList]
+          rw [hbeg, hst, hrLen, henArr, evalSlice_id t htPos, Option.some.injEq] at hr
+          exact hr.symm
+        · cases hmatch
+    · cases hmatch
+
+/-- Full end-to-end soundness & functional equivalence of the polymorphic `viewSimplify` pass
+    (composing `evalGraph_applyRewrites` over all 5 `viewSimplifyRules` + `wellFormed_dce` + `evalGraph_dce`). -/
+theorem evalGraph_viewSimplify {Op α : Type} [HasCoreOps Op]
+    (sem : OpSemantics Op α) (hlaw : CoreViewLawful sem) (fuel : Nat) :
+    PreservesWF (fun g => viewSimplify (Op := Op) g fuel) ∧
+    PreservesSem sem (fun g => viewSimplify (Op := Op) g fuel) := by
+  have hrules : ∀ r ∈ viewSimplifyRules (Op := Op), r.PreservesWF ∧ r.PreservesSem sem := by
+    intro r hr
+    unfold viewSimplifyRules at hr
+    simp only [List.mem_cons, List.not_mem_nil, or_false] at hr
+    rcases hr with rfl | rfl | rfl | rfl | rfl
+    · exact evalGraph_viewSimplify_transpose_id sem hlaw
+    · exact evalGraph_viewSimplify_transpose_compose sem hlaw
+    · exact evalGraph_viewSimplify_reshape_id sem hlaw
+    · exact evalGraph_viewSimplify_reshape_compose sem hlaw
+    · exact evalGraph_viewSimplify_slice_id sem hlaw
+  constructor
+  · intro g hwf
+    unfold viewSimplify
+    have hwf1 := (evalGraph_applyRewrites sem (if fuel == 0 then 4 * g.nodes.size + 16 else fuel)
+      viewSimplifyRules hrules).1 g hwf
+    exact wellFormed_dce _ hwf1
+  · intro g hwf env outs hout
+    unfold viewSimplify
+    have hrew := evalGraph_applyRewrites sem (if fuel == 0 then 4 * g.nodes.size + 16 else fuel)
+      viewSimplifyRules hrules
+    have hwf1 := hrew.1 g hwf
+    have hout1 := hrew.2 g hwf env outs hout
+    exact evalGraph_dce sem _ hwf1 env outs hout1
+
+/-- `mkCoreSemantics` satisfies `CoreViewLawful` for any compute oracle. -/
+theorem mkCoreSemantics_lawful {α : Type}
+    (evalCompute : CoreOp → List (TensorVal α) → List TensorType → Option (List (TensorVal α)))
+    (hComputeLen : ∀ op ins outTys outs, evalCompute op ins outTys = some outs → outs.length = outTys.length) :
+    CoreViewLawful (mkCoreSemantics evalCompute hComputeLen) := by
+  constructor
+  · intro op perm t outTy h
+    have heq : op = .transpose perm := Option.some.inj h
+    subst heq; rfl
+  · intro op sh t outTy h
+    have heq : op = .reshape sh := Option.some.inj h
+    subst heq; rfl
+  · intro op beg en st t outTy h
+    have heq : op = .slice beg en st := Option.some.inj h
+    subst heq; rfl
+  · intro op ax ts outTy h
+    have heq : op = .concat ax := Option.some.inj h
+    subst heq; rfl
 
 end Vane.Proofs

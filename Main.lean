@@ -60,6 +60,7 @@ private def usage : String :=
   "  vane compile-graph --spec <graph.json> [--strip-height <off|auto|N>] --out-dir <dir>\n" ++
   "  vane compile-onnx --target <h16|h17> --model <path> [--safetensors <path>] [--input-shape NAME=C,H,W]...\n" ++
   "                    [--placement auto|l2|dram] [--no-fuse] [--allow-view-ops=true|false]\n" ++
+  "                    [--quantize <int8|int4|pal4|pal2>] [--dump-ir[=high|core]]\n" ++
   "                    [--emit-graph-dir <dir>] --out-dir <dir>\n" ++
   "  vane inspect-safetensors --file <path> [--export-dir <dir>] [--strict] [--json]\n"
 
@@ -3177,6 +3178,8 @@ private def cmdCompileOnnx (args : List String) : IO UInt32 := do
   let mut stripMode : StripMode := .off
   let mut noFuse : Bool := false
   let mut allowViewOps : Bool := true
+  let mut quantizeFmt : Option QuantFormat := none
+  let mut dumpIrMode : Option String := none
   let mut emitGraphDirPath : Option String := none
   let mut outDir : Option String := none
   let mut rest := args
@@ -3218,6 +3221,19 @@ private def cmdCompileOnnx (args : List String) : IO UInt32 := do
       | .error e => IO.eprintln s!"error: {e}"; return 1
     | "--no-fuse" :: tl =>
       noFuse := true; rest := tl
+    | "--quantize" :: tl =>
+      match requireArgValue "--quantize" tl with
+      | .ok (v, tl') =>
+        match Vane.IR.parsePTQFormat? v with
+        | some fmt => quantizeFmt := some fmt; rest := tl'
+        | none => IO.eprintln s!"error: invalid --quantize '{v}' (expected int8, int4, pal4, or pal2)"; return 1
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--dump-ir" :: tl =>
+      dumpIrMode := some "both"; rest := tl
+    | "--dump-ir=high" :: tl =>
+      dumpIrMode := some "high"; rest := tl
+    | "--dump-ir=core" :: tl =>
+      dumpIrMode := some "core"; rest := tl
     | "--allow-view-ops=true" :: tl =>
       allowViewOps := true; rest := tl
     | "--allow-view-ops=false" :: tl =>
@@ -3247,6 +3263,17 @@ private def cmdCompileOnnx (args : List String) : IO UInt32 := do
         match parseBoolArg "--allow-view-ops" val with
         | .ok b => allowViewOps := b; rest := rest.tail
         | .error e => IO.eprintln s!"error: {e}"; return 1
+      else if flag.startsWith "--dump-ir=" then
+        let val := (flag.drop 10).toString.toLower
+        if val == "high" || val == "core" then
+          dumpIrMode := some val; rest := rest.tail
+        else
+          IO.eprintln s!"error: invalid --dump-ir '{val}' (expected high or core)"; return 1
+      else if flag.startsWith "--quantize=" then
+        let val := (flag.drop 11).toString
+        match Vane.IR.parsePTQFormat? val with
+        | some fmt => quantizeFmt := some fmt; rest := rest.tail
+        | none => IO.eprintln s!"error: invalid --quantize '{val}' (expected int8, int4, pal4, or pal2)"; return 1
       else
         IO.eprintln s!"error: unknown argument '{flag}' for compile-onnx"
         IO.eprintln usage
@@ -3281,9 +3308,18 @@ private def cmdCompileOnnx (args : List String) : IO UInt32 := do
       safeTensors := sf?
       noFuse := noFuse
       allowViewOps := allowViewOps
+      quantize := quantizeFmt
     } with
     | .ok r => pure r
     | .error e => IO.eprintln s!"error: compile-onnx lowering failed: {e}"; return 1
+
+  if let some mode := dumpIrMode then
+    if mode == "high" || mode == "both" then
+      IO.println "=== TensorIR (HighOp) ==="
+      IO.println (Vane.IR.SSAGraph.dumpHigh lowered.highGraph)
+    if mode == "core" || mode == "both" then
+      IO.println "=== TensorIR (CoreOp) ==="
+      IO.println (Vane.IR.SSAGraph.dumpCore lowered.coreGraph)
 
   for w in lowered.summary.warnings do
     IO.eprintln w

@@ -491,6 +491,27 @@ def toFp16 (t : OnnxTensor) : Except String (Array UInt16) := do
   let vals ← t.toFloat64
   float64ArrayToFp16 vals t.name
 
+/-- Extract raw 8-bit code bytes from an `INT8` (`dataType=3`) or `UINT8` (`dataType=2`) `OnnxTensor`. -/
+def toByteCodes (t : OnnxTensor) : Except String ByteArray := do
+  if t.dataLocation == onnxDataExternal then
+    throw s!"tensor '{t.name}' uses external data_location=EXTERNAL"
+  let nElems ← t.numElements
+  if t.dataType != onnxInt8 && t.dataType != onnxUint8 then
+    throw s!"tensor '{t.name}': expected INT8 or UINT8 data_type, got {t.dataType}"
+  if t.rawData.size > 0 then
+    if t.rawData.size != nElems then
+      throw s!"tensor '{t.name}' (byte tensor): raw_data length {t.rawData.size} != expected {nElems}"
+    pure t.rawData
+  else
+    if t.int32Data.size != nElems then
+      throw s!"tensor '{t.name}' (byte tensor): int32_data length {t.int32Data.size} != expected {nElems}"
+    let mut out : Array UInt8 := Array.mkEmpty nElems
+    for i in [:nElems] do
+      let v := t.int32Data[i]!
+      let b : UInt8 := (int32ToU32 v &&& 0xff).toUInt8
+      out := out.push b
+    pure (ByteArray.mk out)
+
 end OnnxTensor
 
 -- ============================================================================

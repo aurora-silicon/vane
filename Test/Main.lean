@@ -8096,8 +8096,847 @@ private def runM8aTests : IO (Array TestResult) := do
 
   pure results
 
+-- ============================================================================
+-- Milestone C1: Parameterized SSA TensorIR (HighOp -> CoreOp), Rewriter & PTQ
+-- ============================================================================
+
+namespace C1Tests
+
+open Vane.IR
+open Vane.Quant
+
+private def pbByteTensor (name : String) (dtype : Int) (dims : Array Int) (bytes : ByteArray) : ProtoBuilder :=
+  (((ProtoBuilder.empty.writeString 8 name).writeInt64 2 dtype).writePackedInt64 1 dims).writeBytes 9 bytes
+
+private def lowerOnnxBytes (bytes : ByteArray) (opts : LowerOptions := {}) : Except String LowerResult := do
+  lowerOnnx (← parseOnnx bytes) opts
+
+private def compileOnnxBytes (bytes : ByteArray) (opts : LowerOptions := {}) : Except String CompiledOnnx := do
+  compileOnnx (← parseOnnx bytes) opts
+
+private def mkTestIntTensor (sh : List Nat) (f : Nat → Int) : TensorVal Int :=
+  { shape := sh, data := fun idx => f idx.val }
+
+private def evalTensorToList (t : TensorVal Int) : List Int :=
+  (List.range (shapeProd t.shape)).map fun i =>
+    if h : i < shapeProd t.shape then t.data ⟨i, h⟩ else 0
+
+private def runC1Tests : IO (Array TestResult) := do
+  let mut results : Array TestResult := #[]
+
+  -- 1. SSA Graph Validation: positive multi-input/multi-output + negative rejection rules
+  results := results.push (checkOk "c1 validate: valid multi-input multi-output SSAGraph CoreOp & HighOp" (do
+    let ty : TensorType := { shape := #[1, 8, 4, 4], dtype := .fp16 }
+    let gCore : SSAGraph CoreOp := {
+      target := .h17
+      inputs := #[(0, "a", ty), (1, "b", ty)]
+      nodes := #[
+        { name := "add", op := .elemBinary .add, inputs := #[0, 1], outputs := #[(2, ty)] },
+        { name := "sub", op := .elemBinary .sub, inputs := #[0, 1], outputs := #[(3, ty)] }
+      ]
+      outputs := #[2, 3]
+    }
+    validateGraph gCore
+    let gHigh : SSAGraph HighOp := {
+      target := .h16
+      inputs := #[(0, "x", ty)]
+      nodes := #[
+        { name := "sp", op := .split 1 #[4, 4], inputs := #[0],
+          outputs := #[(1, { shape := #[1, 4, 4, 4], dtype := .fp16 }),
+                       (2, { shape := #[1, 4, 4, 4], dtype := .fp16 })] }
+      ]
+      outputs := #[1, 2]
+    }
+    validateGraph gHigh
+  ))
+
+  results := results.push (checkErr "c1 validate neg: non-dense input ValueIds rejected" (do
+    let ty : TensorType := { shape := #[1, 4, 4, 4], dtype := .fp16 }
+    let g : SSAGraph CoreOp := {
+      target := .h17
+      inputs := #[(1, "x", ty)]
+      nodes := #[]
+      outputs := #[1]
+    }
+    validateGraph g
+  ) "dense")
+
+  results := results.push (checkErr "c1 validate neg: zero dimension in input shape rejected" (do
+    let g : SSAGraph CoreOp := {
+      target := .h17
+      inputs := #[(0, "x", { shape := #[1, 0, 4, 4], dtype := .fp16 })]
+      nodes := #[]
+      outputs := #[0]
+    }
+    validateGraph g
+  ) "positive")
+
+  results := results.push (checkErr "c1 validate neg: duplicate output ValueId rejected" (do
+    let ty : TensorType := { shape := #[1, 4, 4, 4], dtype := .fp16 }
+    let g : SSAGraph CoreOp := {
+      target := .h17
+      inputs := #[(0, "x", ty)]
+      nodes := #[
+        { name := "n0", op := .elemUnary .abs, inputs := #[0], outputs := #[(1, ty)] },
+        { name := "n1", op := .elemUnary .abs, inputs := #[0], outputs := #[(1, ty)] }
+      ]
+      outputs := #[1]
+    }
+    validateGraph g
+  ) "duplicate")
+
+  results := results.push (checkErr "c1 validate neg: use-before-def / cycle rejected" (do
+    let ty : TensorType := { shape := #[1, 4, 4, 4], dtype := .fp16 }
+    let g : SSAGraph CoreOp := {
+      target := .h17
+      inputs := #[(0, "x", ty)]
+      nodes := #[
+        { name := "bad", op := .elemBinary .add, inputs := #[0, 2], outputs := #[(1, ty)] },
+        { name := "late", op := .elemUnary .abs, inputs := #[1], outputs := #[(2, ty)] }
+      ]
+      outputs := #[2]
+    }
+    validateGraph g
+  ) "not defined before node")
+
+  results := results.push (checkErr "c1 validate neg: undefined graph output rejected" (do
+    let ty : TensorType := { shape := #[1, 4, 4, 4], dtype := .fp16 }
+    let g : SSAGraph CoreOp := {
+      target := .h17
+      inputs := #[(0, "x", ty)]
+      nodes := #[]
+      outputs := #[99]
+    }
+    validateGraph g
+  ) "not defined in graph")
+
+  -- 2. Polymorphic DCE on multi-output SSA graph
+  results := results.push (checkOk "c1 dce: multi-output SSA graph drops dead branches and preserves live outputs" (do
+    let ty : TensorType := { shape := #[1, 8, 4, 4], dtype := .fp16 }
+    let g : SSAGraph CoreOp := {
+      target := .h17
+      inputs := #[(0, "x", ty)]
+      nodes := #[
+        { name := "shared", op := .elemUnary .abs, inputs := #[0], outputs := #[(1, ty)] },
+        { name := "dead1", op := .elemUnary .square, inputs := #[1], outputs := #[(2, ty)] },
+        { name := "dead2", op := .elemBinary .add, inputs := #[2, 0], outputs := #[(3, ty)] },
+        { name := "liveA", op := .lut .relu, inputs := #[1], outputs := #[(4, ty)] },
+        { name := "liveB", op := .elemBinary .mul, inputs := #[1, 0], outputs := #[(5, ty)] }
+      ]
+      outputs := #[4, 5]
+    }
+    validateGraph g
+    let gDce := dce g
+    validateGraph gDce
+    if gDce.nodes.size != 3 then
+      throw s!"expected 3 live nodes after DCE, got {gDce.nodes.size}"
+    if gDce.outputs != #[4, 5] then
+      throw s!"unexpected outputs after DCE: {repr gDce.outputs}"
+    let names := gDce.nodes.map (·.name)
+    if names != #["shared", "liveA", "liveB"] then
+      throw s!"unexpected kept node names: {repr names}"
+  ))
+
+  -- 3. Polymorphic ViewSimplify: Transpose(Transpose) / Reshape(Reshape) / full-span Slice
+  results := results.push (checkOk "c1 viewSimplify: ONNX inverse Transpose, round-trip Reshape & full-span Slice compile to 0 DMA view tasks" (do
+    let w1 := mkDetF32 (16 * 16) 0.05
+    let b1 := mkDetF32 16 0.01
+    for tgt in #[Target.h16, Target.h17] do
+      -- (a) Transpose([0,2,3,1]) followed by inverse Transpose([0,3,1,2]) -> Conv1x1
+      let gTr := pbGraph "tr_cancel"
+        #[pbVI "x" #[1, 16, 8, 8]]
+        #[pbVI "y" #[1, 16, 8, 8]]
+        #[pbF32Tensor "w" #[16, 16, 1, 1] w1, pbF32Tensor "b" #[16] b1]
+        #[pbNode "Transpose" "t1" #["x"] #["h1"] #[pbAttrInts "perm" #[0, 2, 3, 1]],
+          pbNode "Transpose" "t2" #["h1"] #["h2"] #[pbAttrInts "perm" #[0, 3, 1, 2]],
+          pbNode "Conv" "conv" #["h2", "w", "b"] #["y"]]
+      let coTr ← compileOnnxBytes (pbWrapModel 18 gTr) { target := tgt }
+      let sTr ← verifyCompiledOnnx coTr
+      if sTr.neView != 0 || sTr.neConv != 1 || sTr.total != 1 then
+        throw s!"{tgt.name} inverse Transpose not eliminated: summary={repr sTr}"
+
+      -- (b) Reshape([1,8,16,8]) followed by Reshape([1,16,8,8]) -> Conv1x1
+      let gRs := pbGraph "rs_cancel"
+        #[pbVI "x" #[1, 16, 8, 8]]
+        #[pbVI "y" #[1, 16, 8, 8]]
+        #[pbI64Tensor "s1" #[4] #[1, 8, 16, 8],
+          pbI64Tensor "s2" #[4] #[1, 16, 8, 8],
+          pbF32Tensor "w" #[16, 16, 1, 1] w1, pbF32Tensor "b" #[16] b1]
+        #[pbNode "Reshape" "r1" #["x", "s1"] #["h1"],
+          pbNode "Reshape" "r2" #["h1", "s2"] #["h2"],
+          pbNode "Conv" "conv" #["h2", "w", "b"] #["y"]]
+      let coRs ← compileOnnxBytes (pbWrapModel 18 gRs) { target := tgt }
+      let sRs ← verifyCompiledOnnx coRs
+      if sRs.neView != 0 || sRs.neConv != 1 || sRs.total != 1 then
+        throw s!"{tgt.name} round-trip Reshape not eliminated: summary={repr sRs}"
+
+      -- (c) Full-span Slice([0,0,0,0]..[1,16,8,8], step=1) -> Conv1x1
+      let gSl := pbGraph "sl_cancel"
+        #[pbVI "x" #[1, 16, 8, 8]]
+        #[pbVI "y" #[1, 16, 8, 8]]
+        #[pbI64Tensor "starts" #[4] #[0, 0, 0, 0],
+          pbI64Tensor "ends" #[4] #[1, 16, 8, 8],
+          pbI64Tensor "axes" #[4] #[0, 1, 2, 3],
+          pbI64Tensor "steps" #[4] #[1, 1, 1, 1],
+          pbF32Tensor "w" #[16, 16, 1, 1] w1, pbF32Tensor "b" #[16] b1]
+        #[pbNode "Slice" "sl" #["x", "starts", "ends", "axes", "steps"] #["h1"],
+          pbNode "Conv" "conv" #["h1", "w", "b"] #["y"]]
+      let coSl ← compileOnnxBytes (pbWrapModel 18 gSl) { target := tgt }
+      let sSl ← verifyCompiledOnnx coSl
+      if sSl.neView != 0 || sSl.neConv != 1 || sSl.total != 1 then
+        throw s!"{tgt.name} full-span Slice not eliminated: summary={repr sSl}"
+  ))
+
+  results := results.push (checkOk "c1 viewSimplify: non-identity Transpose(Transpose(x, p1), p2) composes to single Transpose" (do
+    let t0 : TensorType := { shape := #[1, 8, 4, 6], dtype := .fp16 }
+    let t1 : TensorType := { shape := #[1, 4, 6, 8], dtype := .fp16 }
+    let t2 : TensorType := { shape := #[1, 6, 8, 4], dtype := .fp16 }
+    let g : SSAGraph CoreOp := {
+      target := .h17
+      inputs := #[(0, "x", t0)]
+      nodes := #[
+        { name := "tr1", op := .transpose #[0, 2, 3, 1], inputs := #[0], outputs := #[(1, t1)] },
+        { name := "tr2", op := .transpose #[0, 2, 3, 1], inputs := #[1], outputs := #[(2, t2)] }
+      ]
+      outputs := #[2]
+    }
+    validateGraph g
+    let gSimp := viewSimplify g
+    validateGraph gSimp
+    if gSimp.nodes.size != 1 then
+      throw s!"expected 1 composed transpose node, got {gSimp.nodes.size}"
+    match gSimp.nodes[0]!.op with
+    | .transpose perm =>
+      if perm != #[0, 3, 1, 2] then
+        throw s!"expected composed perm #[0, 3, 1, 2], got {repr perm}"
+    | other => throw s!"expected transpose op, got {other.pretty}"
+  ))
+
+  -- 4. Polymorphic ConstFold: Transpose(const), Reshape(const), scalar fold & fallback dequantize
+  results := results.push (checkOk "c1 constFold: Transpose(const), Reshape(const), scalar math & fallback dequantize" (do
+    let vals : Array Float := #[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    let g1 : SSAGraph CoreOp := {
+      target := .h17
+      inputs := #[]
+      nodes := #[
+        { name := "c", op := .const (.f32 vals), inputs := #[],
+          outputs := #[(0, { shape := #[2, 3], dtype := .f32 })] },
+        { name := "tr", op := .transpose #[1, 0], inputs := #[0],
+          outputs := #[(1, { shape := #[3, 2], dtype := .f32 })] },
+        { name := "rs", op := .reshape #[1, 6], inputs := #[1],
+          outputs := #[(2, { shape := #[1, 6], dtype := .f32 })] }
+      ]
+      outputs := #[2]
+    }
+    validateGraph g1
+    let g1f ← constFold g1
+    let g1d := dce g1f
+    validateGraph g1d
+    if g1d.nodes.size != 1 then
+      throw s!"expected 1 folded const node, got {g1d.nodes.size}"
+    match g1d.nodes[0]!.op with
+    | .const (.f32 folded) =>
+      let expected : Array Float := #[1.0, 4.0, 2.0, 5.0, 3.0, 6.0]
+      if folded != expected then
+        throw s!"unexpected folded transpose/reshape values: {repr folded}"
+    | other => throw s!"expected folded f32 const, got {other.pretty}"
+
+    -- Scalar binary + unary constant folding
+    let sTy : TensorType := { shape := #[1], dtype := .f32 }
+    let g2 : SSAGraph CoreOp := {
+      target := .h17
+      inputs := #[]
+      nodes := #[
+        { name := "a", op := .const (.f32 #[1.5]), inputs := #[], outputs := #[(0, sTy)] },
+        { name := "b", op := .const (.f32 #[2.5]), inputs := #[], outputs := #[(1, sTy)] },
+        { name := "sum", op := .elemBinary .add, inputs := #[0, 1], outputs := #[(2, sTy)] },
+        { name := "neg", op := .elemUnary .neg, inputs := #[2], outputs := #[(3, sTy)] }
+      ]
+      outputs := #[3]
+    }
+    let g2d := dce (← constFold g2)
+    validateGraph g2d
+    if g2d.nodes.size != 1 then
+      throw s!"expected 1 scalar folded const node, got {g2d.nodes.size}"
+    match g2d.nodes[0]!.op with
+    | .const (.f32 #[v]) =>
+      if Float.abs (v - (-4.0)) > 1.0e-5 then
+        throw s!"expected folded scalar -4.0, got {v}"
+    | other => throw s!"expected folded scalar -4.0, got {other.pretty}"
+
+    -- Fallback dequantize(const quant) feeding non-quant-capable op folds into fp16 const
+    let qSpec : QuantWeightSpec := {
+      format := .int8
+      codes := ByteArray.mk #[2, 254, 4, 0] -- signed: [2, -2, 4, 0]
+      scales := #[0.5, 0.25]
+    }
+    let xTy : TensorType := { shape := #[2, 1, 1, 2], dtype := .fp16 }
+    let g3 : SSAGraph CoreOp := {
+      target := .h17
+      inputs := #[(0, "x", xTy)]
+      nodes := #[
+        { name := "qw", op := .const (.quant qSpec), inputs := #[],
+          outputs := #[(1, { shape := #[2, 1, 1, 2], dtype := .i8 })] },
+        { name := "dq", op := .dequantize .int8, inputs := #[1],
+          outputs := #[(2, xTy)] },
+        { name := "add", op := .elemBinary .add, inputs := #[0, 2], outputs := #[(3, xTy)] }
+      ]
+      outputs := #[3]
+    }
+    let g3d := dce (← constFold g3)
+    validateGraph g3d
+    if g3d.nodes.any (fun nd => match nd.op with | .dequantize _ => true | _ => false) then
+      throw "expected fallback dequantize feeding elemBinary.add to fold into fp16 const"
+    match g3d.nodes[0]!.op with
+    | .const (.fp16 bs) =>
+      let got := (List.range 4).map fun i =>
+        f16ToFloat ((bs.get! (2 * i)).toUInt16 ||| ((bs.get! (2 * i + 1)).toUInt16 <<< 8))
+      if got != [1.0, -1.0, 1.0, 0.0] then
+        throw s!"unexpected fallback dequantized fp16 values: {repr got}"
+    | other => throw s!"expected folded fp16 const, got {other.pretty}"
+  ))
+
+  -- 5. HighOp.rmsNorm decomposition + HighFuse + CoreFuse end-to-end
+  results := results.push (checkOk "c1 pipeline: HighOp.rmsNorm decomposes cleanly and compiles to verified HWX on H16 & H17" (do
+    let ty : TensorType := { shape := #[1, 8, 4, 32], dtype := .fp16 }
+    let scaleTy : TensorType := { shape := #[1, 1, 1, 32], dtype := .fp16 }
+    let scaleVals : Array Float := Array.replicate 32 1.25
+    for tgt in #[Target.h16, Target.h17] do
+      let gHigh : SSAGraph HighOp := {
+        target := tgt
+        inputs := #[(0, "x", ty)]
+        nodes := #[
+          { name := "gamma", op := .core (.const (.f32 scaleVals)), inputs := #[], outputs := #[(1, scaleTy)] },
+          { name := "rms", op := .rmsNorm (-1) 1.0e-5 true, inputs := #[0, 1], outputs := #[(2, ty)] }
+        ]
+        outputs := #[2]
+      }
+      let pr ← runStandardPipeline gHigh {}
+      validateGraph pr.coreGraph
+      let bridge ← Vane.IR.ToGraph.coreGraphToGraphSpec pr.coreGraph
+      let compiled ← Vane.Graph.compileGraph bridge.spec
+      validateSections compiled.hwx compiled.sections
+      let s ← verifyHwxTasksSummary compiled.hwx compiled.info (requireKnownTask := true)
+      if s.peReduce != 1 || s.total != compiled.taskCount then
+        throw s!"{tgt.name} HighOp.rmsNorm unexpected verified summary={repr s}"
+  ))
+
+  -- 6. ONNX DequantizeLinear (INT8 & UINT8 with ZP) -> native M8A quantized Conv1x1 & Conv3x3
+  results := results.push (checkOk "c1 dequantizeLinear: ONNX INT8 & UINT8(zp) DequantizeLinear -> native M8A quantized HWX on H16 & H17" (do
+    let wI8 := ByteArray.mk (Array.ofFn (n := 32 * 32) fun i => ((i.val * 7 + 3) % 251).toUInt8)
+    let sc32 := Array.ofFn (n := 32) fun i => 0.03125 * Float.ofNat ((i.val % 4) + 1)
+    let b32 := mkDetF32 32 0.01
+
+    let wU8 := ByteArray.mk (Array.ofFn (n := 16 * 16 * 9) fun i => ((i.val * 5 + 17) % 256).toUInt8)
+    let sc16 := Array.ofFn (n := 16) fun i => 0.0625 * Float.ofNat ((i.val % 3) + 1)
+    let zp16 := ByteArray.mk (Array.ofFn (n := 16) fun i => (120 + (i.val % 15)).toUInt8)
+    let b16 := mkDetF32 16 0.01
+
+    for tgt in #[Target.h16, Target.h17] do
+      -- (a) INT8 per-channel DequantizeLinear -> Conv1x1
+      let gI8 := pbGraph "dq_int8_conv1x1"
+        #[pbVI "x" #[1, 32, 8, 16]]
+        #[pbVI "y" #[1, 32, 8, 16]]
+        #[pbByteTensor "wq" onnxInt8 #[32, 32, 1, 1] wI8,
+          pbF32Tensor "sc" #[32] sc32,
+          pbF32Tensor "b" #[32] b32]
+        #[pbNode "DequantizeLinear" "dq" #["wq", "sc"] #["w"] #[pbAttrInt "axis" 0],
+          pbNode "Conv" "conv" #["x", "w", "b"] #["y"]]
+      let coI8 ← compileOnnxBytes (pbWrapModel 18 gI8) { target := tgt }
+      let sI8 ← verifyCompiledOnnx coI8
+      if coI8.lowered.summary.quantizedConvCount != 1 || sI8.neConv != 1 then
+        throw s!"{tgt.name} INT8 DequantizeLinear expected 1 quantized conv, got qCnt={coI8.lowered.summary.quantizedConvCount} s={repr sI8}"
+
+      -- (b) UINT8 per-channel with zero-point DequantizeLinear -> Conv3x3
+      let gU8 := pbGraph "dq_uint8_conv3x3"
+        #[pbVI "x" #[1, 16, 8, 16]]
+        #[pbVI "y" #[1, 16, 8, 16]]
+        #[pbByteTensor "wq" onnxUint8 #[16, 16, 3, 3] wU8,
+          pbF32Tensor "sc" #[16] sc16,
+          pbByteTensor "zp" onnxUint8 #[16] zp16,
+          pbF32Tensor "b" #[16] b16]
+        #[pbNode "DequantizeLinear" "dq" #["wq", "sc", "zp"] #["w"] #[pbAttrInt "axis" 0],
+          pbNode "Conv" "conv" #["x", "w", "b"] #["y"] #[pbAttrInts "pads" #[1, 1, 1, 1]]]
+      let coU8 ← compileOnnxBytes (pbWrapModel 18 gU8) { target := tgt }
+      let sU8 ← verifyCompiledOnnx coU8
+      if coU8.lowered.summary.quantizedConvCount != 1 || sU8.neConv != 1 then
+        throw s!"{tgt.name} UINT8 DequantizeLinear expected 1 quantized conv, got qCnt={coU8.lowered.summary.quantizedConvCount} s={repr sU8}"
+  ))
+
+  -- 7. Post-Training Quantization (--quantize int8/int4/pal4/pal2) + __KERN_0 compression + M8A LUT unfusion
+  results := results.push (checkOk "c1 ptq: --quantize int8/int4/pal4/pal2 compiles verified HWX, unfuses LUT, compresses __KERN_0 on H16 & H17" (do
+    let w1 := mkDetF32 (64 * 64) 0.05
+    let b1 := mkDetF32 64 0.01
+    let w2 := mkDetF32 (64 * 64 * 9) 0.03
+    let b2 := mkDetF32 64 0.01
+    let gPtq := pbGraph "ptq_two_conv"
+      #[pbVI "x" #[1, 64, 8, 16]]
+      #[pbVI "y" #[1, 64, 8, 16]]
+      #[pbF32Tensor "w1" #[64, 64, 1, 1] w1, pbF32Tensor "b1" #[64] b1,
+        pbF32Tensor "w2" #[64, 64, 3, 3] w2, pbF32Tensor "b2" #[64] b2]
+      #[pbNode "Conv" "c1" #["x", "w1", "b1"] #["h1"],
+        pbNode "Gelu" "g1" #["h1"] #["h2"],
+        pbNode "Conv" "c2" #["h2", "w2", "b2"] #["h3"] #[pbAttrInts "pads" #[1, 1, 1, 1]],
+        pbNode "Relu" "r2" #["h3"] #["y"]]
+    let modelBytes := pbWrapModel 20 gPtq
+    for tgt in #[Target.h16, Target.h17] do
+      let coFp16 ← compileOnnxBytes modelBytes { target := tgt }
+      let sFp16 ← verifyCompiledOnnx coFp16
+      -- In FP16, c1+Gelu fuses into 1 neConv and c2+Relu fuses into 1 neConv (2 total tasks)
+      if sFp16.neConv != 2 || sFp16.neAct != 0 then
+        throw s!"{tgt.name} FP16 baseline expected 2 fused convs, got {repr sFp16}"
+
+      let mut kernSizes : Array (String × Nat) := #[]
+      for (lbl, fmt) in #[("int8", QuantFormat.int8), ("int4", .int4), ("pal4", .pal 4), ("pal2", .pal 2)] do
+        let coQ ← compileOnnxBytes modelBytes { target := tgt, quantize := some fmt }
+        let sQ ← verifyCompiledOnnx coQ
+        -- M8A rule: Gelu LUT must be unfused into a separate neAct task on quantized conv, while Relu stays fused!
+        if coQ.lowered.summary.quantizedConvCount != 2 || sQ.neConv != 2 || sQ.neAct != 1 then
+          throw s!"{tgt.name} PTQ {lbl} expected 2 quantized convs + 1 unfused Gelu LUT, got qCnt={coQ.lowered.summary.quantizedConvCount} s={repr sQ}"
+        kernSizes := kernSizes.push (lbl, coQ.compiled.kernelBytes)
+
+      let kFp16 := coFp16.compiled.kernelBytes
+      let kI8 := kernSizes[0]!.2
+      let kI4 := kernSizes[1]!.2
+      let kP4 := kernSizes[2]!.2
+      let kP2 := kernSizes[3]!.2
+      if !(kP2 < kI4 && kI4 < kI8 && kI8 < kFp16 && kP4 < kI8) then
+        throw s!"{tgt.name} expected __KERN_0 compression pal2({kP2}) < int4({kI4}) < int8({kI8}) < fp16({kFp16}) and pal4({kP4}) < int8({kI8})"
+  ))
+
+  -- 8. IR Dump (dumpHigh / dumpCore) & Polymorphic evalCore on TensorVal Int
+  results := results.push (checkOk "c1 semantics & dump-ir: dumpHigh/dumpCore formatting + exact TensorVal Int evalCore equivalence" (do
+    let w1 := mkDetF32 (16 * 16) 0.05
+    let gOnnx := pbGraph "dump_check"
+      #[pbVI "x" #[1, 16, 4, 8]]
+      #[pbVI "y" #[1, 16, 4, 8]]
+      #[pbF32Tensor "w" #[16, 16, 1, 1] w1]
+      #[pbNode "Conv" "c" #["x", "w"] #["h"], pbNode "Gelu" "g" #["h"] #["y"]]
+    let lr ← lowerOnnxBytes (pbWrapModel 20 gOnnx) { target := .h17 }
+    let hiDump := lr.highGraph.dumpHigh
+    let coDump := lr.coreGraph.dumpCore
+    if (hiDump.splitOn "gelu").length <= 1 || (hiDump.splitOn "graph (target=h17)").length <= 1 then
+      throw s!"dumpHigh missing expected HighOp content:\n{hiDump}"
+    if (coDump.splitOn "conv").length <= 1 || (coDump.splitOn "return").length <= 1 then
+      throw s!"dumpCore missing expected CoreOp content:\n{coDump}"
+
+    -- Executable polymorphic evalCore on TensorVal Int verifying exact equality across DCE + ViewSimplify
+    let t0 : TensorType := { shape := #[2, 3, 2], dtype := .fp16 }
+    let t1 : TensorType := { shape := #[3, 2, 2], dtype := .fp16 }
+    let t2 : TensorType := { shape := #[6, 2], dtype := .fp16 }
+    let gView : SSAGraph CoreOp := {
+      target := .h17
+      inputs := #[(0, "x", t0)]
+      nodes := #[
+        { name := "tr1", op := .transpose #[1, 2, 0], inputs := #[0], outputs := #[(1, t1)] },
+        { name := "tr2", op := .transpose #[2, 0, 1], inputs := #[1], outputs := #[(2, t0)] },
+        { name := "dead", op := .reshape #[12], inputs := #[1], outputs := #[(3, { shape := #[12], dtype := .fp16 })] },
+        { name := "sl", op := .slice #[0, 0, 0] #[2, 3, 2] #[1, 1, 1], inputs := #[2], outputs := #[(4, t0)] },
+        { name := "rs1", op := .reshape #[4, 3], inputs := #[4], outputs := #[(5, { shape := #[4, 3], dtype := .fp16 })] },
+        { name := "rs2", op := .reshape #[6, 2], inputs := #[5], outputs := #[(6, t2)] }
+      ]
+      outputs := #[6]
+    }
+    validateGraph gView
+    let gOpt := viewSimplify (dce gView)
+    validateGraph gOpt
+    if gOpt.nodes.size != 1 then
+      throw s!"expected viewSimplify(dce) to collapse 6-node view chain to 1 reshape, got {gOpt.nodes.size}"
+    let sem : OpSemantics CoreOp Int := mkCoreSemantics (fun _ _ _ => none) (fun _ _ _ _ h => by cases h)
+    let xVal := mkTestIntTensor [2, 3, 2] (fun i => (i : Int) * 3 - 5)
+    let env : Env Int := Env.set Env.empty 0 xVal
+    let some [outOrig] := evalGraphOutputs sem gView env | throw "evalGraphOutputs failed on original graph"
+    let some [outOpt] := evalGraphOutputs sem gOpt env | throw "evalGraphOutputs failed on optimized graph"
+    if outOrig.shape != outOpt.shape || evalTensorToList outOrig != evalTensorToList outOpt then
+      throw s!"evalCore mismatch: orig={outOrig.shape}/{evalTensorToList outOrig} opt={outOpt.shape}/{evalTensorToList outOpt}"
+  ))
+
+  -- 9. Regression tests for review Blockers 1–5 & cleanups
+
+  -- Blocker 1: DequantizeLinear negative validation tests
+  let wI8Dq := ByteArray.mk (Array.ofFn (n := 32 * 32) fun i => ((i.val * 7 + 3) % 251).toUInt8)
+  let sc32Dq := Array.ofFn (n := 32) fun i => 0.03125 * Float.ofNat ((i.val % 4) + 1)
+
+  results := results.push (checkErr "c1 reg neg: DequantizeLinear block_size != 0 rejected" (do
+    let g := pbGraph "dq_bs" #[pbVI "x" #[1, 32, 8, 8]] #[pbVI "y" #[1, 32, 8, 8]]
+      #[pbByteTensor "wq" onnxInt8 #[32, 32, 1, 1] wI8Dq, pbF32Tensor "sc" #[32] sc32Dq]
+      #[pbNode "DequantizeLinear" "dq" #["wq", "sc"] #["w"] #[pbAttrInt "axis" 0, pbAttrInt "block_size" 16],
+        pbNode "Conv" "conv" #["x", "w"] #["y"]]
+    compileOnnxBytes (pbWrapModel 21 g) { target := .h17 }
+  ) "block_size=16 is not supported")
+
+  results := results.push (checkErr "c1 reg neg: DequantizeLinear per-channel default axis=1 rejected" (do
+    let g := pbGraph "dq_axis_def" #[pbVI "x" #[1, 32, 8, 8]] #[pbVI "y" #[1, 32, 8, 8]]
+      #[pbByteTensor "wq" onnxInt8 #[32, 32, 1, 1] wI8Dq, pbF32Tensor "sc" #[32] sc32Dq]
+      #[pbNode "DequantizeLinear" "dq" #["wq", "sc"] #["w"],
+        pbNode "Conv" "conv" #["x", "w"] #["y"]]
+    compileOnnxBytes (pbWrapModel 18 g) { target := .h17 }
+  ) "only axis=0")
+
+  results := results.push (checkErr "c1 reg neg: DequantizeLinear explicit axis=1 rejected" (do
+    let g := pbGraph "dq_axis1" #[pbVI "x" #[1, 32, 8, 8]] #[pbVI "y" #[1, 32, 8, 8]]
+      #[pbByteTensor "wq" onnxInt8 #[32, 32, 1, 1] wI8Dq, pbF32Tensor "sc" #[32] sc32Dq]
+      #[pbNode "DequantizeLinear" "dq" #["wq", "sc"] #["w"] #[pbAttrInt "axis" 1],
+        pbNode "Conv" "conv" #["x", "w"] #["y"]]
+    compileOnnxBytes (pbWrapModel 18 g) { target := .h17 }
+  ) "only axis=0")
+
+  results := results.push (checkErr "c1 reg neg: DequantizeLinear zero_point dataType mismatch rejected" (do
+    let zpU8 := ByteArray.mk (Array.replicate 32 128)
+    let g := pbGraph "dq_zp_dtype" #[pbVI "x" #[1, 32, 8, 8]] #[pbVI "y" #[1, 32, 8, 8]]
+      #[pbByteTensor "wq" onnxInt8 #[32, 32, 1, 1] wI8Dq,
+        pbF32Tensor "sc" #[32] sc32Dq,
+        pbByteTensor "zp" onnxUint8 #[32] zpU8]
+      #[pbNode "DequantizeLinear" "dq" #["wq", "sc", "zp"] #["w"] #[pbAttrInt "axis" 0],
+        pbNode "Conv" "conv" #["x", "w"] #["y"]]
+    compileOnnxBytes (pbWrapModel 18 g) { target := .h17 }
+  ) "x_zero_point dataType")
+
+  results := results.push (checkErr "c1 reg neg: DequantizeLinear zero_point shape != scale shape rejected" (do
+    let zpI8 := ByteArray.mk (Array.replicate 32 0)
+    let g := pbGraph "dq_zp_shape" #[pbVI "x" #[1, 32, 8, 8]] #[pbVI "y" #[1, 32, 8, 8]]
+      #[pbByteTensor "wq" onnxInt8 #[32, 32, 1, 1] wI8Dq,
+        pbF32Tensor "sc" #[1] #[0.0625],
+        pbByteTensor "zp" onnxInt8 #[32] zpI8]
+      #[pbNode "DequantizeLinear" "dq" #["wq", "sc", "zp"] #["w"] #[pbAttrInt "axis" 0],
+        pbNode "Conv" "conv" #["x", "w"] #["y"]]
+    compileOnnxBytes (pbWrapModel 18 g) { target := .h17 }
+  ) "x_zero_point shape")
+
+  results := results.push (checkErr "c1 reg neg: DequantizeLinear bad 2D x_scale shape rejected" (do
+    let g := pbGraph "dq_sc_2d" #[pbVI "x" #[1, 32, 8, 8]] #[pbVI "y" #[1, 32, 8, 8]]
+      #[pbByteTensor "wq" onnxInt8 #[32, 32, 1, 1] wI8Dq, pbF32Tensor "sc" #[32, 1] sc32Dq]
+      #[pbNode "DequantizeLinear" "dq" #["wq", "sc"] #["w"] #[pbAttrInt "axis" 0],
+        pbNode "Conv" "conv" #["x", "w"] #["y"]]
+    compileOnnxBytes (pbWrapModel 18 g) { target := .h17 }
+  ) "x_scale shape")
+
+  -- Blocker 2: 4D MatMul with folded Transpose([0,1,3,2]) when M=1, N=1 preserves exact [1,8,1,1] output
+  results := results.push (checkOk "c1 reg: 4D MatMul [1,8,1,16] @ Transpose([1,8,1,16],[0,1,3,2]) compiles with exact shape [1,8,1,1]" (do
+    let gMm := pbGraph "mm4d_m1n1"
+      #[pbVI "q" #[1, 8, 1, 16], pbVI "k" #[1, 8, 1, 16]]
+      #[pbVI "y" #[1, 8, 1, 1]]
+      #[]
+      #[pbNode "Transpose" "kt" #["k"] #["k_t"] #[pbAttrInts "perm" #[0, 1, 3, 2]],
+        pbNode "MatMul" "qk" #["q", "k_t"] #["y"]]
+    for tgt in #[Target.h16, Target.h17] do
+      let co ← compileOnnxBytes (pbWrapModel 18 gMm) { target := tgt }
+      let s ← verifyCompiledOnnx co
+      if co.lowered.summary.outputShape != { n := 1, c := 8, h := 1, w := 1 } then
+        throw s!"{tgt.name} expected outputShape [1,8,1,1], got {repr co.lowered.summary.outputShape}"
+      if co.lowered.coreGraph.nodes.size != 1 || co.lowered.summary.fusedMatmulCount != 1 || s.neMatmul != 1 then
+        throw s!"{tgt.name} expected 1 folded coreGraph matmul node & 1 verified neMatmul task, got nodes={co.lowered.coreGraph.nodes.size} fused={co.lowered.summary.fusedMatmulCount} s={repr s}"
+  ))
+
+  -- Blocker 3: 4D Conv + 1D/2D Add constant (W-axis broadcast) must NOT misfold into Conv channel bias
+  results := results.push (checkOk "c1 reg: 4D Conv + 1D/2D Add constant is never misfolded into Conv bias (while [1,C,1,1] and 2D [C] do fold)" (do
+    let wTy : TensorType := { shape := #[16, 16, 1, 1], dtype := .f32 }
+    let wPay := ConstPayload.f32 (mkDetF32 (16 * 16) 0.05)
+    let bPay := ConstPayload.f32 (mkDetF32 16 0.01)
+    let x4Ty : TensorType := { shape := #[1, 16, 4, 16], dtype := .fp16 }
+    -- (a) 4D Conv + 1D [16] must NOT fold
+    let g4d1d : SSAGraph CoreOp := {
+      target := .h17
+      inputs := #[(0, "x", x4Ty)]
+      nodes := #[
+        { name := "w", op := .const wPay, inputs := #[], outputs := #[(1, wTy)] },
+        { name := "b", op := .const bPay, inputs := #[], outputs := #[(2, { shape := #[16], dtype := .f32 })] },
+        { name := "c", op := .conv 1 1 1 1 #[0, 0, 0, 0] 1 false .none, inputs := #[0, 1], outputs := #[(3, x4Ty)] },
+        { name := "a", op := .elemBinary .add, inputs := #[3, 2], outputs := #[(4, x4Ty)] }
+      ]
+      outputs := #[4]
+    }
+    let (g4d1dF, _, _) ← coreFuse g4d1d
+    if !g4d1dF.nodes.any (fun nd => nd.op == .elemBinary .add) then
+      throw "4D Conv + 1D [16] Add was erroneously folded into Conv bias!"
+
+    -- (b) 4D Conv + 2D [1, 16] must NOT fold
+    let g4d2d : SSAGraph CoreOp := {
+      target := .h17
+      inputs := #[(0, "x", x4Ty)]
+      nodes := #[
+        { name := "w", op := .const wPay, inputs := #[], outputs := #[(1, wTy)] },
+        { name := "b", op := .const bPay, inputs := #[], outputs := #[(2, { shape := #[1, 16], dtype := .f32 })] },
+        { name := "c", op := .conv 1 1 1 1 #[0, 0, 0, 0] 1 false .none, inputs := #[0, 1], outputs := #[(3, x4Ty)] },
+        { name := "a", op := .elemBinary .add, inputs := #[3, 2], outputs := #[(4, x4Ty)] }
+      ]
+      outputs := #[4]
+    }
+    let (g4d2dF, _, _) ← coreFuse g4d2d
+    if !g4d2dF.nodes.any (fun nd => nd.op == .elemBinary .add) then
+      throw "4D Conv + 2D [1, 16] Add was erroneously folded into Conv bias!"
+
+    -- (c) 4D Conv + [1, 16, 1, 1] DOES fold; 2D Conv [1, 16] + [16] DOES fold
+    let g4dOk : SSAGraph CoreOp := {
+      target := .h17
+      inputs := #[(0, "x", x4Ty)]
+      nodes := #[
+        { name := "w", op := .const wPay, inputs := #[], outputs := #[(1, wTy)] },
+        { name := "b", op := .const bPay, inputs := #[], outputs := #[(2, { shape := #[1, 16, 1, 1], dtype := .f32 })] },
+        { name := "c", op := .conv 1 1 1 1 #[0, 0, 0, 0] 1 false .none, inputs := #[0, 1], outputs := #[(3, x4Ty)] },
+        { name := "a", op := .elemBinary .add, inputs := #[3, 2], outputs := #[(4, x4Ty)] }
+      ]
+      outputs := #[4]
+    }
+    let (g4dOkF, _, _) ← coreFuse g4dOk
+    if g4dOkF.nodes.any (fun nd => nd.op == .elemBinary .add) then
+      throw "4D Conv + [1, 16, 1, 1] Add should have folded into Conv bias"
+
+    let x2Ty : TensorType := { shape := #[1, 16], dtype := .fp16 }
+    let g2dOk : SSAGraph CoreOp := {
+      target := .h17
+      inputs := #[(0, "x", x2Ty)]
+      nodes := #[
+        { name := "w", op := .const wPay, inputs := #[], outputs := #[(1, wTy)] },
+        { name := "b", op := .const bPay, inputs := #[], outputs := #[(2, { shape := #[16], dtype := .f32 })] },
+        { name := "c", op := .conv 1 1 1 1 #[0, 0, 0, 0] 1 false .none, inputs := #[0, 1], outputs := #[(3, x2Ty)] },
+        { name := "a", op := .elemBinary .add, inputs := #[3, 2], outputs := #[(4, x2Ty)] }
+      ]
+      outputs := #[4]
+    }
+    let (g2dOkF, _, _) ← coreFuse g2dOk
+    if g2dOkF.nodes.any (fun nd => nd.op == .elemBinary .add) then
+      throw "2D Conv [1, 16] + [16] Add should have folded into Conv bias"
+  ))
+
+  -- Blocker 4: LayerNormalization with omitted Mean output ["Y", "", "InvStdDev"]
+  results := results.push (checkOk "c1 reg: LayerNormalization [\"Y\", \"\", \"InvStdDev\"] binds slot 2 to InvStdDev (not Mean)" (do
+    let gLn := pbGraph "ln_skip_mean"
+      #[pbVI "x" #[1, 8, 4, 32]]
+      #[pbVI "out" #[1, 8, 4, 1]]
+      #[pbF32Tensor "sc" #[32] (Array.replicate 32 1.0)]
+      #[pbNode "LayerNormalization" "ln" #["x", "sc"] #["y", "", "inv_std"] #[pbAttrInt "axis" (-1), pbAttrFloat "epsilon" 1.0e-5],
+        pbNode "Relu" "out_op" #["inv_std"] #["out"]]
+    for tgt in #[Target.h16, Target.h17] do
+      let co ← compileOnnxBytes (pbWrapModel 18 gLn) { target := tgt }
+      let s ← verifyCompiledOnnx co
+      -- Check that the producer feeding out_op in coreGraph is invStd (lut rsqrt), NOT mean (reduce mean)
+      let some outRelu := co.lowered.coreGraph.nodes.find? (fun nd => nd.name == "out_op")
+        | throw "missing out_op in coreGraph"
+      let some (_, prodNd, _) := co.lowered.coreGraph.producerOf? outRelu.inputs[0]!
+        | throw "missing producer of inv_std"
+      match prodNd.op with
+      | .lut (.lut (.rsqrt _)) => pure ()
+      | other => throw s!"expected InvStdDev to be produced by lut rsqrt, got {other.pretty}"
+      if s.total != co.compiled.taskCount then
+        throw s!"unexpected task count mismatch {repr s}"
+  ))
+
+  -- Blocker 5: Rank-increasing scalar-constant elemBinary layout desync rejected
+  results := results.push (checkErr "c1 reg neg: rank-increasing scalar-constant elemBinary layout desync rejected" (do
+    let g : SSAGraph CoreOp := {
+      target := .h17
+      inputs := #[(0, "x", { shape := #[1, 8], dtype := .fp16 })]
+      nodes := #[
+        { name := "c", op := .const (.f32 #[1.0]), inputs := #[], outputs := #[(1, { shape := #[1, 1, 1, 1], dtype := .f32 })] },
+        { name := "add", op := .elemBinary .add, inputs := #[0, 1], outputs := #[(2, { shape := #[1, 1, 1, 8], dtype := .fp16 })] }
+      ]
+      outputs := #[2]
+    }
+    Vane.IR.ToGraph.coreGraphToGraphSpec g
+  ) "changes physical layout")
+
+  -- Additional cleanups & coverage:
+  -- (a) DequantizeLinear fallback on non-quant-capable Conv (stride-2, depthwise) + Conv+Gelu unfusion
+  results := results.push (checkOk "c1 reg: DequantizeLinear fallback on stride-2 & depthwise Conv3x3 + Conv+Gelu LUT unfusion" (do
+    let w3Dense := ByteArray.mk (Array.ofFn (n := 16 * 16 * 9) fun i => ((i.val * 3 + 11) % 251).toUInt8)
+    let w3Dw := ByteArray.mk (Array.ofFn (n := 16 * 1 * 9) fun i => ((i.val * 5 + 7) % 251).toUInt8)
+    let sc16 := Array.ofFn (n := 16) fun i => 0.0625 * Float.ofNat ((i.val % 3) + 1)
+    let w1 := ByteArray.mk (Array.ofFn (n := 16 * 16) fun i => ((i.val * 7 + 5) % 251).toUInt8)
+
+    -- Stride-2 dense 3x3 falls back to FP16
+    let gS2 := pbGraph "dq_s2_fallback" #[pbVI "x" #[1, 16, 11, 11]] #[pbVI "y" #[1, 16, 6, 6]]
+      #[pbByteTensor "wq" onnxInt8 #[16, 16, 3, 3] w3Dense, pbF32Tensor "sc" #[16] sc16]
+      #[pbNode "DequantizeLinear" "dq" #["wq", "sc"] #["w"] #[pbAttrInt "axis" 0],
+        pbNode "Conv" "conv" #["x", "w"] #["y"] #[pbAttrInts "strides" #[2, 2], pbAttrInts "pads" #[1, 1, 1, 1]]]
+    let coS2 ← compileOnnxBytes (pbWrapModel 18 gS2) { target := .h17 }
+    let sS2 ← verifyCompiledOnnx coS2
+    if coS2.lowered.summary.quantizedConvCount != 0 || sS2.neConv != 1 then
+      throw s!"stride-2 DequantizeLinear expected FP16 fallback (qCnt=0, neConv=1), got qCnt={coS2.lowered.summary.quantizedConvCount} s={repr sS2}"
+
+    -- Depthwise 3x3 falls back to FP16
+    let gDw := pbGraph "dq_dw_fallback" #[pbVI "x" #[1, 16, 8, 8]] #[pbVI "y" #[1, 16, 8, 8]]
+      #[pbByteTensor "wq" onnxInt8 #[16, 1, 3, 3] w3Dw, pbF32Tensor "sc" #[16] sc16]
+      #[pbNode "DequantizeLinear" "dq" #["wq", "sc"] #["w"] #[pbAttrInt "axis" 0],
+        pbNode "Conv" "conv" #["x", "w"] #["y"] #[pbAttrInt "group" 16, pbAttrInts "pads" #[1, 1, 1, 1]]]
+    let coDw ← compileOnnxBytes (pbWrapModel 18 gDw) { target := .h17 }
+    let sDw ← verifyCompiledOnnx coDw
+    if coDw.lowered.summary.quantizedConvCount != 0 || sDw.neConv != 1 then
+      throw s!"depthwise DequantizeLinear expected FP16 fallback (qCnt=0, neConv=1), got qCnt={coDw.lowered.summary.quantizedConvCount} s={repr sDw}"
+
+    -- Quantized Conv1x1 + Gelu keeps native quantized conv and unfuses Gelu onto separate neAct task
+    let gGelu := pbGraph "dq_conv_gelu" #[pbVI "x" #[1, 16, 8, 8]] #[pbVI "y" #[1, 16, 8, 8]]
+      #[pbByteTensor "wq" onnxInt8 #[16, 16, 1, 1] w1, pbF32Tensor "sc" #[16] sc16]
+      #[pbNode "DequantizeLinear" "dq" #["wq", "sc"] #["w"] #[pbAttrInt "axis" 0],
+        pbNode "Conv" "conv" #["x", "w"] #["h"],
+        pbNode "Gelu" "g" #["h"] #["y"]]
+    let coGelu ← compileOnnxBytes (pbWrapModel 20 gGelu) { target := .h17 }
+    let sGelu ← verifyCompiledOnnx coGelu
+    if coGelu.lowered.summary.quantizedConvCount != 1 || sGelu.neConv != 1 || sGelu.neAct != 1 then
+      throw s!"DequantizeLinear Conv+Gelu expected qCnt=1, neConv=1, neAct=1, got qCnt={coGelu.lowered.summary.quantizedConvCount} s={repr sGelu}"
+  ))
+
+  -- (b) Multi-consumer non-fusion in HighFuse & CoreFuse + --quantize PTQ with Conv + BatchNorm
+  results := results.push (checkOk "c1 reg: multi-consumer Conv non-fusion in HighFuse/CoreFuse + PTQ on Conv+BatchNorm" (do
+    let w1 := mkDetF32 (16 * 16) 0.05
+    let gamma := Array.replicate 16 1.2
+    let beta := Array.replicate 16 0.1
+    let mean := Array.replicate 16 0.05
+    let var := Array.replicate 16 1.0
+
+    -- Multi-consumer Conv feeding both BatchNorm and Relu -> neither may fuse into Conv
+    let gMc := pbGraph "mc_no_fuse" #[pbVI "x" #[1, 16, 8, 8]] #[pbVI "y" #[1, 16, 8, 8]]
+      #[pbF32Tensor "w" #[16, 16, 1, 1] w1,
+        pbF32Tensor "g" #[16] gamma, pbF32Tensor "b" #[16] beta,
+        pbF32Tensor "m" #[16] mean, pbF32Tensor "v" #[16] var]
+      #[pbNode "Conv" "conv" #["x", "w"] #["h"],
+        pbNode "BatchNormalization" "bn" #["h", "g", "b", "m", "v"] #["h_bn"],
+        pbNode "Relu" "rl" #["h"] #["h_rl"],
+        pbNode "Add" "sum" #["h_bn", "h_rl"] #["y"]]
+    let coMc ← compileOnnxBytes (pbWrapModel 18 gMc) { target := .h17 }
+    let _ ← verifyCompiledOnnx coMc
+    if coMc.lowered.summary.fusedBnCount != 0 || coMc.lowered.summary.fusedActCount != 0 then
+      throw s!"multi-consumer Conv must not fuse BN or Relu, got bn={coMc.lowered.summary.fusedBnCount} act={coMc.lowered.summary.fusedActCount}"
+
+    -- Conv + BatchNorm with --quantize int4 folds BN then quantizes folded weights
+    let gBnQ := pbGraph "conv_bn_ptq" #[pbVI "x" #[1, 16, 8, 8]] #[pbVI "y" #[1, 16, 8, 8]]
+      #[pbF32Tensor "w" #[16, 16, 1, 1] w1,
+        pbF32Tensor "g" #[16] gamma, pbF32Tensor "b" #[16] beta,
+        pbF32Tensor "m" #[16] mean, pbF32Tensor "v" #[16] var]
+      #[pbNode "Conv" "conv" #["x", "w"] #["h"],
+        pbNode "BatchNormalization" "bn" #["h", "g", "b", "m", "v"] #["y"]]
+    for tgt in #[Target.h16, Target.h17] do
+      let coBnQ ← compileOnnxBytes (pbWrapModel 18 gBnQ) { target := tgt, quantize := some .int4 }
+      let sBnQ ← verifyCompiledOnnx coBnQ
+      if coBnQ.lowered.summary.fusedBnCount != 1 || coBnQ.lowered.summary.quantizedConvCount != 1 || sBnQ.neConv != 1 then
+        throw s!"{tgt.name} Conv+BN PTQ expected fusedBn=1, qCnt=1, neConv=1, got bn={coBnQ.lowered.summary.fusedBnCount} q={coBnQ.lowered.summary.quantizedConvCount} s={repr sBnQ}"
+  ))
+
+  -- (c) Cleanups: CoreFuse phase 4b skips overflowing MatMul scale; rmsNorm bad scale; ToGraph rank-3 conv & bad slice len; ruleTransposeId rank mismatch
+  results := results.push (checkOk "c1 reg: CoreFuse skips overflowing MatMul scale & continues; ViewSimplify preserves rank-mismatched Transpose" (do
+    let mTy : TensorType := { shape := #[2, 4, 4], dtype := .fp16 }
+    let g2Mm : SSAGraph CoreOp := {
+      target := .h17
+      inputs := #[(0, "a", mTy), (1, "b", mTy)]
+      nodes := #[
+        { name := "mm1", op := .matmul false false f16PosOne, inputs := #[0, 1], outputs := #[(2, mTy)] },
+        { name := "c_ovf", op := .const (.f32 #[1.0e10]), inputs := #[], outputs := #[(3, { shape := #[1], dtype := .f32 })] },
+        { name := "mul1", op := .elemBinary .mul, inputs := #[2, 3], outputs := #[(4, mTy)] },
+        { name := "mm2", op := .matmul false false f16PosOne, inputs := #[0, 1], outputs := #[(5, mTy)] },
+        { name := "c_ok", op := .const (.f32 #[0.25]), inputs := #[], outputs := #[(6, { shape := #[1], dtype := .f32 })] },
+        { name := "mul2", op := .elemBinary .mul, inputs := #[5, 6], outputs := #[(7, mTy)] },
+        { name := "sum", op := .elemBinary .add, inputs := #[4, 7], outputs := #[(8, mTy)] }
+      ]
+      outputs := #[8]
+    }
+    let (_, _, mmCnt) ← coreFuse g2Mm
+    if mmCnt != 1 then
+      throw s!"expected second MatMul to fold after skipping overflowing first MatMul scale, got mmCnt={mmCnt}"
+
+    -- ruleTransposeId must NOT fire when perm rank != input rank
+    let gBadRank : SSAGraph CoreOp := {
+      target := .h17
+      inputs := #[(0, "x", { shape := #[1, 8, 4, 4], dtype := .fp16 })]
+      nodes := #[
+        { name := "tr_bad", op := .transpose #[0, 1], inputs := #[0], outputs := #[(1, { shape := #[1, 8, 4, 4], dtype := .fp16 })] }
+      ]
+      outputs := #[1]
+    }
+    if (ruleTransposeId.apply gBadRank).isSome then
+      throw "ruleTransposeId must not fire when perm.size != input rank"
+  ))
+
+  results := results.push (checkErr "c1 reg neg: HighOp.rmsNorm rejects incompatible constant Scale shape" (do
+    let ty : TensorType := { shape := #[1, 8, 4, 32], dtype := .fp16 }
+    let gHigh : SSAGraph HighOp := {
+      target := .h17
+      inputs := #[(0, "x", ty)]
+      nodes := #[
+        { name := "bad_gamma", op := .core (.const (.f32 (Array.replicate 16 1.0))), inputs := #[],
+          outputs := #[(1, { shape := #[16], dtype := .fp16 })] },
+        { name := "rms", op := .rmsNorm (-1) 1.0e-5 true, inputs := #[0, 1], outputs := #[(2, ty)] }
+      ]
+      outputs := #[2]
+    }
+    runStandardPipeline gHigh {}
+  ) "RMSNorm Scale shape")
+
+  results := results.push (checkErr "c1 reg neg: ToGraph rejects rank-3 input on CoreOp.conv" (do
+    let g : SSAGraph CoreOp := {
+      target := .h17
+      inputs := #[(0, "x", { shape := #[4, 4, 16], dtype := .fp16 })]
+      nodes := #[
+        { name := "w", op := .const (.f32 (mkDetF32 (16 * 16) 0.05)), inputs := #[],
+          outputs := #[(1, { shape := #[16, 16, 1, 1], dtype := .f32 })] },
+        { name := "c", op := .conv 1 1 1 1 #[0, 0, 0, 0] 1 false .none, inputs := #[0, 1],
+          outputs := #[(2, { shape := #[4, 4, 16], dtype := .fp16 })] }
+      ]
+      outputs := #[2]
+    }
+    Vane.IR.ToGraph.coreGraphToGraphSpec g
+  ) "conv requires 4D")
+
+  results := results.push (checkErr "c1 reg neg: ToGraph rejects CoreOp.slice with mismatched param length" (do
+    let g : SSAGraph CoreOp := {
+      target := .h17
+      inputs := #[(0, "x", { shape := #[1, 8, 4, 4], dtype := .fp16 })]
+      nodes := #[
+        { name := "sl", op := .slice #[0, 0] #[1, 4] #[1, 1], inputs := #[0],
+          outputs := #[(1, { shape := #[1, 4, 4, 4], dtype := .fp16 })] }
+      ]
+      outputs := #[1]
+    }
+    Vane.IR.ToGraph.coreGraphToGraphSpec g
+  ) "slice params length mismatch")
+
+  -- PR #15 review blocker: rank-increasing [1,1,1,1] Mul/Div after 3D MatMul([1,1,16], [1,16,1]) -> [1,1,1]
+  -- must preserve logical output shape [1,1,1,1] with both fusion ON and OFF, while same-rank scalar Mul still folds.
+  results := results.push (checkOk "c1 reg: 3D MatMul + [1,1,1,1] Mul/Div preserves [1,1,1,1] output (fusion ON & OFF); same-rank scalar Mul folds" (do
+    for opName in #["Mul", "Div"] do
+      let gBcast := pbGraph s!"mm3d_bcast4d_{opName}"
+        #[pbVI "a" #[1, 1, 16], pbVI "b" #[1, 16, 1]]
+        #[pbVI "y" #[1, 1, 1, 1]]
+        #[pbF32Tensor "sc4d" #[1, 1, 1, 1] #[0.25]]
+        #[pbNode "MatMul" "mm" #["a", "b"] #["h"],
+          pbNode opName "sc_op" #["h", "sc4d"] #["y"]]
+      let modelBytes := pbWrapModel 18 gBcast
+      for tgt in #[Target.h16, Target.h17] do
+        for noFuse in #[false, true] do
+          let co ← compileOnnxBytes modelBytes { target := tgt, noFuse := noFuse }
+          let s ← verifyCompiledOnnx co
+          if co.lowered.summary.outputShape != { n := 1, c := 1, h := 1, w := 1 } then
+            throw s!"{tgt.name} {opName} (noFuse={noFuse}) expected outputShape [1,1,1,1], got {repr co.lowered.summary.outputShape}"
+          if co.lowered.summary.fusedMatmulCount != 0 then
+            throw s!"{tgt.name} {opName} (noFuse={noFuse}) must not fold rank-changing [1,1,1,1] broadcast into 3D MatMul, got fusedMatmulCount={co.lowered.summary.fusedMatmulCount}"
+          if s.neMatmul != 1 || s.peOp != 1 || s.total != 2 then
+            throw s!"{tgt.name} {opName} (noFuse={noFuse}) expected 1 neMatmul + 1 peOp task, got {repr s}"
+
+    -- Same-rank scalar Mul (constant shape [] or [1] -> logical [1,1,1]) MUST still fold when fusion is ON
+    for scDims in #[(#[] : Array Int), #[1]] do
+      let gSame := pbGraph "mm3d_same_rank_mul"
+        #[pbVI "a" #[1, 1, 16], pbVI "b" #[1, 16, 1]]
+        #[pbVI "y" #[1, 1, 1]]
+        #[pbF32Tensor "sc" scDims #[0.25]]
+        #[pbNode "MatMul" "mm" #["a", "b"] #["h"],
+          pbNode "Mul" "sc_op" #["h", "sc"] #["y"]]
+      let modelBytes := pbWrapModel 18 gSame
+      for tgt in #[Target.h16, Target.h17] do
+        let coOn ← compileOnnxBytes modelBytes { target := tgt, noFuse := false }
+        let sOn ← verifyCompiledOnnx coOn
+        if coOn.lowered.summary.fusedMatmulCount != 1 || sOn.neMatmul != 1 || sOn.total != 1 then
+          throw s!"{tgt.name} same-rank scalar Mul (dims={scDims.toList}) failed to fold: fused={coOn.lowered.summary.fusedMatmulCount} s={repr sOn}"
+        let coOff ← compileOnnxBytes modelBytes { target := tgt, noFuse := true }
+        let sOff ← verifyCompiledOnnx coOff
+        if coOff.lowered.summary.fusedMatmulCount != 0 || sOff.neMatmul != 1 || sOff.peOp != 1 then
+          throw s!"{tgt.name} same-rank scalar Mul (noFuse=true) unexpected: fused={coOff.lowered.summary.fusedMatmulCount} s={repr sOff}"
+  ))
+
+  pure results
+
+end C1Tests
+
 def main : IO UInt32 := do
-  let results := (← runAllTests) ++ (← runM4Tests) ++ (← runM5aTests) ++ (← runM5bTests) ++ (← runM5cTests) ++ (← runM5dTests) ++ (← runM7bTests) ++ (← runM8aTests) ++ (← runTargetMatrixTests)
+  let results := (← runAllTests) ++ (← runM4Tests) ++ (← runM5aTests) ++ (← runM5bTests) ++ (← runM5cTests) ++ (← runM5dTests) ++ (← runM7bTests) ++ (← runM8aTests) ++ (← C1Tests.runC1Tests) ++ (← runTargetMatrixTests)
   let mut passed := 0
   let mut failed := 0
   for r in results do
