@@ -30,6 +30,7 @@ import Vane.IR.Passes.ConstFold
 import Vane.IR.Passes.HighFuse
 import Vane.IR.Passes.Decompose
 import Vane.IR.Passes.CoreFuse
+import Vane.IR.Passes.DecomposeConv
 import Vane.IR.Pipeline
 import Vane.Ane.Types
 import Vane.Machine.Types

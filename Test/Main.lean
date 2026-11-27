@@ -9789,8 +9789,1049 @@ private def runC2Tests : IO (Array TestResult) := do
 
 end C2Tests
 
+-- ===========================================================================
+-- Milestone C4 Tests: Multi-I/O KV-Cache LLM, Broader Conv Shapes, DnCNN-20 & U-Net
+-- ===========================================================================
+
+namespace C4Tests
+
+open Vane.Binary
+open Vane.Float16
+open Vane.Hwx
+open Vane.Sections
+open Vane.Verify
+open Vane.Tiling
+open Vane.View
+open Vane.Quant
+open Vane.IR
+open Vane.Ane
+open Vane.Machine
+open Vane.Backend.MemoryPlan
+open Vane.Frontend.SafeTensors
+open Vane.Frontend.Onnx
+open Vane.Frontend.Lower
+
+/-- Pure float64 `OpSemantics CoreOp Float` using `mkCoreSemantics` (so structural view ops
+    `transpose`/`reshape`/`slice`/`concat` execute via the exact formal `Vane.IR.Semantics`
+    definitions) plus exact float64 compute semantics for `const`, `conv`, `elemUnary`,
+    `elemBinary`, and `lut` (ReLU). -/
+private def evalCoreComputeF64Single (op : CoreOp) (ins : List (TensorVal Float)) (outTy : TensorType) :
+    Option (TensorVal Float) :=
+  match op, ins with
+  | .const pay, [] =>
+    match pay.toFloat64? with
+    | none => none
+    | some vals =>
+      let sh := outTy.shape.toList
+      if vals.size == shapeProd sh then
+        some { shape := sh, data := fun idx => vals.getD idx.val 0.0 }
+      else none
+  | .conv kh kw sh sw pads groups hasBias act, x :: w :: rest =>
+    match x.shape, w.shape, outTy.shape.toList with
+    | [1, cin, hi, wi], [cout, cinPerG, wkh, wkw], [1, coutO, ho, wo] =>
+      if wkh != kh || wkw != kw || coutO != cout || groups == 0 ||
+         cin % groups != 0 || cout % groups != 0 || cin / groups != cinPerG || pads.size != 4 then
+        none
+      else
+        let biasOpt : Option (TensorVal Float) :=
+          if hasBias then rest.head? else none
+        let pt := pads[0]!; let pl := pads[1]!
+        let coutPerG := cout / groups
+        let outTotal := cout * ho * wo
+        let arr : Array Float := Id.run do
+          let mut out := Array.replicate outTotal 0.0
+          for oc in [:cout] do
+            let g := oc / coutPerG
+            let icBase := g * cinPerG
+            let bVal := match biasOpt with
+              | some bt =>
+                if hlt : oc < shapeProd bt.shape then bt.data ⟨oc, hlt⟩ else 0.0
+              | none => 0.0
+            for oy in [:ho] do
+              for ox in [:wo] do
+                let mut acc := bVal
+                for icLocal in [:cinPerG] do
+                  let ic := icBase + icLocal
+                  for ky in [:kh] do
+                    let iyInt : Int := (oy * sh + ky : Nat) - (pt : Int)
+                    if iyInt >= 0 && iyInt < (hi : Int) then
+                      let iy := iyInt.toNat
+                      for kx in [:kw] do
+                        let ixInt : Int := (ox * sw + kx : Nat) - (pl : Int)
+                        if ixInt >= 0 && ixInt < (wi : Int) then
+                          let ix := ixInt.toNat
+                          let xIdx := (ic * hi + iy) * wi + ix
+                          let wIdx := ((oc * cinPerG + icLocal) * kh + ky) * kw + kx
+                          let xv := if h1 : xIdx < shapeProd x.shape then x.data ⟨xIdx, h1⟩ else 0.0
+                          let wv := if h2 : wIdx < shapeProd w.shape then w.data ⟨wIdx, h2⟩ else 0.0
+                          acc := acc + xv * wv
+                let yv := match act with
+                  | .relu => if acc < 0.0 then 0.0 else acc
+                  | _ => acc
+                out := out.set! ((oc * ho + oy) * wo + ox) yv
+          return out
+        some { shape := [1, cout, ho, wo], data := fun idx => arr.getD idx.val 0.0 }
+    | _, _, _ => none
+  | .elemBinary bop, [a, b] =>
+    let outSh := outTy.shape.toList
+    let rank := outSh.length
+    let padShape (s : List Nat) : List Nat :=
+      if s.length < rank then List.replicate (rank - s.length) 1 ++ s else s
+    let aSh := padShape a.shape
+    let bSh := padShape b.shape
+    let outTotal := shapeProd outSh
+    let arr : Array Float := Id.run do
+      let mut out := Array.replicate outTotal 0.0
+      for idx in [:outTotal] do
+        let coords := unflatten outSh idx
+        let aCoords := (List.range rank).map fun i =>
+          if aSh.getD i 1 == 1 then 0 else coords.getD i 0
+        let bCoords := (List.range rank).map fun i =>
+          if bSh.getD i 1 == 1 then 0 else coords.getD i 0
+        let aIdx := flatIndex aSh aCoords
+        let bIdx := flatIndex bSh bCoords
+        let av := if h1 : aIdx < shapeProd a.shape then a.data ⟨aIdx, h1⟩ else 0.0
+        let bv := if h2 : bIdx < shapeProd b.shape then b.data ⟨bIdx, h2⟩ else 0.0
+        let r := match bop with
+          | .add => av + bv | .sub => av - bv | .mul => av * bv
+          | .div => av / bv | .max => if av >= bv then av else bv | .min => if av <= bv then av else bv
+        out := out.set! idx r
+      return out
+    some { shape := outSh, data := fun idx => arr.getD idx.val 0.0 }
+  | .elemUnary uop, [a] =>
+    let outSh := outTy.shape.toList
+    if shapeProd a.shape != shapeProd outSh then none
+    else
+      some {
+        shape := outSh
+        data := fun idx =>
+          let x := if h1 : idx.val < shapeProd a.shape then a.data ⟨idx.val, h1⟩ else 0.0
+          match uop with
+          | .abs => Float.abs x
+          | .neg => -x
+          | .square => x * x
+          | .scalarAdd b => x + f16ToFloat b
+          | .scalarSub b => x - f16ToFloat b
+          | .scalarRSub b => f16ToFloat b - x
+          | .scalarMul b => x * f16ToFloat b
+          | .scalarDiv b => x / f16ToFloat b
+          | .linearAct sa sb => x * f16ToFloat sa + f16ToFloat sb
+          | _ => x
+      }
+  | .lut act, [a] =>
+    let outSh := outTy.shape.toList
+    if shapeProd a.shape != shapeProd outSh then none
+    else
+      some {
+        shape := outSh
+        data := fun idx =>
+          let x := if h1 : idx.val < shapeProd a.shape then a.data ⟨idx.val, h1⟩ else 0.0
+          match act with
+          | .relu => if x < 0.0 then 0.0 else x
+          | _ => x
+      }
+  | _, _ => none
+
+private def evalCoreComputeF64 (op : CoreOp) (ins : List (TensorVal Float)) (outTys : List TensorType) :
+    Option (List (TensorVal Float)) :=
+  match outTys with
+  | [outTy] => (evalCoreComputeF64Single op ins outTy).map (fun r => [r])
+  | _ => none
+
+private theorem evalCoreComputeF64_len :
+    ∀ op ins outTys outs, evalCoreComputeF64 op ins outTys = some outs → outs.length = outTys.length := by
+  intro op ins outTys outs h
+  cases outTys with
+  | nil => simp [evalCoreComputeF64] at h
+  | cons outTy rest =>
+    cases rest with
+    | nil =>
+      simp only [evalCoreComputeF64, Option.map_eq_some_iff] at h
+      obtain ⟨_, _, rfl⟩ := h
+      rfl
+    | cons _ _ => simp [evalCoreComputeF64] at h
+
+private def coreSemF64 : OpSemantics CoreOp Float :=
+  mkCoreSemantics evalCoreComputeF64 evalCoreComputeF64_len
+
+/-- Direct naive 2D grouped convolution reference in float64. -/
+private def naiveConv2DRef
+    (x : Array Float) (_cin hi wi : Nat)
+    (w : Array Float) (cout cinPerG kh kw : Nat)
+    (sh sw pt pl pb pr groups : Nat)
+    (bias? : Option (Array Float) := none) (relu : Bool := false) :
+    Array Float × Nat × Nat := Id.run do
+  let ho := (hi + pt + pb - kh) / sh + 1
+  let wo := (wi + pl + pr - kw) / sw + 1
+  let coutPerG := cout / groups
+  let mut out := Array.replicate (cout * ho * wo) 0.0
+  for oc in [:cout] do
+    let g := oc / coutPerG
+    let icBase := g * cinPerG
+    let bVal := match bias? with | some bs => bs[oc]! | none => 0.0
+    for oy in [:ho] do
+      for ox in [:wo] do
+        let mut acc := bVal
+        for icL in [:cinPerG] do
+          let ic := icBase + icL
+          for ky in [:kh] do
+            let iyInt : Int := (oy * sh + ky : Nat) - (pt : Int)
+            if iyInt >= 0 && iyInt < (hi : Int) then
+              let iy := iyInt.toNat
+              for kx in [:kw] do
+                let ixInt : Int := (ox * sw + kx : Nat) - (pl : Int)
+                if ixInt >= 0 && ixInt < (wi : Int) then
+                  let ix := ixInt.toNat
+                  let xv := x[(ic * hi + iy) * wi + ix]!
+                  let wv := w[((oc * cinPerG + icL) * kh + ky) * kw + kx]!
+                  acc := acc + xv * wv
+        let yv := if relu && acc < 0.0 then 0.0 else acc
+        out := out.set! ((oc * ho + oy) * wo + ox) yv
+  return (out, ho, wo)
+
+private def assertCoreConvsNative (g : SSAGraph CoreOp) (ctx : String) : Except String Unit := do
+  for nd in g.nodes do
+    match nd.op with
+    | .conv kh kw sh sw pads groups _ _ =>
+      let is1x1 := kh == 1 && kw == 1 && sh == 1 && sw == 1 && groups == 1 && pads == #[0, 0, 0, 0]
+      let is3x3Valid := pads == #[0, 0, 0, 0]
+      let is3x3SameS1 := sh == 1 && pads == #[1, 1, 1, 1]
+      let is3x3SameS2 := sh == 2 && pads.size == 4 &&
+        (pads[0]! == 0 || pads[0]! == 1) && (pads[1]! == 0 || pads[1]! == 1) &&
+        pads[2]! == 1 && pads[3]! == 1
+      let is3x3 := kh == 3 && kw == 3 && sw == sh && (is3x3Valid || is3x3SameS1 || is3x3SameS2)
+      if !is1x1 && !is3x3 then
+        throw s!"{ctx}: non-native conv remaining after pipeline: {nd.name} ({kh}x{kw} s={sh}x{sw} p={pads.toList} g={groups})"
+    | _ => pure ()
+
+private def mkNonUniformF32 (n : Nat) (scale : Float := 0.125) (seed : Nat := 1) : Array Float :=
+  Array.ofFn (n := n) fun i =>
+    let k : Int := (((i.val * 17 + seed * 13) % 23) : Int) - 11
+    Float.ofInt k * scale
+
+private def evalSingleInputCoreF64 (g : SSAGraph CoreOp) (xVals : Array Float) :
+    Except String (Array Float × List Nat) := do
+  if g.inputs.size != 1 || g.outputs.size != 1 then
+    throw s!"expected 1-in 1-out coreGraph, got {g.inputs.size}-in {g.outputs.size}-out"
+  let (inVid, _, inTy) := g.inputs[0]!
+  let inSh := inTy.shape.toList
+  if xVals.size != shapeProd inSh then
+    throw s!"input size mismatch: {xVals.size} != {shapeProd inSh}"
+  let inT : TensorVal Float := { shape := inSh, data := fun idx => xVals.getD idx.val 0.0 }
+  let env0 := Env.set (Env.empty (α := Float)) inVid inT
+  match evalGraphOutputs coreSemF64 g env0 with
+  | none => throw "evalCore returned none"
+  | some [outT] =>
+    let n := shapeProd outT.shape
+    let arr : Array Float := Array.ofFn (n := n) fun i => outT.data i
+    pure (arr, outT.shape)
+  | some _ => throw "evalCore returned unexpected output count"
+
+private def checkMaxAbsErr (got ref : Array Float) (tol : Float) (ctx : String) : Except String Unit := do
+  if got.size != ref.size then
+    throw s!"{ctx}: length mismatch got={got.size} != ref={ref.size}"
+  let mut maxErr := 0.0
+  for i in [:got.size] do
+    let e := Float.abs (got[i]! - ref[i]!)
+    if e > maxErr then maxErr := e
+  if maxErr > tol then
+    throw s!"{ctx}: maxAbsErr={maxErr} > tol={tol}"
+
+/-- Build a realistic 3-input 3-output Llama/Qwen-style KV-cache LLM Transformer Decoder Block
+    (opset-23 RMSNormalization, Q/K/V/O projections, RoPE, KV-cache Concat, GQA 5D Expand + Tile,
+     scaled dot-product attention + additive causal mask, SwiGLU FFN, residual Adds) with SafeTensors. -/
+private def buildKvCacheLlmDecoderModel : Except String (OnnxModel × SafeTensorsFile) := do
+  -- C = 128, n_q = 4, n_kv = 2 (GQA 2:1), D = 64 (D/2 = 32 aligned!), L_new = 8, L_past = 8, L_total = 16, FFN = 256
+  let c := 128; let nq := 4; let nkv := 2; let d := 64; let lNew := 8; let lPast := 8; let lTot := 16; let ffn := 256
+  let halfD := d / 2
+  let norm1W := Array.ofFn (n := c) fun i => 0.8 + Float.ofNat (i.val % 5) * 0.1
+  let norm2W := Array.ofFn (n := c) fun i => 0.9 + Float.ofNat (i.val % 4) * 0.05
+  let ropeCos := Array.ofFn (n := lNew * halfD) fun i => Float.cos (Float.ofNat i.val * 0.05)
+  let ropeSin := Array.ofFn (n := lNew * halfD) fun i => Float.sin (Float.ofNat i.val * 0.05)
+  let causalMask : Array Float := Id.run do
+    let mut m := Array.replicate (lNew * lTot) 0.0
+    for i in [:lNew] do
+      for j in [:lTot] do
+        if j > lPast + i then
+          m := m.set! (i * lTot + j) (-1000.0)
+    return m
+
+  let sfBlob ← writeSafeTensors #[
+    { name := "norm1_w", dtype := "F32", shape := #[c], data := mkF32Bytes norm1W },
+    { name := "wq", dtype := "F16", shape := #[nq * d, c, 1, 1], data := mkF16Bytes (mkNonUniformF32 (nq * d * c) 0.02 1) },
+    { name := "wk", dtype := "F16", shape := #[nkv * d, c, 1, 1], data := mkF16Bytes (mkNonUniformF32 (nkv * d * c) 0.02 2) },
+    { name := "wv", dtype := "BF16", shape := #[nkv * d, c, 1, 1], data := mkBF16Bytes (mkNonUniformF32 (nkv * d * c) 0.02 3) },
+    { name := "wo", dtype := "F16", shape := #[c, nq * d, 1, 1], data := mkF16Bytes (mkNonUniformF32 (c * nq * d) 0.02 4) },
+    { name := "norm2_w", dtype := "F32", shape := #[c], data := mkF32Bytes norm2W },
+    { name := "w_gate", dtype := "F16", shape := #[ffn, c, 1, 1], data := mkF16Bytes (mkNonUniformF32 (ffn * c) 0.02 5) },
+    { name := "w_up", dtype := "F16", shape := #[ffn, c, 1, 1], data := mkF16Bytes (mkNonUniformF32 (ffn * c) 0.02 6) },
+    { name := "w_down", dtype := "F16", shape := #[c, ffn, 1, 1], data := mkF16Bytes (mkNonUniformF32 (c * ffn) 0.02 7) },
+    { name := "rope_cos", dtype := "F32", shape := #[1, 1, lNew, halfD], data := mkF32Bytes ropeCos },
+    { name := "rope_sin", dtype := "F32", shape := #[1, 1, lNew, halfD], data := mkF32Bytes ropeSin },
+    { name := "causal_mask", dtype := "F32", shape := #[1, 1, lNew, lTot], data := mkF32Bytes causalMask }
+  ] #[("arch", "llama_gqa_kv_decoder")]
+  let sf ← parseSafeTensors sfBlob { strict := true }
+
+  let gb := pbGraph "llama_kv_decoder_block"
+    #[
+      pbVI "x" #[1, c, 1, lNew],
+      pbVI "k_in" #[1, nkv, lPast, d],
+      pbVI "v_in" #[1, nkv, lPast, d]
+    ]
+    #[
+      pbVI "y" #[1, c, 1, lNew],
+      pbVI "k_out" #[1, nkv, lTot, d],
+      pbVI "v_out" #[1, nkv, lTot, d]
+    ]
+    #[
+      pbExternalTensor "norm1_w" #[c],
+      pbExternalTensor "wq" #[nq * d, c, 1, 1],
+      pbExternalTensor "wk" #[nkv * d, c, 1, 1],
+      pbExternalTensor "wv" #[nkv * d, c, 1, 1],
+      pbExternalTensor "wo" #[c, nq * d, 1, 1],
+      pbExternalTensor "norm2_w" #[c],
+      pbExternalTensor "w_gate" #[ffn, c, 1, 1],
+      pbExternalTensor "w_up" #[ffn, c, 1, 1],
+      pbExternalTensor "w_down" #[c, ffn, 1, 1],
+      pbExternalTensor "rope_cos" #[1, 1, lNew, halfD],
+      pbExternalTensor "rope_sin" #[1, 1, lNew, halfD],
+      pbExternalTensor "causal_mask" #[1, 1, lNew, lTot],
+      pbI64Tensor "sh_q_heads" #[4] #[1, nq, d, lNew],
+      pbI64Tensor "sh_kv_heads" #[4] #[1, nkv, d, lNew],
+      pbI64Tensor "sh_unsq_ax" #[1] #[2],
+      pbI64Tensor "sh_gqa_5d" #[5] #[1, nkv, nq / nkv, lTot, d],
+      pbI64Tensor "sh_kv_exp" #[4] #[1, nq, lTot, d],
+      pbI64Tensor "sh_ctx_flat" #[4] #[1, nq * d, 1, lNew],
+      pbF32Tensor "inv_sqrt_d" #[] #[0.125]
+    ]
+    #[
+      -- Pre-attention RMSNorm (exact ONNX opset-23 axis=-1 over hidden dim C=128)
+      pbNode "Transpose" "rms1_pre" #["x"] #["x_t"] #[pbAttrInts "perm" #[0, 3, 2, 1]],
+      pbNode "RMSNormalization" "rms1" #["x_t", "norm1_w"] #["x_rn"] #[pbAttrInt "axis" (-1), pbAttrFloat "epsilon" 1e-5],
+      pbNode "Transpose" "rms1_post" #["x_rn"] #["x_norm1"] #[pbAttrInts "perm" #[0, 3, 2, 1]],
+      -- Q/K/V projections
+      pbNode "Conv" "q_proj" #["x_norm1", "wq"] #["q0"],
+      pbNode "Conv" "k_proj" #["x_norm1", "wk"] #["k0"],
+      pbNode "Conv" "v_proj" #["x_norm1", "wv"] #["v0"],
+      pbNode "Reshape" "q_rs" #["q0", "sh_q_heads"] #["q1"],
+      pbNode "Reshape" "k_rs" #["k0", "sh_kv_heads"] #["k1"],
+      pbNode "Reshape" "v_rs" #["v0", "sh_kv_heads"] #["v1"],
+      pbNode "Transpose" "q_tr" #["q1"] #["q2"] #[pbAttrInts "perm" #[0, 1, 3, 2]],
+      pbNode "Transpose" "k_tr" #["k1"] #["k2"] #[pbAttrInts "perm" #[0, 1, 3, 2]],
+      pbNode "Transpose" "v_tr" #["v1"] #["v2"] #[pbAttrInts "perm" #[0, 1, 3, 2]],
+      -- RoPE on Q: Split half-dim + cos/sin Mul + Sub/Add + Concat
+      pbNode "Split" "q_sp" #["q2"] #["q_a", "q_b"] #[pbAttrInt "axis" (-1)],
+      pbNode "Mul" "qa_c" #["q_a", "rope_cos"] #["qa_cos"],
+      pbNode "Mul" "qb_s" #["q_b", "rope_sin"] #["qb_sin"],
+      pbNode "Sub" "q_ra" #["qa_cos", "qb_sin"] #["q_rot_a"],
+      pbNode "Mul" "qb_c" #["q_b", "rope_cos"] #["qb_cos"],
+      pbNode "Mul" "qa_s" #["q_a", "rope_sin"] #["qa_sin"],
+      pbNode "Add" "q_rb" #["qb_cos", "qa_sin"] #["q_rot_b"],
+      pbNode "Concat" "q_rope_cat" #["q_rot_a", "q_rot_b"] #["q_rope"] #[pbAttrInt "axis" (-1)],
+      -- RoPE on K: Split half-dim + Neg + cos/sin Mul + Add + Concat
+      pbNode "Split" "k_sp" #["k2"] #["k_a", "k_b"] #[pbAttrInt "axis" (-1)],
+      pbNode "Neg" "kb_neg" #["k_b"] #["neg_kb"],
+      pbNode "Mul" "ka_c" #["k_a", "rope_cos"] #["ka_cos"],
+      pbNode "Mul" "nkb_s" #["neg_kb", "rope_sin"] #["nkb_sin"],
+      pbNode "Add" "k_ra" #["ka_cos", "nkb_sin"] #["k_rot_a"],
+      pbNode "Mul" "kb_c" #["k_b", "rope_cos"] #["kb_cos"],
+      pbNode "Mul" "ka_s" #["k_a", "rope_sin"] #["ka_sin"],
+      pbNode "Add" "k_rb" #["kb_cos", "ka_sin"] #["k_rot_b"],
+      pbNode "Concat" "k_rope_cat" #["k_rot_a", "k_rot_b"] #["k_rope"] #[pbAttrInt "axis" (-1)],
+      -- KV-cache append along sequence axis (axis=2): produces outputs k_out & v_out
+      pbNode "Concat" "k_cache_upd" #["k_in", "k_rope"] #["k_out"] #[pbAttrInt "axis" 2],
+      pbNode "Concat" "v_cache_upd" #["v_in", "v2"] #["v_out"] #[pbAttrInt "axis" 2],
+      -- True Llama interleaved GQA head repetition on BOTH K and V: [h0, h0, h1, h1]
+      pbNode "Unsqueeze" "k_unsq" #["k_out", "sh_unsq_ax"] #["k_5d"],
+      pbNode "Expand" "k_gqa_exp" #["k_5d", "sh_gqa_5d"] #["k_5d_exp"],
+      pbNode "Reshape" "k_gqa_rs" #["k_5d_exp", "sh_kv_exp"] #["k_exp"],
+      pbNode "Unsqueeze" "v_unsq" #["v_out", "sh_unsq_ax"] #["v_5d"],
+      pbNode "Expand" "v_gqa_exp" #["v_5d", "sh_gqa_5d"] #["v_5d_exp"],
+      pbNode "Reshape" "v_gqa_rs" #["v_5d_exp", "sh_kv_exp"] #["v_exp"],
+      -- Scaled dot-product attention + additive causal mask
+      pbNode "Transpose" "kt_tr" #["k_exp"] #["k_t"] #[pbAttrInts "perm" #[0, 1, 3, 2]],
+      pbNode "MatMul" "qk_mm" #["q_rope", "k_t"] #["scores0"],
+      pbNode "Mul" "qk_scale" #["scores0", "inv_sqrt_d"] #["scores1"],
+      pbNode "Add" "qk_mask" #["scores1", "causal_mask"] #["scores2"],
+      pbNode "Softmax" "attn_sm" #["scores2"] #["probs"] #[pbAttrInt "axis" (-1)],
+      pbNode "MatMul" "pv_mm" #["probs", "v_exp"] #["ctx0"],
+      -- Merge heads + O projection + residual 1
+      pbNode "Transpose" "ctx_tr" #["ctx0"] #["ctx1"] #[pbAttrInts "perm" #[0, 1, 3, 2]],
+      pbNode "Reshape" "ctx_rs" #["ctx1", "sh_ctx_flat"] #["ctx2"],
+      pbNode "Conv" "o_proj" #["ctx2", "wo"] #["attn_out"],
+      pbNode "Add" "res1" #["x", "attn_out"] #["h1"],
+      -- Pre-FFN RMSNorm (exact ONNX opset-23 axis=-1 over hidden dim C=128) + SwiGLU FFN + residual 2
+      pbNode "Transpose" "rms2_pre" #["h1"] #["h1_t"] #[pbAttrInts "perm" #[0, 3, 2, 1]],
+      pbNode "RMSNormalization" "rms2" #["h1_t", "norm2_w"] #["h1_rn"] #[pbAttrInt "axis" (-1), pbAttrFloat "epsilon" 1e-5],
+      pbNode "Transpose" "rms2_post" #["h1_rn"] #["h2"] #[pbAttrInts "perm" #[0, 3, 2, 1]],
+      pbNode "Conv" "gate_proj" #["h2", "w_gate"] #["g0"],
+      pbNode "Sigmoid" "gate_sig" #["g0"] #["g_sig"],
+      pbNode "Mul" "gate_silu" #["g0", "g_sig"] #["g_act"],
+      pbNode "Conv" "up_proj" #["h2", "w_up"] #["u0"],
+      pbNode "Mul" "swiglu_mul" #["g_act", "u0"] #["ffn_mid"],
+      pbNode "Conv" "down_proj" #["ffn_mid", "w_down"] #["ffn_out"],
+      pbNode "Add" "res2" #["h1", "ffn_out"] #["y"]
+    ]
+  let m ← parseOnnx (pbWrapModel 23 gb)
+  pure (m, sf)
+
+def runC4Tests : IO (Array TestResult) := do
+  let mut results : Array TestResult := #[]
+
+  -- 1. ONNX opset-23 RMSNormalization (axis=-1 W-axis, axis=1 H=W=1, shared 1D scale in valOf, and neg checks)
+  results := results.push (checkOk "c4 rmsnorm: opset-23 RMSNormalization axis=-1 & axis=1 (H=W=1) + shared 1D scale in valOf on H16 & H17" (do
+    let wScale := Array.ofFn (n := 32) fun i => 0.5 + Float.ofNat i.val * 0.05
+    let cScale := Array.ofFn (n := 32) fun i => 0.75 + Float.ofNat (i.val % 8) * 0.1
+    let gW := pbGraph "rms_axis_neg1"
+      #[pbVI "x" #[1, 16, 1, 32]] #[pbVI "y" #[1, 16, 1, 32]]
+      #[pbF32Tensor "scale" #[32] wScale]
+      #[pbNode "RMSNormalization" "rms_w" #["x", "scale"] #["y"] #[pbAttrInt "axis" (-1), pbAttrFloat "epsilon" 1e-5]]
+    let mW ← parseOnnx (pbWrapModel 23 gW)
+    -- 4D axis=1 is exact ONNX opset-23 when H=1, W=1
+    let gC := pbGraph "rms_axis_1_hw1"
+      #[pbVI "x" #[1, 32, 1, 1]] #[pbVI "y" #[1, 32, 1, 1]]
+      #[pbF32Tensor "scale" #[32] cScale]
+      #[pbNode "RMSNormalization" "rms_c" #["x", "scale"] #["y"] #[pbAttrInt "axis" 1, pbAttrFloat "epsilon" 1e-5]]
+    let mC ← parseOnnx (pbWrapModel 23 gC)
+    -- Blocker 3a regression: 1D [32] scale ALREADY in valOf (materialized as Conv bias first!) on [1,32,1,1] (axis=1)
+    let wId32 := Array.ofFn (n := 32 * 32) fun i => if i.val / 32 == i.val % 32 then 1.0 else 0.0
+    let gSharedC := pbGraph "rms_shared_1d_c"
+      #[pbVI "x" #[1, 32, 1, 1]] #[pbVI "y" #[1, 32, 1, 1]]
+      #[pbF32Tensor "w" #[32, 32, 1, 1] wId32, pbF32Tensor "shared_sc" #[32] cScale]
+      #[
+        pbNode "Conv" "c0" #["x", "w", "shared_sc"] #["h"],
+        pbNode "RMSNormalization" "rms_sh_c" #["h", "shared_sc"] #["y"] #[pbAttrInt "axis" 1, pbAttrFloat "epsilon" 1e-5]
+      ]
+    let mSharedC ← parseOnnx (pbWrapModel 23 gSharedC)
+    -- Blocker 3a regression: 1D [32] scale ALREADY in valOf (materialized as Conv bias first!) on [1,32,1,32] (axis=-1)
+    let gSharedW := pbGraph "rms_shared_1d_w"
+      #[pbVI "x" #[1, 32, 1, 32]] #[pbVI "y" #[1, 32, 1, 32]]
+      #[pbF32Tensor "w" #[32, 32, 1, 1] wId32, pbF32Tensor "shared_sc" #[32] wScale]
+      #[
+        pbNode "Conv" "c0" #["x", "w", "shared_sc"] #["h"],
+        pbNode "RMSNormalization" "rms_sh_w" #["h", "shared_sc"] #["y"] #[pbAttrInt "axis" (-1), pbAttrFloat "epsilon" 1e-5]
+      ]
+    let mSharedW ← parseOnnx (pbWrapModel 23 gSharedW)
+    for tgt in #[Target.h16, Target.h17] do
+      let coW ← compileOnnx mW { target := tgt }
+      let _ ← verifyCompiledOnnx coW
+      let coC ← compileOnnx mC { target := tgt }
+      let _ ← verifyCompiledOnnx coC
+      let coShC ← compileOnnx mSharedC { target := tgt }
+      let _ ← verifyCompiledOnnx coShC
+      let coShW ← compileOnnx mSharedW { target := tgt }
+      let _ ← verifyCompiledOnnx coShW
+  ))
+
+  results := results.push (checkErr "c4 rmsnorm neg: invalid scale shape rejected cleanly" (do
+    let gBad := pbGraph "rms_bad_scale"
+      #[pbVI "x" #[1, 16, 1, 32]] #[pbVI "y" #[1, 16, 1, 32]]
+      #[pbF32Tensor "scale" #[7] (Array.replicate 7 1.0)]
+      #[pbNode "RMSNormalization" "rms_bad" #["x", "scale"] #["y"] #[pbAttrInt "axis" (-1), pbAttrFloat "epsilon" 1e-5]]
+    let m ← parseOnnx (pbWrapModel 23 gBad)
+    compileOnnx m { target := .h17 }
+  ) "incompatible with normalized axis")
+
+  results := results.push (checkErr "c4 reg B3b: 4D RMSNormalization axis=1 with W>1 rejected (ONNX opset-23 suffix semantics)" (do
+    let gBadW := pbGraph "rms_axis1_w16"
+      #[pbVI "x" #[1, 32, 1, 16]] #[pbVI "y" #[1, 32, 1, 16]]
+      #[pbF32Tensor "scale" #[32] (Array.replicate 32 1.0)]
+      #[pbNode "RMSNormalization" "rms_w16" #["x", "scale"] #["y"] #[pbAttrInt "axis" 1, pbAttrFloat "epsilon" 1e-5]]
+    let m ← parseOnnx (pbWrapModel 23 gBadW)
+    compileOnnx m { target := .h17 }
+  ) "only supported when H=1 and W=1")
+
+  results := results.push (checkErr "c4 reg B3b: 4D RMSNormalization axis=1 with H>1 rejected (ONNX opset-23 suffix semantics)" (do
+    let gBadH := pbGraph "rms_axis1_h4"
+      #[pbVI "x" #[1, 32, 4, 1]] #[pbVI "y" #[1, 32, 4, 1]]
+      #[pbF32Tensor "scale" #[32] (Array.replicate 32 1.0)]
+      #[pbNode "RMSNormalization" "rms_h4" #["x", "scale"] #["y"] #[pbAttrInt "axis" 1, pbAttrFloat "epsilon" 1e-5]]
+    let m ← parseOnnx (pbWrapModel 23 gBadH)
+    compileOnnx m { target := .h17 }
+  ) "only supported when H=1 and W=1")
+
+  -- 2. ONNX Expand / Tile & 5D GQA Unsqueeze->Expand->Reshape (HWX H16/H17 + evalCore exactness)
+  results := results.push (checkOk "c4 gqa expand/tile: 4D Expand, 4D Tile, and 5D Unsqueeze->Expand->Reshape verify on H16/H17 & evalCore exact" (do
+    -- 2a. 4D Expand [1, 1, 4, 32] -> [1, 4, 4, 32]
+    let gExp := pbGraph "gqa_expand4"
+      #[pbVI "x" #[1, 1, 4, 32]] #[pbVI "y" #[1, 4, 4, 32]]
+      #[pbI64Tensor "sh" #[4] #[1, 4, 4, 32]]
+      #[pbNode "Expand" "exp" #["x", "sh"] #["y"]]
+    let mExp ← parseOnnx (pbWrapModel 17 gExp)
+    -- 2b. 4D Tile [1, 2, 4, 32] * [1, 2, 1, 1] -> [1, 4, 4, 32]
+    let gTile := pbGraph "gqa_tile4"
+      #[pbVI "x" #[1, 2, 4, 32]] #[pbVI "y" #[1, 4, 4, 32]]
+      #[pbI64Tensor "reps" #[4] #[1, 2, 1, 1]]
+      #[pbNode "Tile" "tl" #["x", "reps"] #["y"]]
+    let mTile ← parseOnnx (pbWrapModel 17 gTile)
+    -- 2c. 5D GQA Unsqueeze(axis=2)->Expand([1,2,2,4,32])->Reshape([1,4,4,32])
+    let g5D := pbGraph "gqa_5d"
+      #[pbVI "x" #[1, 2, 4, 32]] #[pbVI "y" #[1, 4, 4, 32]]
+      #[pbI64Tensor "ax" #[1] #[2], pbI64Tensor "sh5" #[5] #[1, 2, 2, 4, 32], pbI64Tensor "sh4" #[4] #[1, 4, 4, 32]]
+      #[
+        pbNode "Unsqueeze" "u" #["x", "ax"] #["x5"],
+        pbNode "Expand" "e" #["x5", "sh5"] #["e5"],
+        pbNode "Reshape" "r" #["e5", "sh4"] #["y"]
+      ]
+    let m5D ← parseOnnx (pbWrapModel 17 g5D)
+    for tgt in #[Target.h16, Target.h17] do
+      let coE ← compileOnnx mExp { target := tgt }
+      let _ ← verifyCompiledOnnx coE
+      let coT ← compileOnnx mTile { target := tgt }
+      let _ ← verifyCompiledOnnx coT
+      let co5 ← compileOnnx m5D { target := tgt }
+      let _ ← verifyCompiledOnnx co5
+    -- Exact evalCore numerical check on 5D GQA: head0 repeated at slots 0,1 and head1 at slots 2,3
+    let co5Ref ← compileOnnx m5D { target := .h17 }
+    let xVals := Array.ofFn (n := 2 * 4 * 32) fun i => Float.ofNat (i.val + 1)
+    let (got, outSh) ← evalSingleInputCoreF64 co5Ref.lowered.coreGraph xVals
+    if outSh != [1, 4, 4, 32] then throw s!"5D GQA out shape {outSh} != [1,4,4,32]"
+    let headSize := 4 * 32
+    for h in [:4] do
+      let srcH := h / 2
+      for k in [:headSize] do
+        if got[h * headSize + k]! != xVals[srcH * headSize + k]! then
+          throw s!"5D GQA mismatch at head={h} k={k}"
+  ))
+
+  -- 3. Full 3-in 3-out KV-Cache LLM Transformer Decoder Block (fp16, --quantize int4, --quantize pal4 on H16 & H17)
+  let (llmModel, llmSf) ← match buildKvCacheLlmDecoderModel with
+    | .ok pair => pure pair
+    | .error e =>
+      results := results.push { name := "c4 llm decoder build", passed := false, detail := e }
+      return results
+
+  for tgt in #[Target.h16, Target.h17] do
+    results := results.push (checkOk s!"c4 llm decoder ({tgt.name}): 3-in 3-out KV-cache GQA+RoPE+causal+SwiGLU+RMSNorm+SafeTensors (fp16, int4, pal4)" (do
+      let coFp16 ← compileOnnx llmModel { target := tgt, safeTensors := some llmSf }
+      let sumFp16 ← verifyCompiledOnnx coFp16
+      if coFp16.compiled.info.surfaces.size != 4 then
+        throw s!"{tgt.name} fp16: expected 4 ABI v3 surfaces (3 in + 1 packed out), got {coFp16.compiled.info.surfaces.size}"
+      if coFp16.machineProgram.outputs.size != 3 then
+        throw s!"{tgt.name} fp16: expected 3 logical outputs (y, k_out, v_out), got {coFp16.machineProgram.outputs.size}"
+      if coFp16.lowered.summary.safeTensorsUsed != 12 then
+        throw s!"{tgt.name} fp16: expected safeTensorsUsed=12, got {coFp16.lowered.summary.safeTensorsUsed}"
+      if sumFp16.neMatmul < 2 then
+        throw s!"{tgt.name} fp16: expected >= 2 attention neMatmul tasks, got {sumFp16.neMatmul}"
+
+      let coInt4 ← compileOnnx llmModel { target := tgt, safeTensors := some llmSf, quantize := some .int4 }
+      let _ ← verifyCompiledOnnx coInt4
+      if coInt4.compiled.info.surfaces.size != 4 || coInt4.machineProgram.outputs.size != 3 then
+        throw s!"{tgt.name} int4: unexpected surface/output count"
+      if coInt4.lowered.summary.quantizedConvCount != 7 then
+        throw s!"{tgt.name} int4: expected 7 quantized linear projections, got {coInt4.lowered.summary.quantizedConvCount}"
+      if coInt4.compiled.kernelBytes >= coFp16.compiled.kernelBytes then
+        throw s!"{tgt.name} int4: expected __KERN_0 compression ({coInt4.compiled.kernelBytes}B < {coFp16.compiled.kernelBytes}B)"
+
+      let coPal4 ← compileOnnx llmModel { target := tgt, safeTensors := some llmSf, quantize := some (.pal 4) }
+      let _ ← verifyCompiledOnnx coPal4
+      if coPal4.compiled.info.surfaces.size != 4 || coPal4.machineProgram.outputs.size != 3 then
+        throw s!"{tgt.name} pal4: unexpected surface/output count"
+      if coPal4.lowered.summary.quantizedConvCount != 7 then
+        throw s!"{tgt.name} pal4: expected 7 quantized linear projections, got {coPal4.lowered.summary.quantizedConvCount}"
+      if coPal4.compiled.kernelBytes >= coFp16.compiled.kernelBytes then
+        throw s!"{tgt.name} pal4: expected __KERN_0 compression ({coPal4.compiled.kernelBytes}B < {coFp16.compiled.kernelBytes}B)"
+    ))
+
+  -- 4. Numerical accuracy via `evalCore` for decomposed Conv1d, 5x5, 7x7, 1x5, 5x1, and grouped Conv!
+  results := results.push (checkOk "c4 conv evalCore accuracy: Conv1d (K=3,5,7 s=1,2), 5x5 & 7x7 (s=1,2 same/valid), 1x5/5x1, grouped (g=2,4)" (do
+    -- 4a. 2D convolution cases: (label, cin, cout, h, w, kh, kw, sh, sw, pt, pl, pb, pr, groups, withBias, withRelu)
+    let cases2D : Array (String × Nat × Nat × Nat × Nat × Nat × Nat × Nat × Nat × Nat × Nat × Nat × Nat × Nat × Bool × Bool) := #[
+      ("5x5_same_s1_br",    3, 4, 7, 9, 5, 5, 1, 1, 2, 2, 2, 2, 1, true,  true),
+      ("5x5_valid_s1",      2, 3, 8, 9, 5, 5, 1, 1, 0, 0, 0, 0, 1, true,  false),
+      ("5x5_same_s2_odd",   3, 4, 9, 9, 5, 5, 2, 2, 2, 2, 2, 2, 1, true,  true),
+      ("5x5_same_s2_even",  3, 4, 8, 8, 5, 5, 2, 2, 2, 2, 2, 2, 1, true,  true),
+      ("5x5_valid_s2",      2, 3, 9, 10, 5, 5, 2, 2, 0, 0, 0, 0, 1, false, false),
+      ("7x7_same_s1_br",    2, 3, 9, 10, 7, 7, 1, 1, 3, 3, 3, 3, 1, true,  true),
+      ("7x7_valid_s1",      2, 2, 10, 11, 7, 7, 1, 1, 0, 0, 0, 0, 1, true,  false),
+      ("7x7_same_s2_odd",   2, 3, 11, 11, 7, 7, 2, 2, 3, 3, 3, 3, 1, true,  true),
+      ("7x7_same_s2_even",  2, 3, 10, 10, 7, 7, 2, 2, 3, 3, 3, 3, 1, true,  false),
+      ("2x2_valid_s1",      3, 4, 6, 7, 2, 2, 1, 1, 0, 0, 0, 0, 1, true,  false),
+      ("2x2_same_s1",       3, 4, 6, 7, 2, 2, 1, 1, 0, 0, 1, 1, 1, true,  true),
+      ("4x4_valid_s1",      2, 3, 7, 8, 4, 4, 1, 1, 0, 0, 0, 0, 1, true,  false),
+      ("4x4_same_s1",       2, 3, 7, 8, 4, 4, 1, 1, 1, 1, 2, 2, 1, true,  true),
+      ("4x4_same_s2_even",  2, 3, 8, 8, 4, 4, 2, 2, 1, 1, 1, 1, 1, true,  false),
+      ("1x1_s2_even",       3, 4, 8, 8, 1, 1, 2, 2, 0, 0, 0, 0, 1, true,  false),
+      ("1x1_s2_odd",        3, 4, 7, 9, 1, 1, 2, 2, 0, 0, 0, 0, 1, true,  true),
+      ("3x3_asym_pad",      3, 4, 7, 8, 3, 3, 1, 1, 0, 2, 2, 0, 1, true,  false),
+      ("3x3_asym_pad_s2",   3, 4, 8, 8, 3, 3, 2, 2, 0, 1, 1, 0, 1, true,  true),
+      ("5x5_asym_pad",      2, 3, 8, 9, 5, 5, 1, 1, 1, 2, 3, 0, 1, true,  true),
+      ("1x5_same_s1",       3, 4, 5, 9, 1, 5, 1, 1, 0, 2, 0, 2, 1, true,  false),
+      ("5x1_same_s1",       3, 4, 9, 5, 5, 1, 1, 1, 2, 0, 2, 0, 1, true,  false),
+      ("grouped3x3_g2",     4, 6, 6, 7, 3, 3, 1, 1, 1, 1, 1, 1, 2, true,  true),
+      ("grouped5x5_g2",     4, 6, 7, 8, 5, 5, 1, 1, 2, 2, 2, 2, 2, true,  true),
+      ("grouped1x1_g4",     8, 12, 4, 5, 1, 1, 1, 1, 0, 0, 0, 0, 4, true,  false),
+      ("cin1_5x5_same",     1, 3, 7, 7, 5, 5, 1, 1, 2, 2, 2, 2, 1, true,  false)
+    ]
+    for (lbl, cin, cout, h, w, kh, kw, sh, sw, pt, pl, pb, pr, groups, withBias, withRelu) in cases2D do
+      let cinPerG := cin / groups
+      let xVals := mkNonUniformF32 (cin * h * w) 0.125 3
+      let wVals := mkNonUniformF32 (cout * cinPerG * kh * kw) 0.0625 7
+      let bVals := mkNonUniformF32 cout 0.1 11
+      let (refVals, ho, wo) := naiveConv2DRef xVals cin h w wVals cout cinPerG kh kw sh sw pt pl pb pr groups
+        (if withBias then some bVals else none) withRelu
+      let mut inits : Array ProtoBuilder := #[pbF32Tensor "w" #[cout, cinPerG, kh, kw] wVals]
+      let mut convInps : Array String := #["x", "w"]
+      if withBias then
+        inits := inits.push (pbF32Tensor "b" #[cout] bVals)
+        convInps := convInps.push "b"
+      let convOutNm := if withRelu then "c0" else "y"
+      let mut nds : Array ProtoBuilder := #[
+        pbNode "Conv" "conv" convInps #[convOutNm] #[
+          pbAttrInts "strides" #[sh, sw],
+          pbAttrInts "pads" #[pt, pl, pb, pr],
+          pbAttrInt "group" groups
+        ]
+      ]
+      if withRelu then
+        nds := nds.push (pbNode "Relu" "act" #["c0"] #["y"])
+      let gb := pbGraph lbl #[pbVI "x" #[1, cin, h, w]] #[pbVI "y" #[1, cout, ho, wo]] inits nds
+      let m ← parseOnnx (pbWrapModel 17 gb)
+      let co ← compileOnnx m { target := .h17 }
+      assertCoreConvsNative co.lowered.coreGraph lbl
+      let (gotVals, outSh) ← evalSingleInputCoreF64 co.lowered.coreGraph xVals
+      if outSh != [1, cout, ho, wo] then
+        throw s!"{lbl}: shape mismatch {outSh} != [1,{cout},{ho},{wo}]"
+      checkMaxAbsErr gotVals refVals 1e-4 lbl
+
+    -- 4b. Conv1d cases: (label, cin, cout, l, k, s, pl, pr, groups)
+    let cases1D : Array (String × Nat × Nat × Nat × Nat × Nat × Nat × Nat × Nat) := #[
+      ("conv1d_k3_s1", 4, 6, 12, 3, 1, 1, 1, 1),
+      ("conv1d_k5_s1", 4, 6, 13, 5, 1, 2, 2, 1),
+      ("conv1d_k7_s1", 3, 4, 15, 7, 1, 3, 3, 1),
+      ("conv1d_k5_s2", 4, 6, 13, 5, 2, 2, 2, 1),
+      ("conv1d_k7_s2", 3, 4, 15, 7, 2, 3, 3, 1),
+      ("conv1d_g2_k5", 4, 6, 12, 5, 1, 2, 2, 2)
+    ]
+    for (lbl, cin, cout, l, k, s, pl, pr, groups) in cases1D do
+      let cinPerG := cin / groups
+      let xVals := mkNonUniformF32 (cin * l) 0.125 5
+      let wVals := mkNonUniformF32 (cout * cinPerG * k) 0.0625 9
+      let bVals := mkNonUniformF32 cout 0.1 13
+      let (refVals, _, lo) := naiveConv2DRef xVals cin 1 l wVals cout cinPerG 1 k 1 s 0 pl 0 pr groups (some bVals) true
+      let gb := pbGraph lbl
+        #[pbVI "x" #[1, cin, l]] #[pbVI "y" #[1, cout, lo]]
+        #[pbF32Tensor "w" #[cout, cinPerG, k] wVals, pbF32Tensor "b" #[cout] bVals]
+        #[
+          pbNode "Conv" "c1d" #["x", "w", "b"] #["h"] #[
+            pbAttrInts "strides" #[s], pbAttrInts "pads" #[pl, pr], pbAttrInt "group" groups
+          ],
+          pbNode "Relu" "act" #["h"] #["y"]
+        ]
+      let m ← parseOnnx (pbWrapModel 17 gb)
+      let co ← compileOnnx m { target := .h17 }
+      assertCoreConvsNative co.lowered.coreGraph lbl
+      let (gotVals, outSh) ← evalSingleInputCoreF64 co.lowered.coreGraph xVals
+      if outSh != [1, cout, lo] then
+        throw s!"{lbl}: shape mismatch {outSh} != [1,{cout},{lo}]"
+      checkMaxAbsErr gotVals refVals 1e-4 lbl
+  ))
+
+  -- 5. HWX end-to-end verification of Conv1d (K=3/5/7, s=1/2, BN1d fold, grouped, int4) on H16 & H17
+  results := results.push (checkOk "c4 conv1d HWX: K=3/5/7 s=1/2, BN1d fold, grouped Conv1d & --quantize int4 verify on H16 & H17" (do
+    let cin := 16; let cout := 16; let l := 32
+    let w5 := mkNonUniformF32 (cout * cin * 5) 0.05 1
+    let w7 := mkNonUniformF32 (cout * cin * 7) 0.05 2
+    let b16 := mkNonUniformF32 cout 0.05 3
+    let bnS := Array.replicate cout 1.25
+    let bnB := Array.replicate cout 0.1
+    let bnM := Array.replicate cout 0.0
+    let bnV := Array.replicate cout 1.0
+    -- Conv1d K=5 s=1 + BN1d + ReLU
+    let gBn := pbGraph "conv1d_bn"
+      #[pbVI "x" #[1, cin, l]] #[pbVI "y" #[1, cout, l]]
+      #[
+        pbF32Tensor "w" #[cout, cin, 5] w5, pbF32Tensor "b" #[cout] b16,
+        pbF32Tensor "s" #[cout] bnS, pbF32Tensor "bb" #[cout] bnB,
+        pbF32Tensor "m" #[cout] bnM, pbF32Tensor "v" #[cout] bnV
+      ]
+      #[
+        pbNode "Conv" "c" #["x", "w", "b"] #["c_out"] #[pbAttrInts "pads" #[2, 2]],
+        pbNode "BatchNormalization" "bn" #["c_out", "s", "bb", "m", "v"] #["bn_out"] #[pbAttrFloat "epsilon" 1e-5],
+        pbNode "Relu" "r" #["bn_out"] #["y"]
+      ]
+    let mBn ← parseOnnx (pbWrapModel 17 gBn)
+    -- Conv1d K=7 s=2
+    let g7s2 := pbGraph "conv1d_k7_s2"
+      #[pbVI "x" #[1, cin, l]] #[pbVI "y" #[1, cout, 16]]
+      #[pbF32Tensor "w" #[cout, cin, 7] w7]
+      #[pbNode "Conv" "c" #["x", "w"] #["y"] #[pbAttrInts "strides" #[2], pbAttrInts "pads" #[3, 3]]]
+    let m7s2 ← parseOnnx (pbWrapModel 17 g7s2)
+    for tgt in #[Target.h16, Target.h17] do
+      let coBn ← compileOnnx mBn { target := tgt }
+      let _ ← verifyCompiledOnnx coBn
+      if coBn.lowered.summary.fusedBnCount != 1 then
+        throw s!"{tgt.name}: expected Conv1d+BN1d fusedBnCount=1, got {coBn.lowered.summary.fusedBnCount}"
+      let coBnQ ← compileOnnx mBn { target := tgt, quantize := some .int4 }
+      let _ ← verifyCompiledOnnx coBnQ
+      if coBnQ.lowered.summary.quantizedConvCount == 0 then
+        throw s!"{tgt.name}: expected Conv1d --quantize int4 to quantize decomposed sub-convs"
+      let co7 ← compileOnnx m7s2 { target := tgt }
+      let _ ← verifyCompiledOnnx co7
+  ))
+
+  -- 6. HWX end-to-end verification of 5x5 & 7x7 Conv (s=1/2, same/valid, int4/pal4) on H16 & H17
+  results := results.push (checkOk "c4 conv 5x5 & 7x7 HWX: stride 1 & 2, same & valid, --quantize int4 & pal4 verify on H16 & H17" (do
+    let cin := 16; let cout := 16; let h := 16; let w := 16
+    let w5 := mkNonUniformF32 (cout * cin * 25) 0.03 1
+    let w7 := mkNonUniformF32 (cout * cin * 49) 0.02 2
+    let b16 := mkNonUniformF32 cout 0.05 3
+    let mkConvM (name : String) (k s p ho wo : Nat) (wts : Array Float) : Except String OnnxModel := do
+      let gb := pbGraph name #[pbVI "x" #[1, cin, h, w]] #[pbVI "y" #[1, cout, ho, wo]]
+        #[pbF32Tensor "w" #[cout, cin, k, k] wts, pbF32Tensor "b" #[cout] b16]
+        #[
+          pbNode "Conv" "c" #["x", "w", "b"] #["c0"] #[pbAttrInts "strides" #[s, s], pbAttrInts "pads" #[p, p, p, p]],
+          pbNode "Relu" "r" #["c0"] #["y"]
+        ]
+      parseOnnx (pbWrapModel 17 gb)
+    let m5s1 ← mkConvM "c5_s1_same" 5 1 2 16 16 w5
+    let m5s2 ← mkConvM "c5_s2_same" 5 2 2 8 8 w5
+    let m5v  ← mkConvM "c5_s1_valid" 5 1 0 12 12 w5
+    let m7s1 ← mkConvM "c7_s1_same" 7 1 3 16 16 w7
+    let m7s2 ← mkConvM "c7_s2_same" 7 2 3 8 8 w7
+    let m7v  ← mkConvM "c7_s1_valid" 7 1 0 10 10 w7
+    for tgt in #[Target.h16, Target.h17] do
+      for m in #[m5s1, m5s2, m5v, m7s1, m7s2, m7v] do
+        let co ← compileOnnx m { target := tgt }
+        let _ ← verifyCompiledOnnx co
+      -- Quantized int4 & pal4 on decomposed 5x5 and int4 on 7x7
+      let co5Q4 ← compileOnnx m5s1 { target := tgt, quantize := some .int4 }
+      let _ ← verifyCompiledOnnx co5Q4
+      if co5Q4.lowered.summary.quantizedConvCount == 0 then
+        throw s!"{tgt.name}: expected 5x5 --quantize int4 to quantize sub-convs"
+      let co5Pal ← compileOnnx m5s1 { target := tgt, quantize := some (.pal 4) }
+      let _ ← verifyCompiledOnnx co5Pal
+      if co5Pal.lowered.summary.quantizedConvCount == 0 then
+        throw s!"{tgt.name}: expected 5x5 --quantize pal4 to quantize sub-convs"
+      let co7Q4 ← compileOnnx m7s1 { target := tgt, quantize := some .int4 }
+      let _ ← verifyCompiledOnnx co7Q4
+      if co7Q4.lowered.summary.quantizedConvCount == 0 then
+        throw s!"{tgt.name}: expected 7x7 --quantize int4 to quantize sub-convs"
+  ))
+
+  -- 7. HWX end-to-end verification of Grouped Conv (g=2, g=4 on 1x1, 3x3, 5x5 + zero-copy aliasing + int4)
+  results := results.push (checkOk "c4 grouped conv HWX: group=2 & group=4 (1x1, 3x3, 5x5) zero-copy aliasing & int4 on H16 & H17" (do
+    let cin := 32; let cout := 32; let h := 8; let w := 16
+    let mkGrpM (name : String) (k p g : Nat) : Except String OnnxModel := do
+      let cinPerG := cin / g
+      let wts := mkNonUniformF32 (cout * cinPerG * k * k) 0.04 g
+      let bs := mkNonUniformF32 cout 0.05 g
+      let gb := pbGraph name #[pbVI "x" #[1, cin, h, w]] #[pbVI "y" #[1, cout, h, w]]
+        #[pbF32Tensor "w" #[cout, cinPerG, k, k] wts, pbF32Tensor "b" #[cout] bs]
+        #[
+          pbNode "Conv" "gc" #["x", "w", "b"] #["c0"] #[pbAttrInts "pads" #[p, p, p, p], pbAttrInt "group" g],
+          pbNode "Relu" "r" #["c0"] #["y"]
+        ]
+      parseOnnx (pbWrapModel 17 gb)
+    let m1g2 ← mkGrpM "grp1x1_g2" 1 0 2
+    let m1g4 ← mkGrpM "grp1x1_g4" 1 0 4
+    let m3g2 ← mkGrpM "grp3x3_g2" 3 1 2
+    let m3g4 ← mkGrpM "grp3x3_g4" 3 1 4
+    let m5g2 ← mkGrpM "grp5x5_g2" 5 2 2
+    for tgt in #[Target.h16, Target.h17] do
+      let c1g2 ← compileOnnx m1g2 { target := tgt }
+      let _ ← verifyCompiledOnnx c1g2
+      if c1g2.compiled.taskCount != 2 then
+        throw s!"{tgt.name}: expected zero-copy grouped 1x1 (g=2) to emit 2 tasks, got {c1g2.compiled.taskCount}"
+      let c1g4 ← compileOnnx m1g4 { target := tgt }
+      let _ ← verifyCompiledOnnx c1g4
+      if c1g4.compiled.taskCount != 4 then
+        throw s!"{tgt.name}: expected zero-copy grouped 1x1 (g=4) to emit 4 tasks, got {c1g4.compiled.taskCount}"
+      let c3g2 ← compileOnnx m3g2 { target := tgt }
+      let _ ← verifyCompiledOnnx c3g2
+      let c3g4 ← compileOnnx m3g4 { target := tgt }
+      let _ ← verifyCompiledOnnx c3g4
+      let c5g2 ← compileOnnx m5g2 { target := tgt }
+      let _ ← verifyCompiledOnnx c5g2
+      let c3g2Q ← compileOnnx m3g2 { target := tgt, quantize := some .int4 }
+      let _ ← verifyCompiledOnnx c3g2Q
+      if c3g2Q.lowered.summary.quantizedConvCount != 2 then
+        throw s!"{tgt.name}: expected grouped 3x3 (g=2) --quantize int4 to quantize 2 groups, got {c3g2Q.lowered.summary.quantizedConvCount}"
+  ))
+
+  -- 8. ONNX Resize nearest 2x (scales & sizes) + Upsample: evalCore exactness + HWX H16 & H17
+  results := results.push (checkOk "c4 resize 2x nearest: evalCore exact equality + HWX verification on H16 & H17" (do
+    let c : Nat := 8; let h : Nat := 6; let w : Nat := 8
+    let gSc := pbGraph "resize_scales"
+      #[pbVI "x" #[1, c, h, w]] #[pbVI "y" #[1, c, 2 * h, 2 * w]]
+      #[pbF32Tensor "sc" #[4] #[1.0, 1.0, 2.0, 2.0]]
+      #[pbNode "Resize" "up" #["x", "", "sc"] #["y"] #[pbAttrString "mode" "nearest"]]
+    let mSc ← parseOnnx (pbWrapModel 17 gSc)
+    let gSz := pbGraph "resize_sizes"
+      #[pbVI "x" #[1, c, h, w]] #[pbVI "y" #[1, c, 2 * h, 2 * w]]
+      #[pbI64Tensor "sz" #[4] #[1, c, 2 * h, 2 * w]]
+      #[pbNode "Resize" "up" #["x", "", "", "sz"] #["y"] #[pbAttrString "mode" "nearest"]]
+    let mSz ← parseOnnx (pbWrapModel 17 gSz)
+    for tgt in #[Target.h16, Target.h17] do
+      let co1 ← compileOnnx mSc { target := tgt }
+      let _ ← verifyCompiledOnnx co1
+      let co2 ← compileOnnx mSz { target := tgt }
+      let _ ← verifyCompiledOnnx co2
+    -- Exact evalCore check
+    let coRef ← compileOnnx mSc { target := .h17 }
+    let xVals := Array.ofFn (n := c * h * w) fun i => Float.ofNat (i.val + 1)
+    let (got, outSh) ← evalSingleInputCoreF64 coRef.lowered.coreGraph xVals
+    if outSh != [1, c, 2 * h, 2 * w] then
+      throw s!"Resize out shape {outSh} != [1,{c},{2*h},{2*w}]"
+    for ch in [:c] do
+      for oy in [:(2 * h)] do
+        for ox in [:(2 * w)] do
+          let gotV := got[(ch * (2 * h) + oy) * (2 * w) + ox]!
+          let expV := xVals[(ch * h + (oy / 2)) * w + (ox / 2)]!
+          if gotV != expV then
+            throw s!"Resize mismatch at c={ch} y={oy} x={ox}: got={gotV} != exp={expV}"
+  ))
+
+  -- 9. ONNX DnCNN-20: 20-layer 3x3 Conv+BN+ReLU [1,64,96,128] + residual Sub(x, noise) with rolling L2 cascade (0 B scratch!)
+  results := results.push (checkOk "c4 DnCNN-20: 20-layer 3x3 ONNX stack [1,64,96,128] + BN/ReLU + residual Sub achieves 0 B scratch rolling L2 cascade (H16 & H17)" (do
+    let c := 64; let h := 96; let w := 128
+    -- Share one SafeTensors weight + BN tensors across the 20 layers so test construction stays fast & compact
+    let w3Bytes := mkF16Bytes (Array.replicate (c * c * 9) 0.01)
+    let bBytes := mkF32Bytes (Array.replicate c 0.0)
+    let sBytes := mkF32Bytes (Array.replicate c 1.0)
+    let sfBlob ← writeSafeTensors #[
+      { name := "w3", dtype := "F16", shape := #[c, c, 3, 3], data := w3Bytes },
+      { name := "bn_s", dtype := "F32", shape := #[c], data := sBytes },
+      { name := "bn_b", dtype := "F32", shape := #[c], data := bBytes },
+      { name := "bn_m", dtype := "F32", shape := #[c], data := bBytes },
+      { name := "bn_v", dtype := "F32", shape := #[c], data := sBytes }
+    ]
+    let sf ← parseSafeTensors sfBlob { strict := true }
+    let mut nds : Array ProtoBuilder := #[]
+    -- Layer 0: Conv3x3 + ReLU
+    nds := nds.push (pbNode "Conv" "conv0" #["x", "w3"] #["c0"] #[pbAttrInts "pads" #[1, 1, 1, 1]])
+    nds := nds.push (pbNode "Relu" "relu0" #["c0"] #["h0"])
+    -- Layers 1..18: Conv3x3 + BN + ReLU
+    for i in [1:19] do
+      let prev := s!"h{i - 1}"
+      let ci := s!"c{i}"; let bi := s!"bn{i}"; let hi := s!"h{i}"
+      nds := nds.push (pbNode "Conv" s!"conv{i}" #[prev, "w3"] #[ci] #[pbAttrInts "pads" #[1, 1, 1, 1]])
+      nds := nds.push (pbNode "BatchNormalization" s!"bn_{i}" #[ci, "bn_s", "bn_b", "bn_m", "bn_v"] #[bi] #[pbAttrFloat "epsilon" 1e-5])
+      nds := nds.push (pbNode "Relu" s!"relu{i}" #[bi] #[hi])
+    -- Layer 19: Conv3x3 -> noise, then Sub(x, noise) -> y
+    nds := nds.push (pbNode "Conv" "conv19" #["h18", "w3"] #["noise"] #[pbAttrInts "pads" #[1, 1, 1, 1]])
+    nds := nds.push (pbNode "Sub" "res_sub" #["x", "noise"] #["y"])
+    let gb := pbGraph "dncnn20"
+      #[pbVI "x" #[1, c, h, w]] #[pbVI "y" #[1, c, h, w]]
+      #[
+        pbExternalTensor "w3" #[c, c, 3, 3],
+        pbExternalTensor "bn_s" #[c], pbExternalTensor "bn_b" #[c],
+        pbExternalTensor "bn_m" #[c], pbExternalTensor "bn_v" #[c]
+      ]
+      nds
+    let m ← parseOnnx (pbWrapModel 17 gb)
+    for tgt in #[Target.h16, Target.h17] do
+      let co ← compileOnnx m { target := tgt, safeTensors := some sf, stripMode := .auto }
+      if co.lowered.summary.fusedBnCount != 18 then
+        throw s!"{tgt.name}: expected 18 fused BNs in DnCNN-20, got {co.lowered.summary.fusedBnCount}"
+      if co.lowered.summary.fusedActCount != 19 then
+        throw s!"{tgt.name}: expected 19 fused ReLUs in DnCNN-20, got {co.lowered.summary.fusedActCount}"
+      if co.compiled.stripCount <= 1 then
+        throw s!"{tgt.name}: expected rolling L2 cascade stripCount > 1 on DnCNN-20, got {co.compiled.stripCount}"
+      if co.compiled.scratchBytes != 0 then
+        throw s!"{tgt.name}: expected 0 B scratch on DnCNN-20 rolling L2 cascade, got {co.compiled.scratchBytes}B"
+      if co.compiled.l2PeakBytes > l2CapacityBytes then
+        throw s!"{tgt.name}: DnCNN-20 l2PeakBytes {co.compiled.l2PeakBytes} > 2 MiB"
+      let _ ← verifyCompiledOnnx co
+  ))
+
+  -- 10. ONNX U-Net: encoder 3x3 + stride-2 downsample + bottleneck + Resize 2x nearest + Concat skip + decoder 3x3 (selective BAR 3 spill)
+  results := results.push (checkOk "c4 U-Net: ONNX encoder + stride-2 downsample + bottleneck + Resize 2x + Concat skip + decoder (selective BAR 3 spill on H16 & H17)" (do
+    let h := 96; let w := 96
+    let sfBlob ← writeSafeTensors #[
+      { name := "w_enc1", dtype := "F16", shape := #[64, 32, 3, 3], data := mkF16Bytes (Array.replicate (64 * 32 * 9) 0.01) },
+      { name := "w_enc2", dtype := "F16", shape := #[64, 64, 3, 3], data := mkF16Bytes (Array.replicate (64 * 64 * 9) 0.01) },
+      { name := "w_down", dtype := "F16", shape := #[64, 64, 3, 3], data := mkF16Bytes (Array.replicate (64 * 64 * 9) 0.01) },
+      { name := "w_bot1", dtype := "F16", shape := #[128, 64, 3, 3], data := mkF16Bytes (Array.replicate (128 * 64 * 9) 0.01) },
+      { name := "w_bot2", dtype := "F16", shape := #[64, 128, 3, 3], data := mkF16Bytes (Array.replicate (64 * 128 * 9) 0.01) },
+      { name := "w_dec1", dtype := "F16", shape := #[64, 128, 3, 3], data := mkF16Bytes (Array.replicate (64 * 128 * 9) 0.01) },
+      { name := "w_out",  dtype := "F16", shape := #[32, 64, 3, 3], data := mkF16Bytes (Array.replicate (32 * 64 * 9) 0.01) }
+    ]
+    let sf ← parseSafeTensors sfBlob { strict := true }
+    let gb := pbGraph "unet_2scale"
+      #[pbVI "x" #[1, 32, h, w]] #[pbVI "y" #[1, 32, h, w]]
+      #[
+        pbExternalTensor "w_enc1" #[64, 32, 3, 3],
+        pbExternalTensor "w_enc2" #[64, 64, 3, 3],
+        pbExternalTensor "w_down" #[64, 64, 3, 3],
+        pbExternalTensor "w_bot1" #[128, 64, 3, 3],
+        pbExternalTensor "w_bot2" #[64, 128, 3, 3],
+        pbExternalTensor "w_dec1" #[64, 128, 3, 3],
+        pbExternalTensor "w_out"  #[32, 64, 3, 3],
+        pbF32Tensor "up_scales" #[4] #[1.0, 1.0, 2.0, 2.0]
+      ]
+      #[
+        -- Encoder (full resolution 96x96)
+        pbNode "Conv" "enc1" #["x", "w_enc1"] #["e1c"] #[pbAttrInts "pads" #[1, 1, 1, 1]],
+        pbNode "Relu" "enc1_r" #["e1c"] #["e1"],
+        pbNode "Conv" "enc2" #["e1", "w_enc2"] #["e2c"] #[pbAttrInts "pads" #[1, 1, 1, 1]],
+        pbNode "Relu" "enc2_r" #["e2c"] #["skip1"],
+        -- Stride-2 downsample (48x48) + bottleneck
+        pbNode "Conv" "down1" #["skip1", "w_down"] #["d1c"] #[pbAttrInts "strides" #[2, 2], pbAttrInts "pads" #[1, 1, 1, 1]],
+        pbNode "Relu" "down1_r" #["d1c"] #["d1"],
+        pbNode "Conv" "bot1" #["d1", "w_bot1"] #["b1c"] #[pbAttrInts "pads" #[1, 1, 1, 1]],
+        pbNode "Relu" "bot1_r" #["b1c"] #["b1"],
+        pbNode "Conv" "bot2" #["b1", "w_bot2"] #["b2c"] #[pbAttrInts "pads" #[1, 1, 1, 1]],
+        pbNode "Relu" "bot2_r" #["b2c"] #["b2"],
+        -- 2x nearest Resize upsample (96x96) + Concat skip + Decoder 3x3
+        pbNode "Resize" "up1" #["b2", "", "up_scales"] #["u1"] #[pbAttrString "mode" "nearest"],
+        pbNode "Concat" "cat_skip" #["skip1", "u1"] #["c_in"] #[pbAttrInt "axis" 1],
+        pbNode "Conv" "dec1" #["c_in", "w_dec1"] #["dc1"] #[pbAttrInts "pads" #[1, 1, 1, 1]],
+        pbNode "Relu" "dec1_r" #["dc1"] #["dec1_out"],
+        pbNode "Conv" "dec_out" #["dec1_out", "w_out"] #["y"] #[pbAttrInts "pads" #[1, 1, 1, 1]]
+      ]
+    let m ← parseOnnx (pbWrapModel 17 gb)
+    for tgt in #[Target.h16, Target.h17] do
+      let co ← compileOnnx m { target := tgt, safeTensors := some sf }
+      if co.compiled.scratchBytes == 0 then
+        throw s!"{tgt.name}: expected selective BAR 3 spill (scratchBytes > 0) on U-Net long skip"
+      if co.compiled.l2PeakBytes > l2CapacityBytes then
+        throw s!"{tgt.name}: U-Net l2PeakBytes {co.compiled.l2PeakBytes} > 2 MiB"
+      if !co.machineProgram.witness.l2WithinCapacity then
+        throw s!"{tgt.name}: U-Net MemoryPlanWitness exceeded L2 capacity"
+      let mut hasL2 := false
+      let mut hasScratch := false
+      for buf in co.machineProgram.buffers do
+        match buf with
+        | .l2 .. => hasL2 := true
+        | .dramScratch .. => hasScratch := true
+        | _ => pure ()
+      if !hasL2 || !hasScratch then
+        throw s!"{tgt.name}: expected U-Net selective spill to have BOTH L2-resident bottleneck and DRAM-spilled skip buffers"
+      let _ ← verifyCompiledOnnx co
+  ))
+
+  -- 11. Adversarial review blocker & nit regression tests (B1, B2, B4, Nit 2)
+  results := results.push (checkOk "c4 reg B1 pos: Resize asymmetric+floor and pytorch_half_pixel+round_prefer_ceil compile & verify" (do
+    let g1 := pbGraph "resize_asym_floor"
+      #[pbVI "x" #[1, 4, 4, 4]] #[pbVI "y" #[1, 4, 8, 8]]
+      #[pbF32Tensor "sc" #[4] #[1.0, 1.0, 2.0, 2.0]]
+      #[pbNode "Resize" "up" #["x", "", "sc"] #["y"] #[
+        pbAttrString "mode" "nearest",
+        pbAttrString "coordinate_transformation_mode" "asymmetric",
+        pbAttrString "nearest_mode" "floor"
+      ]]
+    let g2 := pbGraph "resize_pthp_ceil"
+      #[pbVI "x" #[1, 4, 4, 4]] #[pbVI "y" #[1, 4, 8, 8]]
+      #[pbF32Tensor "sc" #[4] #[1.0, 1.0, 2.0, 2.0]]
+      #[pbNode "Resize" "up" #["x", "", "sc"] #["y"] #[
+        pbAttrString "mode" "nearest",
+        pbAttrString "coordinate_transformation_mode" "pytorch_half_pixel",
+        pbAttrString "nearest_mode" "round_prefer_ceil"
+      ]]
+    let m1 ← parseOnnx (pbWrapModel 17 g1)
+    let m2 ← parseOnnx (pbWrapModel 17 g2)
+    let _ ← verifyCompiledOnnx (← compileOnnx m1 { target := .h17 })
+    let _ ← verifyCompiledOnnx (← compileOnnx m2 { target := .h17 })
+  ))
+
+  results := results.push (checkErr "c4 reg B1 neg: Resize non-empty roi rejected" (do
+    let g := pbGraph "resize_roi"
+      #[pbVI "x" #[1, 4, 4, 4]] #[pbVI "y" #[1, 4, 8, 8]]
+      #[pbF32Tensor "roi" #[8] (Array.replicate 8 0.0), pbF32Tensor "sc" #[4] #[1.0, 1.0, 2.0, 2.0]]
+      #[pbNode "Resize" "up" #["x", "roi", "sc"] #["y"] #[pbAttrString "mode" "nearest"]]
+    compileOnnx (← parseOnnx (pbWrapModel 17 g)) { target := .h17 }
+  ) "non-empty roi")
+
+  results := results.push (checkErr "c4 reg B1 neg: Resize non-empty axes rejected" (do
+    let g := pbGraph "resize_axes"
+      #[pbVI "x" #[1, 4, 4, 4]] #[pbVI "y" #[1, 4, 8, 8]]
+      #[pbF32Tensor "sc" #[4] #[1.0, 1.0, 2.0, 2.0]]
+      #[pbNode "Resize" "up" #["x", "", "sc"] #["y"] #[pbAttrString "mode" "nearest", pbAttrInts "axes" #[2, 3]]]
+    compileOnnx (← parseOnnx (pbWrapModel 18 g)) { target := .h17 }
+  ) "non-empty axes")
+
+  results := results.push (checkErr "c4 reg B1 neg: Resize exclude_outside=1 rejected" (do
+    let g := pbGraph "resize_excl"
+      #[pbVI "x" #[1, 4, 4, 4]] #[pbVI "y" #[1, 4, 8, 8]]
+      #[pbF32Tensor "sc" #[4] #[1.0, 1.0, 2.0, 2.0]]
+      #[pbNode "Resize" "up" #["x", "", "sc"] #["y"] #[pbAttrString "mode" "nearest", pbAttrInt "exclude_outside" 1]]
+    compileOnnx (← parseOnnx (pbWrapModel 17 g)) { target := .h17 }
+  ) "exclude_outside")
+
+  results := results.push (checkErr "c4 reg B1 neg: Resize keep_aspect_ratio_policy='not_larger' rejected" (do
+    let g := pbGraph "resize_policy"
+      #[pbVI "x" #[1, 4, 4, 4]] #[pbVI "y" #[1, 4, 8, 8]]
+      #[pbF32Tensor "sc" #[4] #[1.0, 1.0, 2.0, 2.0]]
+      #[pbNode "Resize" "up" #["x", "", "sc"] #["y"] #[pbAttrString "mode" "nearest", pbAttrString "keep_aspect_ratio_policy" "not_larger"]]
+    compileOnnx (← parseOnnx (pbWrapModel 18 g)) { target := .h17 }
+  ) "keep_aspect_ratio_policy")
+
+  results := results.push (checkErr "c4 reg B1 neg: Resize half_pixel + floor rejected" (do
+    let g := pbGraph "resize_hp_floor"
+      #[pbVI "x" #[1, 4, 4, 4]] #[pbVI "y" #[1, 4, 8, 8]]
+      #[pbF32Tensor "sc" #[4] #[1.0, 1.0, 2.0, 2.0]]
+      #[pbNode "Resize" "up" #["x", "", "sc"] #["y"] #[
+        pbAttrString "mode" "nearest",
+        pbAttrString "coordinate_transformation_mode" "half_pixel",
+        pbAttrString "nearest_mode" "floor"
+      ]]
+    compileOnnx (← parseOnnx (pbWrapModel 17 g)) { target := .h17 }
+  ) "coordinate_transformation_mode")
+
+  results := results.push (checkErr "c4 reg B1 neg: Resize asymmetric + round_prefer_ceil rejected" (do
+    let g := pbGraph "resize_asym_rpc"
+      #[pbVI "x" #[1, 4, 4, 4]] #[pbVI "y" #[1, 4, 8, 8]]
+      #[pbF32Tensor "sc" #[4] #[1.0, 1.0, 2.0, 2.0]]
+      #[pbNode "Resize" "up" #["x", "", "sc"] #["y"] #[
+        pbAttrString "mode" "nearest",
+        pbAttrString "coordinate_transformation_mode" "asymmetric",
+        pbAttrString "nearest_mode" "round_prefer_ceil"
+      ]]
+    compileOnnx (← parseOnnx (pbWrapModel 17 g)) { target := .h17 }
+  ) "coordinate_transformation_mode")
+
+  results := results.push (checkErr "c4 reg B1 neg: Resize align_corners rejected" (do
+    let g := pbGraph "resize_align_corners"
+      #[pbVI "x" #[1, 4, 4, 4]] #[pbVI "y" #[1, 4, 8, 8]]
+      #[pbF32Tensor "sc" #[4] #[1.0, 1.0, 2.0, 2.0]]
+      #[pbNode "Resize" "up" #["x", "", "sc"] #["y"] #[
+        pbAttrString "mode" "nearest",
+        pbAttrString "coordinate_transformation_mode" "align_corners"
+      ]]
+    compileOnnx (← parseOnnx (pbWrapModel 17 g)) { target := .h17 }
+  ) "coordinate_transformation_mode")
+
+  results := results.push (checkErr "c4 reg B2 neg: Resize sw=5 w=64 cleanly rejected at Resize lowering" (do
+    let g := pbGraph "resize_sw5_w64"
+      #[pbVI "x" #[1, 4, 4, 64]] #[pbVI "y" #[1, 4, 4, 320]]
+      #[pbF32Tensor "sc" #[4] #[1.0, 1.0, 1.0, 5.0]]
+      #[pbNode "Resize" "up" #["x", "", "sc"] #["y"] #[pbAttrString "mode" "nearest"]]
+    compileOnnx (← parseOnnx (pbWrapModel 17 g)) { target := .h17 }
+  ) "cannot be tiled into 64B-aligned <=128 chunks")
+
+  results := results.push (checkOk "c4 reg B4: planTransposeScratch aliased onto graph output via no-op Reshape inserts neAct .copy & verifies (H16 & H17)" (do
+    -- [1, 12, 1, 6] -> Transpose([0,3,2,1]) -> [1, 6, 1, 12] (kernelOutEnd > y.span -> planTransposeScratch)
+    -- -> Reshape([6, 1, 12]) (physical no-op alias!) as graph output!
+    let g := pbGraph "scratch_tr_noop_rs_out"
+      #[pbVI "x" #[1, 12, 1, 6]] #[pbVI "y" #[6, 1, 12]]
+      #[pbI64Tensor "sh3" #[3] #[6, 1, 12]]
+      #[
+        pbNode "Transpose" "tr" #["x"] #["t0"] #[pbAttrInts "perm" #[0, 3, 2, 1]],
+        pbNode "Reshape" "rs" #["t0", "sh3"] #["y"]
+      ]
+    let m ← parseOnnx (pbWrapModel 17 g)
+    for tgt in #[Target.h16, Target.h17] do
+      let co ← compileOnnx m { target := tgt }
+      if co.compiled.scratchBytes == 0 then
+        throw s!"{tgt.name}: expected scratchBytes > 0 for oversized scratch transpose"
+      let _ ← verifyCompiledOnnx co
+  ))
+
+  results := results.push (checkErr "c4 reg Nit2 neg: Squeeze duplicate axes rejected" (do
+    let g := pbGraph "squeeze_dup_axes"
+      #[pbVI "x" #[1, 8, 1, 4]] #[pbVI "y" #[1, 8, 4]]
+      #[pbI64Tensor "ax" #[2] #[2, -2]]
+      #[pbNode "Squeeze" "sq" #["x", "ax"] #["y"]]
+    compileOnnx (← parseOnnx (pbWrapModel 17 g)) { target := .h17 }
+  ) "duplicate axis")
+
+  pure results
+
+end C4Tests
+
 def main : IO UInt32 := do
-  let results := (← runAllTests) ++ (← runM4Tests) ++ (← runM5aTests) ++ (← runM5bTests) ++ (← runM5cTests) ++ (← runM5dTests) ++ (← runM7bTests) ++ (← runM8aTests) ++ (← C1Tests.runC1Tests) ++ (← C2Tests.runC2Tests) ++ (← runTargetMatrixTests)
+  let results := (← runAllTests) ++ (← runM4Tests) ++ (← runM5aTests) ++ (← runM5bTests) ++ (← runM5cTests) ++ (← runM5dTests) ++ (← runM7bTests) ++ (← runM8aTests) ++ (← C1Tests.runC1Tests) ++ (← C2Tests.runC2Tests) ++ (← C4Tests.runC4Tests) ++ (← runTargetMatrixTests)
   let mut passed := 0
   let mut failed := 0
   for r in results do

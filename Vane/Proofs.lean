@@ -27,6 +27,7 @@ import Vane.Proofs.C3Backend
 import Vane.Proofs.C3MemoryPlan
 import Vane.Proofs.C3Sync
 import Vane.Proofs.C3Emit
+import Vane.Proofs.C4Conv
 
 namespace Vane.Proofs
 
