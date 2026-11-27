@@ -14,6 +14,10 @@ import Vane.Graph
 import Vane.Frontend.SafeTensors
 import Vane.Frontend.Onnx
 import Vane.IR.ToGraph
+import Vane.Ane.Types
+import Vane.Machine.Types
+import Vane.Backend.LayoutSelect
+import Vane.Backend.SyncAndEmit
 
 namespace Vane.Frontend.Lower
 
@@ -34,6 +38,9 @@ open Vane.Frontend.SafeTensors
 open Vane.Frontend.Onnx
 open Vane.IR
 open Vane.IR.ToGraph
+open Vane.Ane
+open Vane.Machine
+open Vane.Backend.SyncAndEmit
 
 -- Re-export pure classifiers & helpers used by existing proofs and tests
 export Vane.IR (
@@ -103,6 +110,8 @@ structure LowerSummary where
   inputs : Array GraphInput
   output : String
   outputShape : Shape4D
+  outputs : Array String := #[]
+  outputShapes : Array Shape4D := #[]
   onnxNodeCount : Nat
   nodeCount : Nat
   fusedBnCount : Nat
@@ -116,18 +125,22 @@ structure LowerSummary where
   warnings : Array String
   deriving Repr, BEq
 
-/-- Result of pure Lean 4 ONNX lowering: `HighOp`/`CoreOp` SSA graphs, in-memory `GraphSpec`, and `LowerSummary`. -/
+/-- Result of pure Lean 4 ONNX lowering: `HighOp`/`CoreOp` SSA graphs, L2 `AneProgram`,
+    backwards-compatible `GraphSpec`, and `LowerSummary`. -/
 structure LowerResult where
   spec : GraphSpec
   summary : LowerSummary
   highGraph : SSAGraph HighOp
   coreGraph : SSAGraph CoreOp
+  aneProgram : AneProgram
   deriving BEq
 
-/-- Result of full end-to-end ONNX compilation (`lowerOnnx` + `compileGraph`). -/
+/-- Result of full end-to-end ONNX compilation (L1 `TensorIR` → L2 `AneIR` → L3 `MachineIR` → L4 `SyncAndEmit`). -/
 structure CompiledOnnx where
   lowered : LowerResult
   compiled : CompiledGraph
+  aneProgram : AneProgram
+  machineProgram : MachineProgram
 
 /-- Parse a CLI `--input-shape` override of the form `NAME=C,H,W` or `NAME=1,C,H,W`. -/
 def parseInputShapeOverride (raw : String) : Except String (String × TensorDims) := do
@@ -352,8 +365,8 @@ def decodeOnnxToHighGraph (model : OnnxModel) (opts : LowerOptions := {}) :
   if !model.hasGraph then
     throw "onnx model has no graph"
   let g := model.graph
-  if g.outputs.size != 1 then
-    throw s!"graph '{g.name}': expected exactly 1 output, got {g.outputs.size}"
+  if g.outputs.isEmpty then
+    throw s!"graph '{g.name}': expected at least 1 output, got 0"
 
   -- 1. Collect initializers & SafeTensors overrides into a raw constant table.
   let mut consts : Array (String × RawConst) := #[]
@@ -1396,23 +1409,26 @@ def decodeOnnxToHighGraph (model : OnnxModel) (opts : LowerOptions := {}) :
       | other =>
         throw s!"{ctx}: unsupported ONNX operator '{other}'"
 
-  let graphOutputName := resolveAliasStr aliases g.outputs[0]!.name
-  let (outVid, _) ← lookupRuntime valOf tyOf graphOutputName "graph output"
+  let mut outVids : Array ValueId := Array.mkEmpty g.outputs.size
+  for oi in [:g.outputs.size] do
+    let graphOutputName := resolveAliasStr aliases g.outputs[oi]!.name
+    let (ov, _) ← lookupRuntime valOf tyOf graphOutputName s!"graph output[{oi}]"
+    outVids := outVids.push ov
 
   let highGraph : SSAGraph HighOp := {
     target := opts.target
     inputs := ssaInputs
     nodes := nodes
-    outputs := #[outVid]
+    outputs := outVids
   }
   pure (highGraph, elidedCount, sfUsed)
 
 -- ============================================================================
--- End-to-End ONNX -> HighOp -> CoreOp -> GraphSpec Lowering
+-- End-to-End ONNX -> L1 TensorIR -> L2 AneIR -> L3 MachineIR -> L4 SyncAndEmit
 -- ============================================================================
 
 /-- Lower a decoded `OnnxModel` through `SSAGraph HighOp` → `runStandardPipeline` → `SSAGraph CoreOp`
-    → `Vane.Graph.GraphSpec` and `LowerSummary`. -/
+    → L2 `AneProgram` (plus backwards-compatible `GraphSpec` for single-output models) and `LowerSummary`. -/
 def lowerOnnx (model : OnnxModel) (opts : LowerOptions := {}) : Except String LowerResult := do
   let (highGraph, decodeElided, sfUsed) ← decodeOnnxToHighGraph model opts
   let pipeCfg : PassConfig := {
@@ -1421,51 +1437,92 @@ def lowerOnnx (model : OnnxModel) (opts : LowerOptions := {}) : Except String Lo
     quantize := opts.quantize
   }
   let pipeRes ← runStandardPipeline highGraph pipeCfg
-  let bridged ← coreGraphToGraphSpec pipeRes.coreGraph opts.placement opts.stripMode opts.allowViewOps
+  let outNames := model.graph.outputs.map fun o => o.name
+  let aneProg ← Vane.Backend.LayoutSelect.lowerCoreToAne pipeRes.coreGraph {
+    placement := opts.placement
+    allowViewOps := opts.allowViewOps
+    outputNames := outNames
+  }
 
-  -- Validate lowered output ONNX shape against declared static output dimensions (if any).
-  let declOut := model.graph.outputs[0]!
-  let outLogical := bridged.outputLogicalShape
-  if declOut.hasShape && !declOut.dims.isEmpty then
-    if outLogical.size != declOut.dims.size then
-      throw s!"graph output '{declOut.name}': lowered ONNX shape {outLogical.toList} (rank {outLogical.size}) != declared output rank {declOut.dims.size}"
-    for i in [:declOut.dims.size] do
-      let d := declOut.dims[i]!
-      if d.hasValue && d.value > 0 then
-        if outLogical[i]! != d.value.toNat then
-          throw s!"graph output '{declOut.name}': lowered ONNX shape {outLogical.toList} != declared output dim[{i}]={d.value}"
+  -- Validate lowered output ONNX shapes against declared static output dimensions for ALL outputs.
+  let mut outShapes4D : Array Shape4D := Array.mkEmpty model.graph.outputs.size
+  for oi in [:model.graph.outputs.size] do
+    let declOut := model.graph.outputs[oi]!
+    let outLogical := aneProg.outputLogicalShapes[oi]!
+    if declOut.hasShape && !declOut.dims.isEmpty then
+      if outLogical.size != declOut.dims.size then
+        throw s!"graph output '{declOut.name}': lowered ONNX shape {outLogical.toList} (rank {outLogical.size}) != declared output rank {declOut.dims.size}"
+      for i in [:declOut.dims.size] do
+        let d := declOut.dims[i]!
+        if d.hasValue && d.value > 0 then
+          if outLogical[i]! != d.value.toNat then
+            throw s!"graph output '{declOut.name}': lowered ONNX shape {outLogical.toList} != declared output dim[{i}]={d.value}"
+    let oSh4 ← logicalToShape4D outLogical s!"graph output '{declOut.name}'"
+    outShapes4D := outShapes4D.push oSh4
+
+  -- Build backwards-compatible `GraphSpec` for single-output models (`--emit-graph-dir` & legacy tests);
+  -- multi-output models compile directly through `aneProgram` (L2 -> L3 -> L4).
+  let (compatSpec, compatInputs, primaryOutId) ←
+    if pipeRes.coreGraph.outputs.size == 1 then
+      let bridged ← coreGraphToGraphSpec pipeRes.coreGraph opts.placement opts.stripMode opts.allowViewOps
+      pure (bridged.spec, bridged.spec.inputs, bridged.outputId)
+    else
+      let mut gInps : Array GraphInput := Array.mkEmpty aneProg.graph.inputs.size
+      for (_, nm, ty) in aneProg.graph.inputs do
+        let sh := (tensorTypeToShape4D ty nm).toOption.getD { n := 1, c := 1, h := 1, w := 1 }
+        gInps := gInps.push { name := nm, shape := shape4DToDims sh }
+      let dummySpec : GraphSpec := {
+        target := opts.target
+        inputs := gInps
+        nodes := #[]
+        defaultPlacement := opts.placement
+        stripMode := opts.stripMode
+        outputs := outNames
+      }
+      pure (dummySpec, gInps, outNames[0]!)
 
   let summary : LowerSummary := {
     target := opts.target
     placement := opts.placement
-    inputs := bridged.spec.inputs
-    output := bridged.outputId
-    outputShape := bridged.outputShape
+    inputs := compatInputs
+    output := primaryOutId
+    outputShape := outShapes4D[0]!
+    outputs := outNames
+    outputShapes := outShapes4D
     onnxNodeCount := model.graph.nodes.size
-    nodeCount := bridged.spec.nodes.size
+    nodeCount := if pipeRes.coreGraph.outputs.size == 1 then compatSpec.nodes.size else aneProg.graph.nodes.size
     fusedBnCount := pipeRes.stats.fusedBnCount
     fusedActCount := pipeRes.stats.fusedActCount
     fusedMatmulCount := pipeRes.stats.fusedMatmulCount
     elidedCount := decodeElided + pipeRes.stats.elidedCount
-    weightCount := bridged.weightCount
-    weightBytes := bridged.weightBytes
+    weightCount := aneProg.weightCount
+    weightBytes := aneProg.weightBytes
     safeTensorsUsed := sfUsed
     quantizedConvCount := pipeRes.stats.quantizedConvCount
     warnings := #[]
   }
 
   pure {
-    spec := bridged.spec
+    spec := compatSpec
     summary := summary
     highGraph := pipeRes.highGraph
     coreGraph := pipeRes.coreGraph
+    aneProgram := aneProg
   }
 
-/-- Lower an `OnnxModel` in memory and compile it directly into a verified HWX + 4 LOAD sections. -/
+/-- Lower an `OnnxModel` directly through L1 (`TensorIR`) → L2 (`AneIR` + SOK + rolling cascades) →
+    L3 (`MachineIR` + `MemoryPlan`) → L4 (`SyncAndEmit`) into a verified HWX + 4 LOAD sections.
+    Supports both single-output and multi-output (`1..3` outputs) ONNX models natively! -/
 def compileOnnx (model : OnnxModel) (opts : LowerOptions := {}) : Except String CompiledOnnx := do
   let lowered ← lowerOnnx model opts
-  let compiled ← compileGraph lowered.spec
-  pure { lowered := lowered, compiled := compiled }
+  let (finalAne, cm) ← compileAneProgram lowered.aneProgram opts.stripMode
+  let compiled := compiledMachineToGraph cm (some finalAne)
+  pure {
+    lowered := lowered
+    compiled := compiled
+    aneProgram := finalAne
+    machineProgram := cm.machine
+  }
 
 -- ============================================================================
 -- Optional `graph.json` + fp16 Weight `.bin` Exporter (`--emit-graph-dir`)
@@ -1513,6 +1570,8 @@ private def convActFields (act : ConvActivation) : List (String × Json) :=
 /-- Write a lowered `LowerResult` to `outDir` as `graph.json` + little-endian fp16 weight `.bin` files
     compatible with both `vane compile-graph` and `vane-runner gen-graph`. -/
 def emitGraphDir (outDir : System.FilePath) (res : LowerResult) : IO (Except String Unit) := do
+  if res.summary.outputs.size > 1 then
+    return .error "emitGraphDir does not yet support multi-output ONNX models"
   try
     IO.FS.createDirAll outDir
   catch e =>

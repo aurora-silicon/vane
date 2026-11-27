@@ -699,3 +699,33 @@ func TestExecuteAnecLifecycleAndCleanup(t *testing.T) {
 		})
 	}
 }
+
+func TestStrictABIv3SingleOutputValidation(t *testing.T) {
+	tr := NewMockTransport(map[string]MockDeviceSpec{
+		"/dev/accel/accel0": {ABIVersion: ABIV3, ChipFamily: ChipH17},
+	}, nil)
+
+	fd, caps, err := DiscoverDevice(tr, "", ChipH17)
+	if err != nil {
+		t.Fatalf("DiscoverDevice: %v", err)
+	}
+	defer tr.Close(fd)
+
+	// ABI v3 strictly requires exactly 1 HWX output surface; 2 output surfaces must be rejected.
+	loaded := LoadedProgram{
+		SurfaceCount:      3,
+		SurfaceSizes:      []uint64{64, 64, 64},
+		SurfaceDirections: []uint32{1, 2, 2},
+	}
+	tr.openFDs[fd].loaded = &loaded
+	tr.openFDs[fd].surfaces = [][]byte{
+		make([]byte, PageSize16K),
+		make([]byte, PageSize16K),
+		make([]byte, PageSize16K),
+	}
+
+	inData := make([]byte, 64)
+	if _, _, err := ExecuteProgram(tr, fd, caps, loaded, [][]byte{inData}, ExecOptions{Runs: 1}); err == nil {
+		t.Fatalf("expected ExecuteProgram to reject 2 output surfaces under strict ABI v3")
+	}
+}

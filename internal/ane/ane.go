@@ -340,6 +340,25 @@ func BuildSectionsFromHWX(hwx []byte) (map[uint32][]byte, error) {
 		}
 	}
 
+	// Strict ABI v3 surface validation: 2..4 total surfaces, >=1 input, exactly 1 output.
+	if len(surfaces) < 2 || len(surfaces) > MaxSurfaces {
+		return nil, fmt.Errorf("ABI v3 requires 2..%d surfaces, got %d", MaxSurfaces, len(surfaces))
+	}
+	var inCount, outCount uint32
+	for _, s := range surfaces {
+		switch s.direction {
+		case 1:
+			inCount++
+		case 2:
+			outCount++
+		default:
+			return nil, fmt.Errorf("invalid surface direction %d (expected 1=input or 2=output)", s.direction)
+		}
+	}
+	if inCount < 1 || outCount != 1 {
+		return nil, fmt.Errorf("ABI v3 requires >=1 input surface and exactly 1 output surface (got %d inputs, %d outputs)", inCount, outCount)
+	}
+
 	// Assign buffer IDs: output = 4, inputs = 5, 6, ..., scratch = next
 	nextIn := uint32(5)
 	surfIDs := make([]uint32, len(surfaces))
@@ -354,6 +373,14 @@ func BuildSectionsFromHWX(hwx []byte) (map[uint32][]byte, error) {
 	var scratchID uint32
 	if scratch != nil {
 		scratchID = nextIn
+		if scratchID > 0x3c {
+			return nil, fmt.Errorf("scratch buffer ID 0x%x exceeds 0x3c", scratchID)
+		}
+	}
+	for _, id := range surfIDs {
+		if id > 0x3c {
+			return nil, fmt.Errorf("surface buffer ID 0x%x exceeds 0x3c", id)
+		}
 	}
 
 	// 1. GENERIC
@@ -813,10 +840,20 @@ type ExecOptions struct {
 	Warmup    int
 	InPlace   bool
 	AltInputs [][]byte // Optional alternate input surfaces used on odd runs (run 2, 4, ...) when Runs > 1.
-	Expected  []byte
+	Expected  []byte   // Optional expected output fp16 binary for direct byte comparison.
 	Atol      float64
 	Rtol      float64
 	MaxULP    *int
+}
+
+// OutputReport summarizes one logical output slice unpacked from a packed ABI v3 output surface.
+type OutputReport struct {
+	Name            string                `json:"name,omitempty"`
+	Offset          uint64                `json:"offset"`
+	OutputSize      uint64                `json:"output_size"`
+	OutputSHA256    string                `json:"output_sha256"`
+	AltOutputSHA256 string                `json:"alt_output_sha256,omitempty"`
+	Comparison      *ref.ComparisonResult `json:"comparison,omitempty"`
 }
 
 // RunReport summarizes device execution, repeatability, latency, and optional comparison.
@@ -833,6 +870,8 @@ type RunReport struct {
 	OutputSize        uint64                `json:"output_size"`
 	OutputSHA256      string                `json:"output_sha256"`
 	AltOutputSHA256   string                `json:"alt_output_sha256,omitempty"`
+	AltOutputBytes    []byte                `json:"-"`
+	Outputs           []OutputReport        `json:"outputs,omitempty"`
 	LatenciesMS       []float64             `json:"latencies_ms"`
 	MinMS             float64               `json:"min_ms"`
 	MedianMS          float64               `json:"median_ms"`
@@ -875,13 +914,9 @@ func ComputeLatencyStats(latencies []float64) (minMS, medianMS, p95MS, meanMS fl
 	return minMS, medianMS, p95MS, meanMS
 }
 
-// ExecuteProgram executes a loaded program opts.Warmup warmup runs followed by opts.Runs timed runs
-// in copy or in-place mmap mode. Copy mode poisons the output buffer with 0xff before every run.
-// Repeatability is checked across ALL (Warmup + Runs) executions, while LatenciesMS and summary stats
-// (MinMS, MedianMS, P95MS, MeanMS) are computed strictly over the opts.Runs timed runs.
-// When opts.AltInputs is non-empty and opts.Runs > 1, even runs (r=0,2,4,...) execute
-// inputs and odd runs (r=1,3,5,...) execute opts.AltInputs, checking independent
-// determinism for both input sets.
+// ExecuteProgram executes a loaded ABI v3 program (1..3 inputs, exactly 1 output surface)
+// opts.Warmup warmup runs followed by opts.Runs timed runs in copy or in-place mmap mode.
+// Copy mode poisons the output buffer with 0xff before every run.
 func ExecuteProgram(
 	tr Transport,
 	fd int,
@@ -902,21 +937,19 @@ func ExecuteProgram(
 
 	var inIndices []int
 	outIdx := -1
+	outCount := 0
 	for i, d := range loaded.SurfaceDirections {
 		switch d {
 		case 1:
 			inIndices = append(inIndices, i)
 		case 2:
-			if outIdx != -1 {
-				return nil, RunReport{}, errors.New("expected exactly 1 output surface, found multiple")
-			}
 			outIdx = i
+			outCount++
 		}
 	}
-	if outIdx < 0 {
-		return nil, RunReport{}, errors.New("program has no output surface")
+	if outCount != 1 || outIdx < 0 {
+		return nil, RunReport{}, fmt.Errorf("ABI v3 program must have exactly 1 output surface, got %d", outCount)
 	}
-	outSize := int(loaded.SurfaceSizes[outIdx])
 
 	resolvedInputs := make([][]byte, len(inIndices))
 	if len(inputs) == 0 {
@@ -957,6 +990,7 @@ func ExecuteProgram(
 	latencies := make([]float64, 0, runs)
 	var firstOutput []byte
 	var firstAltOutput []byte
+	outSize := int(loaded.SurfaceSizes[outIdx])
 
 	recordOutput := func(r int, isAlt bool, outBytes []byte) error {
 		if isAlt {
@@ -968,15 +1002,15 @@ func ExecuteProgram(
 				return fmt.Errorf("non-deterministic alt-input output on run %d: sha256 %s != run 2 sha256 %s",
 					r+1, hex.EncodeToString(s2[:]), hex.EncodeToString(s1[:]))
 			}
-			return nil
-		}
-		if firstOutput == nil {
-			firstOutput = outBytes
-		} else if !bytes.Equal(outBytes, firstOutput) {
-			s1 := sha256.Sum256(firstOutput)
-			s2 := sha256.Sum256(outBytes)
-			return fmt.Errorf("non-deterministic output on run %d: sha256 %s != run 1 sha256 %s",
-				r+1, hex.EncodeToString(s2[:]), hex.EncodeToString(s1[:]))
+		} else {
+			if firstOutput == nil {
+				firstOutput = outBytes
+			} else if !bytes.Equal(outBytes, firstOutput) {
+				s1 := sha256.Sum256(firstOutput)
+				s2 := sha256.Sum256(outBytes)
+				return fmt.Errorf("non-deterministic output on run %d: sha256 %s != run 1 sha256 %s",
+					r+1, hex.EncodeToString(s2[:]), hex.EncodeToString(s1[:]))
+			}
 		}
 		return nil
 	}
@@ -1025,7 +1059,6 @@ func ExecuteProgram(
 			if r >= warmup {
 				latencies = append(latencies, dt)
 			}
-
 			outBytes := make([]byte, outSize)
 			copy(outBytes, mappings[outIdx][:outSize])
 			if err := recordOutput(r, isAlt, outBytes); err != nil {
@@ -1060,7 +1093,6 @@ func ExecuteProgram(
 			if r >= warmup {
 				latencies = append(latencies, dt)
 			}
-
 			outBytes := make([]byte, outSize)
 			copy(outBytes, surfBufs[outIdx])
 			if err := recordOutput(r, isAlt, outBytes); err != nil {
@@ -1070,13 +1102,13 @@ func ExecuteProgram(
 	}
 
 	minMS, medianMS, p95MS, meanMS := ComputeLatencyStats(latencies)
-
 	sum := sha256.Sum256(firstOutput)
 	var altSHA string
 	if firstAltOutput != nil {
 		as := sha256.Sum256(firstAltOutput)
 		altSHA = hex.EncodeToString(as[:])
 	}
+
 	var compPtr *ref.ComparisonResult
 	if opts.Expected != nil {
 		comp, err := ref.CompareFP16Bytes(firstOutput, opts.Expected, opts.Atol, opts.Rtol, opts.MaxULP)
@@ -1103,6 +1135,7 @@ func ExecuteProgram(
 		OutputSize:        uint64(outSize),
 		OutputSHA256:      hex.EncodeToString(sum[:]),
 		AltOutputSHA256:   altSHA,
+		AltOutputBytes:    firstAltOutput,
 		LatenciesMS:       latencies,
 		MinMS:             minMS,
 		MedianMS:          medianMS,

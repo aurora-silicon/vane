@@ -4,6 +4,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -57,8 +59,8 @@ func (f *optFloatFlag) Set(s string) error {
 func usage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  vane-runner probe [--abi N] [--device PATH] [--json]")
-	fmt.Fprintln(w, "  vane-runner run --hwx PATH [--sections-dir DIR] [--input PATH]... [--alt-input PATH]... [--output-out PATH]")
-	fmt.Fprintln(w, "                  [--expected PATH] [--runs N] [--warmup N] [--in-place] [--atol F] [--rtol F]")
+	fmt.Fprintln(w, "  vane-runner run --hwx PATH [--sections-dir DIR] [--manifest PATH] [--input PATH]... [--alt-input PATH]... [--output-out PATH]...")
+	fmt.Fprintln(w, "                  [--expected PATH]... [--runs N] [--warmup N] [--in-place] [--atol F] [--rtol F]")
 	fmt.Fprintln(w, "                  [--max-ulp N] [--device PATH] [--json] [--json-out PATH]")
 	fmt.Fprintln(w, "  vane-runner run-anec --anec PATH [--input PATH]... [--alt-input PATH]... [--output-out PATH]")
 	fmt.Fprintln(w, "                       [--expected PATH] [--runs N] [--warmup N] [--atol F] [--rtol F]")
@@ -310,12 +312,15 @@ func cmdRun(args []string, tr ane.Transport, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	hwxPath := fs.String("hwx", "", "Path to HWX program file")
 	sectionsDir := fs.String("sections-dir", "", "Directory containing the 4 host-built LOAD sections")
+	manifestPath := fs.String("manifest", "", "Optional compiled manifest.json for unpacking packed multi-output HWX surfaces")
 	var inputPaths stringSliceFlag
 	fs.Var(&inputPaths, "input", "Input binary file (repeatable in HWX input surface order)")
 	var altInputPaths stringSliceFlag
 	fs.Var(&altInputPaths, "alt-input", "Alternate input binary file used on odd runs when --runs > 1 (repeatable)")
-	outputOut := fs.String("output-out", "", "Write output surface bytes to this path")
-	expectedPath := fs.String("expected", "", "Expected output fp16 binary for direct byte comparison")
+	var outputOutPaths stringSliceFlag
+	fs.Var(&outputOutPaths, "output-out", "Write output bytes to this path (repeatable with --manifest for packed multi-output HWX)")
+	var expectedPaths stringSliceFlag
+	fs.Var(&expectedPaths, "expected", "Expected output fp16 binary for comparison (repeatable with --manifest for packed multi-output HWX)")
 	runs := fs.Int("runs", 1, "Number of consecutive timed runs for repeatability verification")
 	warmup := fs.Int("warmup", 0, "Number of unmeasured warmup runs before timed --runs (checked for determinism)")
 	inPlace := fs.Bool("in-place", false, "Use mmap in-place execution mode (requires 16 KiB pages)")
@@ -384,13 +389,14 @@ func cmdRun(args []string, tr ane.Transport, stdout, stderr io.Writer) int {
 		altInputPayloads = append(altInputPayloads, b)
 	}
 
-	var expectedBytes []byte
-	if *expectedPath != "" {
-		expectedBytes, err = os.ReadFile(*expectedPath)
+	var expectedPayloads [][]byte
+	for _, p := range expectedPaths {
+		b, err := os.ReadFile(p)
 		if err != nil {
-			fmt.Fprintf(stderr, "error: read expected %q: %v\n", *expectedPath, err)
+			fmt.Fprintf(stderr, "error: read expected %q: %v\n", p, err)
 			return 1
 		}
+		expectedPayloads = append(expectedPayloads, b)
 	}
 
 	var maxULP *int
@@ -416,12 +422,88 @@ func cmdRun(args []string, tr ane.Transport, stdout, stderr io.Writer) int {
 		return 1
 	}
 
+	type manifestOutputSpec struct {
+		Name        string `json:"name"`
+		N           int    `json:"n"`
+		Channels    int    `json:"channels"`
+		Height      int    `json:"height"`
+		Width       int    `json:"width"`
+		RowStride   int    `json:"row_stride"`
+		PlaneStride int    `json:"plane_stride"`
+		BatchStride int    `json:"batch_stride"`
+		Offset      int    `json:"offset"`
+		Bytes       int    `json:"bytes"`
+	}
+	var manifestOutputs []manifestOutputSpec
+	if *manifestPath != "" {
+		rawMan, err := os.ReadFile(*manifestPath)
+		if err != nil {
+			fmt.Fprintf(stderr, "error: read manifest %q: %v\n", *manifestPath, err)
+			return 1
+		}
+		var man struct {
+			Outputs []manifestOutputSpec `json:"outputs"`
+		}
+		if err := json.Unmarshal(rawMan, &man); err != nil {
+			fmt.Fprintf(stderr, "error: parse manifest %q: %v\n", *manifestPath, err)
+			return 1
+		}
+		manifestOutputs = man.Outputs
+		for oi, spec := range manifestOutputs {
+			if spec.Offset < 0 || spec.Offset%64 != 0 {
+				fmt.Fprintf(stderr, "error: manifest output[%d] (%s) offset %d must be non-negative and 64-byte aligned\n", oi, spec.Name, spec.Offset)
+				return 1
+			}
+			if spec.Bytes <= 0 {
+				fmt.Fprintf(stderr, "error: manifest output[%d] (%s) bytes %d must be positive\n", oi, spec.Name, spec.Bytes)
+				return 1
+			}
+		}
+		for oi, spec := range manifestOutputs {
+			for oj := oi + 1; oj < len(manifestOutputs); oj++ {
+				other := manifestOutputs[oj]
+				if spec.Offset < other.Offset+other.Bytes && other.Offset < spec.Offset+spec.Bytes {
+					fmt.Fprintf(stderr, "error: manifest outputs[%d] (%s) [%d,%d) and [%d] (%s) [%d,%d) overlap\n",
+						oi, spec.Name, spec.Offset, spec.Offset+spec.Bytes,
+						oj, other.Name, other.Offset, other.Offset+other.Bytes)
+					return 1
+				}
+			}
+		}
+	}
+
+	multiPacked := len(manifestOutputs) > 1
+	if !multiPacked {
+		if len(outputOutPaths) > 1 {
+			fmt.Fprintf(stderr, "error: provided %d --output-out paths without a multi-output --manifest\n", len(outputOutPaths))
+			return 1
+		}
+		if len(expectedPayloads) > 1 {
+			fmt.Fprintf(stderr, "error: provided %d --expected paths without a multi-output --manifest\n", len(expectedPayloads))
+			return 1
+		}
+	} else {
+		if len(outputOutPaths) > len(manifestOutputs) {
+			fmt.Fprintf(stderr, "error: provided %d --output-out paths, manifest declares %d logical outputs\n", len(outputOutPaths), len(manifestOutputs))
+			return 1
+		}
+		if len(expectedPayloads) > len(manifestOutputs) {
+			fmt.Fprintf(stderr, "error: provided %d --expected paths, manifest declares %d logical outputs\n", len(expectedPayloads), len(manifestOutputs))
+			return 1
+		}
+	}
+
+	var singleExpected []byte
+	if !multiPacked && len(expectedPayloads) == 1 {
+		singleExpected = expectedPayloads[0]
+	}
+
 	outBytes, report, err := ane.ExecuteProgram(tr, fd, caps, loaded, inputPayloads, ane.ExecOptions{
 		Runs:      *runs,
 		Warmup:    *warmup,
 		InPlace:   *inPlace,
 		AltInputs: altInputPayloads,
-		Expected:  expectedBytes,
+		Expected:  singleExpected,
 		Atol:      *atol,
 		Rtol:      *rtol,
 		MaxULP:    maxULP,
@@ -431,13 +513,61 @@ func cmdRun(args []string, tr ane.Transport, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	if *outputOut != "" {
-		if err := os.MkdirAll(filepath.Dir(*outputOut), 0o755); err != nil {
+	var outSlices [][]byte
+	if multiPacked {
+		outSlices = make([][]byte, len(manifestOutputs))
+		outReports := make([]ane.OutputReport, len(manifestOutputs))
+		for oi, spec := range manifestOutputs {
+			if spec.Offset < 0 || spec.Bytes <= 0 || spec.Offset+spec.Bytes > len(outBytes) {
+				fmt.Fprintf(stderr, "error: manifest output[%d] (%s) range [%d, %d) exceeds packed HWX output size %d\n",
+					oi, spec.Name, spec.Offset, spec.Offset+spec.Bytes, len(outBytes))
+				return 1
+			}
+			slice := outBytes[spec.Offset : spec.Offset+spec.Bytes]
+			outSlices[oi] = slice
+			sum := sha256.Sum256(slice)
+			var altSHA string
+			if report.AltOutputBytes != nil {
+				if spec.Offset+spec.Bytes > len(report.AltOutputBytes) {
+					fmt.Fprintf(stderr, "error: manifest output[%d] (%s) exceeds alt output size %d\n", oi, spec.Name, len(report.AltOutputBytes))
+					return 1
+				}
+				as := sha256.Sum256(report.AltOutputBytes[spec.Offset : spec.Offset+spec.Bytes])
+				altSHA = hex.EncodeToString(as[:])
+			}
+			var compPtr *ref.ComparisonResult
+			if oi < len(expectedPayloads) && expectedPayloads[oi] != nil {
+				comp, err := ref.CompareFP16Bytes(slice, expectedPayloads[oi], *atol, *rtol, maxULP)
+				if err != nil {
+					fmt.Fprintf(stderr, "error: reference comparison failed for output[%d] (%s): %v\n", oi, spec.Name, err)
+					return 1
+				}
+				compPtr = &comp
+			}
+			outReports[oi] = ane.OutputReport{
+				Name:            spec.Name,
+				Offset:          uint64(spec.Offset),
+				OutputSize:      uint64(spec.Bytes),
+				OutputSHA256:    hex.EncodeToString(sum[:]),
+				AltOutputSHA256: altSHA,
+				Comparison:      compPtr,
+			}
+		}
+		report.Outputs = outReports
+	} else {
+		outSlices = [][]byte{outBytes}
+	}
+
+	for oi, outPath := range outputOutPaths {
+		if outPath == "" {
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
 			fmt.Fprintf(stderr, "error: create output dir: %v\n", err)
 			return 1
 		}
-		if err := os.WriteFile(*outputOut, outBytes, 0o644); err != nil {
-			fmt.Fprintf(stderr, "error: write output %q: %v\n", *outputOut, err)
+		if err := os.WriteFile(outPath, outSlices[oi], 0o644); err != nil {
+			fmt.Fprintf(stderr, "error: write output %q: %v\n", outPath, err)
 			return 1
 		}
 	}
@@ -477,14 +607,29 @@ func cmdRun(args []string, tr ane.Transport, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stdout, " alt_sha256=%s", report.AltOutputSHA256)
 		}
 		fmt.Fprintln(stdout)
-		if report.Comparison != nil {
+		if len(report.Outputs) > 1 {
+			for oi, o := range report.Outputs {
+				fmt.Fprintf(stdout, "output[%d] (%s): offset=%d size=%d sha256=%s\n", oi, o.Name, o.Offset, o.OutputSize, o.OutputSHA256)
+				if o.Comparison != nil {
+					c := o.Comparison
+					fmt.Fprintf(stdout, "reference[%d]: passed=%t max_abs=%.6g max_rel=%.6g rmse=%.6g max_ulp=%d exact=%d/%d\n",
+						oi, c.Passed, c.MaxAbsErr, c.MaxRelErr, c.RMSE, c.MaxULPErr, c.ExactFP16Count, c.TotalElements)
+				}
+			}
+		} else if report.Comparison != nil {
 			c := report.Comparison
 			fmt.Fprintf(stdout, "reference: passed=%t max_abs=%.6g max_rel=%.6g rmse=%.6g max_ulp=%d exact=%d/%d\n",
 				c.Passed, c.MaxAbsErr, c.MaxRelErr, c.RMSE, c.MaxULPErr, c.ExactFP16Count, c.TotalElements)
 		}
 	}
 
-	if report.Comparison != nil && !report.Comparison.Passed {
+	if len(report.Outputs) > 1 {
+		for _, o := range report.Outputs {
+			if o.Comparison != nil && !o.Comparison.Passed {
+				return 1
+			}
+		}
+	} else if report.Comparison != nil && !report.Comparison.Passed {
 		return 1
 	}
 	return 0

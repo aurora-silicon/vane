@@ -18,7 +18,6 @@ import Vane.Conv1x1
 import Vane.Conv3x3
 import Vane.View
 import Vane.Matmul
-import Vane.Graph
 import Vane.IR.Ops
 import Vane.IR.Graph
 import Vane.IR.Validate
@@ -32,6 +31,14 @@ import Vane.IR.Passes.HighFuse
 import Vane.IR.Passes.Decompose
 import Vane.IR.Passes.CoreFuse
 import Vane.IR.Pipeline
+import Vane.Ane.Types
+import Vane.Machine.Types
+import Vane.Backend.LayoutSelect
+import Vane.Backend.ChannelSplit
+import Vane.Backend.Cascade
+import Vane.Backend.MemoryPlan
+import Vane.Backend.SyncAndEmit
+import Vane.Graph
 import Vane.IR.ToGraph
 import Vane.Frontend.SafeTensors
 import Vane.Frontend.Onnx
