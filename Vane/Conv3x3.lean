@@ -75,4 +75,37 @@ def compileConv3x3
     sections := compiled.sections
   }
 
+/-- Compile a single-task quantized/palettized dense 3x3 convolution (stride 1, same or valid padding)
+    into a statically verified HWX binary and 4 LOAD sections. -/
+def compileConv3x3DenseQuant
+    (target : Target)
+    (shape : Conv3x3Shape)
+    (quant : Vane.Quant.QuantWeightSpec)
+    (bias : Option ByteArray := none)
+    (relu : Bool := false)
+    (tilingOverride : Option Tiling := none)
+    (act : ConvActivation := .none) : Except String CompiledConv3x3 := do
+  if shape.mode != .dense then
+    throw s!"compileConv3x3DenseQuant: quantized 3x3 convolution only supports dense mode, got {shape.mode.name}"
+  if shape.stride != 1 then
+    throw s!"compileConv3x3DenseQuant: quantized 3x3 convolution only supports stride=1, got stride={shape.stride}"
+  let compiled ← compileConvQuant target shape.toConvSpec quant bias relu tilingOverride act
+  pure {
+    target := compiled.target
+    shape := shape
+    tiling := compiled.tiling
+    sparse := compiled.sparse
+    wide3x3 := compiled.wide3x3
+    hasBias := compiled.hasBias
+    relu := compiled.relu
+    activation := compiled.activation
+    lutBytes := compiled.lutBytes
+    direct := compiled.direct
+    l2UseBytes := compiled.l2UseBytes
+    kernelBytes := compiled.kernelBytes
+    hwx := compiled.hwx
+    info := compiled.info
+    sections := compiled.sections
+  }
+
 end Vane.Conv3x3

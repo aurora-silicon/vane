@@ -14,6 +14,7 @@ import Vane.Conv
 import Vane.Conv3x3
 import Vane.Frontend.SafeTensors
 import Vane.Frontend.Lower
+import Vane.Quant
 
 namespace Vane.Proofs
 
@@ -33,6 +34,7 @@ open Vane.Conv
 open Vane.Conv3x3
 open Vane.Frontend.SafeTensors
 open Vane.Frontend.Lower
+open Vane.Quant
 
 -- ============================================================================
 -- 1. Alignment soundness (alignUp_ge, alignUp_dvd)
@@ -6300,5 +6302,484 @@ theorem layerNorm_paramShape_axis3_exact (w : Nat) :
     isValidLayerNormParamShape #[w] 3 w 4 = true ∧
     isValidLayerNormParamShape #[1, 1, 1, w] 3 w 4 = true := by
   simp [isValidLayerNormParamShape]
+
+-- ============================================================================
+-- 22. Native NE Weight Quantization Proofs (M8A)
+-- ============================================================================
+
+-- 22.1 Quantized register WordLayout validity & encodeWord/decodeFieldChecked round-trips
+
+theorem neCfgQuantLayout_valid : (validateWordLayout neCfgQuantLayout).isOk = true := by decide
+theorem neOpQuantLayout_valid : (validateWordLayout neOpQuantLayout).isOk = true := by decide
+theorem neScaleExtLayout_valid : (validateWordLayout neScaleExtLayout).isOk = true := by decide
+theorem scalarBiasExtLayout_valid : (validateWordLayout scalarBiasExtLayout).isOk = true := by decide
+
+theorem neCfgQuant_roundTrip (wKind wWidth sparse dynKern hasZP h17Flag : UInt32)
+    (hk : wKind < 16) (hw : wWidth < 16) (hs : sparse < 2)
+    (hd : dynKern < 2) (hz : hasZP < 2) (hh : h17Flag < 2) :
+    ∃ w, encodeWord neCfgQuantLayout #[
+            ("wKind", wKind), ("wWidth", wWidth), ("sparse", sparse),
+            ("dynKern", dynKern), ("hasZP", hasZP), ("h17Flag", h17Flag)
+          ] = .ok w ∧
+         decodeFieldChecked neCfgQuantLayout w "wKind" = .ok wKind ∧
+         decodeFieldChecked neCfgQuantLayout w "wWidth" = .ok wWidth ∧
+         decodeFieldChecked neCfgQuantLayout w "sparse" = .ok sparse ∧
+         decodeFieldChecked neCfgQuantLayout w "dynKern" = .ok dynKern ∧
+         decodeFieldChecked neCfgQuantLayout w "hasZP" = .ok hasZP ∧
+         decodeFieldChecked neCfgQuantLayout w "h17Flag" = .ok h17Flag := by
+  have h1 : ¬ wKind.toNat ≥ 16 := u32_not_ge_of_lt hk
+  have h2 : ¬ wWidth.toNat ≥ 16 := u32_not_ge_of_lt hw
+  have h3 : ¬ sparse.toNat ≥ 2 := u32_not_ge_of_lt hs
+  have h4 : ¬ dynKern.toNat ≥ 2 := u32_not_ge_of_lt hd
+  have h5 : ¬ hasZP.toNat ≥ 2 := u32_not_ge_of_lt hz
+  have h6 : ¬ h17Flag.toNat ≥ 2 := u32_not_ge_of_lt hh
+  have henc : encodeWord neCfgQuantLayout #[
+      ("wKind", wKind), ("wWidth", wWidth), ("sparse", sparse),
+      ("dynKern", dynKern), ("hasZP", hasZP), ("h17Flag", h17Flag)
+    ] = .ok (((((((0 : UInt32) ||| (wKind <<< 0)) ||| (wWidth <<< 4)) ||| (sparse <<< 8)) |||
+              (dynKern <<< 16)) ||| (hasZP <<< 24)) ||| (h17Flag <<< 28)) := by
+    change (if wKind.toNat ≥ 16 then _ else if wWidth.toNat ≥ 16 then _ else
+            if sparse.toNat ≥ 2 then _ else if dynKern.toNat ≥ 2 then _ else
+            if hasZP.toNat ≥ 2 then _ else if h17Flag.toNat ≥ 2 then _ else _) = _
+    simp only [h1, h2, h3, h4, h5, h6, ↓reduceIte]
+    rfl
+  exact ⟨_, henc,
+    encodeWord_decodeFieldChecked _ _ _ "wKind" wKind henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "wWidth" wWidth henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "sparse" sparse henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "dynKern" dynKern henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "hasZP" hasZP henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "h17Flag" h17Flag henc rfl⟩
+
+theorem neOpQuant_roundTrip (biasInKernel unscaled perLaneScale relu lut base20 : UInt32)
+    (hb : biasInKernel < 2) (hu : unscaled < 16) (hp : perLaneScale < 2)
+    (hr : relu < 2) (hl : lut < 2) (h20 : base20 < 2) :
+    ∃ w, encodeWord neOpQuantLayout #[
+            ("biasInKernel", biasInKernel), ("unscaled", unscaled), ("perLaneScale", perLaneScale),
+            ("relu", relu), ("lut", lut), ("base20", base20)
+          ] = .ok w ∧
+         decodeFieldChecked neOpQuantLayout w "biasInKernel" = .ok biasInKernel ∧
+         decodeFieldChecked neOpQuantLayout w "unscaled" = .ok unscaled ∧
+         decodeFieldChecked neOpQuantLayout w "perLaneScale" = .ok perLaneScale ∧
+         decodeFieldChecked neOpQuantLayout w "relu" = .ok relu ∧
+         decodeFieldChecked neOpQuantLayout w "lut" = .ok lut ∧
+         decodeFieldChecked neOpQuantLayout w "base20" = .ok base20 := by
+  have h1 : ¬ biasInKernel.toNat ≥ 2 := u32_not_ge_of_lt hb
+  have h2 : ¬ unscaled.toNat ≥ 16 := u32_not_ge_of_lt hu
+  have h3 : ¬ perLaneScale.toNat ≥ 2 := u32_not_ge_of_lt hp
+  have h4 : ¬ relu.toNat ≥ 2 := u32_not_ge_of_lt hr
+  have h5 : ¬ lut.toNat ≥ 2 := u32_not_ge_of_lt hl
+  have h6 : ¬ base20.toNat ≥ 2 := u32_not_ge_of_lt h20
+  have henc : encodeWord neOpQuantLayout #[
+      ("biasInKernel", biasInKernel), ("unscaled", unscaled), ("perLaneScale", perLaneScale),
+      ("relu", relu), ("lut", lut), ("base20", base20)
+    ] = .ok (((((((0 : UInt32) ||| (biasInKernel <<< 4)) ||| (unscaled <<< 10)) |||
+              (perLaneScale <<< 14)) ||| (relu <<< 16)) ||| (lut <<< 17)) ||| (base20 <<< 20)) := by
+    change (if biasInKernel.toNat ≥ 2 then _ else if unscaled.toNat ≥ 16 then _ else
+            if perLaneScale.toNat ≥ 2 then _ else if relu.toNat ≥ 2 then _ else
+            if lut.toNat ≥ 2 then _ else if base20.toNat ≥ 2 then _ else _) = _
+    simp only [h1, h2, h3, h4, h5, h6, ↓reduceIte]
+    rfl
+  exact ⟨_, henc,
+    encodeWord_decodeFieldChecked _ _ _ "biasInKernel" biasInKernel henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "unscaled" unscaled henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "perLaneScale" perLaneScale henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "relu" relu henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "lut" lut henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "base20" base20 henc rfl⟩
+
+theorem neScaleExt_roundTrip (val pexp : UInt32)
+    (hv : val < 65536) (hp : pexp < 65536) :
+    ∃ w, encodeWord neScaleExtLayout #[("val", val), ("pexp", pexp)] = .ok w ∧
+         decodeFieldChecked neScaleExtLayout w "val" = .ok val ∧
+         decodeFieldChecked neScaleExtLayout w "pexp" = .ok pexp := by
+  have h1 : ¬ val.toNat ≥ 65536 := u32_not_ge_of_lt hv
+  have h2 : ¬ pexp.toNat ≥ 65536 := u32_not_ge_of_lt hp
+  have henc : encodeWord neScaleExtLayout #[("val", val), ("pexp", pexp)] =
+      .ok (((0 : UInt32) ||| (val <<< 0)) ||| (pexp <<< 16)) := by
+    change (if val.toNat ≥ 65536 then _ else if pexp.toNat ≥ 65536 then _ else _) = _
+    simp only [h1, h2, ↓reduceIte]
+    rfl
+  exact ⟨_, henc,
+    encodeWord_decodeFieldChecked _ _ _ "val" val henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "pexp" pexp henc rfl⟩
+
+theorem scalarBiasExt_roundTrip (val biasShift : UInt32)
+    (hv : val < 65536) (hs : biasShift < 65536) :
+    ∃ w, encodeWord scalarBiasExtLayout #[("val", val), ("biasShift", biasShift)] = .ok w ∧
+         decodeFieldChecked scalarBiasExtLayout w "val" = .ok val ∧
+         decodeFieldChecked scalarBiasExtLayout w "biasShift" = .ok biasShift := by
+  have h1 : ¬ val.toNat ≥ 65536 := u32_not_ge_of_lt hv
+  have h2 : ¬ biasShift.toNat ≥ 65536 := u32_not_ge_of_lt hs
+  have henc : encodeWord scalarBiasExtLayout #[("val", val), ("biasShift", biasShift)] =
+      .ok (((0 : UInt32) ||| (val <<< 0)) ||| (biasShift <<< 16)) := by
+    change (if val.toNat ≥ 65536 then _ else if biasShift.toNat ≥ 65536 then _ else _) = _
+    simp only [h1, h2, ↓reduceIte]
+    rfl
+  exact ⟨_, henc,
+    encodeWord_decodeFieldChecked _ _ _ "val" val henc rfl,
+    encodeWord_decodeFieldChecked _ _ _ "biasShift" biasShift henc rfl⟩
+
+/-- `neCommon` bit 27 (`wide3x3`) helper clears bit 27 whenever `wide3x3` is false
+    (H16, 1x1, linear, stride-2, depthwise, or `maxBlockSlots > 32768*rep`),
+    `hasZP` is true, or `wKind` is unsigned (`uint8`/`uint4`). -/
+theorem neCommonQuantBit27_cleared_when_illegal (wide3x3 hasZP : Bool) (wKind : UInt32)
+    (h : wide3x3 = false ∨ hasZP = true ∨ wKind = wKindUint8 ∨ wKind = wKindUint4) :
+    neCommonQuantBit27 wide3x3 hasZP wKind = 0 := by
+  unfold neCommonQuantBit27 isUnsignedWeightKind
+  rcases h with rfl | rfl | rfl | rfl <;> simp [wKindUint8, wKindUint4]
+
+/-- `neCommon` bit 27 (`wide3x3`) is set to `1` iff `wide3x3 = true`, `hasZP = false`,
+    and `wKind` is not unsigned. -/
+theorem neCommonQuantBit27_eq_one_iff (wide3x3 hasZP : Bool) (wKind : UInt32) :
+    neCommonQuantBit27 wide3x3 hasZP wKind = 1 ↔
+      wide3x3 = true ∧ hasZP = false ∧ isUnsignedWeightKind wKind = false := by
+  unfold neCommonQuantBit27
+  cases wide3x3 <;> cases hasZP <;> cases isUnsignedWeightKind wKind <;> simp
+
+-- 22.2 Canonical int4 / uint4 decode table theorems
+
+theorem int4Table_size : int4Table.size = 16 := by decide
+theorem uint4Table_size : uint4Table.size = 16 := by decide
+
+/-- `int4Table` maps every 4-bit two's-complement nibble `i ∈ 0..15` to its exact signed int8 byte. -/
+theorem int4Table_canonical (i : Fin 16) :
+    let b := (int4Table[i.val]'(by rw [int4Table_size]; exact i.isLt)).toNat
+    (if b ≥ 128 then (b : Int) - 256 else (b : Int)) =
+    (if i.val < 8 then (i.val : Int) else (i.val : Int) - 16) := by
+  revert i; decide
+
+/-- `int4Table` is injective (bijective onto the 16 signed two's-complement int4 values). -/
+theorem int4Table_injective (i j : Fin 16)
+    (h : int4Table[i.val]'(by rw [int4Table_size]; exact i.isLt) =
+         int4Table[j.val]'(by rw [int4Table_size]; exact j.isLt)) :
+    i = j := by
+  revert i j h; decide
+
+/-- `uint4Table` maps every 4-bit unsigned nibble `i ∈ 0..15` identically to `i`. -/
+theorem uint4Table_canonical (i : Fin 16) :
+    (uint4Table[i.val]'(by rw [uint4Table_size]; exact i.isLt)).toNat = i.val := by
+  revert i; decide
+
+-- 22.3 Pure LSB-first bit-packing/unpacking lossless round-trip theorems
+
+theorem packBitsLSB_size (w : Nat) (codes : Array UInt8) :
+    (packBitsLSB w codes).size = packedByteCount w codes.size := by
+  simp [packBitsLSB, ByteArray.size]
+
+theorem unpackBitsLSB_size (w : Nat) (bytes : ByteArray) (count : Nat) :
+    (unpackBitsLSB w bytes count).size = count := by
+  simp [unpackBitsLSB]
+
+private theorem testBit_shifted_single_bit (x k j r : Nat) :
+    ((((x >>> k) &&& 1) <<< j)).testBit r = (decide (r = j) && x.testBit k) := by
+  rw [Nat.testBit_shiftLeft, Nat.testBit_and, Nat.testBit_shiftRight]
+  by_cases h : r = j
+  · subst h
+    simp
+  · by_cases hle : j ≤ r
+    · have hne : r - j ≠ 0 := by omega
+      have h1 : (1 : Nat).testBit (r - j) = false := by
+        have hlt : 1 < 2 ^ (r - j) := by
+          have : 2 ^ 1 ≤ 2 ^ (r - j) := Nat.pow_le_pow_right (by omega) (by omega)
+          omega
+        exact Nat.testBit_lt_two_pow hlt
+      simp [h, hle, h1]
+    · simp [h, hle]
+
+private theorem testBit_packByteLSB_bitAt (w : Nat) (codes : Array UInt8) (b j r : Nat) :
+    (if 8 * b + j < codes.size * w then
+       if h : (8 * b + j) / w < codes.size then
+         ((codes[(8 * b + j) / w].toNat >>> ((8 * b + j) % w)) &&& 1) <<< j
+       else 0
+     else 0).testBit r =
+    (decide (r = j) &&
+      if 8 * b + j < codes.size * w then
+        if h : (8 * b + j) / w < codes.size then
+          codes[(8 * b + j) / w].toNat.testBit ((8 * b + j) % w)
+        else false
+      else false) := by
+  split
+  · split
+    · exact testBit_shifted_single_bit _ _ _ _
+    · simp
+  · simp
+
+private theorem testBit_packByteLSB (w : Nat) (codes : Array UInt8) (b r : Nat) (hr : r < 8) :
+    (packByteLSB w codes b).toNat.testBit r =
+    if 8 * b + r < codes.size * w then
+      if h : (8 * b + r) / w < codes.size then
+        codes[(8 * b + r) / w].toNat.testBit ((8 * b + r) % w)
+      else false
+    else false := by
+  unfold packByteLSB
+  have hmod : ∀ n : Nat, n.toUInt8.toNat = n % 2 ^ 8 := fun _ => rfl
+  rw [hmod, Nat.testBit_mod_two_pow]
+  simp only [hr, decide_true, Bool.true_and]
+  simp only [Nat.testBit_or, testBit_packByteLSB_bitAt]
+  match r with
+  | 0 => simp
+  | 1 => simp
+  | 2 => simp
+  | 3 => simp
+  | 4 => simp
+  | 5 => simp
+  | 6 => simp
+  | 7 => simp
+  | _ + 8 => omega
+
+private theorem testBit_unpackCodeLSB_go (w : Nat) (bytes : ByteArray) (i : Nat) :
+    ∀ (k acc m : Nat),
+      (unpackCodeLSB.go w bytes i k acc).testBit m =
+      (acc.testBit m ||
+        (decide (m < k) &&
+          if h : (i * w + m) / 8 < bytes.data.size then
+            bytes.data[(i * w + m) / 8].toNat.testBit ((i * w + m) % 8)
+          else false)) := by
+  intro k
+  induction k with
+  | zero =>
+    intro acc m
+    simp [unpackCodeLSB.go]
+  | succ k' ih =>
+    intro acc m
+    unfold unpackCodeLSB.go
+    rw [ih]
+    rw [Nat.testBit_or]
+    have hbit :
+        (if h : (i * w + k') / 8 < bytes.data.size then
+           ((bytes.data[(i * w + k') / 8].toNat >>> ((i * w + k') % 8)) &&& 1) <<< k'
+         else 0).testBit m =
+        (decide (m = k') &&
+          if h : (i * w + k') / 8 < bytes.data.size then
+            bytes.data[(i * w + k') / 8].toNat.testBit ((i * w + k') % 8)
+          else false) := by
+      split
+      · exact testBit_shifted_single_bit _ _ _ _
+      · simp
+    rw [hbit]
+    by_cases hlt : m < k'
+    · have hne : m ≠ k' := by omega
+      have hlt2 : m < k' + 1 := by omega
+      simp [hlt, hne, hlt2]
+    · by_cases heq : m = k'
+      · subst heq
+        simp
+      · have hnot : ¬ m < k' + 1 := by omega
+        simp [hlt, heq, hnot]
+
+/-- Lossless bit-packing round-trip theorem: for ANY bit width `1 ≤ w ≤ 8` and ANY code array `codes`,
+    `unpackBitsLSB w (packBitsLSB w codes) codes.size` recovers every code masked to its low `w` bits. -/
+theorem unpackBitsLSB_packBitsLSB (w : Nat) (hw1 : 1 ≤ w) (hw8 : w ≤ 8) (codes : Array UInt8) :
+    unpackBitsLSB w (packBitsLSB w codes) codes.size =
+    codes.map (fun c => c &&& (((1 : Nat) <<< w) - 1).toUInt8) := by
+  apply Array.ext
+  · simp [unpackBitsLSB]
+  · intro i hi1 hi2
+    simp only [unpackBitsLSB, Array.getElem_ofFn, Array.getElem_map]
+    apply UInt8.toNat_inj.mp
+    apply Nat.eq_of_testBit_eq
+    intro m
+    have hi : i < codes.size := by simpa [unpackBitsLSB] using hi1
+    unfold unpackCodeLSB
+    have hmod8 : ∀ n : Nat, n.toUInt8.toNat = n % 2 ^ 8 := fun _ => rfl
+    rw [hmod8, Nat.testBit_mod_two_pow, testBit_unpackCodeLSB_go]
+    rw [UInt8.toNat_and, hmod8, Nat.testBit_and, Nat.testBit_mod_two_pow, testBit_one_shift_sub_one]
+    simp only [Nat.zero_testBit, Bool.false_or]
+    by_cases hm : m < w
+    · have hm8 : m < 8 := by omega
+      simp only [hm8, hm, decide_true, Bool.true_and, Bool.and_true]
+      have hgLt : i * w + m < codes.size * w := by
+        have h1 : (i + 1) * w ≤ codes.size * w := Nat.mul_le_mul_right w (by omega)
+        rw [Nat.add_mul, Nat.one_mul] at h1
+        omega
+      have hbLt : (i * w + m) / 8 < (packBitsLSB w codes).data.size := by
+        simp only [packBitsLSB, Array.size_ofFn, packedByteCount]
+        omega
+      simp only [hbLt, ↓reduceDIte]
+      have hget : (packBitsLSB w codes).data[(i * w + m) / 8]'hbLt =
+                  packByteLSB w codes ((i * w + m) / 8) := by
+        simp [packBitsLSB]
+      rw [hget, testBit_packByteLSB w codes ((i * w + m) / 8) ((i * w + m) % 8) (Nat.mod_lt _ (by omega))]
+      have hdivmod : 8 * ((i * w + m) / 8) + (i * w + m) % 8 = i * w + m := Nat.div_add_mod _ 8
+      rw [hdivmod]
+      have hdivW : (i * w + m) / w = i := by
+        rw [Nat.mul_comm i w, Nat.mul_add_div (by omega), Nat.div_eq_of_lt hm, Nat.add_zero]
+      have hmodW : (i * w + m) % w = m := by
+        rw [Nat.mul_comm i w, Nat.mul_add_mod, Nat.mod_eq_of_lt hm]
+      simp [hgLt, hdivW, hmodW, hi]
+    · simp [hm]
+
+/-- Explicit round-trip corollary across all hardware-supported bit widths `w ∈ {1, 2, 4, 6, 8}`. -/
+theorem unpackBitsLSB_packBitsLSB_supported (w : Nat)
+    (hw : w = 1 ∨ w = 2 ∨ w = 4 ∨ w = 6 ∨ w = 8) (codes : Array UInt8) :
+    unpackBitsLSB w (packBitsLSB w codes) codes.size =
+    codes.map (fun c => c &&& (((1 : Nat) <<< w) - 1).toUInt8) := by
+  have h1 : 1 ≤ w := by rcases hw with rfl | rfl | rfl | rfl | rfl <;> omega
+  have h8 : w ≤ 8 := by rcases hw with rfl | rfl | rfl | rfl | rfl <;> omega
+  exact unpackBitsLSB_packBitsLSB w h1 h8 codes
+
+/-- Exact identity round-trip when every input code is already in `[0, 2^w)`. -/
+theorem unpackBitsLSB_packBitsLSB_exact (w : Nat) (hw1 : 1 ≤ w) (hw8 : w ≤ 8) (codes : Array UInt8)
+    (hbound : ∀ i (hi : i < codes.size), codes[i].toNat < 2 ^ w) :
+    unpackBitsLSB w (packBitsLSB w codes) codes.size = codes := by
+  rw [unpackBitsLSB_packBitsLSB w hw1 hw8 codes]
+  apply Array.ext
+  · simp
+  · intro i hi1 hi2
+    simp only [Array.getElem_map]
+    apply UInt8.toNat_inj.mp
+    apply Nat.eq_of_testBit_eq
+    intro m
+    have hmod8 : ∀ n : Nat, n.toUInt8.toNat = n % 2 ^ 8 := fun _ => rfl
+    rw [UInt8.toNat_and, hmod8, Nat.testBit_and, Nat.testBit_mod_two_pow, testBit_one_shift_sub_one]
+    by_cases hm : m < w
+    · have hm8 : m < 8 := by omega
+      simp [hm, hm8]
+    · have hzero : codes[i].toNat.testBit m = false :=
+        testBit_eq_false_of_lt_two_pow (hbound i hi2) (by omega)
+      simp [hm, hzero]
+
+-- 22.4 Quantized chunk size, 64-byte alignment, monotonicity & packQuantChunk exactness
+
+/-- Every quantized decode/palette table is 64-byte aligned. -/
+theorem quantTableBytes_dvd_64 (wKind : UInt32) (wWidth : Nat) :
+    quantTableBytes wKind wWidth % 64 = 0 := by
+  unfold quantTableBytes
+  split
+  · rfl
+  · split
+    · exact alignUp_dvd _ 64 (by omega)
+    · rfl
+
+/-- `expectedQuantChunkSize` is always a multiple of 64 bytes (DMA line alignment). -/
+theorem expectedQuantChunkSize_dvd_64
+    (wKind : UInt32) (wWidth cin taps : Nat)
+    (perLaneScale biasInKernel hasZeroPoint : Bool)
+    (blocks : Array (Nat × Nat)) :
+    expectedQuantChunkSize wKind wWidth cin taps perLaneScale biasInKernel hasZeroPoint blocks % 64 = 0 := by
+  unfold expectedQuantChunkSize
+  exact alignUp_dvd _ 64 (by omega)
+
+private theorem foldl_add_ge_init {α : Type} (f : α → Nat) :
+    ∀ (xs : List α) (init : Nat), init ≤ xs.foldl (fun acc x => acc + f x) init
+  | [], init => Nat.le_refl init
+  | x :: rest, init => by
+    simp only [List.foldl_cons]
+    exact Nat.le_trans (Nat.le_add_right init (f x)) (foldl_add_ge_init f rest (init + f x))
+
+/-- `expectedQuantChunkSize` is always at least `quantTableBytes`. -/
+theorem expectedQuantChunkSize_ge_table
+    (wKind : UInt32) (wWidth cin taps : Nat)
+    (perLaneScale biasInKernel hasZeroPoint : Bool)
+    (blocks : Array (Nat × Nat)) :
+    quantTableBytes wKind wWidth ≤
+    expectedQuantChunkSize wKind wWidth cin taps perLaneScale biasInKernel hasZeroPoint blocks := by
+  unfold expectedQuantChunkSize
+  have h1 : quantTableBytes wKind wWidth ≤
+      blocks.toList.foldl
+        (fun acc p => acc + quantBlockBytes wWidth cin taps perLaneScale biasInKernel hasZeroPoint p.2)
+        (quantTableBytes wKind wWidth) :=
+    foldl_add_ge_init (fun p : Nat × Nat => quantBlockBytes wWidth cin taps perLaneScale biasInKernel hasZeroPoint p.2)
+      blocks.toList (quantTableBytes wKind wWidth)
+  have hfold : blocks.foldl
+        (fun acc (_, n) => acc + quantBlockBytes wWidth cin taps perLaneScale biasInKernel hasZeroPoint n)
+        (quantTableBytes wKind wWidth) =
+      blocks.toList.foldl
+        (fun acc p => acc + quantBlockBytes wWidth cin taps perLaneScale biasInKernel hasZeroPoint p.2)
+        (quantTableBytes wKind wWidth) := by
+    rw [← Array.foldl_toList]
+  rw [hfold]
+  exact Nat.le_trans h1 (alignUp_ge _ 64)
+
+/-- `quantBlockBytes` is monotonic in lane count `n`. -/
+theorem quantBlockBytes_mono_lanes
+    (wWidth cin taps : Nat) (perLaneScale biasInKernel hasZeroPoint : Bool)
+    {n1 n2 : Nat} (h : n1 ≤ n2) :
+    quantBlockBytes wWidth cin taps perLaneScale biasInKernel hasZeroPoint n1 ≤
+    quantBlockBytes wWidth cin taps perLaneScale biasInKernel hasZeroPoint n2 := by
+  unfold quantBlockBytes packedByteCount
+  have hmul : cin * taps * n1 * wWidth ≤ cin * taps * n2 * wWidth :=
+    Nat.mul_le_mul_right wWidth (Nat.mul_le_mul_left (cin * taps) h)
+  have hdiv : (cin * taps * n1 * wWidth + 7) / 8 ≤ (cin * taps * n2 * wWidth + 7) / 8 :=
+    Nat.div_le_div_right (by omega)
+  cases perLaneScale <;> cases biasInKernel <;> cases hasZeroPoint <;> simp <;> omega
+
+/-- `encodeQuantTable` produces the exact byte length predicted by `quantTableBytes`. -/
+theorem encodeQuantTable_size (format : QuantFormat) (palette : Array UInt16) :
+    (encodeQuantTable format palette).size = quantTableBytes format.wKind format.wWidth := by
+  cases format with
+  | int8 =>
+    rfl
+  | uint8 =>
+    rfl
+  | int4 =>
+    unfold encodeQuantTable
+    rw [padToAlign_size]
+    have hs : (ByteArray.mk int4Table).size = 16 := int4Table_size
+    rw [hs]
+    decide
+  | uint4 =>
+    unfold encodeQuantTable
+    rw [padToAlign_size]
+    have hs : (ByteArray.mk uint4Table).size = 16 := uint4Table_size
+    rw [hs]
+    decide
+  | pal bits =>
+    unfold encodeQuantTable
+    rw [padToAlign_size]
+    simp only [ByteArray.size, Array.size_ofFn]
+    simp [quantTableBytes, QuantFormat.wKind, QuantFormat.wWidth, wKindPal, wKindInt4, wKindUint4]
+
+/-- `encodeQuantBlock` produces the exact byte length predicted by `quantBlockBytes`. -/
+theorem encodeQuantBlock_size
+    (wWidth : Nat) (codes : ByteArray) (cout cin taps : Nat)
+    (storedScales foldedBiases : Array UInt16) (zeroPoints : Option (Array UInt8))
+    (perLaneScale biasInKernel hasZeroPoint : Bool) (o0 n : Nat) :
+    (encodeQuantBlock wWidth codes cout cin taps storedScales foldedBiases zeroPoints
+      perLaneScale biasInKernel hasZeroPoint o0 n).size =
+    quantBlockBytes wWidth cin taps perLaneScale biasInKernel hasZeroPoint n := by
+  unfold encodeQuantBlock quantBlockBytes
+  simp only [ByteArray.size_append, packBitsLSB_size, Array.size_ofFn]
+  have hempty : ByteArray.empty.data.size = 0 := rfl
+  cases perLaneScale <;> cases biasInKernel <;> cases hasZeroPoint <;>
+    simp only [Bool.false_eq_true, ↓reduceIte, ByteArray.size, hempty, Array.size_ofFn,
+      Nat.zero_add, Nat.add_zero]
+
+private theorem foldl_append_size {α : Type} (f : α → ByteArray) (g : α → Nat)
+    (hfg : ∀ x, (f x).size = g x) :
+    ∀ (xs : List α) (init : ByteArray),
+      (xs.foldl (fun acc x => acc ++ f x) init).size =
+      xs.foldl (fun acc x => acc + g x) init.size
+  | [], init => rfl
+  | x :: rest, init => by
+    simp only [List.foldl_cons]
+    rw [foldl_append_size f g hfg rest (init ++ f x), ByteArray.size_append, hfg x]
+
+/-- Exactness theorem: `packQuantChunk` always emits a chunk of byte length exactly equal to
+    `expectedQuantChunkSize` (for any format, geometry, flags, and block partition). -/
+theorem packQuantChunk_size_eq_expected
+    (format : QuantFormat) (palette : Array UInt16) (codes : ByteArray) (cout cin taps : Nat)
+    (storedScales foldedBiases : Array UInt16) (zeroPoints : Option (Array UInt8))
+    (perLaneScale biasInKernel hasZeroPoint : Bool) (blocks : Array (Nat × Nat)) :
+    (packQuantChunk format palette codes cout cin taps storedScales foldedBiases zeroPoints
+      perLaneScale biasInKernel hasZeroPoint blocks).size =
+    expectedQuantChunkSize format.wKind format.wWidth cin taps perLaneScale biasInKernel hasZeroPoint blocks := by
+  unfold packQuantChunk expectedQuantChunkSize
+  rw [padToAlign_size]
+  congr 1
+  rw [← Array.foldl_toList, ← Array.foldl_toList]
+  have hstep : ∀ (p : Nat × Nat),
+      (encodeQuantBlock format.wWidth codes cout cin taps storedScales foldedBiases zeroPoints
+        perLaneScale biasInKernel hasZeroPoint p.1 p.2).size =
+      quantBlockBytes format.wWidth cin taps perLaneScale biasInKernel hasZeroPoint p.2 := fun p =>
+    encodeQuantBlock_size format.wWidth codes cout cin taps storedScales foldedBiases zeroPoints
+      perLaneScale biasInKernel hasZeroPoint p.1 p.2
+  rw [foldl_append_size
+    (fun p : Nat × Nat => encodeQuantBlock format.wWidth codes cout cin taps storedScales foldedBiases zeroPoints
+      perLaneScale biasInKernel hasZeroPoint p.1 p.2)
+    (fun p : Nat × Nat => quantBlockBytes format.wWidth cin taps perLaneScale biasInKernel hasZeroPoint p.2)
+    hstep blocks.toList (encodeQuantTable format palette)]
+  rw [encodeQuantTable_size format palette]
 
 end Vane.Proofs

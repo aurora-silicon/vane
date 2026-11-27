@@ -7,6 +7,7 @@ import Vane.Register
 import Vane.Reach
 import Vane.Alloc
 import Vane.Tiling
+import Vane.Quant
 import Vane.Program
 import Vane.Verify
 import Vane.Pe

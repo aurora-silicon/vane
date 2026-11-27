@@ -5,6 +5,7 @@ import Vane.Hwx
 import Vane.Sections
 import Vane.Register
 import Vane.Tiling
+import Vane.Quant
 import Vane.Program
 import Vane.Verify
 import Vane.Lut
@@ -19,10 +20,13 @@ open Vane.Hwx
 open Vane.Sections
 open Vane.Register
 open Vane.Tiling
+open Vane.Quant
 open Vane.Program
 open Vane.Verify
 open Vane.Lut
 open Vane.View
+
+export Vane.Quant (KernelChunkSlot)
 
 /-- Fused post-convolution activation (`none`, hardware `relu`, or any 128-byte NE LUT). -/
 inductive ConvActivation where
@@ -47,13 +51,6 @@ def isLut : ConvActivation → Bool
   | _ => false
 
 end ConvActivation
-
-/-- Packed chunk slot metadata in `__KERN_0`. -/
-structure KernelChunkSlot where
-  slot : Nat
-  offset : Nat
-  size : Nat
-  deriving Repr, BEq, Inhabited
 
 /-- Result of packing fp16 weights, optional bias, and optional fused 128-byte LUT into `__KERN_0`. -/
 structure PackedKernel where
@@ -1040,5 +1037,624 @@ def compileConv1x1Split
     info := emitted.info
     sections := emitted.sections
   }
+
+-- ============================================================================
+-- Native Quantized & Palettized NE Convolution Compilation
+-- ============================================================================
+
+/-- Lower a single-task quantized/palettized dense NE convolution (`1x1` or stride-1 `3x3`)
+    into a generic `TaskDesc`. -/
+def lowerConvTaskQuant
+    (target : Target)
+    (shape : ConvSpec)
+    (tiling : Tiling)
+    (packed : PackedQuantKernel)
+    (relu : Bool)
+    (taskId : Nat := 0) : Except String TaskDesc := do
+  let direct := isDirectConv target shape tiling
+  let chs := chsBytesConv shape tiling
+  let dchs := dchsBytesConv shape tiling
+  let srcRow := srcRowStrideConv shape tiling
+  let resRow := resRowStrideConv shape tiling
+  let resBase := resBaseBytesConv shape tiling
+
+  let ho := shape.outH
+  let wo := shape.outW
+  let inRowStride := alignUp (2 * shape.w) dmaLineBytes
+  let inPlaneStride := shape.h * inRowStride
+  let outRowStride := alignUp (2 * wo) dmaLineBytes
+  let outPlaneStride := ho * outRowStride
+
+  let taskIdU32 ← natToU32Checked taskId "taskId"
+  let wWin ← encodeWord (dim16Layout "Win") #[("val", ← natToU32Checked shape.winReg "Win")]
+  let wHin ← encodeWord (dim16Layout "Hin") #[("val", ← natToU32Checked shape.hinReg "Hin")]
+  let cinU32 ← natToU32Checked shape.cin "Cin"
+  let wWout ← encodeWord (dim16Layout "Wout") #[("val", ← natToU32Checked wo "Wout")]
+  let wHout ← encodeWord (dim16Layout "Hout") #[("val", ← natToU32Checked ho "Hout")]
+  let coutU32 ← natToU32Checked shape.cout "Cout"
+  let kU32 ← natToU32Checked shape.kernelSize "kernelSize"
+  let sU32 ← natToU32Checked shape.stride "stride"
+  let plU32 ← natToU32Checked shape.padLeft "padLeft"
+  let ptU32 ← natToU32Checked shape.padTop "padTop"
+  let wConvCfg ← encodeWord convCfgLayout #[
+    ("kw", kU32), ("kh", kU32),
+    ("sx", sU32), ("sy", sU32),
+    ("pl", plU32), ("pt", ptU32),
+    ("hx", 1), ("vy", 1)
+  ]
+  let wTH ← encodeWord (dim16Layout "TH") #[("val", ← natToU32Checked tiling.tileHeight "TH")]
+  let wide3x3 := computeWide3x3Conv target shape tiling
+  let wNeCommon ← encodeWord neCommonLayout #[
+    ("kind", 0),
+    ("shPref", ← natToU32Checked tiling.shPref "shPref"),
+    ("shMin", ← natToU32Checked tiling.shPref "shMin"),
+    ("shMax", ← natToU32Checked tiling.shMax "shMax"),
+    ("F", ← natToU32Checked tiling.f "F"),
+    ("wide3x3", neCommonQuantBit27 wide3x3 packed.hasZeroPoint packed.format.wKind)
+  ]
+  let wNeTile ← encodeWord neTileLayout #[
+    ("ocg", ← natToU32Checked (effOcgConv shape tiling) "ocg"),
+    ("fat", ← natToU32Checked tiling.fat "fat"),
+    ("WU", ← natToU32Checked tiling.wu "WU")
+  ]
+  let wSrc1Cfg ← encodeWord src1CfgLayout #[("mode", 2), ("P", 1)]
+  let wResCfg ← encodeWord resCfgLayout #[
+    ("mode", 2),
+    ("direct", if direct then 1 else 0),
+    ("P", 1)
+  ]
+  let wNeCfg ← encodeWord neCfgQuantLayout #[
+    ("wKind", packed.format.wKind),
+    ("wWidth", ← natToU32Checked packed.format.wWidth "wWidth"),
+    ("sparse", 0),
+    ("dynKern", 0),
+    ("hasZP", if packed.hasZeroPoint then 1 else 0),
+    ("h17Flag", if target == .h17 && !packed.hasZeroPoint then 1 else 0)
+  ]
+  let wNeOp ← encodeWord neOpQuantLayout #[
+    ("biasInKernel", if packed.biasInKernel then 1 else 0),
+    ("unscaled", if packed.format.isPalette then neOpUnscaledBits else 0),
+    ("perLaneScale", if packed.perLaneScale then 1 else 0),
+    ("relu", if relu then 1 else 0),
+    ("lut", 0),
+    ("base20", 1)
+  ]
+  let wNeScale ← encodeWord neScaleExtLayout #[
+    ("val", packed.tensorScaleFp16.toUInt32),
+    ("pexp", ← natToU32Checked packed.scalePexp "scalePexp")
+  ]
+  let wSrc1Fmt ← encodeWord (dmaFmtLayout "src1Fmt") #[("format", 0x002031), ("P", 1)]
+  let wResFmt ← encodeWord (dmaFmtLayout "resFmt") #[("format", 0x302031), ("P", 1)]
+  let wKernStage ← encodeWord kernelStageLayout #[("sparse", 0), ("stage", 1)]
+  let wChunkSlotVal ← encodeWord chunkSlotLayout #[("enable", 1), ("on20", 1), ("task", taskIdU32)]
+  let wOut2 ← encodeWord out2Layout #[("form", 0xe0), ("task", taskIdU32)]
+
+  let mut plain : Array RegWrite := #[
+    { byteAddr := regWin, value := wWin },
+    { byteAddr := regHin, value := wHin },
+    { byteAddr := regCin, value := cinU32 },
+    { byteAddr := regWout, value := wWout },
+    { byteAddr := regHout, value := wHout },
+    { byteAddr := regCout, value := coutU32 },
+    { byteAddr := regConvCfg, value := wConvCfg },
+    { byteAddr := regTH, value := wTH },
+    { byteAddr := regNeCommon, value := wNeCommon },
+    { byteAddr := regNeTile, value := wNeTile },
+    { byteAddr := regTargetCfg, value := targetCfgValue target },
+    { byteAddr := regSrc1Cfg, value := wSrc1Cfg },
+    { byteAddr := regSrc2Cfg, value := src2CfgValue },
+    { byteAddr := regSrc1Base, value := 0 },
+    { byteAddr := regSrc1ChanStride, value := ← natToU32Checked chs "src1ChanStride" },
+    { byteAddr := regSrc1RowStride, value := ← natToU32Checked srcRow "src1RowStride" },
+    { byteAddr := regSrc1RowBytesA, value := ← natToU32Checked (shape.cin * chs) "src1RowBytesA" },
+    { byteAddr := regSrc1RowBytesB, value := ← natToU32Checked (shape.cin * chs) "src1RowBytesB" },
+    { byteAddr := regResCfg, value := wResCfg },
+    { byteAddr := regResBase, value := ← natToU32Checked resBase "resBase" },
+    { byteAddr := regNeCfg, value := wNeCfg },
+    { byteAddr := regNeOp, value := wNeOp },
+    { byteAddr := regNeScale, value := wNeScale },
+    { byteAddr := regSrc1DmaCfg, value := src1DmaCfgValue },
+    { byteAddr := regSrc1DmaRowStride, value := ← natToU32Checked inRowStride "src1DmaRowStride" },
+    { byteAddr := regSrc1DmaPlaneStride, value := ← natToU32Checked inPlaneStride "src1DmaPlaneStride" },
+    { byteAddr := regSrc1Fmt, value := wSrc1Fmt },
+    { byteAddr := regResDmaRowStride, value := ← natToU32Checked outRowStride "resDmaRowStride" },
+    { byteAddr := regResDmaPlaneStride, value := ← natToU32Checked outPlaneStride "resDmaPlaneStride" },
+    { byteAddr := regResFmt, value := wResFmt },
+    { byteAddr := regKernelStage, value := wKernStage },
+    { byteAddr := regOut0, value := out0Value },
+    { byteAddr := regOut1, value := out1Value },
+    { byteAddr := regOut2, value := wOut2 },
+    { byteAddr := regOut3, value := out3Value },
+    { byteAddr := regOut4, value := out4Value },
+    { byteAddr := regOut5, value := out5Value }
+  ]
+
+  if !direct then
+    let resRowBytesU32 ← natToU32Checked (shape.cout * dchs) "resRowBytes"
+    plain := plain ++ #[
+      { byteAddr := regResChanStride, value := ← natToU32Checked dchs "resChanStride" },
+      { byteAddr := regResRowStride, value := ← natToU32Checked resRow "resRowStride" },
+      { byteAddr := regResRowBytesA, value := resRowBytesU32 },
+      { byteAddr := regResRowBytesB, value := resRowBytesU32 }
+    ]
+
+  -- Always write `0x490c` on quantized tasks (with `val = 0, biasShift = 0` when unused)
+  -- to prevent hardware register carry-over from an earlier task/slice with non-zero `biasShift`.
+  let wSb ← encodeWord scalarBiasExtLayout #[
+    ("val", 0),
+    ("biasShift", ← natToU32Checked packed.biasShift "biasShift")
+  ]
+  plain := plain.push { byteAddr := regScalarBias, value := wSb }
+
+  for cs in packed.slots do
+    plain := plain ++ #[
+      { byteAddr := regChunkSlot cs.slot, value := wChunkSlotVal },
+      { byteAddr := regChunkOffset cs.slot, value := ← natToU32Checked cs.offset s!"chunkOffset[{cs.slot}]" },
+      { byteAddr := regChunkSize cs.slot, value := ← natToU32Checked cs.size s!"chunkSize[{cs.slot}]" }
+    ]
+
+  let wSrc1Dep ← encodeWord src1DepLayout #[("code", 0x21), ("task", taskIdU32)]
+  let wResDep ← encodeWord resDepLayout #[
+    ("code", resDepCode target),
+    ("task", taskIdU32),
+    ("direct", if direct then 1 else 0)
+  ]
+  let barRecs : Array BarRegWrite := #[
+    { baseByteAddr := regKernelBaseLo, barSlot := 8, values := #[0, 0] },
+    { baseByteAddr := regSrc1BaseLo, barSlot := 6, values := #[0, 0] },
+    { baseByteAddr := regResBaseLo, barSlot := 7, values := #[0, 0] },
+    { baseByteAddr := regSrc1Dep, barSlot := 4, values := #[wSrc1Dep] },
+    { baseByteAddr := regResDep, barSlot := 4, values := #[wResDep] }
+  ]
+
+  pure {
+    taskId := taskId
+    logNE := tiling.logNE
+    plainWrites := plain
+    barWrites := barRecs
+    kernelRelocs := #[{ barRecIndex := 0, payloadWordIndex := 0 }]
+  }
+
+/-- Compile a single-task quantized/palettized dense NE convolution (`1x1` or stride-1 `3x3`)
+    into a statically verified HWX binary and 4 LOAD sections. -/
+def compileConvQuant
+    (target : Target)
+    (shape : ConvSpec)
+    (quant : QuantWeightSpec)
+    (bias : Option ByteArray := none)
+    (relu : Bool := false)
+    (tilingOverride : Option Tiling := none)
+    (act : ConvActivation := .none) : Except String CompiledConv := do
+  validateConvShape shape
+  if shape.effMode != .dense || shape.stride != 1 then
+    throw s!"compileConvQuant: quantized weights require dense stride-1 convolution (got mode={shape.mode.name}, stride={shape.stride})"
+
+  let effectiveAct ← match act with
+    | .none => pure (if relu then ConvActivation.relu else ConvActivation.none)
+    | .relu => pure ConvActivation.relu
+    | .lut spec =>
+      throw s!"compileConvQuant: fused LUT activation '{spec.name}' is not supported with quantized weights (use a separate lut graph node)"
+
+  validateQuantWeightSpec quant shape.cout shape.cin shape.taps
+  let qp := quantChunkParamsFor quant shape.cout bias.isSome
+  let tiling ← match tilingOverride with
+    | some t => validateConvTilingQuant target shape t qp; pure t
+    | none => chooseConvTilingQuant target shape qp
+
+  let packed ← packQuantKernel target shape tiling quant bias
+  let taskDesc ← lowerConvTaskQuant target shape tiling packed effectiveAct.isRelu
+
+  let inSurf ← makeFp16Surface target "x" "input_x" .input shape.cin shape.h shape.w
+  let outSurf ← makeFp16Surface target "y" "output_y" .output shape.cout shape.outH shape.outW
+
+  let emitted ← emitProgram {
+    target := target
+    surfaces := #[inSurf, outSurf]
+    tasks := #[taskDesc]
+    kernel := some packed.bytes
+    scratch := none
+    constants := zeroBytes textConstBytes
+    ident := some "vane"
+  }
+
+  let summary ← verifyHwxTasksSummary emitted.hwx emitted.info (requireKnownTask := true)
+  if summary.neConv != 1 || summary.total != 1 then
+    throw s!"internal error: verifier checked {summary.neConv}/{summary.total} quantized conv tasks != 1"
+
+  pure {
+    target := target
+    shape := shape
+    tiling := tiling
+    sparse := false
+    wide3x3 := neCommonQuantBit27 (computeWide3x3Conv target shape tiling) packed.hasZeroPoint packed.format.wKind == 1
+    hasBias := bias.isSome
+    relu := effectiveAct.isRelu
+    activation := effectiveAct
+    lutBytes := none
+    direct := isDirectConv target shape tiling
+    l2UseBytes := l2UseBytesConv target shape tiling
+    kernelBytes := packed.bytes.size
+    hwx := emitted.hwx
+    info := emitted.info
+    sections := emitted.sections
+  }
+
+/-- Choose contiguous output-channel slice widths partitioning `cout` for quantized `conv1x1` / `linear`. -/
+def chooseConv1x1OutputSlicesQuant
+    (target : Target) (h w cin cout : Nat)
+    (quant : QuantWeightSpec) (hasBias : Bool := false) : Except String (Array Nat) := do
+  let fullSpec : ConvSpec := { kernelSize := 1, mode := .dense, h := h, w := w, cin := cin, cout := cout }
+  validateConvShape fullSpec
+  let canFit := fun (dc : Nat) =>
+    let sh : ConvSpec := { kernelSize := 1, mode := .dense, h := h, w := w, cin := cin, cout := dc }
+    let qp := quantChunkParamsFor quant dc hasBias
+    (chooseConvTilingQuant target sh qp).isOk
+
+  if canFit cout then
+    return #[cout]
+
+  let maxSingle := min (cout - 1) (target.profile.conv1x1MaxCout 4 4)
+  if maxSingle == 0 then
+    throw s!"no legal {target.name} quantized output-channel split for conv1x1 ({h}x{w}, {cin}->{cout})"
+
+  let tryWidth := fun (s : Nat) =>
+    if s == 0 || s >= cout then none
+    else
+      let numSlices := ceilDiv cout s
+      if numSlices > 255 then none
+      else
+        let rem := cout % s
+        if canFit s && (rem == 0 || canFit rem) then
+          let fullCount := cout / s
+          let base := Array.replicate fullCount s
+          some (if rem == 0 then base else base.push rem)
+        else
+          none
+
+  for alignStep in #[32, 16, 8, 1] do
+    let top := (maxSingle / alignStep) * alignStep
+    let count := top / alignStep
+    for i in [:count] do
+      let s := top - i * alignStep
+      if let some slices := tryWidth s then
+        return slices
+
+  throw s!"no legal {target.name} quantized output-channel split for conv1x1 ({h}x{w}, {cin}->{cout})"
+
+/-- Lower one slice of a multi-task output-channel-split quantized `conv1x1` / `linear` into a `TaskDesc`. -/
+private def lowerConv1x1SliceTaskQuant
+    (target : Target)
+    (shape : ConvSpec)
+    (tiling : Tiling)
+    (packed : PackedQuantKernel)
+    (relu : Bool)
+    (taskId totalTasks : Nat)
+    (kernBaseOff outOff : Nat)
+    (waitNe5 : Bool) : Except String TaskDesc := do
+  let isFirst := taskId == 0
+  let isLast := taskId + 1 == totalTasks
+  let direct := isDirectConv target shape tiling
+  let chs := chsBytesConv shape tiling
+  let dchs := dchsBytesConv shape tiling
+  let srcRow := srcRowStrideConv shape tiling
+  let resRow := resRowStrideConv shape tiling
+  let resBase := resBaseBytesConv shape tiling
+
+  let rowStride := alignUp (2 * shape.w) dmaLineBytes
+  let planeStride := shape.h * rowStride
+
+  let taskIdU32 ← natToU32Checked taskId "taskId"
+  let wWin ← encodeWord (dim16Layout "Win") #[("val", ← natToU32Checked shape.w "Win")]
+  let wHin ← encodeWord (dim16Layout "Hin") #[("val", ← natToU32Checked shape.h "Hin")]
+  let cinU32 ← natToU32Checked shape.cin "Cin"
+  let coutU32 ← natToU32Checked shape.cout "Cout"
+  let wConvCfg ← encodeWord convCfgLayout #[
+    ("kw", 1), ("kh", 1), ("sx", 1), ("sy", 1),
+    ("pl", 0), ("pt", 0), ("hx", 1), ("vy", 1)
+  ]
+  let wTH ← encodeWord (dim16Layout "TH") #[("val", ← natToU32Checked tiling.tileHeight "TH")]
+  let wide3x3 := computeWide3x3Conv target shape tiling
+  let wNeCommon ← encodeWord neCommonLayout #[
+    ("kind", 0),
+    ("shPref", ← natToU32Checked tiling.shPref "shPref"),
+    ("shMin", ← natToU32Checked tiling.shPref "shMin"),
+    ("shMax", ← natToU32Checked tiling.shMax "shMax"),
+    ("F", ← natToU32Checked tiling.f "F"),
+    ("wide3x3", neCommonQuantBit27 wide3x3 packed.hasZeroPoint packed.format.wKind)
+  ]
+  let wNeTile ← encodeWord neTileLayout #[
+    ("ocg", ← natToU32Checked tiling.ocg "ocg"),
+    ("fat", ← natToU32Checked tiling.fat "fat"),
+    ("WU", ← natToU32Checked tiling.wu "WU")
+  ]
+  let wSrc1Cfg ← encodeWord (portCfgMultiLayout "src1Cfg") #[
+    ("mode", portModeDma),
+    ("handoffNe", 0),
+    ("handoffPe", 0),
+    ("waitNe4", if isFirst then 1 else 0),
+    ("waitNe5", if isFirst || waitNe5 then 1 else 0),
+    ("dmaFlag", 1),
+    ("P", 1),
+    ("waitPe20", if isFirst then 1 else 0),
+    ("waitPe22", if isFirst then 1 else 0)
+  ]
+  let wResCfg ← encodeWord resCfgMultiLayout #[
+    ("mode", portModeDma),
+    ("direct", if direct then 1 else 0),
+    ("waitNe4", if isFirst then 1 else 0),
+    ("waitNe5", if isFirst then 1 else 0),
+    ("dmaFlag", 1),
+    ("P", 1),
+    ("waitPe20", if isFirst then 1 else 0),
+    ("waitPe22", if isFirst then 1 else 0)
+  ]
+  let wNeCfg ← encodeWord neCfgQuantLayout #[
+    ("wKind", packed.format.wKind),
+    ("wWidth", ← natToU32Checked packed.format.wWidth "wWidth"),
+    ("sparse", 0),
+    ("dynKern", 0),
+    ("hasZP", if packed.hasZeroPoint then 1 else 0),
+    ("h17Flag", if target == .h17 && !packed.hasZeroPoint then 1 else 0)
+  ]
+  let wNeOp ← encodeWord neOpQuantLayout #[
+    ("biasInKernel", if packed.biasInKernel then 1 else 0),
+    ("unscaled", if packed.format.isPalette then neOpUnscaledBits else 0),
+    ("perLaneScale", if packed.perLaneScale then 1 else 0),
+    ("relu", if relu then 1 else 0),
+    ("lut", 0),
+    ("base20", 1)
+  ]
+  let wNeScale ← encodeWord neScaleExtLayout #[
+    ("val", packed.tensorScaleFp16.toUInt32),
+    ("pexp", ← natToU32Checked packed.scalePexp "scalePexp")
+  ]
+  let wKernStage ← encodeWord kernelStageMultiLayout #[
+    ("sparse", 0),
+    ("kernEn", 1),
+    ("isLast", if isLast then 1 else 0),
+    ("kernCfg", 1),
+    ("stage", ← natToU32Checked (taskId + 1) "kernelStage.stage")
+  ]
+
+  let mut plain : Array RegWrite := #[
+    { byteAddr := regWin, value := wWin },
+    { byteAddr := regHin, value := wHin },
+    { byteAddr := regCin, value := cinU32 },
+    { byteAddr := regWout, value := wWin },
+    { byteAddr := regHout, value := wHin },
+    { byteAddr := regCout, value := coutU32 },
+    { byteAddr := regConvCfg, value := wConvCfg },
+    { byteAddr := regTH, value := wTH },
+    { byteAddr := regNeCommon, value := wNeCommon },
+    { byteAddr := regNeTile, value := wNeTile },
+    { byteAddr := regTargetCfg, value := targetCfgValue target },
+    { byteAddr := regSrc1Cfg, value := wSrc1Cfg },
+    { byteAddr := regSrc1Base, value := 0 },
+    { byteAddr := regSrc1ChanStride, value := ← natToU32Checked chs "src1ChanStride" },
+    { byteAddr := regSrc1RowStride, value := ← natToU32Checked srcRow "src1RowStride" },
+    { byteAddr := regSrc1RowBytesA, value := ← natToU32Checked (shape.cin * chs) "src1RowBytesA" },
+    { byteAddr := regSrc1RowBytesB, value := ← natToU32Checked (shape.cin * chs) "src1RowBytesB" },
+    { byteAddr := regResCfg, value := wResCfg },
+    { byteAddr := regResBase, value := ← natToU32Checked resBase "resBase" },
+    { byteAddr := regNeCfg, value := wNeCfg },
+    { byteAddr := regNeOp, value := wNeOp },
+    { byteAddr := regNeScale, value := wNeScale },
+    { byteAddr := regSrc1DmaCfg, value := src1DmaCfgValue },
+    { byteAddr := regSrc1DmaRowStride, value := ← natToU32Checked rowStride "src1DmaRowStride" },
+    { byteAddr := regSrc1DmaPlaneStride, value := ← natToU32Checked planeStride "src1DmaPlaneStride" },
+    { byteAddr := regSrc1Fmt, value := srcFmtWordP1 },
+    { byteAddr := regResDmaRowStride, value := ← natToU32Checked rowStride "resDmaRowStride" },
+    { byteAddr := regResDmaPlaneStride, value := ← natToU32Checked planeStride "resDmaPlaneStride" },
+    { byteAddr := regResFmt, value := resFmtWordP1 },
+    { byteAddr := regKernelStage, value := wKernStage }
+  ]
+
+  if isFirst then
+    plain := plain.push { byteAddr := regSrc2Cfg, value := src2CfgValue }
+
+  if !direct then
+    let resRowBytesU32 ← natToU32Checked (shape.cout * dchs) "resRowBytes"
+    plain := plain ++ #[
+      { byteAddr := regResChanStride, value := ← natToU32Checked dchs "resChanStride" },
+      { byteAddr := regResRowStride, value := ← natToU32Checked resRow "resRowStride" },
+      { byteAddr := regResRowBytesA, value := resRowBytesU32 },
+      { byteAddr := regResRowBytesB, value := resRowBytesU32 }
+    ]
+
+  -- Always write `0x490c` on every quantized slice so an earlier slice's `biasShift` cannot carry over.
+  let wSb ← encodeWord scalarBiasExtLayout #[
+    ("val", 0),
+    ("biasShift", ← natToU32Checked packed.biasShift "biasShift")
+  ]
+  plain := plain.push { byteAddr := regScalarBias, value := wSb }
+
+  let wSlotOn ← encodeWord chunkSlotLayout #[("enable", 1), ("on20", 1), ("task", taskIdU32)]
+  let wSlotOff ← encodeWord chunkSlotLayout #[("enable", 0), ("on20", 1), ("task", taskIdU32)]
+  for s in [:16] do
+    match packed.slots.find? (fun cs => cs.slot == s) with
+    | some cs =>
+      plain := plain ++ #[
+        { byteAddr := regChunkSlot s, value := wSlotOn },
+        { byteAddr := regChunkOffset s, value := ← natToU32Checked cs.offset s!"chunkOffset[{s}]" },
+        { byteAddr := regChunkSize s, value := ← natToU32Checked cs.size s!"chunkSize[{s}]" }
+      ]
+    | none =>
+      if !isFirst then
+        plain := plain.push { byteAddr := regChunkSlot s, value := wSlotOff }
+
+  if isLast then
+    let wOut2 ← encodeWord out2Layout #[("form", out2FormValue), ("task", taskIdU32)]
+    plain := plain ++ #[
+      { byteAddr := regOut0, value := out0Value },
+      { byteAddr := regOut1, value := out1Value },
+      { byteAddr := regOut2, value := wOut2 },
+      { byteAddr := regOut3, value := out3Value },
+      { byteAddr := regOut4, value := out4Value },
+      { byteAddr := regOut5, value := out5Value }
+    ]
+
+  let wSrc1Dep ← encodeWord (srcDepMultiLayout "src1Dep") #[
+    ("code", srcDepCodeDma), ("task", taskIdU32), ("depDist", 0), ("depKind", 0)
+  ]
+  let wResDep ← encodeWord resDepLayout #[
+    ("code", resDepCode target),
+    ("task", taskIdU32),
+    ("direct", if direct then 1 else 0)
+  ]
+  let barRecs : Array BarRegWrite := #[
+    { baseByteAddr := regKernelBaseLo, barSlot := 8, values := #[← natToU32Checked kernBaseOff "kernelBaseLo", 0] },
+    { baseByteAddr := regSrc1BaseLo, barSlot := 6, values := #[0, 0] },
+    { baseByteAddr := regResBaseLo, barSlot := 7, values := #[← natToU32Checked outOff "resBaseLo", 0] },
+    { baseByteAddr := regSrc1Dep, barSlot := barSlotConfigZero, values := #[wSrc1Dep] },
+    { baseByteAddr := regResDep, barSlot := barSlotConfigZero, values := #[wResDep] }
+  ]
+
+  pure {
+    taskId := taskId
+    logNE := tiling.logNE
+    eneOverride := some (tiling.logNE + 1)
+    isFirst := isFirst
+    isLast := isLast
+    liveL2Mask := 0
+    plainWrites := plain
+    barWrites := barRecs
+    kernelRelocs := #[{ barRecIndex := 0, payloadWordIndex := 0 }]
+  }
+
+/-- Compile a standalone quantized/palettized `conv1x1` layer with automatic wide-`Cout` output-channel splitting. -/
+def compileConv1x1Quant
+    (target : Target)
+    (shape : Conv1x1Shape)
+    (quant : QuantWeightSpec)
+    (bias : Option ByteArray := none)
+    (relu : Bool := false)
+    (tilingOverride : Option Tiling := none)
+    (act : ConvActivation := .none) : Except String CompiledConv1x1Split := do
+  let fullSpec := shape.toConvSpec
+  validateConvShape fullSpec
+  validateQuantWeightSpec quant shape.cout shape.cin 1
+
+  let effectiveAct ← match act with
+    | .none => pure (if relu then ConvActivation.relu else ConvActivation.none)
+    | .relu => pure ConvActivation.relu
+    | .lut spec =>
+      throw s!"compileConv1x1Quant: fused LUT activation '{spec.name}' is not supported with quantized weights"
+
+  if tilingOverride.isSome then
+    let c ← compileConvQuant target fullSpec quant bias relu tilingOverride effectiveAct
+    return {
+      target := c.target, shape := shape, slices := #[shape.cout], tilings := #[c.tiling],
+      hasBias := c.hasBias, relu := c.relu, activation := c.activation, lutBytes := none,
+      direct := c.direct, l2UseBytes := c.l2UseBytes, kernelBytes := c.kernelBytes,
+      hwx := c.hwx, info := c.info, sections := c.sections
+    }
+
+  let slices ← chooseConv1x1OutputSlicesQuant target shape.h shape.w shape.cin shape.cout quant bias.isSome
+  if slices.size == 1 then
+    let c ← compileConvQuant target fullSpec quant bias relu none effectiveAct
+    return {
+      target := c.target, shape := shape, slices := slices, tilings := #[c.tiling],
+      hasBias := c.hasBias, relu := c.relu, activation := c.activation, lutBytes := none,
+      direct := c.direct, l2UseBytes := c.l2UseBytes, kernelBytes := c.kernelBytes,
+      hwx := c.hwx, info := c.info, sections := c.sections
+    }
+
+  if let some b := bias then
+    if b.size != 2 * shape.cout then
+      throw s!"bias byte size {b.size} != expected {2 * shape.cout} (2 * Cout={shape.cout})"
+
+  let k := slices.size
+  let starts := prefixStarts slices.toList
+  let outRowStride := alignUp (2 * shape.w) dmaLineBytes
+  let outPlaneStride := shape.h * outRowStride
+
+  let mut packedSlices : Array (Nat × PackedQuantKernel) := Array.mkEmpty k
+  let mut tilings : Array Tiling := Array.mkEmpty k
+  let mut taskDescs : Array TaskDesc := Array.mkEmpty k
+  let mut prevResRanges : Array (Nat × Nat) := Array.mkEmpty k
+  let mut peakL2 : Nat := 0
+  let mut allDirect := true
+  let mut totalKernBytes : Nat := 0
+
+  for i in [:k] do
+    let c0 := starts[i]!
+    let dc := slices[i]!
+    let sh_i : ConvSpec := {
+      kernelSize := 1, mode := .dense, h := shape.h, w := shape.w, cin := shape.cin, cout := dc
+    }
+    let qSlice ← sliceQuantWeightSpec quant c0 dc shape.cin 1
+    let bSlice? := bias.map (fun b => b.extract (2 * c0) (2 * (c0 + dc)))
+    let qp_i := quantChunkParamsFor qSlice dc bias.isSome
+    let t_i ← chooseConvTilingQuant target sh_i qp_i
+    let packed_i ← packQuantKernel target sh_i t_i qSlice bSlice?
+
+    let kernOff := alignUp totalKernBytes dmaLineBytes
+    totalKernBytes := kernOff + packed_i.bytes.size
+    packedSlices := packedSlices.push (kernOff, packed_i)
+
+    let srcEnd := srcL2BytesConv sh_i t_i
+    let resLo := resBaseBytesConv sh_i t_i
+    let resHi := resLo + resL2BytesConv target sh_i t_i
+    peakL2 := max peakL2 resHi
+    if !isDirectConv target sh_i t_i then
+      allDirect := false
+
+    let haz := i > 0 && prevResRanges.any (fun (rLo, rHi) => rLo < srcEnd && 0 < rHi)
+    prevResRanges := prevResRanges.push (resLo, resHi)
+
+    let outOff := c0 * outPlaneStride
+    let td ← lowerConv1x1SliceTaskQuant target sh_i t_i packed_i effectiveAct.isRelu i k kernOff outOff haz
+    tilings := tilings.push t_i
+    taskDescs := taskDescs.push td
+
+  let mut kernBuf := zeroBytes totalKernBytes
+  for (kernOff, packed_i) in packedSlices do
+    kernBuf := ByteArray.copySlice packed_i.bytes 0 kernBuf kernOff packed_i.bytes.size true
+
+  let inSurf ← makeFp16Surface target "x" "input_x" .input shape.cin shape.h shape.w
+  let outSurf ← makeFp16Surface target "y" "output_y" .output shape.cout shape.h shape.w
+
+  let emitted ← emitProgram {
+    target := target
+    surfaces := #[inSurf, outSurf]
+    tasks := taskDescs
+    kernel := some kernBuf
+    scratch := none
+    constants := zeroBytes textConstBytes
+    ident := some "vane"
+  }
+
+  let summary ← verifyHwxTasksSummary emitted.hwx emitted.info (requireKnownTask := true)
+  if summary.neConv != k || summary.total != k then
+    throw s!"internal error: verifier checked {summary.neConv}/{summary.total} split quantized conv1x1 tasks != {k}"
+
+  pure {
+    target := target
+    shape := shape
+    slices := slices
+    tilings := tilings
+    hasBias := bias.isSome
+    relu := effectiveAct.isRelu
+    activation := effectiveAct
+    lutBytes := none
+    direct := allDirect
+    l2UseBytes := peakL2
+    kernelBytes := kernBuf.size
+    hwx := emitted.hwx
+    info := emitted.info
+    sections := emitted.sections
+  }
+
+/-- Compile a quantized/palettized `linear` layer `[1, K, B, M] -> [1, N, B, M]` by lowering
+    onto single-task or auto-output-split quantized `conv1x1`. -/
+def compileLinearQuant
+    (target : Target)
+    (m k n : Nat)
+    (quant : QuantWeightSpec)
+    (bias : Option ByteArray := none)
+    (batch : Nat := 1)
+    (relu : Bool := false)
+    (act : ConvActivation := .none) : Except String CompiledConv1x1Split :=
+  compileConv1x1Quant target { h := batch, w := m, cin := k, cout := n } quant bias relu none act
 
 end Vane.Conv

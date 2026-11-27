@@ -12,7 +12,7 @@ open Vane.Verify
 open Vane.Conv
 
 export Vane.Program (textConstBytes dmaLineBytes)
-export Vane.Conv (ConvActivation KernelChunkSlot PackedKernel)
+export Vane.Conv (ConvActivation KernelChunkSlot PackedKernel compileConv1x1Quant compileLinearQuant)
 export Vane.Verify (isNeConvTask verifyConv1x1Task)
 
 /-- Complete compilation artifact for a single-task or output-channel-split fp16 1x1 convolution. -/

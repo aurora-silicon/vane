@@ -26,7 +26,7 @@ def standardAxioms : List Name := [``propext, ``Classical.choice, ``Quot.sound]
 
 /-- Lower bound on user-declared theorems in `Vane.Proofs`; guards against an
 empty or truncated audit passing silently. -/
-def minProofTheorems : Nat := 348
+def minProofTheorems : Nat := 381
 
 def proofsModule : Name := `Vane.Proofs
 

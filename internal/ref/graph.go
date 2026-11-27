@@ -145,6 +145,15 @@ func (a GraphActSpec) ToActSpec() (ActSpec, error) {
 	}
 }
 
+// GraphQuantSpec represents optional native NE weight quantization metadata on
+// conv1x1, linear, or dense conv3x3 nodes in graph.json.
+type GraphQuantSpec struct {
+	Format     string `json:"format"`
+	Scales     string `json:"scales,omitempty"`
+	ZeroPoints string `json:"zero_points,omitempty"`
+	Palette    string `json:"palette,omitempty"`
+}
+
 // GraphNodeSpec describes one node in topological order inside a graph.json spec.
 // Note: Bias is stored as json.RawMessage so the same JSON field name "bias" can hold
 // a filename string or boolean on conv nodes, or a numeric scalar on PE chain nodes.
@@ -161,6 +170,7 @@ type GraphNodeSpec struct {
 	Stride       int             `json:"stride,omitempty"`
 	Pad          string          `json:"pad,omitempty"`
 	Weights      string          `json:"weights,omitempty"`
+	Quant        *GraphQuantSpec `json:"quant,omitempty"`
 	Bias         json.RawMessage `json:"bias,omitempty"`
 	HasBias      bool            `json:"has_bias,omitempty"`
 	Relu         bool            `json:"relu,omitempty"`
@@ -278,10 +288,11 @@ type GraphSpec struct {
 	Nodes       []GraphNodeSpec  `json:"nodes"`
 }
 
-// GraphNodeWeights supplies fp16 weights and optional fp16 bias for a conv node.
+// GraphNodeWeights supplies fp16 weights (or quantized weights) and optional fp16 bias for a conv node.
 type GraphNodeWeights struct {
 	Weights []uint16
 	Bias    []uint16
+	Quant   *QuantWeights
 }
 
 func graphF16CanonZero(v float64) uint16 {
@@ -448,7 +459,19 @@ func evalGraph(spec GraphSpec, inputs map[string]Tensor, nodeWeights map[string]
 			if errAct != nil {
 				return Tensor{}, nil, errAct
 			}
-			if exactHW {
+			isQuant := nw.Quant != nil || (nd.Quant != nil && strings.ToLower(nd.Quant.Format) != "fp16")
+			if isQuant {
+				if nw.Quant == nil {
+					return Tensor{}, nil, fmt.Errorf("node %q: spec declares quant=%q but GraphNodeWeights.Quant is nil", nd.ID, nd.Quant.Format)
+				}
+				if nd.Quant != nil && strings.ToLower(nd.Quant.Format) != strings.ToLower(nw.Quant.Format) {
+					return Tensor{}, nil, fmt.Errorf("node %q: quant format mismatch spec=%q vs weights=%q", nd.ID, nd.Quant.Format, nw.Quant.Format)
+				}
+				if isLut {
+					return Tensor{}, nil, fmt.Errorf("node %q: fused LUT activation is not supported with quantized weights", nd.ID)
+				}
+				out, err = EvalConv1x1Quant(x, *nw.Quant, cout, nw.Bias, actSpec.Name == "relu")
+			} else if exactHW {
 				if isLut {
 					tbl, preScale, shift, errL := BuildLutTable(actSpec)
 					if errL != nil {
@@ -503,7 +526,22 @@ func evalGraph(spec GraphSpec, inputs map[string]Tensor, nodeWeights map[string]
 			if errAct != nil {
 				return Tensor{}, nil, errAct
 			}
-			if exactHW {
+			isQuant := nw.Quant != nil || (nd.Quant != nil && strings.ToLower(nd.Quant.Format) != "fp16")
+			if isQuant {
+				if nw.Quant == nil {
+					return Tensor{}, nil, fmt.Errorf("node %q: spec declares quant=%q but GraphNodeWeights.Quant is nil", nd.ID, nd.Quant.Format)
+				}
+				if nd.Quant != nil && strings.ToLower(nd.Quant.Format) != strings.ToLower(nw.Quant.Format) {
+					return Tensor{}, nil, fmt.Errorf("node %q: quant format mismatch spec=%q vs weights=%q", nd.ID, nd.Quant.Format, nw.Quant.Format)
+				}
+				if mode != "dense" {
+					return Tensor{}, nil, fmt.Errorf("node %q: quantized conv3x3 only supports dense mode", nd.ID)
+				}
+				if isLut {
+					return Tensor{}, nil, fmt.Errorf("node %q: fused LUT activation is not supported with quantized weights", nd.ID)
+				}
+				out, err = EvalConv3x3Quant(x, *nw.Quant, cout, nw.Bias, stride, pad, actSpec.Name == "relu")
+			} else if exactHW {
 				if isLut {
 					tbl, preScale, shift, errL := BuildLutTable(actSpec)
 					if errL != nil {
@@ -759,6 +797,12 @@ func evalGraph(spec GraphSpec, inputs map[string]Tensor, nodeWeights map[string]
 	}
 
 	return lastOut, env, nil
+}
+
+// EvalGraph evaluates a multi-task DAG using hardware-accurate operator models
+// (including native quantized conv1x1/linear/conv3x3 weight dequantization).
+func EvalGraph(spec GraphSpec, inputs map[string]Tensor, nodeWeights map[string]GraphNodeWeights) (Tensor, map[string]Tensor, error) {
+	return evalGraph(spec, inputs, nodeWeights, true)
 }
 
 // EvalGraphQ1516 evaluates a multi-task DAG using the exact hardware arithmetic models:

@@ -8,6 +8,7 @@ open Vane.TaskStream
 open Vane.Hwx
 open Vane.Sections
 open Vane.Tiling
+open Vane.Quant
 open Vane.Verify
 open Vane.Pe
 open Vane.Lut
@@ -28,13 +29,19 @@ private def usage : String :=
   "  vane sections --hwx <path> --out-dir <dir>\n" ++
   "  vane emit-demo --target <h16|h17> --out-dir <dir> [--with-kernel] [--with-scratch]\n" ++
   "  vane compile-conv1x1 --target <h16|h17> --h <H> --w <W> --cin <Cin> --cout <Cout>\n" ++
-  "                       --weights <path> [--bias <path>] [--relu | --act <name> [act params]] --out-dir <dir>\n" ++
+  "                       --weights <path> [--bias <path>] [--relu | --act <name> [act params]]\n" ++
+  "                       [--weight-format <fp16|int8|uint8|int4|uint4|pal1|pal2|pal4|pal6|pal8>]\n" ++
+  "                       [--scales <path>] [--zero-points <path>] [--palette <path>] --out-dir <dir>\n" ++
   "  vane compile-linear --target <h16|h17> --m <M> --k <K> --n <N> [--batch <B>]\n" ++
-  "                      --weights <path> [--bias <path>] [--relu | --act <name> [act params]] --out-dir <dir>\n" ++
+  "                      --weights <path> [--bias <path>] [--relu | --act <name> [act params]]\n" ++
+  "                      [--weight-format <fp16|int8|uint8|int4|uint4|pal1|pal2|pal4|pal6|pal8>]\n" ++
+  "                      [--scales <path>] [--zero-points <path>] [--palette <path>] --out-dir <dir>\n" ++
   "  vane compile-conv3x3 --target <h16|h17> --mode <dense|depthwise>\n" ++
   "                       --h <H> --w <W> --cin <Cin> --cout <Cout>\n" ++
   "                       --stride <1|2> --pad <same|valid>\n" ++
-  "                       --weights <path> [--bias <path>] [--relu | --act <name> [act params]] --out-dir <dir>\n" ++
+  "                       --weights <path> [--bias <path>] [--relu | --act <name> [act params]]\n" ++
+  "                       [--weight-format <fp16|int8|uint8|int4|uint4|pal1|pal2|pal4|pal6|pal8>]\n" ++
+  "                       [--scales <path>] [--zero-points <path>] [--palette <path>] --out-dir <dir>\n" ++
   "  vane compile-pe --target <h16|h17> --op <abs|square|linear|chain|sadd|ssub|srsub|smul|sdiv|add|sub|rsub|mul|max|min>\n" ++
   "                  --h <H> --w <W> --c <C> [--z-h <ZH> --z-w <ZW> --z-c <ZC>]\n" ++
   "                  [--alpha F] [--beta F] [--in-scale F] [--bias F] [--scale F] [--scalar F]\n" ++
@@ -158,6 +165,96 @@ private def parseConvAct (reluFlag : Bool) (actName? : Option String) (p : ActPa
     else
       ConvActivation.lut <$> parseLutSpec low p
 
+private def readF32ArrayLE (bs : ByteArray) (label : String) : Except String (Array Float) := do
+  if bs.size % 4 != 0 then
+    throw s!"{label}: byte size {bs.size} is not a multiple of 4 (raw LE float32)"
+  let n := bs.size / 4
+  let mut out : Array Float := Array.mkEmpty n
+  for i in [:n] do
+    let u ← readU32LE bs (4 * i)
+    out := out.push (f32BitsToFloat u)
+  pure out
+
+private def readU16ArrayLE (bs : ByteArray) (label : String) : Except String (Array UInt16) := do
+  if bs.size % 2 != 0 then
+    throw s!"{label}: byte size {bs.size} is not a multiple of 2 (raw LE uint16)"
+  let n := bs.size / 2
+  let mut out : Array UInt16 := Array.mkEmpty n
+  for i in [:n] do
+    let u ← readU16LE bs (2 * i)
+    out := out.push u
+  pure out
+
+private def loadQuantWeightSpecIO
+    (fmtStr : String)
+    (codesBytes : ByteArray)
+    (scalesPath? zpPath? palPath? : Option System.FilePath)
+    (ctx : String) : IO (Except String (Option QuantWeightSpec)) := do
+  let low := fmtStr.toLower
+  if low == "fp16" then
+    if scalesPath?.isSome || zpPath?.isSome || palPath?.isSome then
+      return .error s!"{ctx}: --scales, --zero-points, and --palette cannot be used with fp16 weights"
+    return .ok none
+  let some fmt := QuantFormat.parse? low
+    | return .error s!"{ctx}: unknown weight format '{fmtStr}' (expected fp16, int8, uint8, int4, uint4, pal1, pal2, pal4, pal6, or pal8)"
+  if fmt.isInteger then
+    if palPath?.isSome then
+      return .error s!"{ctx}: integer weight format '{fmt.name}' cannot specify a palette"
+    let some sPath := scalesPath?
+      | return .error s!"{ctx}: integer weight format '{fmt.name}' requires scales"
+    let scalesBytes ← try IO.FS.readBinFile sPath catch e =>
+      return .error s!"{ctx}: failed to read scales '{sPath}': {e}"
+    let scales ← match readF32ArrayLE scalesBytes s!"{ctx} scales" with
+      | .ok arr => pure arr
+      | .error e => return .error e
+    let zp? ← match zpPath? with
+      | none => pure none
+      | some zPath =>
+        let zBytes ← try IO.FS.readBinFile zPath catch e =>
+          return .error s!"{ctx}: failed to read zero-points '{zPath}': {e}"
+        pure (some zBytes.data)
+    return .ok (some {
+      format := fmt
+      codes := codesBytes
+      scales := scales
+      zeroPoints := zp?
+      palette := #[]
+    })
+  else
+    if scalesPath?.isSome || zpPath?.isSome then
+      return .error s!"{ctx}: palette weight format '{fmt.name}' cannot specify scales or zero-points"
+    let some pPath := palPath?
+      | return .error s!"{ctx}: palette weight format '{fmt.name}' requires a palette file"
+    let palBytes ← try IO.FS.readBinFile pPath catch e =>
+      return .error s!"{ctx}: failed to read palette '{pPath}': {e}"
+    let pal ← match readU16ArrayLE palBytes s!"{ctx} palette" with
+      | .ok arr => pure arr
+      | .error e => return .error e
+    return .ok (some {
+      format := fmt
+      codes := codesBytes
+      scales := #[]
+      zeroPoints := none
+      palette := pal
+    })
+
+private def compiledSplitToConv1x1 (c : CompiledConv1x1Split) : CompiledConv1x1 := {
+  target := c.target
+  shape := c.shape
+  tiling := c.tilings[0]!
+  slices := c.slices
+  hasBias := c.hasBias
+  relu := c.relu
+  activation := c.activation
+  lutBytes := c.lutBytes
+  direct := c.direct
+  l2UseBytes := c.l2UseBytes
+  kernelBytes := c.kernelBytes
+  hwx := c.hwx
+  info := c.info
+  sections := c.sections
+}
+
 private def formatBarSlots (slots : Array UInt8) : String :=
   let parts := slots.toList.map fun s => toString s.toNat
   "[" ++ String.intercalate ", " parts ++ "]"
@@ -256,14 +353,17 @@ private def renderManifestJson (info : HwxInfo) (secs : LoadSections) : String :
 private def formatNatListJson (xs : Array Nat) : String :=
   "[" ++ String.intercalate ", " (xs.toList.map toString) ++ "]"
 
-private def renderConv1x1ManifestJson (compiled : CompiledConv1x1) (opLabel : String := "conv1x1") : String :=
+private def renderConv1x1ManifestJson (compiled : CompiledConv1x1) (opLabel : String := "conv1x1")
+    (weightFormat : String := "fp16") : String :=
   let info := compiled.info
   let secs := compiled.sections
   let sh := compiled.shape
   let t := compiled.tiling
   let lutLine := if compiled.lutBytes.isSome then "  \"lut_file\": \"lut.bin\",\n" else ""
+  let wfLine := if weightFormat != "fp16" then s!"  \"weight_format\": \"{escapeJsonString weightFormat}\",\n" else ""
   "{\n" ++
   s!"  \"op\": \"{escapeJsonString opLabel}\",\n" ++
+  wfLine ++
   s!"  \"target\": \"{compiled.target.name}\",\n" ++
   "  \"hwx\": \"program.hwx\",\n" ++
   "  \"sections\": {\n" ++
@@ -341,14 +441,16 @@ private def renderViewManifestJson (compiled : CompiledView) : String :=
   "  ]\n" ++
   "}\n"
 
-private def renderConv3x3ManifestJson (compiled : CompiledConv3x3) : String :=
+private def renderConv3x3ManifestJson (compiled : CompiledConv3x3) (weightFormat : String := "fp16") : String :=
   let info := compiled.info
   let secs := compiled.sections
   let sh := compiled.shape
   let t := compiled.tiling
   let lutLine := if compiled.lutBytes.isSome then "  \"lut_file\": \"lut.bin\",\n" else ""
+  let wfLine := if weightFormat != "fp16" then s!"  \"weight_format\": \"{escapeJsonString weightFormat}\",\n" else ""
   "{\n" ++
   "  \"op\": \"conv3x3\",\n" ++
+  wfLine ++
   s!"  \"mode\": \"{sh.mode.name}\",\n" ++
   s!"  \"effective_mode\": \"{sh.effMode.name}\",\n" ++
   s!"  \"target\": \"{compiled.target.name}\",\n" ++
@@ -695,6 +797,10 @@ private def cmdCompileConv1x1 (args : List String) : IO UInt32 := do
   let mut coutStr : Option String := none
   let mut weightsPath : Option String := none
   let mut biasPath : Option String := none
+  let mut weightFormatStr : String := "fp16"
+  let mut scalesPath : Option String := none
+  let mut zeroPointsPath : Option String := none
+  let mut palettePath : Option String := none
   let mut relu := false
   let mut actStr : Option String := none
   let mut actParams : ActParamFlags := {}
@@ -730,6 +836,22 @@ private def cmdCompileConv1x1 (args : List String) : IO UInt32 := do
     | "--bias" :: tl =>
       match requireArgValue "--bias" tl with
       | .ok (v, tl') => biasPath := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--weight-format" :: tl =>
+      match requireArgValue "--weight-format" tl with
+      | .ok (v, tl') => weightFormatStr := v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--scales" :: tl =>
+      match requireArgValue "--scales" tl with
+      | .ok (v, tl') => scalesPath := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--zero-points" :: tl =>
+      match requireArgValue "--zero-points" tl with
+      | .ok (v, tl') => zeroPointsPath := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--palette" :: tl =>
+      match requireArgValue "--palette" tl with
+      | .ok (v, tl') => palettePath := some v; rest := tl'
       | .error e => IO.eprintln s!"error: {e}"; return 1
     | "--relu" :: tl =>
       relu := true; rest := tl
@@ -835,13 +957,23 @@ private def cmdCompileConv1x1 (args : List String) : IO UInt32 := do
         IO.eprintln s!"error: failed to read bias '{bPath}': {e}"
         return 1
 
-  let compiled ← match compileConv1x1 target shape weightsBytes biasBytes? false none act with
-    | .ok c => pure c
-    | .error e =>
-      IO.eprintln s!"error: compile-conv1x1 failed: {e}"
-      return 1
+  let quantSpec? ← match ← loadQuantWeightSpecIO weightFormatStr weightsBytes
+      (scalesPath.map System.FilePath.mk) (zeroPointsPath.map System.FilePath.mk)
+      (palettePath.map System.FilePath.mk) "compile-conv1x1" with
+    | .ok q? => pure q?
+    | .error e => IO.eprintln s!"error: {e}"; return 1
 
-  let manifest := renderConv1x1ManifestJson compiled
+  let (compiled, wfName) ← match quantSpec? with
+    | none =>
+      match compileConv1x1 target shape weightsBytes biasBytes? false none act with
+      | .ok c => pure (c, "fp16")
+      | .error e => IO.eprintln s!"error: compile-conv1x1 failed: {e}"; return 1
+    | some q =>
+      match compileConv1x1Quant target shape q biasBytes? false none act with
+      | .ok c => pure (compiledSplitToConv1x1 c, q.format.name)
+      | .error e => IO.eprintln s!"error: compile-conv1x1 failed: {e}"; return 1
+
+  let manifest := renderConv1x1ManifestJson compiled "conv1x1" wfName
   let dir := System.FilePath.mk dirStr
   try
     IO.FS.createDirAll dir
@@ -876,6 +1008,10 @@ private def cmdCompileLinear (args : List String) : IO UInt32 := do
   let mut batchStr : Option String := none
   let mut weightsPath : Option String := none
   let mut biasPath : Option String := none
+  let mut weightFormatStr : String := "fp16"
+  let mut scalesPath : Option String := none
+  let mut zeroPointsPath : Option String := none
+  let mut palettePath : Option String := none
   let mut relu := false
   let mut actStr : Option String := none
   let mut actParams : ActParamFlags := {}
@@ -911,6 +1047,22 @@ private def cmdCompileLinear (args : List String) : IO UInt32 := do
     | "--bias" :: tl =>
       match requireArgValue "--bias" tl with
       | .ok (v, tl') => biasPath := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--weight-format" :: tl =>
+      match requireArgValue "--weight-format" tl with
+      | .ok (v, tl') => weightFormatStr := v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--scales" :: tl =>
+      match requireArgValue "--scales" tl with
+      | .ok (v, tl') => scalesPath := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--zero-points" :: tl =>
+      match requireArgValue "--zero-points" tl with
+      | .ok (v, tl') => zeroPointsPath := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--palette" :: tl =>
+      match requireArgValue "--palette" tl with
+      | .ok (v, tl') => palettePath := some v; rest := tl'
       | .error e => IO.eprintln s!"error: {e}"; return 1
     | "--relu" :: tl =>
       relu := true; rest := tl
@@ -1012,13 +1164,23 @@ private def cmdCompileLinear (args : List String) : IO UInt32 := do
         IO.eprintln s!"error: failed to read bias '{bPath}': {e}"
         return 1
 
-  let compiled ← match compileLinear target m k n weightsBytes biasBytes? batch false act with
-    | .ok c => pure c
-    | .error e =>
-      IO.eprintln s!"error: compile-linear failed: {e}"
-      return 1
+  let quantSpec? ← match ← loadQuantWeightSpecIO weightFormatStr weightsBytes
+      (scalesPath.map System.FilePath.mk) (zeroPointsPath.map System.FilePath.mk)
+      (palettePath.map System.FilePath.mk) "compile-linear" with
+    | .ok q? => pure q?
+    | .error e => IO.eprintln s!"error: {e}"; return 1
 
-  let manifest := renderConv1x1ManifestJson compiled "linear"
+  let (compiled, wfName) ← match quantSpec? with
+    | none =>
+      match compileLinear target m k n weightsBytes biasBytes? batch false act with
+      | .ok c => pure (c, "fp16")
+      | .error e => IO.eprintln s!"error: compile-linear failed: {e}"; return 1
+    | some q =>
+      match compileLinearQuant target m k n q biasBytes? batch false act with
+      | .ok c => pure (compiledSplitToConv1x1 c, q.format.name)
+      | .error e => IO.eprintln s!"error: compile-linear failed: {e}"; return 1
+
+  let manifest := renderConv1x1ManifestJson compiled "linear" wfName
   let dir := System.FilePath.mk dirStr
   try
     IO.FS.createDirAll dir
@@ -1052,6 +1214,10 @@ private def cmdCompileConv3x3 (args : List String) : IO UInt32 := do
   let mut padStr : Option String := none
   let mut weightsPath : Option String := none
   let mut biasPath : Option String := none
+  let mut weightFormatStr : String := "fp16"
+  let mut scalesPath : Option String := none
+  let mut zeroPointsPath : Option String := none
+  let mut palettePath : Option String := none
   let mut relu := false
   let mut actStr : Option String := none
   let mut actParams : ActParamFlags := {}
@@ -1099,6 +1265,22 @@ private def cmdCompileConv3x3 (args : List String) : IO UInt32 := do
     | "--bias" :: tl =>
       match requireArgValue "--bias" tl with
       | .ok (v, tl') => biasPath := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--weight-format" :: tl =>
+      match requireArgValue "--weight-format" tl with
+      | .ok (v, tl') => weightFormatStr := v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--scales" :: tl =>
+      match requireArgValue "--scales" tl with
+      | .ok (v, tl') => scalesPath := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--zero-points" :: tl =>
+      match requireArgValue "--zero-points" tl with
+      | .ok (v, tl') => zeroPointsPath := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--palette" :: tl =>
+      match requireArgValue "--palette" tl with
+      | .ok (v, tl') => palettePath := some v; rest := tl'
       | .error e => IO.eprintln s!"error: {e}"; return 1
     | "--relu" :: tl =>
       relu := true; rest := tl
@@ -1223,13 +1405,23 @@ private def cmdCompileConv3x3 (args : List String) : IO UInt32 := do
         IO.eprintln s!"error: failed to read bias '{bPath}': {e}"
         return 1
 
-  let compiled ← match compileConv3x3 target shape weightsBytes biasBytes? false none act with
-    | .ok c => pure c
-    | .error e =>
-      IO.eprintln s!"error: compile-conv3x3 failed: {e}"
-      return 1
+  let quantSpec? ← match ← loadQuantWeightSpecIO weightFormatStr weightsBytes
+      (scalesPath.map System.FilePath.mk) (zeroPointsPath.map System.FilePath.mk)
+      (palettePath.map System.FilePath.mk) "compile-conv3x3" with
+    | .ok q? => pure q?
+    | .error e => IO.eprintln s!"error: {e}"; return 1
 
-  let manifest := renderConv3x3ManifestJson compiled
+  let (compiled, wfName) ← match quantSpec? with
+    | none =>
+      match compileConv3x3 target shape weightsBytes biasBytes? false none act with
+      | .ok c => pure (c, "fp16")
+      | .error e => IO.eprintln s!"error: compile-conv3x3 failed: {e}"; return 1
+    | some q =>
+      match compileConv3x3DenseQuant target shape q biasBytes? false none act with
+      | .ok c => pure (c, q.format.name)
+      | .error e => IO.eprintln s!"error: compile-conv3x3 failed: {e}"; return 1
+
+  let manifest := renderConv3x3ManifestJson compiled wfName
   let dir := System.FilePath.mk dirStr
   try
     IO.FS.createDirAll dir
@@ -2390,6 +2582,22 @@ private def resolveSpecRelPath (specDir : System.FilePath) (raw : String) : Syst
   let p := System.FilePath.mk raw
   if p.isAbsolute then p else specDir / p
 
+private structure JsonQuantPaths where
+  format : String
+  scales? : Option String := none
+  zeroPoints? : Option String := none
+  palette? : Option String := none
+
+private def parseJsonQuantField (j : Json) (ctx : String) : Except String (Option JsonQuantPaths) := do
+  match jsonObjField? j "quant" with
+  | none => pure none
+  | some qj =>
+    let fmt ← jsonReqStr qj "format" s!"{ctx}.quant"
+    let sc? ← jsonOptStr qj "scales" s!"{ctx}.quant"
+    let zp? ← jsonOptStr qj "zero_points" s!"{ctx}.quant"
+    let pal? ← jsonOptStr qj "palette" s!"{ctx}.quant"
+    pure (some { format := fmt, scales? := sc?, zeroPoints? := zp?, palette? := pal? })
+
 private def renderGraphManifestJson (compiled : CompiledGraph) : String :=
   let info := compiled.info
   let secs := compiled.sections
@@ -2588,10 +2796,11 @@ private def cmdCompileGraph (args : List String) : IO UInt32 := do
             let act ← match actInfo? with
               | none => parseConvAct reluFlag none {}
               | some (nm, p) => parseConvAct reluFlag (some nm) p
-            pure (cin, cout, wRel, bRel?, act, { c := cout, h := inDims.h, w := inDims.w : TensorDims })) with
+            let quantPaths? ← parseJsonQuantField nj ctx
+            pure (cin, cout, wRel, bRel?, act, quantPaths?, { c := cout, h := inDims.h, w := inDims.w : TensorDims })) with
           | .ok v => pure v
           | .error e => IO.eprintln s!"error: {e}"; return 1
-        let (cin, cout, wRel, bRel?, act, outDims) := parsed
+        let (cin, cout, wRel, bRel?, act, quantPaths?, outDims) := parsed
         let wPath := resolveSpecRelPath specDir wRel
         let weightsBytes ← try IO.FS.readBinFile wPath catch e =>
           IO.eprintln s!"error: {ctx}: failed to read weights '{wPath}': {e}"; return 1
@@ -2601,8 +2810,17 @@ private def cmdCompileGraph (args : List String) : IO UInt32 := do
             let bPath := resolveSpecRelPath specDir bRel
             try some <$> IO.FS.readBinFile bPath catch e =>
               IO.eprintln s!"error: {ctx}: failed to read bias '{bPath}': {e}"; return 1
-        let op := if isLinear then NodeOp.linear cin cout weightsBytes biasBytes? act
-                  else NodeOp.conv1x1 cin cout weightsBytes biasBytes? act
+        let quantSpec? ← match quantPaths? with
+          | none => pure none
+          | some qp =>
+            match ← loadQuantWeightSpecIO qp.format weightsBytes
+                (qp.scales?.map (resolveSpecRelPath specDir))
+                (qp.zeroPoints?.map (resolveSpecRelPath specDir))
+                (qp.palette?.map (resolveSpecRelPath specDir)) ctx with
+            | .ok q? => pure q?
+            | .error e => IO.eprintln s!"error: {e}"; return 1
+        let op := if isLinear then NodeOp.linear cin cout weightsBytes biasBytes? act quantSpec?
+                  else NodeOp.conv1x1 cin cout weightsBytes biasBytes? act quantSpec?
         pure (op, outDims)
 
       | "conv3x3" =>
@@ -2628,15 +2846,16 @@ private def cmdCompileGraph (args : List String) : IO UInt32 := do
             let act ← match actInfo? with
               | none => parseConvAct reluFlag none {}
               | some (nm, p) => parseConvAct reluFlag (some nm) p
+            let quantPaths? ← parseJsonQuantField nj ctx
             let sh : ConvSpec := {
               kernelSize := 3, mode := mode, h := inDims.h, w := inDims.w,
               cin := cin, cout := cout, stride := stride, pad := padMode
             }
             validateConvShape sh
-            pure (mode, cin, cout, stride, padMode, wRel, bRel?, act, { c := cout, h := sh.outH, w := sh.outW : TensorDims })) with
+            pure (mode, cin, cout, stride, padMode, wRel, bRel?, act, quantPaths?, { c := cout, h := sh.outH, w := sh.outW : TensorDims })) with
           | .ok v => pure v
           | .error e => IO.eprintln s!"error: {e}"; return 1
-        let (mode, cin, cout, stride, padMode, wRel, bRel?, act, outDims) := parsed
+        let (mode, cin, cout, stride, padMode, wRel, bRel?, act, quantPaths?, outDims) := parsed
         let wPath := resolveSpecRelPath specDir wRel
         let weightsBytes ← try IO.FS.readBinFile wPath catch e =>
           IO.eprintln s!"error: {ctx}: failed to read weights '{wPath}': {e}"; return 1
@@ -2646,7 +2865,16 @@ private def cmdCompileGraph (args : List String) : IO UInt32 := do
             let bPath := resolveSpecRelPath specDir bRel
             try some <$> IO.FS.readBinFile bPath catch e =>
               IO.eprintln s!"error: {ctx}: failed to read bias '{bPath}': {e}"; return 1
-        pure (NodeOp.conv3x3 mode cin cout stride padMode weightsBytes biasBytes? act, outDims)
+        let quantSpec? ← match quantPaths? with
+          | none => pure none
+          | some qp =>
+            match ← loadQuantWeightSpecIO qp.format weightsBytes
+                (qp.scales?.map (resolveSpecRelPath specDir))
+                (qp.zeroPoints?.map (resolveSpecRelPath specDir))
+                (qp.palette?.map (resolveSpecRelPath specDir)) ctx with
+            | .ok q? => pure q?
+            | .error e => IO.eprintln s!"error: {e}"; return 1
+        pure (NodeOp.conv3x3 mode cin cout stride padMode weightsBytes biasBytes? act quantSpec?, outDims)
 
       | "pe" =>
         let parsed ← match (do

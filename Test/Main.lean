@@ -7433,8 +7433,671 @@ private def runM7bTests : IO (Array TestResult) := do
 
   pure results
 
+-- ===========================================================================
+-- Milestone 8A Tests: Native NE Weight Quantization (int8, uint8, int4, uint4, pal*)
+-- ===========================================================================
+
+private def mkQuantCodes (n : Nat) (modVal : Nat) (seed : Nat := 1) : ByteArray :=
+  ByteArray.mk (Array.ofFn (n := n) fun i => ((i.val * 7 + seed) % modVal).toUInt8)
+
+private def mkQuantScales (n : Nat) (base : Float := 0.0625) : Array Float :=
+  Array.ofFn (n := n) fun i => base * Float.ofNat (1 + i.val % 4)
+
+private def mkQuantZps (n : Nat) (modVal : Nat) : Array UInt8 :=
+  Array.ofFn (n := n) fun i => ((i.val * 3 + 1) % modVal).toUInt8
+
+private def mkQuantPalette (bits : Nat) : Array UInt16 :=
+  let entries := (1 : Nat) <<< bits
+  Array.ofFn (n := entries) fun i =>
+    let centered : Float := (Float.ofNat i.val / Float.ofNat entries - 0.5) * 2.0
+    floatToF16CanonicalZero centered
+
+private def mkConstBiasBytes (cout : Nat) (val : Float) : ByteArray := Id.run do
+  let h := floatToF16CanonicalZero val
+  let mut bs := ByteArray.emptyWithCapacity (2 * cout)
+  for _ in [:cout] do
+    bs := pushU16LE bs h
+  return bs
+
+private def runM8aTests : IO (Array TestResult) := do
+  let mut results : Array TestResult := #[]
+
+  -- 1. Unit tests: packBitsLSB / unpackBitsLSB round-trip across widths {1, 2, 4, 6, 8}
+  results := results.push (checkOk "m8a: packBitsLSB / unpackBitsLSB lossless round-trip for widths {1, 2, 4, 6, 8}" (do
+    for w in #[1, 2, 4, 6, 8] do
+      let mask : UInt8 := (((1 : Nat) <<< w) - 1).toUInt8
+      for cnt in #[0, 1, 2, 3, 5, 7, 8, 9, 13, 16, 33] do
+        let codes := Array.ofFn (n := cnt) fun i => ((i.val * 19 + 5) % 256).toUInt8
+        let packed := Vane.Quant.packBitsLSB w codes
+        if packed.size != packedByteCount w cnt then
+          throw s!"w={w} cnt={cnt}: packed size {packed.size} != {packedByteCount w cnt}"
+        let unpacked := Vane.Quant.unpackBitsLSB w packed cnt
+        let expected := codes.map (fun c => c &&& mask)
+        if unpacked != expected then
+          throw s!"w={w} cnt={cnt}: unpacked mismatch"
+    -- Concrete LSB-first 4-bit and 6-bit byte checks
+    let p4 := Vane.Quant.packBitsLSB 4 #[0x03, 0x0a, 0x05]
+    if p4.data != #[0xa3, 0x05] then
+      throw s!"4-bit LSB packing mismatch: got {p4.data}"
+    let p6 := Vane.Quant.packBitsLSB 6 #[0x3f, 0x01, 0x2a, 0x15]
+    -- c0=0b111111, c1=0b000001 -> b0 = 0x3f | (1<<6) = 0x7f, b1 = 0 | (0x0a<<4) = 0xa0, b2 = 0x02 | (0x15<<2) = 0x56
+    if p6.data != #[0x7f, 0xa0, 0x56] then
+      throw s!"6-bit LSB packing mismatch: got {p6.data}"
+    pure ()
+  ))
+
+  -- 2. Unit tests: computePexp & computeBiasShift exact thresholds
+  results := results.push (checkOk "m8a: computePexp and computeBiasShift exact thresholds" (do
+    if Vane.Quant.computePexp #[0.0625] != 0 then
+      throw "computePexp(0.0625) != 0"
+    if Vane.Quant.computePexp #[ldexp 1.0 (-16)] != 0 then
+      throw "computePexp(2^-16) != 0"
+    if Vane.Quant.computePexp #[ldexp 1.0 (-18)] != 2 then
+      throw "computePexp(2^-18) != 2"
+    if Vane.Quant.computePexp #[0.5, ldexp 1.0 (-20)] != 4 then
+      throw "computePexp([0.5, 2^-20]) != 4"
+    let s15 := ldexp 1.0 (-15)
+    if Vane.Quant.computeBiasShift #[s15] #[1.5] != 1 then
+      throw "computeBiasShift(2^-15, 1.5) != 1"
+    if Vane.Quant.computeBiasShift #[0.125] #[1.5] != 0 then
+      throw "computeBiasShift(0.125, 1.5) != 0"
+    pure ()
+  ))
+
+  -- 3. Positive H16 & H17: int8 (per-tensor, per-channel, per-channel+ZP, tiny scale pexp>0, biasShift>0)
+  for tgt in Target.all do
+    results := results.push (checkOk s!"m8a ({tgt.name}): int8 per-tensor, per-channel, per-channel+ZP, pexp>0, biasShift>0 compile & verify" (do
+      let sh : Conv1x1Shape := { h := 8, w := 16, cin := 32, cout := 32 }
+      let bias32 := mkM5aBias 32
+      -- per-tensor
+      let qPt : Vane.Quant.QuantWeightSpec := {
+        format := .int8, codes := mkQuantCodes (32 * 32) 256 1, scales := #[0.0625]
+      }
+      let cPt ← compileConv1x1Quant tgt sh qPt (some bias32) true
+      matrixVerify tgt cPt.hwx cPt.sections { total := 1, neConv := 1, neAct := 0, peOp := 0 }
+
+      -- per-channel: verify 0x003c bit 27 == 0 and explicit 0x490c == 0 on ALL 1x1 quantized convs (both H16 & H17!)
+      let qPc : Vane.Quant.QuantWeightSpec := {
+        format := .int8, codes := mkQuantCodes (32 * 32) 256 2, scales := mkQuantScales 32 0.03125
+      }
+      let cPc ← compileConv1x1Quant tgt sh qPc (some bias32) false
+      matrixVerify tgt cPc.hwx cPc.sections { total := 1, neConv := 1, neAct := 0, peOp := 0 }
+      let fComPc ← findM5aTaskRegOffset cPc.hwx cPc.info 0 regNeCommon
+      let wComPc ← readU32LE cPc.hwx fComPc
+      if (wComPc &&& ((1 : UInt32) <<< 27)) != 0 then
+        throw s!"{tgt.name} 1x1 int8: 0x003c bit 27 (wide3x3) must be 0 on 1x1 conv"
+      let fSbPc ← findM5aTaskRegOffset cPc.hwx cPc.info 0 regScalarBias
+      let wSbPc ← readU32LE cPc.hwx fSbPc
+      if wSbPc != 0 then
+        throw s!"{tgt.name} 1x1 int8: expected explicit 0x490c == 0 when biasShift=0, got {toHex wSbPc.toNat}"
+
+      -- per-channel + ZP: verify H17 0x4900 bit 28 == 0 and 0x003c bit 27 == 0
+      let qZp : Vane.Quant.QuantWeightSpec := {
+        format := .int8, codes := mkQuantCodes (32 * 32) 256 3,
+        scales := mkQuantScales 32 0.03125, zeroPoints := some (mkQuantZps 32 120)
+      }
+      let cZp ← compileConv1x1Quant tgt sh qZp (some bias32) false
+      matrixVerify tgt cZp.hwx cZp.sections { total := 1, neConv := 1, neAct := 0, peOp := 0 }
+      let fCfg ← findM5aTaskRegOffset cZp.hwx cZp.info 0 regNeCfg
+      let wCfg ← readU32LE cZp.hwx fCfg
+      if (wCfg &&& ((1 : UInt32) <<< 28)) != 0 then
+        throw s!"{tgt.name} int8+ZP: 0x4900 bit 28 must be 0 when hasZP=1"
+      let fCom ← findM5aTaskRegOffset cZp.hwx cZp.info 0 regNeCommon
+      let wCom ← readU32LE cZp.hwx fCom
+      if (wCom &&& ((1 : UInt32) <<< 27)) != 0 then
+        throw s!"{tgt.name} int8+ZP: 0x003c bit 27 must be 0 when hasZP=1"
+
+      -- tiny scale s = 2^-18 -> pexp = 2
+      let qTiny : Vane.Quant.QuantWeightSpec := {
+        format := .int8, codes := mkQuantCodes (32 * 32) 256 4, scales := #[ldexp 1.0 (-18)]
+      }
+      let cTiny ← compileConv1x1Quant tgt sh qTiny none false
+      matrixVerify tgt cTiny.hwx cTiny.sections { total := 1, neConv := 1, neAct := 0, peOp := 0 }
+      let fSc ← findM5aTaskRegOffset cTiny.hwx cTiny.info 0 regNeScale
+      let wSc ← readU32LE cTiny.hwx fSc
+      if (wSc >>> 16) != 2 then
+        throw s!"{tgt.name} int8 tiny scale: expected pexp=2 in 0x4910[31:16], got {wSc >>> 16}"
+
+      -- large bias/scale -> biasShift = 1 on Cout=1 and Cout=16
+      let sh1 : Conv1x1Shape := { h := 8, w := 16, cin := 32, cout := 1 }
+      let qBs1 : Vane.Quant.QuantWeightSpec := {
+        format := .int8, codes := mkQuantCodes 32 256 5, scales := #[ldexp 1.0 (-15)]
+      }
+      let cBs1 ← compileConv1x1Quant tgt sh1 qBs1 (some (mkConstBiasBytes 1 1.5)) false
+      matrixVerify tgt cBs1.hwx cBs1.sections { total := 1, neConv := 1, neAct := 0, peOp := 0 }
+      let fSb ← findM5aTaskRegOffset cBs1.hwx cBs1.info 0 regScalarBias
+      let wSb ← readU32LE cBs1.hwx fSb
+      if wSb != 0x00010000 then
+        throw s!"{tgt.name} int8 biasShift: expected 0x490c == 0x00010000, got {toHex wSb.toNat}"
+      pure ()
+    ))
+
+    -- 4. Positive H16 & H17: uint8+ZP, int4 (bias, nobias, 3x3 same & valid), uint4+ZP, pal1/2/4/6/8
+    results := results.push (checkOk s!"m8a ({tgt.name}): uint8+ZP, int4 (1x1/3x3), uint4+ZP, and pal1/pal2/pal4/pal6/pal8 compile & verify" (do
+      let sh : Conv1x1Shape := { h := 8, w := 16, cin := 32, cout := 32 }
+      let bias32 := mkM5aBias 32
+
+      -- uint8 per-channel + ZP
+      let qU8 : Vane.Quant.QuantWeightSpec := {
+        format := .uint8, codes := mkQuantCodes (32 * 32) 256 6,
+        scales := mkQuantScales 32 0.03125, zeroPoints := some (mkQuantZps 32 200)
+      }
+      let cU8 ← compileConv1x1Quant tgt sh qU8 (some bias32) true
+      matrixVerify tgt cU8.hwx cU8.sections { total := 1, neConv := 1, neAct := 0, peOp := 0 }
+
+      -- int4 per-channel (with bias & bias-free)
+      let qI4 : Vane.Quant.QuantWeightSpec := {
+        format := .int4, codes := mkQuantCodes (32 * 32) 16 7, scales := mkQuantScales 32 0.125
+      }
+      let cI4 ← compileConv1x1Quant tgt sh qI4 (some bias32) false
+      matrixVerify tgt cI4.hwx cI4.sections { total := 1, neConv := 1, neAct := 0, peOp := 0 }
+      let cI4Nb ← compileConv1x1Quant tgt sh qI4 none true
+      matrixVerify tgt cI4Nb.hwx cI4Nb.sections { total := 1, neConv := 1, neAct := 0, peOp := 0 }
+
+      -- int4 dense 3x3 (same & valid): check wide3x3 bit 27 (1 on H17 without ZP, 0 on H16)
+      let sh3Same : Conv3x3Shape := { mode := .dense, h := 8, w := 16, cin := 16, cout := 16, stride := 1, pad := .same }
+      let q3 : Vane.Quant.QuantWeightSpec := {
+        format := .int4, codes := mkQuantCodes (16 * 16 * 9) 16 8, scales := mkQuantScales 16 0.125
+      }
+      let c3Same ← compileConv3x3DenseQuant tgt sh3Same q3 (some (mkM5aBias 16)) true
+      matrixVerify tgt c3Same.hwx c3Same.sections { total := 1, neConv := 1, neAct := 0, peOp := 0 }
+      let expW3 := tgt == .h17
+      if c3Same.wide3x3 != expW3 then
+        throw s!"{tgt.name} 3x3 int4: wide3x3={c3Same.wide3x3} != expected {expW3}"
+      let sh3Valid : Conv3x3Shape := { sh3Same with pad := .valid }
+      let c3Valid ← compileConv3x3DenseQuant tgt sh3Valid q3 none false
+      matrixVerify tgt c3Valid.hwx c3Valid.sections { total := 1, neConv := 1, neAct := 0, peOp := 0 }
+
+      -- uint4 per-channel + ZP (and uint4 without ZP)
+      let qU4Zp : Vane.Quant.QuantWeightSpec := {
+        format := .uint4, codes := mkQuantCodes (32 * 32) 16 9,
+        scales := mkQuantScales 32 0.125, zeroPoints := some (mkQuantZps 32 16)
+      }
+      let cU4Zp ← compileConv1x1Quant tgt sh qU4Zp (some bias32) false
+      matrixVerify tgt cU4Zp.hwx cU4Zp.sections { total := 1, neConv := 1, neAct := 0, peOp := 0 }
+      let qU4NoZp : Vane.Quant.QuantWeightSpec := { qU4Zp with zeroPoints := none }
+      let cU4NoZp ← compileConv1x1Quant tgt sh qU4NoZp none false
+      matrixVerify tgt cU4NoZp.hwx cU4NoZp.sections { total := 1, neConv := 1, neAct := 0, peOp := 0 }
+
+      -- pal1, pal2, pal4, pal6, pal8
+      for b in #[1, 2, 4, 6, 8] do
+        let qPal : Vane.Quant.QuantWeightSpec := {
+          format := .pal b,
+          codes := mkQuantCodes (32 * 32) ((1 : Nat) <<< b) (10 + b),
+          palette := mkQuantPalette b
+        }
+        let cPal ← compileConv1x1Quant tgt sh qPal (some bias32) false
+        matrixVerify tgt cPal.hwx cPal.sections { total := 1, neConv := 1, neAct := 0, peOp := 0 }
+      pure ()
+    ))
+
+    -- 5. Positive H16 & H17: wide-Cout auto-output-split quantized linear & weight compression ratio
+    results := results.push (checkOk s!"m8a ({tgt.name}): wide-Cout auto-split linear (256->640 int4) & compression ratio" (do
+      let qWide : Vane.Quant.QuantWeightSpec := {
+        format := .int4, codes := mkQuantCodes (640 * 256) 16 12, scales := mkQuantScales 640 0.0625
+      }
+      let cWide ← compileLinearQuant tgt 16 256 640 qWide (some (mkM5aBias 640)) 1 true
+      if cWide.slices.size < 2 then
+        throw s!"{tgt.name}: expected wide 256->640 to split into >= 2 slices, got {cWide.slices}"
+      if cWide.slices.foldl (· + ·) 0 != 640 then
+        throw s!"{tgt.name}: split slice sum != 640"
+      matrixVerify tgt cWide.hwx cWide.sections { total := cWide.slices.size, neConv := cWide.slices.size, neAct := 0, peOp := 0 }
+      -- Verify mixed-biasShift split linear: slice 0 has biasShift=1, later slices explicitly reset 0x490c=0
+      let mixedScales : Array Float := Array.ofFn (n := 640) fun i =>
+        if i.val < cWide.slices[0]! then ldexp 1.0 (-15) else 0.0625
+      let cWideMix ← compileLinearQuant tgt 16 256 640 { qWide with scales := mixedScales }
+        (some (mkConstBiasBytes 640 1.5)) 1 false
+      matrixVerify tgt cWideMix.hwx cWideMix.sections { total := cWideMix.slices.size, neConv := cWideMix.slices.size, neAct := 0, peOp := 0 }
+      let fSb0 ← findM5aTaskRegOffset cWideMix.hwx cWideMix.info 0 regScalarBias
+      let wSb0 ← readU32LE cWideMix.hwx fSb0
+      if wSb0 != 0x00010000 then
+        throw s!"{tgt.name}: mixed-biasShift slice 0 expected 0x490c=0x00010000, got {toHex wSb0.toNat}"
+      for si in [1 : cWideMix.slices.size] do
+        let fSbi ← findM5aTaskRegOffset cWideMix.hwx cWideMix.info si regScalarBias
+        let wSbi ← readU32LE cWideMix.hwx fSbi
+        if wSbi != 0 then
+          throw s!"{tgt.name}: mixed-biasShift slice {si} expected explicit 0x490c=0, got {toHex wSbi.toNat}"
+
+      -- Check compression ratios on 256->256 linear
+      let cFp16 ← compileLinear tgt 16 256 256 (mkM5aW1x1 256 256 1) none 1 false
+      let cI8 ← compileLinearQuant tgt 16 256 256 {
+        format := .int8, codes := mkQuantCodes (256 * 256) 256 1, scales := mkQuantScales 256 0.0625
+      } none 1 false
+      let cI4 ← compileLinearQuant tgt 16 256 256 {
+        format := .int4, codes := mkQuantCodes (256 * 256) 16 1, scales := mkQuantScales 256 0.0625
+      } none 1 false
+      let cP2 ← compileLinearQuant tgt 16 256 256 {
+        format := .pal 2, codes := mkQuantCodes (256 * 256) 4 1, palette := mkQuantPalette 2
+      } none 1 false
+      if !(cP2.kernelBytes < cI4.kernelBytes && cI4.kernelBytes < cI8.kernelBytes && cI8.kernelBytes < cFp16.kernelBytes) then
+        throw s!"{tgt.name}: expected pal2({cP2.kernelBytes}) < int4({cI4.kernelBytes}) < int8({cI8.kernelBytes}) < fp16({cFp16.kernelBytes})"
+      pure ()
+    ))
+
+    -- 6. Positive H16 & H17: multi-layer mixed-precision quantized graph + residual
+    results := results.push (checkOk s!"m8a ({tgt.name}): multi-layer quantized graph (int8 conv3x3 -> ReLU -> int4 conv1x1 -> pal4 linear + fp16 residual)" (do
+      let qC1 : Vane.Quant.QuantWeightSpec := {
+        format := .int8, codes := mkQuantCodes (16 * 16 * 9) 256 1,
+        scales := mkQuantScales 16 0.0625, zeroPoints := some (mkQuantZps 16 64)
+      }
+      let qC2 : Vane.Quant.QuantWeightSpec := {
+        format := .int4, codes := mkQuantCodes (16 * 16) 16 2, scales := mkQuantScales 16 0.125
+      }
+      let qC3 : Vane.Quant.QuantWeightSpec := {
+        format := .pal 4, codes := mkQuantCodes (16 * 16) 16 3, palette := mkQuantPalette 4
+      }
+      let g ← Vane.Graph.compileGraph {
+        target := tgt
+        defaultPlacement := .auto
+        inputs := #[{ name := "x", shape := { c := 16, h := 8, w := 16 } }]
+        nodes := #[
+          { id := "c1", inputs := #["x"], op := .conv3x3 .dense 16 16 1 .same ByteArray.empty (some (mkM5aBias 16)) .relu (some qC1) },
+          { id := "c2", inputs := #["c1"], op := .conv1x1 16 16 ByteArray.empty (some (mkM5aBias 16)) .none (some qC2) },
+          { id := "c3", inputs := #["c2"], op := .linear 16 16 ByteArray.empty (some (mkM5aBias 16)) .none (some qC3) },
+          { id := "out", inputs := #["c3", "x"], op := .pe2 .add false }
+        ]
+      }
+      if g.taskCount != 4 then
+        throw s!"expected 4 tasks, got {g.taskCount}"
+      matrixVerify tgt g.hwx g.sections { total := 4, neConv := 3, neAct := 0, peOp := 1 }
+    ))
+
+  -- 7. Dedicated Negative Verifier Tamper Tests (every new M8A verifier rule)
+  let shBase : Conv1x1Shape := { h := 8, w := 16, cin := 32, cout := 32 }
+  let baseI8H17 ← match compileConv1x1Quant .h17 shBase {
+      format := .int8, codes := mkQuantCodes (32 * 32) 256 1, scales := mkQuantScales 32 0.0625
+    } (some (mkM5aBias 32)) false with
+    | .ok c => pure c
+    | .error e => throw (IO.userError s!"baseI8H17 setup failed: {e}")
+
+  let baseI8PtH17 ← match compileConv1x1Quant .h17 shBase {
+      format := .int8, codes := mkQuantCodes (32 * 32) 256 2, scales := #[0.0625]
+    } (some (mkM5aBias 32)) false with
+    | .ok c => pure c
+    | .error e => throw (IO.userError s!"baseI8PtH17 setup failed: {e}")
+
+  let baseI8ZpH17 ← match compileConv1x1Quant .h17 shBase {
+      format := .int8, codes := mkQuantCodes (32 * 32) 256 3,
+      scales := mkQuantScales 32 0.0625, zeroPoints := some (mkQuantZps 32 64)
+    } (some (mkM5aBias 32)) false with
+    | .ok c => pure c
+    | .error e => throw (IO.userError s!"baseI8ZpH17 setup failed: {e}")
+
+  let baseI8H16 ← match compileConv1x1Quant .h16 shBase {
+      format := .int8, codes := mkQuantCodes (32 * 32) 256 4, scales := mkQuantScales 32 0.0625
+    } (some (mkM5aBias 32)) false with
+    | .ok c => pure c
+    | .error e => throw (IO.userError s!"baseI8H16 setup failed: {e}")
+
+  let baseI4H17 ← match compileConv1x1Quant .h17 shBase {
+      format := .int4, codes := mkQuantCodes (32 * 32) 16 5, scales := mkQuantScales 32 0.125
+    } (some (mkM5aBias 32)) false with
+    | .ok c => pure c
+    | .error e => throw (IO.userError s!"baseI4H17 setup failed: {e}")
+
+  let baseU4H17 ← match compileConv1x1Quant .h17 shBase {
+      format := .uint4, codes := mkQuantCodes (32 * 32) 16 6, scales := mkQuantScales 32 0.125
+    } none false with
+    | .ok c => pure c
+    | .error e => throw (IO.userError s!"baseU4H17 setup failed: {e}")
+
+  let basePal4H17 ← match compileConv1x1Quant .h17 shBase {
+      format := .pal 4, codes := mkQuantCodes (32 * 32) 16 7, palette := mkQuantPalette 4
+    } (some (mkM5aBias 32)) false with
+    | .ok c => pure c
+    | .error e => throw (IO.userError s!"basePal4H17 setup failed: {e}")
+
+  let baseBsH17 ← match compileConv1x1Quant .h17 { h := 8, w := 16, cin := 32, cout := 1 } {
+      format := .int8, codes := mkQuantCodes 32 256 8, scales := #[ldexp 1.0 (-15)]
+    } (some (mkConstBiasBytes 1 1.5)) false with
+    | .ok c => pure c
+    | .error e => throw (IO.userError s!"baseBsH17 setup failed: {e}")
+
+  -- Helper to verify a quantized tamper test matches a specific non-empty error substring
+  let checkQuantTamper (name : String) (act : Except String Unit) (expectedSubstr : String) : TestResult :=
+    if expectedSubstr.isEmpty then
+      { name := name, passed := false, detail := "internal test bug: expectedSubstr must be non-empty" }
+    else
+      checkErr name act expectedSubstr
+
+  -- Helper to drop a single plain register write from a single-task HWX and re-emit + verify
+  let stripRegAndVerify (hwx : ByteArray) (info : HwxInfo) (cIn cOut h w dropAddr : Nat) : Except String Unit := do
+    let textBytes ← readSlice hwx info.textSection.offset.toNat info.textSection.size.toNat
+    let decoded ← decodeTaskStream .h17 textBytes
+    let td0 ← rebuildTaskWithExtraWrites decoded[0]! 1 #[]
+    let td := { td0 with plainWrites := td0.plainWrites.filter (fun wr => wr.byteAddr != dropAddr) }
+    let inSurf ← makeFp16Surface .h17 "x" "input_x" .input cIn h w
+    let outSurf ← makeFp16Surface .h17 "y" "output_y" .output cOut h w
+    let some kSec := info.kernelSection | throw "missing kernel section"
+    let kBytes ← readSlice hwx kSec.offset.toNat kSec.size.toNat
+    let em ← emitProgram {
+      target := .h17, surfaces := #[inSurf, outSurf], tasks := #[td],
+      kernel := some kBytes, scratch := none, constants := zeroBytes textConstBytes, ident := some "vane"
+    }
+    let _ ← verifyHwxTasksSummary em.hwx em.info (requireKnownTask := true)
+    pure ()
+
+  -- Tamper 1a: Illegal (wKind, wWidth) = 0x31
+  results := results.push (checkQuantTamper "m8a neg tamper: illegal (wKind=1, wWidth=3) 0x31 in 0x4900 rejected" (do
+    tamperM5aTaskReg baseI8H17.hwx baseI8H17.info 0 regNeCfg 0x10000031
+  ) "illegal weight format in neCfg (wKind=1, wWidth=3)")
+
+  -- Tamper 1b: Illegal wKind = 7
+  results := results.push (checkQuantTamper "m8a neg tamper: illegal wKind=7 in 0x4900 rejected" (do
+    tamperM5aTaskReg baseI8H17.hwx baseI8H17.info 0 regNeCfg 0x10000087
+  ) "illegal weight format in neCfg (wKind=7, wWidth=8)")
+
+  -- Tamper 1c: sparse = 1 on quantized int8 rejected
+  results := results.push (checkQuantTamper "m8a neg tamper: sparse=1 on quantized int8 rejected" (do
+    let fCfg ← findM5aTaskRegOffset baseI8H17.hwx baseI8H17.info 0 regNeCfg
+    let orig ← readU32LE baseI8H17.hwx fCfg
+    tamperM5aTaskReg baseI8H17.hwx baseI8H17.info 0 regNeCfg (orig ||| ((1 : UInt32) <<< 8))
+  ) "neCfg sparse=1 is forbidden for quantized weights")
+
+  -- Tamper 2: H17 0x4900 bit 28 left set when hasZP = 1
+  results := results.push (checkQuantTamper "m8a neg tamper: H17 0x4900 bit 28 set with hasZP=1 rejected" (do
+    let fCfg ← findM5aTaskRegOffset baseI8ZpH17.hwx baseI8ZpH17.info 0 regNeCfg
+    let orig ← readU32LE baseI8ZpH17.hwx fCfg
+    tamperM5aTaskReg baseI8ZpH17.hwx baseI8ZpH17.info 0 regNeCfg (orig ||| ((1 : UInt32) <<< 28))
+  ) "H17 quantized neCfg bit 28 (h17Flag=1) != expected 0")
+
+  -- Tamper 3: H16 0x4900 bit 28 erroneously set
+  results := results.push (checkQuantTamper "m8a neg tamper: H16 0x4900 bit 28 set rejected" (do
+    let fCfg ← findM5aTaskRegOffset baseI8H16.hwx baseI8H16.info 0 regNeCfg
+    let orig ← readU32LE baseI8H16.hwx fCfg
+    tamperM5aTaskReg baseI8H16.hwx baseI8H16.info 0 regNeCfg (orig ||| ((1 : UInt32) <<< 28))
+  ) "H16 neCfg bit 28 (h17Flag) must be 0")
+
+  -- Tamper 4a: hasZP = 1 on pal4 rejected
+  results := results.push (checkQuantTamper "m8a neg tamper: hasZP=1 on pal4 rejected" (do
+    let fCfg ← findM5aTaskRegOffset basePal4H17.hwx basePal4H17.info 0 regNeCfg
+    let orig ← readU32LE basePal4H17.hwx fCfg
+    tamperM5aTaskReg basePal4H17.hwx basePal4H17.info 0 regNeCfg ((orig &&& (~~~((1 : UInt32) <<< 28))) ||| ((1 : UInt32) <<< 24))
+  ) "neCfg hasZeroPoint=1 is forbidden for fp16 and palette weights")
+
+  -- Tamper 4b: 0x003c bit 27 set on H17 quantized conv1x1 (without ZP) rejected (live H17 quarantine guard!)
+  results := results.push (checkQuantTamper "m8a neg tamper: 0x003c bit 27 (wide3x3=1) on H17 quantized conv1x1 rejected" (do
+    let fCom ← findM5aTaskRegOffset baseI8H17.hwx baseI8H17.info 0 regNeCommon
+    let orig ← readU32LE baseI8H17.hwx fCom
+    tamperM5aTaskReg baseI8H17.hwx baseI8H17.info 0 regNeCommon (orig ||| ((1 : UInt32) <<< 27))
+  ) "neCommon wide3x3=1 must be 0 for 1x1 conv")
+
+  -- Tamper 4c: 0x003c bit 27 set on H16 quantized conv3x3 rejected
+  let baseI43x3H16 ← match compileConv3x3DenseQuant .h16
+      { mode := .dense, h := 8, w := 16, cin := 16, cout := 16, stride := 1, pad := .same }
+      { format := .int4, codes := mkQuantCodes (16 * 16 * 9) 16 11, scales := mkQuantScales 16 0.125 }
+      (some (mkM5aBias 16)) false with
+    | .ok c => pure c
+    | .error e => throw (IO.userError s!"baseI43x3H16 setup failed: {e}")
+
+  results := results.push (checkQuantTamper "m8a neg tamper: 0x003c bit 27 (wide3x3=1) on H16 quantized conv3x3 rejected" (do
+    let fCom ← findM5aTaskRegOffset baseI43x3H16.hwx baseI43x3H16.info 0 regNeCommon
+    let orig ← readU32LE baseI43x3H16.hwx fCom
+    tamperM5aTaskReg baseI43x3H16.hwx baseI43x3H16.info 0 regNeCommon (orig ||| ((1 : UInt32) <<< 27))
+  ) "neCommon wide3x3=1 is illegal on h16")
+
+  -- Tamper 4d: 0x003c bit 27 left set on H17 3x3 with hasZP = 1 rejected
+  let baseI8Zp3x3H17 ← match compileConv3x3DenseQuant .h17
+      { mode := .dense, h := 8, w := 16, cin := 16, cout := 16, stride := 1, pad := .same }
+      { format := .int8, codes := mkQuantCodes (16 * 16 * 9) 256 12,
+        scales := mkQuantScales 16 0.0625, zeroPoints := some (mkQuantZps 16 64) }
+      (some (mkM5aBias 16)) false with
+    | .ok c => pure c
+    | .error e => throw (IO.userError s!"baseI8Zp3x3H17 setup failed: {e}")
+
+  results := results.push (checkQuantTamper "m8a neg tamper: 0x003c bit 27 set on H17 3x3 with hasZP=1 rejected" (do
+    let fCom ← findM5aTaskRegOffset baseI8Zp3x3H17.hwx baseI8Zp3x3H17.info 0 regNeCommon
+    let orig ← readU32LE baseI8Zp3x3H17.hwx fCom
+    tamperM5aTaskReg baseI8Zp3x3H17.hwx baseI8Zp3x3H17.info 0 regNeCommon (orig ||| ((1 : UInt32) <<< 27))
+  ) "neCommon bit 27 must be 0 when hasZeroPoint=true")
+
+  -- Tamper 4e: 0x003c bit 27 left set on H17 unsigned uint4 3x3 rejected
+  let baseU43x3H17 ← match compileConv3x3DenseQuant .h17
+      { mode := .dense, h := 8, w := 16, cin := 16, cout := 16, stride := 1, pad := .same }
+      { format := .uint4, codes := mkQuantCodes (16 * 16 * 9) 16 13, scales := mkQuantScales 16 0.125 }
+      none false with
+    | .ok c => pure c
+    | .error e => throw (IO.userError s!"baseU43x3H17 setup failed: {e}")
+
+  results := results.push (checkQuantTamper "m8a neg tamper: 0x003c bit 27 set on H17 unsigned uint4 3x3 rejected" (do
+    let fCom ← findM5aTaskRegOffset baseU43x3H17.hwx baseU43x3H17.info 0 regNeCommon
+    let orig ← readU32LE baseU43x3H17.hwx fCom
+    tamperM5aTaskReg baseU43x3H17.hwx baseU43x3H17.info 0 regNeCommon (orig ||| ((1 : UInt32) <<< 27))
+  ) "neCommon bit 27 must be 0 when hasZeroPoint=false or unsigned weight kind (wKind=4)")
+
+  -- Tamper 4f: 0x003c bit 27 left set on 1x1 with hasZP = 1 or unsigned uint4 rejected
+  results := results.push (checkQuantTamper "m8a neg tamper: 0x003c bit 27 set on 1x1 with hasZP=1 rejected" (do
+    let fCom ← findM5aTaskRegOffset baseI8ZpH17.hwx baseI8ZpH17.info 0 regNeCommon
+    let orig ← readU32LE baseI8ZpH17.hwx fCom
+    tamperM5aTaskReg baseI8ZpH17.hwx baseI8ZpH17.info 0 regNeCommon (orig ||| ((1 : UInt32) <<< 27))
+  ) "neCommon wide3x3=1 must be 0 for 1x1 conv")
+
+  results := results.push (checkQuantTamper "m8a neg tamper: 0x003c bit 27 set on 1x1 unsigned uint4 rejected" (do
+    let fCom ← findM5aTaskRegOffset baseU4H17.hwx baseU4H17.info 0 regNeCommon
+    let orig ← readU32LE baseU4H17.hwx fCom
+    tamperM5aTaskReg baseU4H17.hwx baseU4H17.info 0 regNeCommon (orig ||| ((1 : UInt32) <<< 27))
+  ) "neCommon wide3x3=1 must be 0 for 1x1 conv")
+
+  -- Tamper 4g: quantized weights combined with depthwise 3x3 conv rejected
+  results := results.push (checkQuantTamper "m8a neg tamper: quantized int8 on depthwise 3x3 conv rejected" (do
+    let cDw ← compileConv3x3 .h17 { mode := .depthwise, h := 8, w := 16, cin := 16, cout := 16, stride := 1, pad := .same }
+      (mkTaggedWeights3x3 16 1) none false
+    tamperM5aTaskReg cDw.hwx cDw.info 0 regNeCfg 0x10000081
+  ) "quantized weights (wKind=1) are only supported for dense convolutions")
+
+  -- Tamper 4h: quantized weights combined with stride-2 sparse 3x3 conv rejected
+  results := results.push (checkQuantTamper "m8a neg tamper: quantized int8 on stride-2 sparse 3x3 conv rejected" (do
+    let cS2 ← compileConv3x3 .h17 { mode := .dense, h := 12, w := 14, cin := 8, cout := 16, stride := 2, pad := .same }
+      (mkTaggedWeights3x3 16 8) none false
+    tamperM5aTaskReg cS2.hwx cS2.info 0 regNeCfg 0x10000081
+  ) "quantized weights (wKind=1) are not supported for stride-2 sparse convolutions")
+
+  -- Tamper 5a0: neOp base20 (bit 20) cleared rejected
+  results := results.push (checkQuantTamper "m8a neg tamper: 0x4904 base20 (bit 20) cleared on quantized int8 rejected" (do
+    let fOp ← findM5aTaskRegOffset baseI8H17.hwx baseI8H17.info 0 regNeOp
+    let orig ← readU32LE baseI8H17.hwx fOp
+    tamperM5aTaskReg baseI8H17.hwx baseI8H17.info 0 regNeOp (orig &&& (~~~((1 : UInt32) <<< 20)))
+  ) "neOp base20 (bit 20) must be 1")
+
+  -- Tamper 5a1: fused LUT (0x4904 bit 17) on quantized weights rejected
+  results := results.push (checkQuantTamper "m8a neg tamper: 0x4904 fused LUT bit 17 set on quantized int8 rejected" (do
+    let fOp ← findM5aTaskRegOffset baseI8H17.hwx baseI8H17.info 0 regNeOp
+    let orig ← readU32LE baseI8H17.hwx fOp
+    tamperM5aTaskReg baseI8H17.hwx baseI8H17.info 0 regNeOp (orig ||| ((1 : UInt32) <<< 17))
+  ) "fused LUT activation (0x4904 bit 17) is not supported for quantized weights")
+
+  -- Tamper 5a: 0x4904 0x3c00 (unscaled) left set on scaled int8
+  results := results.push (checkQuantTamper "m8a neg tamper: 0x4904 0x3c00 bits set on scaled int8 rejected" (do
+    let fOp ← findM5aTaskRegOffset baseI8H17.hwx baseI8H17.info 0 regNeOp
+    let orig ← readU32LE baseI8H17.hwx fOp
+    tamperM5aTaskReg baseI8H17.hwx baseI8H17.info 0 regNeOp (orig ||| 0x00003c00)
+  ) "neOp unscaledBits (0xf) must be 0 for scaled integer weights")
+
+  -- Tamper 5b: 0x4904 perLaneScale=1 on pal4 rejected
+  results := results.push (checkQuantTamper "m8a neg tamper: 0x4904 perLaneScale=1 on pal4 rejected" (do
+    let fOp ← findM5aTaskRegOffset basePal4H17.hwx basePal4H17.info 0 regNeOp
+    let orig ← readU32LE basePal4H17.hwx fOp
+    tamperM5aTaskReg basePal4H17.hwx basePal4H17.info 0 regNeOp (orig ||| 0x00004000)
+  ) "neOp perLaneScale (bit 14) must be 0 for fp16 and palette weights")
+
+  -- Tamper 5c: 0x4904 unscaled bits cleared on pal4 rejected
+  results := results.push (checkQuantTamper "m8a neg tamper: 0x4904 unscaled bits cleared on pal4 rejected" (do
+    let fOp ← findM5aTaskRegOffset basePal4H17.hwx basePal4H17.info 0 regNeOp
+    let orig ← readU32LE basePal4H17.hwx fOp
+    tamperM5aTaskReg basePal4H17.hwx basePal4H17.info 0 regNeOp (orig &&& (~~~0x00003c00))
+  ) "neOp unscaledBits (0x0) must be 0xf (0x3c00) for fp16 and palette weights")
+
+  -- Tamper 6a: 0x4910 non-zero low 16 bits when perLaneScale = 1
+  results := results.push (checkQuantTamper "m8a neg tamper: 0x4910 non-zero low 16 bits with perLaneScale=1 rejected" (do
+    tamperM5aTaskReg baseI8H17.hwx baseI8H17.info 0 regNeScale 0x00003c00
+  ) "neScale low 16 bits (0x3c00) must be 0 when perLaneScale=1")
+
+  -- Tamper 6b: 0x4910 zero per-tensor scale rejected
+  results := results.push (checkQuantTamper "m8a neg tamper: 0x4910 zero per-tensor scale rejected" (do
+    tamperM5aTaskReg baseI8PtH17.hwx baseI8PtH17.info 0 regNeScale 0x00000000
+  ) "per-tensor neScale (0x0) must be a finite positive fp16 value")
+
+  -- Tamper 6c: 0x4910 Inf / NaN / negative per-tensor scale rejected
+  for (lbl, badVal, hexStr) in #[("+Inf", 0x00007c00, "0x7c00"), ("NaN", 0x00007e00, "0x7e00"), ("negative", 0x0000bc00, "0xbc00")] do
+    results := results.push (checkQuantTamper s!"m8a neg tamper: 0x4910 {lbl} per-tensor scale rejected" (do
+      tamperM5aTaskReg baseI8PtH17.hwx baseI8PtH17.info 0 regNeScale badVal
+    ) s!"per-tensor neScale ({hexStr}) must be a finite positive fp16 value")
+
+  -- Tamper 6d: 0x4910 pexp = 31 (> 30) rejected
+  results := results.push (checkQuantTamper "m8a neg tamper: 0x4910 pexp=31 (> 30) rejected" (do
+    tamperM5aTaskReg baseI8H17.hwx baseI8H17.info 0 regNeScale ((31 : UInt32) <<< 16)
+  ) "neScale pexp (31) exceeds maximum 30")
+
+  -- Tamper 7a0: Missing 0x490c on quantized int8 rejected (prevents biasShift carry-over!)
+  results := results.push (checkQuantTamper "m8a neg tamper: missing 0x490c on quantized int8 rejected" (do
+    stripRegAndVerify baseI8H17.hwx baseI8H17.info 32 32 8 16 regScalarBias
+  ) "missing required register scalarBias (0x490c)")
+
+  -- Tamper 7a1: Missing 0x490c on quantized pal4 rejected (prevents biasShift carry-over!)
+  results := results.push (checkQuantTamper "m8a neg tamper: missing 0x490c on quantized pal4 rejected" (do
+    stripRegAndVerify basePal4H17.hwx basePal4H17.info 32 32 8 16 regScalarBias
+  ) "missing required register scalarBias (0x490c)")
+
+  -- Tamper 7a: 0x490c biasShift = 16 (> 15) rejected
+  results := results.push (checkQuantTamper "m8a neg tamper: 0x490c biasShift=16 (> 15) rejected" (do
+    tamperM5aTaskReg baseBsH17.hwx baseBsH17.info 0 regScalarBias ((16 : UInt32) <<< 16)
+  ) "scalarBias biasShift (16) exceeds maximum 15")
+
+  -- Tamper 7a2: Integer 0x490c low 16 bits != 0 when biasInKernel=1 rejected
+  results := results.push (checkQuantTamper "m8a neg tamper: 0x490c low 16 bits != 0 with biasInKernel=1 on int8 rejected" (do
+    tamperM5aTaskReg baseI8H17.hwx baseI8H17.info 0 regScalarBias 0x00003c00
+  ) "scalarBias low 16 bits (0x3c00) must be 0 when biasInKernel=1")
+
+  -- Tamper 7a3: Integer 0x490c low 16 bits != 0 when biasInKernel=0 and Cout != 1 rejected
+  results := results.push (checkQuantTamper "m8a neg tamper: 0x490c low 16 bits != 0 with biasInKernel=0 and Cout=32 rejected" (do
+    tamperM5aTaskReg baseU4H17.hwx baseU4H17.info 0 regScalarBias 0x00003c00
+  ) "scalarBias low 16 bits only allowed for Cout=1 when biasInKernel=0")
+
+  -- Tamper 7a4: Integer 0x490c non-finite low 16 bits when biasInKernel=0 and Cout=1 rejected
+  results := results.push (checkQuantTamper "m8a neg tamper: non-finite 0x490c scalarBias on Cout=1 bias-free int8 rejected" (do
+    let cI8C1 ← compileConv1x1Quant .h17 { h := 8, w := 16, cin := 32, cout := 1 } {
+      format := .int8, codes := mkQuantCodes 32 256 15, scales := #[0.0625]
+    } none false
+    tamperM5aTaskReg cI8C1.hwx cI8C1.info 0 regScalarBias f16QNaN.toUInt32
+  ) "scalarBias low 16 bits (0x7e00) must be finite fp16")
+
+  -- Tamper 7b: 0x490c biasShift = 1 on pal4 rejected
+  results := results.push (checkQuantTamper "m8a neg tamper: 0x490c biasShift=1 on pal4 rejected" (do
+    tamperM5aTaskReg basePal4H17.hwx basePal4H17.info 0 regScalarBias 0x00010000
+  ) "scalarBias biasShift (1) must be 0 for palette weights")
+
+  -- Tamper 7b1: 0x490c low 16 bits != 0 on pal4 when biasInKernel=1 or Cout != 1 rejected
+  results := results.push (checkQuantTamper "m8a neg tamper: 0x490c low 16 bits != 0 on pal4 Cout=32 rejected" (do
+    tamperM5aTaskReg basePal4H17.hwx basePal4H17.info 0 regScalarBias 0x00003c00
+  ) "scalarBias low 16 bits (0x3c00) invalid for palette weights when biasInKernel=true or Cout=32")
+
+  -- Tamper 7c: 0x4910 != 0x3c00 on pal4 rejected
+  results := results.push (checkQuantTamper "m8a neg tamper: 0x4910 != 0x3c00 on pal4 rejected" (do
+    tamperM5aTaskReg basePal4H17.hwx basePal4H17.info 0 regNeScale 0x00004000
+  ) "!= expected fp16 1.0 (0x3c00) for palette weights")
+
+  -- Tamper 7d: 0x4910 pexp = 1 on pal4 rejected
+  results := results.push (checkQuantTamper "m8a neg tamper: 0x4910 pexp=1 on pal4 rejected" (do
+    tamperM5aTaskReg basePal4H17.hwx basePal4H17.info 0 regNeScale 0x00013c00
+  ) "neScale pexp (1) must be 0 for palette weights")
+
+  -- Tamper 8a: Corrupted int4 decode table byte in __KERN_0
+  results := results.push (checkQuantTamper "m8a neg tamper: corrupted int4 decode table byte in __KERN_0 rejected" (do
+    let some kSec := baseI4H17.info.kernelSection | throw "missing kernel section"
+    let badHwx ← putU8 baseI4H17.hwx (kSec.offset.toNat + 8) 0x77
+    let badInfo ← validateHwx badHwx
+    let _ ← verifyHwxTasksSummary badHwx badInfo (requireKnownTask := true)
+    pure ()
+  ) "corrupted int4 decode table byte[8]")
+
+  -- Tamper 8b: Non-zero padding byte in int4 64B table pad (byte 20)
+  results := results.push (checkQuantTamper "m8a neg tamper: non-zero int4 decode table padding byte rejected" (do
+    let some kSec := baseI4H17.info.kernelSection | throw "missing kernel section"
+    let badHwx ← putU8 baseI4H17.hwx (kSec.offset.toNat + 20) 0x01
+    let badInfo ← validateHwx badHwx
+    let _ ← verifyHwxTasksSummary badHwx badInfo (requireKnownTask := true)
+    pure ()
+  ) "non-zero int4 decode table padding byte[20]")
+
+  -- Tamper 8a2: Corrupted uint4 decode table byte in __KERN_0
+  results := results.push (checkQuantTamper "m8a neg tamper: corrupted uint4 decode table byte in __KERN_0 rejected" (do
+    let some kSec := baseU4H17.info.kernelSection | throw "missing kernel section"
+    let badHwx ← putU8 baseU4H17.hwx (kSec.offset.toNat + 8) 0x77
+    let badInfo ← validateHwx badHwx
+    let _ ← verifyHwxTasksSummary badHwx badInfo (requireKnownTask := true)
+    pure ()
+  ) "corrupted uint4 decode table byte[8]")
+
+  -- Tamper 8b2: Non-zero padding byte in uint4 64B table pad (byte 20)
+  results := results.push (checkQuantTamper "m8a neg tamper: non-zero uint4 decode table padding byte rejected" (do
+    let some kSec := baseU4H17.info.kernelSection | throw "missing kernel section"
+    let badHwx ← putU8 baseU4H17.hwx (kSec.offset.toNat + 20) 0x01
+    let badInfo ← validateHwx badHwx
+    let _ ← verifyHwxTasksSummary badHwx badInfo (requireKnownTask := true)
+    pure ()
+  ) "non-zero uint4 decode table padding byte[20]")
+
+  -- Tamper 8c: NaN entry in pal4 palette table in __KERN_0
+  results := results.push (checkQuantTamper "m8a neg tamper: NaN entry in pal4 table rejected" (do
+    let some kSec := basePal4H17.info.kernelSection | throw "missing kernel section"
+    let badHwx ← putU16LE basePal4H17.hwx (kSec.offset.toNat + 4) f16QNaN
+    let badInfo ← validateHwx badHwx
+    let _ ← verifyHwxTasksSummary badHwx badInfo (requireKnownTask := true)
+    pure ()
+  ) "pal4 palette entry[2] (0x7e00) is non-finite (NaN/Inf)")
+
+  -- Tamper 8d: Non-zero padding byte in pal4 64B table pad (byte 40)
+  results := results.push (checkQuantTamper "m8a neg tamper: non-zero pal4 table padding byte rejected" (do
+    let some kSec := basePal4H17.info.kernelSection | throw "missing kernel section"
+    let badHwx ← putU8 basePal4H17.hwx (kSec.offset.toNat + 40) 0xff
+    let badInfo ← validateHwx badHwx
+    let _ ← verifyHwxTasksSummary badHwx badInfo (requireKnownTask := true)
+    pure ()
+  ) "non-zero pal4 table padding byte[40]")
+
+  -- Tamper 8e: Per-lane fp16 scale entry tampered to NaN / 0 / negative in __KERN_0 rejected
+  for (lbl, badScale, hexStr) in #[("NaN", f16QNaN, "0x7e00"), ("zero", f16PosZero, "0x0"), ("negative", f16NegOne, "0xbc00")] do
+    results := results.push (checkQuantTamper s!"m8a neg tamper: per-lane fp16 scale {lbl} in __KERN_0 rejected" (do
+      let some kSec := baseI8H17.info.kernelSection | throw "missing kernel section"
+      -- int8 has tableBytes=0, so block 0 per-lane scale[0] is at chunk offset 0!
+      let badHwx ← putU16LE baseI8H17.hwx kSec.offset.toNat badScale
+      let badInfo ← validateHwx badHwx
+      let _ ← verifyHwxTasksSummary badHwx badInfo (requireKnownTask := true)
+      pure ()
+    ) s!"block 0 per-lane scale[0] ({hexStr}) must be a finite positive fp16 value")
+
+  -- Tamper 8f: Non-finite scalarBias on Cout=1 bias-free pal4 rejected
+  results := results.push (checkQuantTamper "m8a neg tamper: non-finite 0x490c scalarBias on Cout=1 pal4 rejected" (do
+    let cPal1 ← compileConv1x1Quant .h17 { h := 8, w := 16, cin := 32, cout := 1 } {
+      format := .pal 4, codes := mkQuantCodes 32 16 14, palette := mkQuantPalette 4
+    } none false
+    tamperM5aTaskReg cPal1.hwx cPal1.info 0 regScalarBias f16PosInf.toUInt32
+  ) "scalarBias low 16 bits (0x7c00) must be finite fp16")
+
+  -- Tamper 8g: Non-zero quantized chunk tail padding byte in __KERN_0 rejected
+  results := results.push (checkQuantTamper "m8a neg tamper: non-zero quantized chunk tail padding byte rejected" (do
+    -- Cout=1, Cin=32, int4 per-tensor no-bias: table=64B + 16B codes = 80B unpadded, 128B chunk -> tail pad is [80..127]
+    let cTail ← compileConv1x1Quant .h17 { h := 8, w := 16, cin := 32, cout := 1 } {
+      format := .int4, codes := mkQuantCodes 32 16 16, scales := #[0.125]
+    } none false
+    let some kSec := cTail.info.kernelSection | throw "missing kernel section"
+    let badHwx ← putU8 cTail.hwx (kSec.offset.toNat + 80) 0x42
+    let badInfo ← validateHwx badHwx
+    let _ ← verifyHwxTasksSummary badHwx badInfo (requireKnownTask := true)
+    pure ()
+  ) "non-zero quantized chunk tail padding byte[80]=66")
+
+  -- Tamper 9: Truncated/mismatched chunkSize[0] on quantized conv
+  results := results.push (checkQuantTamper "m8a neg tamper: mismatched chunkSize[0] on quantized conv rejected" (do
+    let fSz ← findM5aTaskRegOffset baseI4H17.hwx baseI4H17.info 0 (regChunkSize 0)
+    let orig ← readU32LE baseI4H17.hwx fSz
+    tamperM5aTaskReg baseI4H17.hwx baseI4H17.info 0 (regChunkSize 0) (orig - 64)
+  ) "quantized size")
+
+  pure results
+
 def main : IO UInt32 := do
-  let results := (← runAllTests) ++ (← runM4Tests) ++ (← runM5aTests) ++ (← runM5bTests) ++ (← runM5cTests) ++ (← runM5dTests) ++ (← runM7bTests) ++ (← runTargetMatrixTests)
+  let results := (← runAllTests) ++ (← runM4Tests) ++ (← runM5aTests) ++ (← runM5bTests) ++ (← runM5cTests) ++ (← runM5dTests) ++ (← runM7bTests) ++ (← runM8aTests) ++ (← runTargetMatrixTests)
   let mut passed := 0
   let mut failed := 0
   for r in results do
