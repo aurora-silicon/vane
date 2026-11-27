@@ -8889,6 +8889,48 @@ private def runC1Tests : IO (Array TestResult) := do
     Vane.IR.ToGraph.coreGraphToGraphSpec g
   ) "slice params length mismatch")
 
+  -- PR #15 review blocker: rank-increasing [1,1,1,1] Mul/Div after 3D MatMul([1,1,16], [1,16,1]) -> [1,1,1]
+  -- must preserve logical output shape [1,1,1,1] with both fusion ON and OFF, while same-rank scalar Mul still folds.
+  results := results.push (checkOk "c1 reg: 3D MatMul + [1,1,1,1] Mul/Div preserves [1,1,1,1] output (fusion ON & OFF); same-rank scalar Mul folds" (do
+    for opName in #["Mul", "Div"] do
+      let gBcast := pbGraph s!"mm3d_bcast4d_{opName}"
+        #[pbVI "a" #[1, 1, 16], pbVI "b" #[1, 16, 1]]
+        #[pbVI "y" #[1, 1, 1, 1]]
+        #[pbF32Tensor "sc4d" #[1, 1, 1, 1] #[0.25]]
+        #[pbNode "MatMul" "mm" #["a", "b"] #["h"],
+          pbNode opName "sc_op" #["h", "sc4d"] #["y"]]
+      let modelBytes := pbWrapModel 18 gBcast
+      for tgt in #[Target.h16, Target.h17] do
+        for noFuse in #[false, true] do
+          let co ← compileOnnxBytes modelBytes { target := tgt, noFuse := noFuse }
+          let s ← verifyCompiledOnnx co
+          if co.lowered.summary.outputShape != { n := 1, c := 1, h := 1, w := 1 } then
+            throw s!"{tgt.name} {opName} (noFuse={noFuse}) expected outputShape [1,1,1,1], got {repr co.lowered.summary.outputShape}"
+          if co.lowered.summary.fusedMatmulCount != 0 then
+            throw s!"{tgt.name} {opName} (noFuse={noFuse}) must not fold rank-changing [1,1,1,1] broadcast into 3D MatMul, got fusedMatmulCount={co.lowered.summary.fusedMatmulCount}"
+          if s.neMatmul != 1 || s.peOp != 1 || s.total != 2 then
+            throw s!"{tgt.name} {opName} (noFuse={noFuse}) expected 1 neMatmul + 1 peOp task, got {repr s}"
+
+    -- Same-rank scalar Mul (constant shape [] or [1] -> logical [1,1,1]) MUST still fold when fusion is ON
+    for scDims in #[(#[] : Array Int), #[1]] do
+      let gSame := pbGraph "mm3d_same_rank_mul"
+        #[pbVI "a" #[1, 1, 16], pbVI "b" #[1, 16, 1]]
+        #[pbVI "y" #[1, 1, 1]]
+        #[pbF32Tensor "sc" scDims #[0.25]]
+        #[pbNode "MatMul" "mm" #["a", "b"] #["h"],
+          pbNode "Mul" "sc_op" #["h", "sc"] #["y"]]
+      let modelBytes := pbWrapModel 18 gSame
+      for tgt in #[Target.h16, Target.h17] do
+        let coOn ← compileOnnxBytes modelBytes { target := tgt, noFuse := false }
+        let sOn ← verifyCompiledOnnx coOn
+        if coOn.lowered.summary.fusedMatmulCount != 1 || sOn.neMatmul != 1 || sOn.total != 1 then
+          throw s!"{tgt.name} same-rank scalar Mul (dims={scDims.toList}) failed to fold: fused={coOn.lowered.summary.fusedMatmulCount} s={repr sOn}"
+        let coOff ← compileOnnxBytes modelBytes { target := tgt, noFuse := true }
+        let sOff ← verifyCompiledOnnx coOff
+        if coOff.lowered.summary.fusedMatmulCount != 0 || sOff.neMatmul != 1 || sOff.peOp != 1 then
+          throw s!"{tgt.name} same-rank scalar Mul (noFuse=true) unexpected: fused={coOff.lowered.summary.fusedMatmulCount} s={repr sOff}"
+  ))
+
   pure results
 
 end C1Tests

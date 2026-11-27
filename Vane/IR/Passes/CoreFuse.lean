@@ -84,14 +84,14 @@ private def fuseConvAddBiasCore (g : SSAGraph CoreOp) : SSAGraph CoreOp := Id.ru
       if found?.isNone then
         let addNd := cur.nodes[i]!
         match addNd.op, addNd.inputs.toList, addNd.outputs.toList with
-        | .elemBinary .add, [a, b], [(_, _)] =>
+        | .elemBinary .add, [a, b], [(_, addOutTy)] =>
           let checkSide := fun (convOutId biasId : ValueId) =>
             if cur.consumerCount convOutId == 1 then
               match cur.producerOf? convOutId, lookupConstCore cur biasId with
               | some (convIdx, convNd, 0), some (bTy, bPay) =>
                 match convNd.op, convNd.outputs[0]? with
                 | .conv _ _ _ _ _ _ false .none, some (_, convOutTy) =>
-                  if isChannelBiasShapeCore bTy.shape convOutTy.shape && bPay.toFloat64?.isSome then
+                  if convOutTy == addOutTy && isChannelBiasShapeCore bTy.shape convOutTy.shape && bPay.toFloat64?.isSome then
                     some (convIdx, i, biasId)
                   else none
                 | _, _ => none
@@ -273,42 +273,44 @@ private def fuseMatmulCore (g : SSAGraph CoreOp) : Except String (SSAGraph CoreO
       if found?.isNone then
         let nd := cur.nodes[i]!
         match nd.op, nd.inputs.toList, nd.outputs.toList with
-        | .elemUnary (.scalarMul scBits), [mmId], [(_, _)] =>
+        | .elemUnary (.scalarMul scBits), [mmId], [(_, scOutTy)] =>
           if cur.consumerCount mmId == 1 then
             if let some (mmIdx, mmNd, 0) := cur.producerOf? mmId then
-              if let .matmul _ _ oldBits := mmNd.op then
-                if let some newBits ← computeFoldedScale nd.name oldBits (f16ToFloat scBits) false then
-                  found? := some (mmIdx, i, newBits)
-        | .elemUnary (.scalarDiv scBits), [mmId], [(_, _)] =>
+              if let (.matmul _ _ oldBits, some (_, mmOutTy)) := (mmNd.op, mmNd.outputs[0]?) then
+                if mmOutTy == scOutTy then
+                  if let some newBits ← computeFoldedScale nd.name oldBits (f16ToFloat scBits) false then
+                    found? := some (mmIdx, i, newBits)
+        | .elemUnary (.scalarDiv scBits), [mmId], [(_, scOutTy)] =>
           if cur.consumerCount mmId == 1 then
             if let some (mmIdx, mmNd, 0) := cur.producerOf? mmId then
-              if let .matmul _ _ oldBits := mmNd.op then
-                if let some newBits ← computeFoldedScale nd.name oldBits (f16ToFloat scBits) true then
-                  found? := some (mmIdx, i, newBits)
-        | .elemBinary .div, [mmId, cId], [(_, _)] =>
+              if let (.matmul _ _ oldBits, some (_, mmOutTy)) := (mmNd.op, mmNd.outputs[0]?) then
+                if mmOutTy == scOutTy then
+                  if let some newBits ← computeFoldedScale nd.name oldBits (f16ToFloat scBits) true then
+                    found? := some (mmIdx, i, newBits)
+        | .elemBinary .div, [mmId, cId], [(_, scOutTy)] =>
           if cur.consumerCount mmId == 1 then
             match cur.producerOf? mmId, lookupConstCore cur cId with
             | some (mmIdx, mmNd, 0), some (cTy, cPay) =>
               if cTy.numElems == 1 then
-                if let (.matmul _ _ oldBits, some vs) := (mmNd.op, cPay.toFloat64?) then
-                  if vs.size == 1 then
+                if let (.matmul _ _ oldBits, some (_, mmOutTy), some vs) := (mmNd.op, mmNd.outputs[0]?, cPay.toFloat64?) then
+                  if mmOutTy == scOutTy && vs.size == 1 then
                     if let some newBits ← computeFoldedScale nd.name oldBits vs[0]! true then
                       found? := some (mmIdx, i, newBits)
             | _, _ => pure ()
-        | .elemBinary .mul, [aId, bId], [(_, _)] =>
+        | .elemBinary .mul, [aId, bId], [(_, scOutTy)] =>
           let checkSide := fun (mmId cId : ValueId) => do
             if cur.consumerCount mmId == 1 then
               match cur.producerOf? mmId, lookupConstCore cur cId with
               | some (mmIdx, mmNd, 0), some (cTy, cPay) =>
                 if cTy.numElems == 1 then
-                  match mmNd.op, cPay.toFloat64? with
-                  | .matmul _ _ oldBits, some vs =>
-                    if vs.size == 1 then
+                  match mmNd.op, mmNd.outputs[0]?, cPay.toFloat64? with
+                  | .matmul _ _ oldBits, some (_, mmOutTy), some vs =>
+                    if mmOutTy == scOutTy && vs.size == 1 then
                       match ← computeFoldedScale nd.name oldBits vs[0]! false with
                       | some newBits => pure (some (mmIdx, i, newBits))
                       | none => pure none
                     else pure none
-                  | _, _ => pure none
+                  | _, _, _ => pure none
                 else pure none
               | _, _ => pure none
             else pure none
