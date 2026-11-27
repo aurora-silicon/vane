@@ -57,11 +57,11 @@ private def usage : String :=
   "                      --h <H> --w <W> --c <C> --axes <w|h|c|hw|cw|ch|chw> [--eps F] --out-dir <dir>\n" ++
   "  vane compile-view --target <h16|h17> --op <transpose|slice|concat|split|reshape> [op flags] --out-dir <dir>\n" ++
   "  vane compile-matmul --target <h16|h17> [--b <B>] --m <M> --k <K> --n <N> [--transpose-a] [--transpose-b] [--scale <F>] --out-dir <dir>\n" ++
-  "  vane compile-graph --spec <graph.json> [--strip-height <off|auto|N>] --out-dir <dir>\n" ++
+  "  vane compile-graph --spec <graph.json> [--strip-height <off|auto|N>] [--dump-ir[=ane|machine|all]] --out-dir <dir>\n" ++
   "  vane compile-onnx --target <h16|h17> --model <path> [--safetensors <path>] [--input-shape NAME=C,H,W]...\n" ++
-  "                    [--placement auto|l2|dram] [--no-fuse] [--allow-view-ops=true|false]\n" ++
-  "                    [--quantize <int8|int4|pal4|pal2>] [--dump-ir[=high|core]]\n" ++
-  "                    [--emit-graph-dir <dir>] --out-dir <dir>\n" ++
+  "                    [--placement auto|l2|dram] [--strip-height <off|auto|N>] [--no-fuse]\n" ++
+  "                    [--allow-view-ops=true|false] [--quantize <int8|int4|pal4|pal2>]\n" ++
+  "                    [--dump-ir[=high|core|ane|machine|all]] [--emit-graph-dir <dir>] --out-dir <dir>\n" ++
   "  vane inspect-safetensors --file <path> [--export-dir <dir>] [--strict] [--json]\n"
 
 private def requireArgValue (flag : String) (rest : List String) : Except String (String × List String) :=
@@ -2614,6 +2614,28 @@ private def renderGraphManifestJson (compiled : CompiledGraph) : String :=
     s!"      \"direct\": {if nd.direct then "true" else "false"},\n" ++
     s!"      \"l2_use_bytes\": {nd.l2UseBytes}\n" ++
     "    }"
+  let outSlotItems : List String := match compiled.machineProgram with
+    | some mp =>
+      mp.outputs.toList.map fun o =>
+        "    {\n" ++
+        s!"      \"name\": \"{escapeJsonString o.name}\",\n" ++
+        s!"      \"n\": {o.shape.n},\n" ++
+        s!"      \"channels\": {o.shape.c},\n" ++
+        s!"      \"height\": {o.shape.h},\n" ++
+        s!"      \"width\": {o.shape.w},\n" ++
+        s!"      \"row_stride\": {o.rowStride},\n" ++
+        s!"      \"plane_stride\": {o.planeStride},\n" ++
+        s!"      \"batch_stride\": {o.batchStride},\n" ++
+        s!"      \"offset\": {o.byteOffset},\n" ++
+        s!"      \"bytes\": {o.byteSize}\n" ++
+        "    }"
+    | none => []
+  let outputsField :=
+    if outSlotItems.isEmpty then ""
+    else
+      "  \"outputs\": [\n" ++
+      String.intercalate ",\n" outSlotItems ++ "\n" ++
+      "  ],\n"
   "{\n" ++
   "  \"op\": \"graph\",\n" ++
   s!"  \"target\": \"{compiled.target.name}\",\n" ++
@@ -2634,6 +2656,7 @@ private def renderGraphManifestJson (compiled : CompiledGraph) : String :=
   s!"  \"l2_peak_bytes\": {compiled.l2PeakBytes},\n" ++
   s!"  \"strip_count\": {compiled.stripCount},\n" ++
   s!"  \"strip_height\": {compiled.stripHeight},\n" ++
+  outputsField ++
   "  \"nodes\": [\n" ++
   String.intercalate ",\n" nodeItems ++ "\n" ++
   "  ],\n" ++
@@ -2646,6 +2669,7 @@ private def cmdCompileGraph (args : List String) : IO UInt32 := do
   let mut specPath : Option String := none
   let mut outDir : Option String := none
   let mut stripFlag : Option StripMode := none
+  let mut dumpIrMode : Option String := none
   let mut rest := args
   while !rest.isEmpty do
     match rest with
@@ -2664,10 +2688,25 @@ private def cmdCompileGraph (args : List String) : IO UInt32 := do
         | some m => stripFlag := some m; rest := tl'
         | none => IO.eprintln s!"error: invalid --strip-height '{v}' (expected off, auto, or positive integer)"; return 1
       | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--dump-ir" :: tl =>
+      dumpIrMode := some "all"; rest := tl
+    | "--dump-ir=ane" :: tl =>
+      dumpIrMode := some "ane"; rest := tl
+    | "--dump-ir=machine" :: tl =>
+      dumpIrMode := some "machine"; rest := tl
+    | "--dump-ir=all" :: tl =>
+      dumpIrMode := some "all"; rest := tl
     | flag :: _ =>
-      IO.eprintln s!"error: unknown argument '{flag}' for compile-graph"
-      IO.eprintln usage
-      return 1
+      if flag.startsWith "--dump-ir=" then
+        let val := (flag.drop 10).toString.toLower
+        if val == "ane" || val == "machine" || val == "all" then
+          dumpIrMode := some val; rest := rest.tail
+        else
+          IO.eprintln s!"error: invalid --dump-ir '{val}' (expected ane, machine, or all)"; return 1
+      else
+        IO.eprintln s!"error: unknown argument '{flag}' for compile-graph"
+        IO.eprintln usage
+        return 1
     | [] => break
 
   let some sPathStr := specPath
@@ -3132,17 +3171,38 @@ private def cmdCompileGraph (args : List String) : IO UInt32 := do
     }
     knownShapes := knownShapes.push (ndId, inferredDims)
 
+  let graphOutputs : Array String ← match ((do
+      match jsonObjField? root "outputs" with
+      | some _ => jsonReqStrArray root "outputs" "graph"
+      | none =>
+        match ← jsonOptStr root "output" "graph" with
+        | some s => pure #[s]
+        | none => pure #[]) : Except String (Array String)) with
+    | .ok outs => pure outs
+    | .error e => IO.eprintln s!"error: {e}"; return 1
+
   let graphSpec : GraphSpec := {
     target := target
     inputs := graphInputs
     nodes := graphNodes
     defaultPlacement := defaultPlacement
     stripMode := stripMode
+    outputs := graphOutputs
   }
 
   let compiled ← match compileGraph graphSpec with
     | .ok c => pure c
     | .error e => IO.eprintln s!"error: compile-graph failed: {e}"; return 1
+
+  if let some mode := dumpIrMode then
+    if mode == "ane" || mode == "all" then
+      if let some ane := compiled.aneProgram then
+        IO.println "=== AneIR (L2) ==="
+        IO.println ane.dumpAne
+    if mode == "machine" || mode == "all" then
+      if let some mp := compiled.machineProgram then
+        IO.println "=== MachineIR (L3) ==="
+        IO.println mp.pretty
 
   let manifest := renderGraphManifestJson compiled
   let dir := System.FilePath.mk dirStr
@@ -3234,6 +3294,12 @@ private def cmdCompileOnnx (args : List String) : IO UInt32 := do
       dumpIrMode := some "high"; rest := tl
     | "--dump-ir=core" :: tl =>
       dumpIrMode := some "core"; rest := tl
+    | "--dump-ir=ane" :: tl =>
+      dumpIrMode := some "ane"; rest := tl
+    | "--dump-ir=machine" :: tl =>
+      dumpIrMode := some "machine"; rest := tl
+    | "--dump-ir=all" :: tl =>
+      dumpIrMode := some "all"; rest := tl
     | "--allow-view-ops=true" :: tl =>
       allowViewOps := true; rest := tl
     | "--allow-view-ops=false" :: tl =>
@@ -3265,10 +3331,10 @@ private def cmdCompileOnnx (args : List String) : IO UInt32 := do
         | .error e => IO.eprintln s!"error: {e}"; return 1
       else if flag.startsWith "--dump-ir=" then
         let val := (flag.drop 10).toString.toLower
-        if val == "high" || val == "core" then
+        if val == "high" || val == "core" || val == "ane" || val == "machine" || val == "all" then
           dumpIrMode := some val; rest := rest.tail
         else
-          IO.eprintln s!"error: invalid --dump-ir '{val}' (expected high or core)"; return 1
+          IO.eprintln s!"error: invalid --dump-ir '{val}' (expected high, core, ane, machine, or all)"; return 1
       else if flag.startsWith "--quantize=" then
         let val := (flag.drop 11).toString
         match Vane.IR.parsePTQFormat? val with
@@ -3300,7 +3366,7 @@ private def cmdCompileOnnx (args : List String) : IO UInt32 := do
     | .ok m => pure m
     | .error e => IO.eprintln s!"error: {e}"; return 1
 
-  let lowered ← match lowerOnnx model {
+  let co ← match compileOnnx model {
       target := target
       placement := placement
       stripMode := stripMode
@@ -3311,15 +3377,24 @@ private def cmdCompileOnnx (args : List String) : IO UInt32 := do
       quantize := quantizeFmt
     } with
     | .ok r => pure r
-    | .error e => IO.eprintln s!"error: compile-onnx lowering failed: {e}"; return 1
+    | .error e => IO.eprintln s!"error: compile-onnx failed: {e}"; return 1
+
+  let lowered := co.lowered
+  let compiled := co.compiled
 
   if let some mode := dumpIrMode then
-    if mode == "high" || mode == "both" then
+    if mode == "high" || mode == "both" || mode == "all" then
       IO.println "=== TensorIR (HighOp) ==="
       IO.println (Vane.IR.SSAGraph.dumpHigh lowered.highGraph)
-    if mode == "core" || mode == "both" then
+    if mode == "core" || mode == "both" || mode == "all" then
       IO.println "=== TensorIR (CoreOp) ==="
       IO.println (Vane.IR.SSAGraph.dumpCore lowered.coreGraph)
+    if mode == "ane" || mode == "all" then
+      IO.println "=== AneIR (L2) ==="
+      IO.println co.aneProgram.dumpAne
+    if mode == "machine" || mode == "all" then
+      IO.println "=== MachineIR (L3) ==="
+      IO.println co.machineProgram.pretty
 
   for w in lowered.summary.warnings do
     IO.eprintln w
@@ -3328,10 +3403,6 @@ private def cmdCompileOnnx (args : List String) : IO UInt32 := do
     match ← emitGraphDir (System.FilePath.mk gDir) lowered with
     | .ok () => pure ()
     | .error e => IO.eprintln s!"error: --emit-graph-dir failed: {e}"; return 1
-
-  let compiled ← match compileGraph lowered.spec with
-    | .ok c => pure c
-    | .error e => IO.eprintln s!"error: compile-onnx compilation failed: {e}"; return 1
 
   let manifest := renderGraphManifestJson compiled
   let dir := System.FilePath.mk dirStr
@@ -3349,10 +3420,11 @@ private def cmdCompileOnnx (args : List String) : IO UInt32 := do
 
   let sm := lowered.summary
   let outS := sm.outputShape
+  let multiOutNote := if sm.outputs.size > 1 then s!", outputs={sm.outputs.size}" else ""
   IO.println (
     s!"compiled {target.name} onnx ({compiled.taskCount} tasks, nodes={sm.nodeCount}, " ++
     s!"fused_bn={sm.fusedBnCount}, fused_act={sm.fusedActCount}, fused_mm={sm.fusedMatmulCount}, " ++
-    s!"elided={sm.elidedCount}, out=[{outS.n},{outS.c},{outS.h},{outS.w}]) to {dirStr}: " ++
+    s!"elided={sm.elidedCount}, out=[{outS.n},{outS.c},{outS.h},{outS.w}]{multiOutNote}) to {dirStr}: " ++
     s!"hwx={compiled.hwx.size}B kernel={compiled.kernelBytes}B " ++
     s!"scratch={compiled.scratchBytes}B l2_peak={compiled.l2PeakBytes}B"
   )

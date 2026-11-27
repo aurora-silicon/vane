@@ -8935,8 +8935,803 @@ private def runC1Tests : IO (Array TestResult) := do
 
 end C1Tests
 
+-- ============================================================================
+-- Milestone C2: AneIR, Rolling L2 Cascades, MachineIR, Selective Spill & Multi-I/O
+-- ============================================================================
+
+namespace C2Tests
+
+open Vane.IR
+open Vane.Ane
+open Vane.Machine
+open Vane.Backend.LayoutSelect
+open Vane.Backend.ChannelSplit
+open Vane.Backend.Cascade
+open Vane.Backend.MemoryPlan
+open Vane.Backend.SyncAndEmit
+
+private def compileOnnxBytes (bytes : ByteArray) (opts : LowerOptions := {}) : Except String CompiledOnnx := do
+  compileOnnx (← parseOnnx bytes) opts
+
+private def mkFp16Weights (n : Nat) (val : UInt16 := 0x3400) : ByteArray :=
+  Vane.Graph.u16ArrayToBytes (Array.replicate n val)
+
+private def runC2Tests : IO (Array TestResult) := do
+  let mut results : Array TestResult := #[]
+
+  -- 1. Multi-output ONNX models (homogeneous & heterogeneous shapes) packed into single ABI v3 HWX output surface (H16 & H17)
+  results := results.push (checkOk "c2 multi-output onnx: 1-in 2-out (homogeneous & heterogeneous) pack into single ABI v3 output surface (H16 & H17)" (do
+    let w1 := Array.replicate (16 * 16 * 1 * 1) 0.125
+    let w2 := Array.replicate (8 * 16 * 3 * 3) 0.0625
+    -- 1a. Homogeneous (H=8, W=8): [1,16,8,8] + [1,8,8,8] -> packed [1,24,8,8]
+    let gHomo := pbGraph "multi_out_onnx_homo"
+      #[pbVI "x" #[1, 16, 8, 8]]
+      #[pbVI "y0" #[1, 16, 8, 8], pbVI "y1" #[1, 8, 8, 8]]
+      #[pbF32Tensor "w1" #[16, 16, 1, 1] w1, pbF32Tensor "w2" #[8, 16, 3, 3] w2]
+      #[pbNode "Conv" "conv1" #["x", "w1"] #["c1"],
+        pbNode "Relu" "relu0" #["c1"] #["y0"],
+        pbNode "Conv" "conv2" #["x", "w2"] #["y1"] #[pbAttrInts "pads" #[1, 1, 1, 1]]]
+    let mHomo := pbWrapModel 17 gHomo
+    -- 1b. Heterogeneous (H,W): [1,16,8,8] + [1,8,3,3] (stride-2 valid conv3x3) -> packed [1,cPack,hPack,32]
+    let gHetero := pbGraph "multi_out_onnx_hetero"
+      #[pbVI "x" #[1, 16, 8, 8]]
+      #[pbVI "y0" #[1, 16, 8, 8], pbVI "y1" #[1, 8, 3, 3]]
+      #[pbF32Tensor "w1" #[16, 16, 1, 1] w1, pbF32Tensor "w2" #[8, 16, 3, 3] w2]
+      #[pbNode "Conv" "conv1" #["x", "w1"] #["c1"],
+        pbNode "Relu" "relu0" #["c1"] #["y0"],
+        pbNode "Conv" "conv2" #["x", "w2"] #["y1"] #[pbAttrInts "pads" #[0, 0, 0, 0], pbAttrInts "strides" #[2, 2]]]
+    let mHetero := pbWrapModel 17 gHetero
+    for (tag, mBytes) in #[("homo", mHomo), ("hetero", mHetero)] do
+      for tgt in #[Target.h16, Target.h17] do
+        let co ← compileOnnxBytes mBytes { target := tgt }
+        if co.lowered.summary.outputs.size != 2 then
+          throw s!"{tag}/{tgt.name}: expected 2 lowered outputs, got {co.lowered.summary.outputs.size}"
+        if co.machineProgram.outputs.size != 2 then
+          throw s!"{tag}/{tgt.name}: expected 2 logical OutputSlots, got {co.machineProgram.outputs.size}"
+        if co.machineProgram.outputSurfaces.size != 1 then
+          throw s!"{tag}/{tgt.name}: expected 1 ABI v3 HWX output surface, got {co.machineProgram.outputSurfaces.size}"
+        let outSurfs := co.compiled.info.surfaces.filter fun s => s.direction == .output
+        if outSurfs.size != 1 || co.compiled.info.surfaces.size != 2 then
+          throw s!"{tag}/{tgt.name}: expected 1 HWX output surface & 2 total surfaces, got out={outSurfs.size} total={co.compiled.info.surfaces.size}"
+        let sl0 := co.machineProgram.outputs[0]!
+        let sl1 := co.machineProgram.outputs[1]!
+        if sl0.byteOffset != 0 || sl1.byteOffset < sl0.byteSize || sl1.byteOffset % 64 != 0 ||
+            sl1.byteOffset + sl1.byteSize > outSurfs[0]!.span.toNat then
+          throw s!"{tag}/{tgt.name}: invalid packed output layout {repr sl0} / {repr sl1} vs span {outSurfs[0]!.span}"
+        let summary ← verifyHwxTasksSummary co.compiled.hwx co.compiled.info (requireKnownTask := true)
+        if summary.total != co.compiled.taskCount then
+          throw s!"{tag}/{tgt.name}: verified task count mismatch"
+        validateSectionsWithInfo co.compiled.info co.compiled.sections
+  ))
+
+  -- 2. Multi-output GraphSpec: 2-in 2-out + 3-in 3-out KV-cache-style block (4 ABI v3 surfaces!) + negative 4-input rejection
+  results := results.push (checkOk "c2 multi-output graph: 2-in 2-out & 3-in 3-out KV-cache GraphSpecs verify on H16 & H17" (do
+    let w1 := mkFp16Weights (16 * 16)
+    let w8 := mkFp16Weights (8 * 8)
+    for tgt in #[Target.h16, Target.h17] do
+      -- 2a. 2-in 2-out (3 HWX surfaces: 2 inputs + 1 packed output)
+      let spec2 : Vane.Graph.GraphSpec := {
+        target := tgt
+        inputs := #[
+          { name := "a", shape := { c := 16, h := 8, w := 8 } },
+          { name := "b", shape := { c := 16, h := 8, w := 8 } }
+        ]
+        nodes := #[
+          { id := "c1", inputs := #["a"], op := .conv1x1 16 16 w1 none .relu },
+          { id := "sum", inputs := #["c1", "b"], op := .pe2 .add false },
+          { id := "out2", inputs := #["sum"], op := .lut (.lut .gelu) }
+        ]
+        outputs := #["c1", "out2"]
+      }
+      let g2 ← Vane.Graph.compileGraph spec2
+      if g2.info.surfaces.size != 3 then
+        throw s!"{tgt.name}: expected 3 ABI v3 surfaces for 2-in 2-out, got {g2.info.surfaces.size}"
+      let outSurfs2 := g2.info.surfaces.filter fun s => s.direction == .output
+      let some mp2 := g2.machineProgram | throw s!"{tgt.name}: missing MachineProgram"
+      if outSurfs2.size != 1 || mp2.outputs.size != 2 then
+        throw s!"{tgt.name}: expected 1 HWX output surface & 2 logical outputs"
+      let _ ← verifyHwxTasksSummary g2.hwx g2.info (requireKnownTask := true)
+      validateSectionsWithInfo g2.info g2.sections
+
+      -- 2b. 3-in 3-out KV-cache block (x, k_in, v_in) -> (y, k_out, v_out) = 4 ABI v3 surfaces!
+      let specKV : Vane.Graph.GraphSpec := {
+        target := tgt
+        inputs := #[
+          { name := "x", shape := { c := 8, h := 4, w := 8 } },
+          { name := "k_in", shape := { c := 8, h := 4, w := 8 } },
+          { name := "v_in", shape := { c := 8, h := 4, w := 8 } }
+        ]
+        nodes := #[
+          { id := "q", inputs := #["x"], op := .conv1x1 8 8 w8 none .relu },
+          { id := "k_out", inputs := #["q", "k_in"], op := .pe2 .add false },
+          { id := "v_out", inputs := #["q", "v_in"], op := .pe2 .add false },
+          { id := "y", inputs := #["k_out", "v_out"], op := .pe2 .add false }
+        ]
+        outputs := #["y", "k_out", "v_out"]
+      }
+      let gKV ← Vane.Graph.compileGraph specKV
+      if gKV.info.surfaces.size != 4 then
+        throw s!"{tgt.name}: expected 4 ABI v3 surfaces for 3-in 3-out KV block, got {gKV.info.surfaces.size}"
+      let outSurfsKV := gKV.info.surfaces.filter fun s => s.direction == .output
+      let some mpKV := gKV.machineProgram | throw s!"{tgt.name}: missing MachineProgram"
+      if outSurfsKV.size != 1 || mpKV.outputs.size != 3 then
+        throw s!"{tgt.name}: expected 1 HWX output surface & 3 logical outputs for KV block"
+      let _ ← verifyHwxTasksSummary gKV.hwx gKV.info (requireKnownTask := true)
+      validateSectionsWithInfo gKV.info gKV.sections
+  ))
+
+  results := results.push (checkErr "c2 multi-output neg: 4 inputs (>3 ABI v3 input limit) rejected" (do
+    let spec : Vane.Graph.GraphSpec := {
+      target := .h17
+      inputs := #[
+        { name := "a", shape := { c := 8, h := 4, w := 8 } },
+        { name := "b", shape := { c := 8, h := 4, w := 8 } },
+        { name := "c", shape := { c := 8, h := 4, w := 8 } },
+        { name := "d", shape := { c := 8, h := 4, w := 8 } }
+      ]
+      nodes := #[
+        { id := "s1", inputs := #["a", "b"], op := .pe2 .add false },
+        { id := "s2", inputs := #["c", "d"], op := .pe2 .add false },
+        { id := "out", inputs := #["s1", "s2"], op := .pe2 .add false }
+      ]
+    }
+    Vane.Graph.compileGraph spec
+  ) "1..3 inputs")
+
+  -- 3. Multi-output duplicate output inserts explicit pack_out copy tasks into single ABI v3 output surface
+  results := results.push (checkOk "c2 multi-output duplicate: packs aliased outputs via 2 pack_out stores into single output surface" (do
+    let w1 := mkFp16Weights (8 * 8)
+    let spec : Vane.Graph.GraphSpec := {
+      target := .h17
+      inputs := #[{ name := "x", shape := { c := 8, h := 4, w := 8 } }]
+      nodes := #[{ id := "c1", inputs := #["x"], op := .conv1x1 8 8 w1 none .relu }]
+      outputs := #["c1", "c1"]
+    }
+    let g ← Vane.Graph.compileGraph spec
+    let some mpDup := g.machineProgram | throw "missing MachineProgram"
+    if g.taskCount != 3 || g.info.surfaces.size != 2 || mpDup.outputs.size != 2 then
+      throw s!"expected 3 tasks (conv + 2 pack_out), 2 surfaces, 2 logical outputs; got tasks={g.taskCount} surfs={g.info.surfaces.size} outs={mpDup.outputs.size}"
+    let _ ← verifyHwxTasksSummary g.hwx g.info (requireKnownTask := true)
+    validateSectionsWithInfo g.info g.sections
+  ))
+
+  -- 4. Vela-style rolling L2 cascade on a deep 10-layer 3x3 stack exceeding 2 MiB unstripped (H16 & H17)
+  results := results.push (checkOk "c2 rolling cascade: 10-layer 3x3 stack (>2 MiB unstripped) achieves 0 B scratch on H16 & H17" (do
+    let c := 64; let h := 96; let w := 128
+    let w3 := mkFp16Weights (c * c * 9)
+    let mut nodes : Array Vane.Graph.GraphNode := Array.mkEmpty 10
+    for i in [:10] do
+      let inp := if i == 0 then "x" else s!"conv{i - 1}"
+      nodes := nodes.push {
+        id := s!"conv{i}"
+        inputs := #[inp]
+        op := .conv3x3 .dense c c 1 .same w3 none .relu
+      }
+    for tgt in #[Target.h16, Target.h17] do
+      let unstripped ← Vane.Graph.compileGraph {
+        target := tgt
+        inputs := #[{ name := "x", shape := { c := c, h := h, w := w } }]
+        nodes := nodes
+        defaultPlacement := .auto
+        stripMode := .off
+      }
+      if unstripped.scratchBytes == 0 then
+        throw s!"{tgt.name}: expected unstripped 10-layer 3x3 stack to exceed 2 MiB and spill to scratch"
+      let cascaded ← Vane.Graph.compileGraph {
+        target := tgt
+        inputs := #[{ name := "x", shape := { c := c, h := h, w := w } }]
+        nodes := nodes
+        defaultPlacement := .auto
+        stripMode := .auto
+      }
+      if cascaded.stripCount <= 1 then
+        throw s!"{tgt.name}: expected stripCount > 1, got {cascaded.stripCount}"
+      if cascaded.scratchBytes != 0 then
+        throw s!"{tgt.name}: expected cascaded scratchBytes == 0, got {cascaded.scratchBytes}"
+      if cascaded.l2PeakBytes > l2CapacityBytes then
+        throw s!"{tgt.name}: cascaded l2PeakBytes {cascaded.l2PeakBytes} > 2 MiB"
+      if cascaded.kernelBytes != unstripped.kernelBytes then
+        throw s!"{tgt.name}: expected shared __KERN_0 weights ({unstripped.kernelBytes}B), got {cascaded.kernelBytes}B"
+      let _ ← verifyHwxTasksSummary cascaded.hwx cascaded.info (requireKnownTask := true)
+      validateSectionsWithInfo cascaded.info cascaded.sections
+  ))
+
+  -- 5. Zero-recompute rolling halo-stitch cascade via `cascadePass` (0 B scratch on halo=0 interior) & direct 3x3->LUT->3x3 (L2 c0!)
+  results := results.push (checkOk "c2 rolling halo-stitch: cascadePass achieves 0 B scratch & micro-DMA halo reuse keeps c0 in L2 (H16 & H17)" (do
+    let w3Big := mkFp16Weights (64 * 64 * 9)
+    let w1Big := mkFp16Weights (64 * 64)
+    let w3Small := mkFp16Weights (16 * 16 * 9)
+    for tgt in #[Target.h16, Target.h17] do
+      -- 5a. Reachable through `cascadePass { stripMode := .auto, allowRollingHaloStitch := true }`:
+      -- conv3x3 -> lut(silu) -> conv1x1 (>2 MiB unstripped) achieves 0 B scratch!
+      let specAuto : Vane.Graph.GraphSpec := {
+        target := tgt
+        inputs := #[{ name := "x", shape := { c := 64, h := 64, w := 128 } }]
+        nodes := #[
+          { id := "c0", inputs := #["x"], op := .conv3x3 .dense 64 64 1 .same w3Big none .none },
+          { id := "act1", inputs := #["c0"], op := .lut (.lut .silu) },
+          { id := "c2", inputs := #["act1"], op := .conv1x1 64 64 w1Big none .relu }
+        ]
+      }
+      let aneAuto ← Vane.Graph.graphSpecToAne specAuto
+      let rolledAuto ← cascadePass aneAuto { stripMode := .auto, allowRollingHaloStitch := true }
+      if rolledAuto.stripCount <= 1 then
+        throw s!"{tgt.name}: expected cascadePass(allowRollingHaloStitch=true) to strip >1 strips"
+      let mpAuto ← planMemory rolledAuto
+      if mpAuto.scratchBytes != 0 then
+        throw s!"{tgt.name}: expected 0 B scratch on rolling halo-stitch conv3x3->lut->conv1x1, got {mpAuto.scratchBytes}B"
+      if !mpAuto.witness.l2WithinCapacity then
+        throw s!"{tgt.name}: rolling halo auto witness exceeded L2 capacity"
+      let cmAuto ← syncAndEmit mpAuto
+      let _ ← verifyHwxTasksSummary cmAuto.hwx cmAuto.info (requireKnownTask := true)
+      validateSectionsWithInfo cmAuto.info cmAuto.sections
+
+      -- 5b. Interior 3x3 consumer: c0 stays L2-resident (no forced DRAM!), zero halo DMA on act1, micro-DMA halo stitch on c2
+      let spec3 : Vane.Graph.GraphSpec := {
+        target := tgt
+        inputs := #[{ name := "x", shape := { c := 16, h := 32, w := 32 } }]
+        nodes := #[
+          { id := "c0", inputs := #["x"], op := .conv3x3 .dense 16 16 1 .same w3Small none .none },
+          { id := "act1", inputs := #["c0"], op := .lut (.lut .silu) },
+          { id := "c2", inputs := #["act1"], op := .conv3x3 .dense 16 16 1 .same w3Small none .relu }
+        ]
+      }
+      let ane3 ← Vane.Graph.graphSpecToAne spec3
+      let rolled ← unrollRollingHaloCascade ane3 8
+      let act1HaloCount := rolled.graph.nodes.foldl (fun acc nd =>
+        if (nd.name.splitOn "act1").length > 1 && (nd.name.splitOn "halo").length > 1 then acc + 1 else acc) 0
+      let c2HaloCount := rolled.graph.nodes.foldl (fun acc nd =>
+        if (nd.name.splitOn "c2").length > 1 && (nd.name.splitOn "halo").length > 1 then acc + 1 else acc) 0
+      if act1HaloCount != 0 then
+        throw s!"{tgt.name}: expected 0 halo DMA tasks for halo=0 LUT layer, got {act1HaloCount}"
+      if c2HaloCount == 0 then
+        throw s!"{tgt.name}: expected halo DMA stitching tasks for second 3x3 conv layer"
+      let mp ← planMemory rolled
+      -- Verify c0 strips are placed in L2 (not forced to DRAM!)
+      let c0DramCount := mp.tasks.foldl (fun acc mt =>
+        if (mt.name.splitOn "c0_s").length > 1 then
+          match mp.buffers[mt.output]! with
+          | .l2 .. => acc
+          | _ => acc + 1
+        else acc) 0
+      if c0DramCount != 0 then
+        throw s!"{tgt.name}: expected all c0 rolling strips to remain L2-resident, found {c0DramCount} in DRAM"
+      if !mp.witness.l2WithinCapacity then
+        throw s!"{tgt.name}: rolling halo MemoryPlanWitness exceeded L2 capacity"
+      let cm ← syncAndEmit mp
+      let _ ← verifyHwxTasksSummary cm.hwx cm.info (requireKnownTask := true)
+      validateSectionsWithInfo cm.info cm.sections
+  ))
+
+  -- 6. W/sequence stripping on H=1, W=seq_len block (0 B scratch, verified HWX on H16 & H17)
+  results := results.push (checkOk "c2 sequence W-strip: H=1 W=seq_len block cascades with 0 B scratch on H16 & H17" (do
+    let c := 64; let wFull := 128
+    let w1 := mkFp16Weights (c * c)
+    for tgt in #[Target.h16, Target.h17] do
+      let spec : Vane.Graph.GraphSpec := {
+        target := tgt
+        inputs := #[{ name := "x", shape := { c := c, h := 1, w := wFull } }]
+        nodes := #[
+          { id := "fc1", inputs := #["x"], op := .conv1x1 c c w1 none .relu },
+          { id := "fc2", inputs := #["fc1"], op := .conv1x1 c c w1 none .none }
+        ]
+      }
+      let ane ← Vane.Graph.graphSpecToAne spec
+      let wStripped ← unrollWStripCascade ane 64
+      if wStripped.stripCount != 2 || wStripped.stripAxis != 3 then
+        throw s!"{tgt.name}: expected 2 W-strips on axis 3, got count={wStripped.stripCount} axis={wStripped.stripAxis}"
+      let mp ← planMemory wStripped
+      if mp.scratchBytes != 0 then
+        throw s!"{tgt.name}: expected 0 B scratch for W-stripped sequence cascade, got {mp.scratchBytes}B"
+      if !mp.witness.l2WithinCapacity then
+        throw s!"{tgt.name}: W-strip witness exceeded 2 MiB L2"
+      let cm ← syncAndEmit mp
+      let _ ← verifyHwxTasksSummary cm.hwx cm.info (requireKnownTask := true)
+      validateSectionsWithInfo cm.info cm.sections
+  ))
+
+  -- 7. Selective L2<->DRAM BAR 3 spilling on U-Net-style long-skip DAG (>2 MiB live) on H16 & H17
+  results := results.push (checkOk "c2 selective spill: U-Net long skip spills to BAR 3 while hot bottleneck stays in L2 (H16 & H17)" (do
+    -- enc: 48x128x128 (~1.5 MiB L2) spans 4 bottleneck convs (16x128x128 ~512 KiB each) before residual add.
+    -- Peak live = 1.5 + 0.5 + 0.5 = 2.5 MiB > 2 MiB -> selective spill must spill `enc` (highest bytes*lifetime)
+    -- to BAR 3 DRAM scratch while keeping hot short-lived bottleneck activations in L2!
+    let h := 128; let w := 128
+    let wEnc := mkFp16Weights (48 * 16)
+    let wDown := mkFp16Weights (16 * 48)
+    let wMid := mkFp16Weights (16 * 16)
+    let wUp := mkFp16Weights (48 * 16)
+    for tgt in #[Target.h16, Target.h17] do
+      let spec : Vane.Graph.GraphSpec := {
+        target := tgt
+        inputs := #[{ name := "x", shape := { c := 16, h := h, w := w } }]
+        nodes := #[
+          { id := "enc", inputs := #["x"], op := .conv1x1 16 48 wEnc none .relu },
+          { id := "b0", inputs := #["enc"], op := .conv1x1 48 16 wDown none .relu },
+          { id := "b1", inputs := #["b0"], op := .conv1x1 16 16 wMid none .relu },
+          { id := "b2", inputs := #["b1"], op := .conv1x1 16 16 wMid none .relu },
+          { id := "up", inputs := #["b2"], op := .conv1x1 16 48 wUp none .none },
+          { id := "out", inputs := #["enc", "up"], op := .pe2 .add false }
+        ]
+        defaultPlacement := .auto
+        stripMode := .off
+      }
+      let g ← Vane.Graph.compileGraph spec
+      if g.scratchBytes == 0 then
+        throw s!"{tgt.name}: expected selective spill scratchBytes > 0"
+      if g.l2PeakBytes > l2CapacityBytes then
+        throw s!"{tgt.name}: selective spill l2PeakBytes {g.l2PeakBytes} > 2 MiB"
+      let some mp := g.machineProgram
+        | throw s!"{tgt.name}: missing MachineProgram"
+      if !mp.witness.l2WithinCapacity then
+        throw s!"{tgt.name}: MemoryPlanWitness not within L2 capacity"
+      let encNode? := g.nodes.find? fun n => n.id == "enc"
+      let b0Node? := g.nodes.find? fun n => n.id == "b0"
+      let b1Node? := g.nodes.find? fun n => n.id == "b1"
+      match encNode?, b0Node?, b1Node? with
+      | some encN, some b0N, some b1N =>
+        if encN.outLocation.placementName != "dram" then
+          throw s!"{tgt.name}: expected long-skip 'enc' to spill to dram, got {encN.outLocation.placementName}"
+        if b0N.outLocation.placementName != "l2" || b1N.outLocation.placementName != "l2" then
+          throw s!"{tgt.name}: expected hot bottleneck 'b0'/'b1' to stay in l2, got {b0N.outLocation.placementName}/{b1N.outLocation.placementName}"
+      | _, _, _ => throw s!"{tgt.name}: missing expected nodes in compiled U-Net graph"
+      let _ ← verifyHwxTasksSummary g.hwx g.info (requireKnownTask := true)
+      validateSectionsWithInfo g.info g.sections
+  ))
+
+  -- 8. Zero-copy subview aliasing (contiguous C-axis slice & dual conv1x1 concat(axis=1))
+  results := results.push (checkOk "c2 zero-copy subview: contiguous C-slice and dual conv1x1 concat emit zero copy tasks" (do
+    let w8 := mkFp16Weights (8 * 8)
+    -- 8a. Contiguous C-axis slice [0..1, 8..16, 0..8, 0..16] -> conv1x1 => 1 task (slice aliased!)
+    let specSlice : Vane.Graph.GraphSpec := {
+      target := .h17
+      inputs := #[{ name := "x", shape := { c := 16, h := 8, w := 16 } }]
+      nodes := #[
+        { id := "sl", inputs := #["x"], op := .slice #[0, 8, 0, 0] #[1, 16, 8, 16] #[1, 1, 1, 1] },
+        { id := "c1", inputs := #["sl"], op := .conv1x1 8 8 w8 none .relu }
+      ]
+    }
+    let gSl ← Vane.Graph.compileGraph specSlice
+    if gSl.taskCount != 1 then
+      throw s!"expected zero-copy aliased slice to emit 1 task, got {gSl.taskCount}"
+    let _ ← verifyHwxTasksSummary gSl.hwx gSl.info (requireKnownTask := true)
+
+    -- 8b. Dual conv1x1 -> concat(axis=1) => 2 tasks (concat zero-copy aliased into output surface!)
+    let specCat : Vane.Graph.GraphSpec := {
+      target := .h17
+      inputs := #[{ name := "x", shape := { c := 8, h := 8, w := 16 } }]
+      nodes := #[
+        { id := "b0", inputs := #["x"], op := .conv1x1 8 8 w8 none .relu },
+        { id := "b1", inputs := #["x"], op := .conv1x1 8 8 w8 none .relu },
+        { id := "cat", inputs := #["b0", "b1"], op := .concat 1 }
+      ]
+    }
+    let gCat ← Vane.Graph.compileGraph specCat
+    if gCat.taskCount != 2 then
+      throw s!"expected zero-copy aliased concat to emit 2 tasks, got {gCat.taskCount}"
+    let _ ← verifyHwxTasksSummary gCat.hwx gCat.info (requireKnownTask := true)
+    validateSectionsWithInfo gCat.info gCat.sections
+  ))
+
+  -- 9. Buffer donation validation (positive 2-task chain + negative shape mismatch / intra-task / post-write / duplicate)
+  results := results.push (checkOk "c2 buffer donation: valid 2-task chain donation recorded with lr < fw and sync barrier" (do
+    let w8 := mkFp16Weights (8 * 8)
+    let spec : Vane.Graph.GraphSpec := {
+      target := .h17
+      inputs := #[{ name := "x", shape := { c := 8, h := 4, w := 8 } }]
+      nodes := #[
+        { id := "h", inputs := #["x"], op := .conv1x1 8 8 w8 none .relu },
+        { id := "y", inputs := #["h"], op := .conv1x1 8 8 w8 none .relu }
+      ]
+      donations := #[(0, 0)]
+    }
+    let g ← Vane.Graph.compileGraph spec
+    let some mp := g.machineProgram | throw "missing MachineProgram"
+    if mp.donations.size != 1 then
+      throw s!"expected 1 recorded buffer donation, got {mp.donations.size}"
+    let d := mp.donations[0]!
+    if d.lastReadTask != 0 || d.firstWriteTask != 1 then
+      throw s!"expected donation lr=0 < fw=1, got lr={d.lastReadTask} fw={d.firstWriteTask}"
+    let _ ← verifyHwxTasksSummary g.hwx g.info (requireKnownTask := true)
+  ))
+
+  results := results.push (checkErr "c2 buffer donation neg: mismatched input/output shapes rejected" (do
+    let w8 := mkFp16Weights (8 * 8)
+    let w16 := mkFp16Weights (16 * 8)
+    let spec : Vane.Graph.GraphSpec := {
+      target := .h17
+      inputs := #[{ name := "x", shape := { c := 8, h := 4, w := 8 } }]
+      nodes := #[
+        { id := "h", inputs := #["x"], op := .conv1x1 8 8 w8 none .relu },
+        { id := "y", inputs := #["h"], op := .conv1x1 8 16 w16 none .relu }
+      ]
+      donations := #[(0, 0)]
+    }
+    Vane.Graph.compileGraph spec
+  ) "shape mismatch")
+
+  results := results.push (checkErr "c2 buffer donation neg: single-task intra-task donation (lr == fw) rejected" (do
+    let w8 := mkFp16Weights (8 * 8)
+    let spec : Vane.Graph.GraphSpec := {
+      target := .h17
+      inputs := #[{ name := "x", shape := { c := 8, h := 4, w := 8 } }]
+      nodes := #[{ id := "y", inputs := #["x"], op := .conv1x1 8 8 w8 none .relu }]
+      donations := #[(0, 0)]
+    }
+    Vane.Graph.compileGraph spec
+  ) "not strictly before")
+
+  results := results.push (checkErr "c2 buffer donation neg: post-write input read (lr > fw) rejected" (do
+    let w8 := mkFp16Weights (8 * 16)
+    let spec : Vane.Graph.GraphSpec := {
+      target := .h17
+      inputs := #[{ name := "x", shape := { c := 16, h := 4, w := 8 } }]
+      nodes := #[
+        { id := "b0", inputs := #["x"], op := .conv1x1 16 8 w8 none .relu },
+        { id := "b1", inputs := #["x"], op := .conv1x1 16 8 w8 none .relu },
+        { id := "y", inputs := #["b0", "b1"], op := .concat 1 }
+      ]
+      donations := #[(0, 0)]
+    }
+    Vane.Graph.compileGraph spec
+  ) "not strictly before")
+
+  results := results.push (checkErr "c2 buffer donation neg: duplicate output donation index rejected" (do
+    let w8 := mkFp16Weights (8 * 8)
+    let spec : Vane.Graph.GraphSpec := {
+      target := .h17
+      inputs := #[
+        { name := "x", shape := { c := 8, h := 4, w := 8 } },
+        { name := "z", shape := { c := 8, h := 4, w := 8 } }
+      ]
+      nodes := #[
+        { id := "h", inputs := #["x", "z"], op := .pe2 .add false },
+        { id := "y", inputs := #["h"], op := .conv1x1 8 8 w8 none .relu }
+      ]
+      donations := #[(0, 0), (1, 0)]
+    }
+    Vane.Graph.compileGraph spec
+  ) "duplicate buffer donation")
+
+  results := results.push (checkErr "c2 reg R3-B3: buffer donation on packed multi-output rejected" (do
+    let w8 := mkFp16Weights (8 * 8)
+    let spec : Vane.Graph.GraphSpec := {
+      target := .h17
+      inputs := #[{ name := "x", shape := { c := 8, h := 4, w := 8 } }]
+      nodes := #[
+        { id := "h", inputs := #["x"], op := .conv1x1 8 8 w8 none .relu },
+        { id := "y0", inputs := #["h"], op := .conv1x1 8 8 w8 none .relu },
+        { id := "y1", inputs := #["h"], op := .conv1x1 8 8 w8 none .none }
+      ]
+      outputs := #["y0", "y1"]
+      donations := #[(0, 0)]
+    }
+    Vane.Graph.compileGraph spec
+  ) "unsupported on packed multi-output")
+
+  -- 10. SOK ChannelSplit pass on wide-Cout fp16 1x1, fp16 3x3 & quantized int8 3x3 convs (H16 & H17)
+  results := results.push (checkOk "c2 channelSplit (SOK): wide-Cout fp16 1x1, fp16 3x3 & int8 3x3 convs split cleanly on H16 & H17" (do
+    let wWide1x1 := mkFp16Weights (1024 * 128)
+    let wWide3x3 := mkFp16Weights (256 * 256 * 9)
+    let q3x3 : Vane.Quant.QuantWeightSpec := {
+      format := .int8
+      codes := ByteArray.mk (Array.replicate (512 * 256 * 9) (1 : UInt8))
+      scales := Array.replicate 512 (0.125 : Float)
+      zeroPoints := none
+    }
+    for tgt in #[Target.h16, Target.h17] do
+      let g1 ← Vane.Graph.compileGraph {
+        target := tgt
+        inputs := #[{ name := "x", shape := { c := 128, h := 4, w := 8 } }]
+        nodes := #[{ id := "wide1x1", inputs := #["x"], op := .conv1x1 128 1024 wWide1x1 none .relu }]
+      }
+      if g1.taskCount < 2 then
+        throw s!"{tgt.name}: expected SOK split on 128->1024 conv1x1 (>1 task), got {g1.taskCount}"
+      let _ ← verifyHwxTasksSummary g1.hwx g1.info (requireKnownTask := true)
+
+      let g3 ← Vane.Graph.compileGraph {
+        target := tgt
+        inputs := #[{ name := "x", shape := { c := 256, h := 8, w := 8 } }]
+        nodes := #[{ id := "wide3x3", inputs := #["x"], op := .conv3x3 .dense 256 256 1 .same wWide3x3 none .relu }]
+      }
+      if g3.taskCount < 2 then
+        throw s!"{tgt.name}: expected SOK split on 256->256 fp16 conv3x3 (>1 task), got {g3.taskCount}"
+      let _ ← verifyHwxTasksSummary g3.hwx g3.info (requireKnownTask := true)
+
+      let gQ3 ← Vane.Graph.compileGraph {
+        target := tgt
+        inputs := #[{ name := "x", shape := { c := 256, h := 8, w := 8 } }]
+        nodes := #[{ id := "wideQ3x3", inputs := #["x"], op := .conv3x3 .dense 256 512 1 .same ByteArray.empty none .relu (some q3x3) }]
+      }
+      if gQ3.taskCount < 2 then
+        throw s!"{tgt.name}: expected SOK split on 256->512 int8 conv3x3 (>1 task), got {gQ3.taskCount}"
+      let _ ← verifyHwxTasksSummary gQ3.hwx gQ3.info (requireKnownTask := true)
+  ))
+
+  -- 11. Textual IR dumps (`--dump-ir=ane` and `--dump-ir=machine`)
+  results := results.push (checkOk "c2 dump-ir: AneProgram.dumpAne & MachineProgram.pretty format cleanly" (do
+    let w8 := mkFp16Weights (8 * 8)
+    let g ← Vane.Graph.compileGraph {
+      target := .h17
+      inputs := #[{ name := "x", shape := { c := 8, h := 4, w := 8 } }]
+      nodes := #[
+        { id := "c1", inputs := #["x"], op := .conv1x1 8 8 w8 none .relu },
+        { id := "y", inputs := #["c1", "x"], op := .pe2 .add false }
+      ]
+    }
+    let some ane := g.aneProgram | throw "missing AneProgram"
+    let some mp := g.machineProgram | throw "missing MachineProgram"
+    let aneStr := ane.dumpAne
+    let mpStr := mp.pretty
+    if (aneStr.splitOn "// AneIR:").length <= 1 || (aneStr.splitOn "ane.ne_conv").length <= 1 then
+      throw s!"unexpected AneIR dump:\n{aneStr}"
+    if (mpStr.splitOn "machine_program").length <= 1 || (mpStr.splitOn "l2_peak=").length <= 1 then
+      throw s!"unexpected MachineIR dump:\n{mpStr}"
+  ))
+
+  -- 12. Blocker #1 regression: SOK-split node 0 + separate node 1 with distinct weights must NOT alias in __KERN_0
+  results := results.push (checkOk "c2 reg B1: SOK-split wide conv1x1 + second conv1x1 with distinct weights never collide in __KERN_0 (H16 & H17)" (do
+    let w0 := mkFp16Weights (1024 * 128) (val := 0x3800)
+    let w1 := mkFp16Weights (256 * 128) (val := 0x3C00)
+    for tgt in #[Target.h16, Target.h17] do
+      let gSingle ← Vane.Graph.compileGraph {
+        target := tgt
+        inputs := #[{ name := "x", shape := { c := 128, h := 4, w := 8 } }]
+        nodes := #[{ id := "n0", inputs := #["x"], op := .conv1x1 128 1024 w0 none .relu }]
+      }
+      let gBoth ← Vane.Graph.compileGraph {
+        target := tgt
+        inputs := #[{ name := "x", shape := { c := 128, h := 4, w := 8 } }]
+        nodes := #[
+          { id := "n0", inputs := #["x"], op := .conv1x1 128 1024 w0 none .relu },
+          { id := "n1", inputs := #["x"], op := .conv1x1 128 256 w1 none .relu }
+        ]
+        outputs := #["n0", "n1"]
+      }
+      if gBoth.kernelBytes <= gSingle.kernelBytes then
+        throw s!"{tgt.name}: __KERN_0 weight collision detected! combined={gBoth.kernelBytes}B <= single={gSingle.kernelBytes}B"
+      let _ ← verifyHwxTasksSummary gBoth.hwx gBoth.info (requireKnownTask := true)
+      validateSectionsWithInfo gBoth.info gBoth.sections
+  ))
+
+  -- 13. Blocker #4 regression: dmaView with BOTH outBase > 0 and cp.outOff > 0 adds offsets cleanly
+  results := results.push (checkOk "c2 reg B4: dmaView writing into packed output slot (outBase > 0) with cp.outOff > 0 verifies on H16 & H17" (do
+    let w8 := mkFp16Weights (8 * 8)
+    for tgt in #[Target.h16, Target.h17] do
+      -- y0: [1, 8, 4, 64] at offset 0; y1 = concat(axis=3, [a, b]): [1, 8, 4, 64] at outBase = 4096,
+      -- where concat slice 1 has cp.outOff = 64 > 0 -> effOutOff = 4096 + 64 = 4160!
+      let spec : Vane.Graph.GraphSpec := {
+        target := tgt
+        inputs := #[
+          { name := "x", shape := { c := 8, h := 4, w := 64 } },
+          { name := "a", shape := { c := 8, h := 4, w := 32 } },
+          { name := "b", shape := { c := 8, h := 4, w := 32 } }
+        ]
+        nodes := #[
+          { id := "y0", inputs := #["x"], op := .conv1x1 8 8 w8 none .relu },
+          { id := "y1", inputs := #["a", "b"], op := .concat 3 }
+        ]
+        outputs := #["y0", "y1"]
+      }
+      let g ← Vane.Graph.compileGraph spec
+      let _ ← verifyHwxTasksSummary g.hwx g.info (requireKnownTask := true)
+      validateSectionsWithInfo g.info g.sections
+  ))
+
+  -- 14. Blocker #5 regression: conv1x1 [1,8,8,9] -> pool(max, 2x2, stride=2, valid) avoids illegal L2 input placement
+  results := results.push (checkOk "c2 reg B5: conv1x1 [1,8,8,9] -> pool(max,2x2,s=2,valid) spills to DRAM and verifies on H16 & H17" (do
+    let w8 := mkFp16Weights (8 * 8)
+    for tgt in #[Target.h16, Target.h17] do
+      let spec : Vane.Graph.GraphSpec := {
+        target := tgt
+        inputs := #[{ name := "x", shape := { c := 8, h := 8, w := 9 } }]
+        nodes := #[
+          { id := "c0", inputs := #["x"], op := .conv1x1 8 8 w8 none .relu },
+          { id := "p0", inputs := #["c0"], op := .pool .max 2 2 2 2 .valid false }
+        ]
+      }
+      let g ← Vane.Graph.compileGraph spec
+      let some c0N := g.nodes.find? fun n => n.id == "c0" | throw s!"{tgt.name}: missing c0"
+      if c0N.outLocation.placementName != "dram" then
+        throw s!"{tgt.name}: expected c0 feeding odd-width stride-2 valid pool to spill to dram, got {c0N.outLocation.placementName}"
+      let _ ← verifyHwxTasksSummary g.hwx g.info (requireKnownTask := true)
+      validateSectionsWithInfo g.info g.sections
+  ))
+
+  -- 15. Blocker #7 regressions: Conv weight kernel-dim mismatch & non-conv CoreOp.dequantize rejection
+  results := results.push (checkErr "c2 reg B7a: CoreOp.conv mismatched weight kernel dims rejected" (do
+    let wBad := mkFp16Weights (8 * 8)
+    let xTy : Vane.IR.TensorType := { shape := #[1, 8, 4, 8], dtype := .fp16 }
+    let wTy : Vane.IR.TensorType := { shape := #[8, 8, 1, 1], dtype := .fp16 }
+    let cg : Vane.IR.SSAGraph Vane.IR.CoreOp := {
+      target := .h17
+      inputs := #[(0, "x", xTy)]
+      nodes := #[
+        { name := "w_1x1", op := .const (.fp16 wBad), inputs := #[], outputs := #[(1, wTy)] },
+        { name := "conv3", op := .conv 3 3 1 1 #[1, 1, 1, 1] 1 false .none, inputs := #[0, 1], outputs := #[(2, xTy)] }
+      ]
+      outputs := #[2]
+    }
+    Vane.Backend.LayoutSelect.lowerCoreToAne cg
+  ) "kernel dims")
+
+  results := results.push (checkErr "c2 reg B7b: CoreOp.dequantize consumed by non-conv op rejected cleanly" (do
+    let q : Vane.Quant.QuantWeightSpec := {
+      format := .int8
+      codes := ByteArray.mk (Array.replicate (8 * 8) (1 : UInt8))
+      scales := Array.replicate 8 (0.125 : Float)
+      zeroPoints := none
+    }
+    let wTy : Vane.IR.TensorType := { shape := #[8, 8, 1, 1], dtype := .fp16 }
+    let cg : Vane.IR.SSAGraph Vane.IR.CoreOp := {
+      target := .h17
+      inputs := #[(0, "x", { shape := #[1, 8, 4, 8], dtype := .fp16 })]
+      nodes := #[
+        { name := "q_w", op := .const (.quant q), inputs := #[], outputs := #[(1, wTy)] },
+        { name := "deq_w", op := .dequantize .int8, inputs := #[1], outputs := #[(2, wTy)] },
+        { name := "bad_act", op := .elemUnary .abs, inputs := #[2], outputs := #[(3, wTy)] }
+      ]
+      outputs := #[3]
+    }
+    Vane.Backend.LayoutSelect.lowerCoreToAne cg
+  ) "can only be consumed as a Conv weight input")
+
+  -- 16. Blocker #8 regression: emitGraphDir rejects multi-output ONNX explicitly
+  results := results.push (← do
+    let name := "c2 reg B8: emitGraphDir rejects multi-output ONNX cleanly"
+    let w1 := Array.replicate (8 * 8) 0.125
+    let g := pbGraph "multi_out_emit_dir"
+      #[pbVI "x" #[1, 8, 4, 8]]
+      #[pbVI "y0" #[1, 8, 4, 8], pbVI "y1" #[1, 8, 4, 8]]
+      #[pbF32Tensor "w1" #[8, 8, 1, 1] w1]
+      #[pbNode "Conv" "c1" #["x", "w1"] #["y0"], pbNode "Relu" "r1" #["x"] #["y1"]]
+    match (do
+      let m ← parseOnnx (pbWrapModel 17 g)
+      lowerOnnx m { target := .h17 }) with
+    | .error e => pure { name := name, passed := false, detail := s!"lowerOnnx failed: {e}" }
+    | .ok lr =>
+      match ← emitGraphDir (System.FilePath.mk "/tmp/vane_test_b8_unused") lr with
+      | .ok () => pure { name := name, passed := false, detail := "expected emitGraphDir error on multi-output" }
+      | .error e =>
+        if (e.splitOn "does not yet support multi-output").length > 1 then
+          pure { name := name, passed := true, detail := e }
+        else
+          pure { name := name, passed := false, detail := s!"unexpected error: {e}" })
+
+  -- 17. Minor #4 regression: GraphSpec DCE prunes dead trailing nodes when explicit `outputs` are given
+  results := results.push (checkOk "c2 reg M4: GraphSpec DCE prunes unused trailing nodes with explicit outputs" (do
+    let w8 := mkFp16Weights (8 * 8)
+    let spec : Vane.Graph.GraphSpec := {
+      target := .h17
+      inputs := #[{ name := "x", shape := { c := 8, h := 4, w := 8 } }]
+      nodes := #[
+        { id := "y0", inputs := #["x"], op := .conv1x1 8 8 w8 none .relu },
+        { id := "dead_branch", inputs := #["x"], op := .conv1x1 8 8 w8 none .relu }
+      ]
+      outputs := #["y0"]
+    }
+    let g ← Vane.Graph.compileGraph spec
+    if g.taskCount != 1 then
+      throw s!"expected DCE to prune dead_branch leaving 1 task, got {g.taskCount}"
+    let _ ← verifyHwxTasksSummary g.hwx g.info (requireKnownTask := true)
+  ))
+
+  -- 18. Round 3 Blocker #1: H-stripped packed multi-output (non-direct conv3x3 + conv1x1 AND downstream-consumed y0 -> y1 + dup outputs)
+  results := results.push (checkOk "c2 reg R3-B1: H-stripped packed multi-output (conv3x3+conv1x1 & downstream y0->y1) packs per-strip with 0 B scratch (H16 & H17)" (do
+    let w3 := mkFp16Weights (64 * 64 * 9)
+    let w1 := mkFp16Weights (64 * 64)
+    for tgt in #[Target.h16, Target.h17] do
+      -- 18a. Non-direct conv3x3 + direct conv1x1 on 64x128x128 (>2 MiB unstripped -> forced H-strip!)
+      let g1 ← Vane.Graph.compileGraph {
+        target := tgt
+        inputs := #[{ name := "x", shape := { c := 64, h := 128, w := 128 } }]
+        nodes := #[
+          { id := "b0", inputs := #["x"], op := .conv3x3 .dense 64 64 1 .same w3 none .relu },
+          { id := "y0", inputs := #["b0"], op := .conv3x3 .dense 64 64 1 .same w3 none .relu },
+          { id := "b1", inputs := #["x"], op := .conv1x1 64 64 w1 none .relu },
+          { id := "y1", inputs := #["b1"], op := .conv1x1 64 64 w1 none .relu }
+        ]
+        outputs := #["y0", "y1"]
+        stripMode := .auto
+      }
+      if g1.stripCount <= 1 then
+        throw s!"{tgt.name} (18a): expected stripCount > 1, got {g1.stripCount}"
+      if g1.scratchBytes != 0 then
+        throw s!"{tgt.name} (18a): expected 0 B scratch with per-strip pack_out, got {g1.scratchBytes}B"
+      let _ ← verifyHwxTasksSummary g1.hwx g1.info (requireKnownTask := true)
+      validateSectionsWithInfo g1.info g1.sections
+
+      -- 18b. Output 0 also consumed downstream by output 1 (y0 = conv1x1(h0), y1 = relu(y0))
+      let g2 ← Vane.Graph.compileGraph {
+        target := tgt
+        inputs := #[{ name := "x", shape := { c := 64, h := 128, w := 128 } }]
+        nodes := #[
+          { id := "h0", inputs := #["x"], op := .conv1x1 64 64 w1 none .relu },
+          { id := "y0", inputs := #["h0"], op := .conv1x1 64 64 w1 none .none },
+          { id := "y1", inputs := #["y0"], op := .lut .relu }
+        ]
+        outputs := #["y0", "y1"]
+        stripMode := .auto
+      }
+      if g2.stripCount <= 1 then
+        throw s!"{tgt.name} (18b): expected stripCount > 1, got {g2.stripCount}"
+      if g2.scratchBytes != 0 then
+        throw s!"{tgt.name} (18b): expected 0 B scratch for downstream-consumed y0->y1, got {g2.scratchBytes}B"
+      let _ ← verifyHwxTasksSummary g2.hwx g2.info (requireKnownTask := true)
+      validateSectionsWithInfo g2.info g2.sections
+
+    -- 18c. Duplicate outputs under stripMode=.auto cleanly skips H-stripping without corrupting nodeOutIdx
+    let gDup ← Vane.Graph.compileGraph {
+      target := .h17
+      inputs := #[{ name := "x", shape := { c := 16, h := 16, w := 16 } }]
+      nodes := #[{ id := "y0", inputs := #["x"], op := .conv1x1 16 16 (mkFp16Weights (16 * 16)) none .relu }]
+      outputs := #["y0", "y0"]
+      stripMode := .auto
+    }
+    let _ ← verifyHwxTasksSummary gDup.hwx gDup.info (requireKnownTask := true)
+  ))
+
+  -- 19. Round 3 Blocker #2: Multi-head (n = 4) packed multi-output preserves all 4 batches & exact byteSize/batchStride
+  results := results.push (checkOk "c2 reg R3-B2: multi-head (n=4) 2-output neMatmul preserves full 4-head byteSize/batchStride (H16 & H17)" (do
+    let aSh : Vane.View.Shape4D := { n := 1, c := 4, h := 8, w := 16 }
+    let bSh : Vane.View.Shape4D := { n := 4, c := 16, h := 1, w := 16 }
+    let outSh : Vane.View.Shape4D := { n := 4, c := 8, h := 1, w := 16 }
+    let aTy := Vane.Ane.shape4DToTensorType aSh
+    let bTy := Vane.Ane.shape4DToTensorType bSh
+    let outTy := Vane.Ane.shape4DToTensorType outSh
+    for tgt in #[Target.h16, Target.h17] do
+      let aneProg : Vane.Ane.AneProgram := {
+        graph := {
+          target := tgt
+          inputs := #[(0, "a", aTy), (1, "b", bTy)]
+          nodes := #[
+            { name := "mm0", op := .neMatmul 4 8 16 16 false false (0x3C00 : UInt16) 0 8, inputs := #[0, 1], outputs := #[(2, outTy)] },
+            { name := "mm1", op := .neMatmul 4 8 16 16 false false (0x3C00 : UInt16) 0 8, inputs := #[0, 1], outputs := #[(3, outTy)] }
+          ]
+          outputs := #[2, 3]
+        }
+        outputNames := #["y0", "y1"]
+      }
+      let mp ← planMemory aneProg
+      if mp.outputs.size != 2 then
+        throw s!"{tgt.name}: expected 2 OutputSlots, got {mp.outputs.size}"
+      let expBSt := 8 * 64
+      let expSz := 4 * expBSt
+      let sl0 := mp.outputs[0]!
+      let sl1 := mp.outputs[1]!
+      if sl0.shape.n != 4 || sl0.batchStride != expBSt || sl0.byteSize != expSz || sl0.byteOffset != 0 then
+        throw s!"{tgt.name}: bad output[0] multi-head slot {repr sl0}"
+      if sl1.shape.n != 4 || sl1.batchStride != expBSt || sl1.byteSize != expSz || sl1.byteOffset != expSz then
+        throw s!"{tgt.name}: bad output[1] multi-head slot {repr sl1}"
+      let cm ← syncAndEmit mp
+      let _ ← verifyHwxTasksSummary cm.hwx cm.info (requireKnownTask := true)
+      validateSectionsWithInfo cm.info cm.sections
+  ))
+
+  -- 20. Round 3 Minor #1: All-passthrough multi-output graph (nodes = #[], outputs = #["x", "y"]) compiles via 2 pack_out copies
+  results := results.push (checkOk "c2 reg R3-M1: all-passthrough multi-output (outputs=[x, y]) compiles and verifies on H16 & H17" (do
+    for tgt in #[Target.h16, Target.h17] do
+      let spec : Vane.Graph.GraphSpec := {
+        target := tgt
+        inputs := #[
+          { name := "x", shape := { c := 8, h := 4, w := 8 } },
+          { name := "y", shape := { c := 8, h := 4, w := 8 } }
+        ]
+        nodes := #[]
+        outputs := #["x", "y"]
+      }
+      let g ← Vane.Graph.compileGraph spec
+      if g.taskCount != 2 || g.info.surfaces.size != 3 then
+        throw s!"{tgt.name}: expected 2 pack_out tasks & 3 ABI v3 surfaces, got tasks={g.taskCount} surfs={g.info.surfaces.size}"
+      let _ ← verifyHwxTasksSummary g.hwx g.info (requireKnownTask := true)
+      validateSectionsWithInfo g.info g.sections
+  ))
+
+  pure results
+
+end C2Tests
+
 def main : IO UInt32 := do
-  let results := (← runAllTests) ++ (← runM4Tests) ++ (← runM5aTests) ++ (← runM5bTests) ++ (← runM5cTests) ++ (← runM5dTests) ++ (← runM7bTests) ++ (← runM8aTests) ++ (← C1Tests.runC1Tests) ++ (← runTargetMatrixTests)
+  let results := (← runAllTests) ++ (← runM4Tests) ++ (← runM5aTests) ++ (← runM5bTests) ++ (← runM5cTests) ++ (← runM5dTests) ++ (← runM7bTests) ++ (← runM8aTests) ++ (← C1Tests.runC1Tests) ++ (← C2Tests.runC2Tests) ++ (← runTargetMatrixTests)
   let mut passed := 0
   let mut failed := 0
   for r in results do

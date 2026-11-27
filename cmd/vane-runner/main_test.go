@@ -2142,3 +2142,195 @@ func TestM5dMatmulAndAttentionCLI(t *testing.T) {
 		t.Fatalf("expected gen-graph matmul K mismatch error, rc=%d stderr=%s", rc, stderr.String())
 	}
 }
+
+func TestC2MultiOutputAndDumpIRCLI(t *testing.T) {
+	vaneBin := findVaneBin(t)
+	tmp := t.TempDir()
+	specPath := filepath.Join(tmp, "multi_out.json")
+	compDir := filepath.Join(tmp, "compiled")
+
+	// Write minimal 8x8 fp16 identity weights (8 * 8 * 2 = 128 bytes)
+	wVals := make([]uint16, 64)
+	for i := 0; i < 8; i++ {
+		wVals[i*8+i] = fp16.FromFloat64(1.0)
+	}
+	wPath := filepath.Join(tmp, "w.bin")
+	if err := os.WriteFile(wPath, fp16.EncodeLE(wVals), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	graphJSON := `{
+		"target": "h17",
+		"placement": "auto",
+		"inputs": [{"name": "x", "c": 8, "h": 4, "w": 8}],
+		"nodes": [
+			{"id": "y0", "op": "conv1x1", "cin": 8, "cout": 8, "weights": "w.bin", "relu": true, "inputs": ["x"]},
+			{"id": "y1", "op": "pe", "pe_op": "abs", "inputs": ["x"]}
+		],
+		"outputs": ["y0", "y1"]
+	}`
+	if err := os.WriteFile(specPath, []byte(graphJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Compile with Lean `vane compile-graph --dump-ir=all`
+	compOut := runVane(t, vaneBin, "compile-graph", "--spec", specPath, "--dump-ir=all", "--out-dir", compDir)
+	if !strings.Contains(compOut, "=== AneIR (L2) ===") || !strings.Contains(compOut, "=== MachineIR (L3) ===") {
+		t.Fatalf("expected AneIR & MachineIR dumps in compile-graph output:\n%s", compOut)
+	}
+
+	// 2. Validate HWX + Lean sections (ABI v3: 1 input + 1 packed output = 2 surfaces!)
+	hwxPath := filepath.Join(compDir, "program.hwx")
+	manifestPath := filepath.Join(compDir, "manifest.json")
+	valOut := runVane(t, vaneBin, "validate", "--hwx", hwxPath, "--sections", compDir, "--check-tasks")
+	if !strings.Contains(valOut, "status: ok") || !strings.Contains(valOut, "surfaces (2)") {
+		t.Fatalf("unexpected validate output for packed 2-output ABI v3 HWX:\n%s", valOut)
+	}
+
+	// 3. Verify Go BuildSectionsFromHWX matches Lean's 4 LOAD sections byte-for-byte on packed 2-output HWX!
+	hwxBytes, err := os.ReadFile(hwxPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	goSecs, err := ane.BuildSectionsFromHWX(hwxBytes)
+	if err != nil {
+		t.Fatalf("BuildSectionsFromHWX failed on packed 2-output HWX: %v", err)
+	}
+	for kind, fname := range ane.SectionFilenames {
+		leanBytes, err := os.ReadFile(filepath.Join(compDir, fname))
+		if err != nil {
+			t.Fatalf("read %s: %v", fname, err)
+		}
+		if !bytes.Equal(goSecs[kind], leanBytes) {
+			t.Fatalf("Go BuildSectionsFromHWX mismatch on packed 2-output HWX section %s", fname)
+		}
+	}
+
+	// 4. Execute via `vane-runner run --manifest manifest.json` with repeatable --output-out and --expected
+	var manifest struct {
+		Surfaces []struct {
+			Direction string `json:"direction"`
+			Span      int    `json:"span"`
+		} `json:"surfaces"`
+		Outputs []struct {
+			Name        string `json:"name"`
+			N           int    `json:"n"`
+			BatchStride int    `json:"batch_stride"`
+			Offset      int    `json:"offset"`
+			Bytes       int    `json:"bytes"`
+		} `json:"outputs"`
+	}
+	mRaw, _ := os.ReadFile(manifestPath)
+	if err := json.Unmarshal(mRaw, &manifest); err != nil || len(manifest.Surfaces) != 2 || len(manifest.Outputs) != 2 {
+		t.Fatalf("unexpected manifest surfaces/outputs: %s (err=%v)", string(mRaw), err)
+	}
+	inSpan := manifest.Surfaces[0].Span
+	outSpan := manifest.Surfaces[1].Span
+	if manifest.Outputs[0].N != 1 || manifest.Outputs[0].BatchStride != inSpan ||
+		manifest.Outputs[0].Offset != 0 || manifest.Outputs[0].Bytes != inSpan ||
+		manifest.Outputs[1].N != 1 || manifest.Outputs[1].BatchStride != inSpan ||
+		manifest.Outputs[1].Offset != inSpan || manifest.Outputs[1].Bytes != inSpan ||
+		outSpan < manifest.Outputs[1].Offset+manifest.Outputs[1].Bytes {
+		t.Fatalf("unexpected packed output offsets/batch_stride in manifest: %+v (outSpan=%d)", manifest.Outputs, outSpan)
+	}
+
+	inVals := make([]uint16, inSpan/2)
+	altInVals := make([]uint16, inSpan/2)
+	exp0Vals := make([]uint16, inSpan/2)
+	exp1Vals := make([]uint16, inSpan/2)
+	for i := range inVals {
+		v := float64((i%9)-4) * 0.5
+		inVals[i] = fp16.FromFloat64(v)
+		altInVals[i] = fp16.FromFloat64(-v)
+		r := v
+		if r < 0 {
+			r = 0
+		}
+		exp0Vals[i] = fp16.FromFloat64(r)
+		a := v
+		if a < 0 {
+			a = -a
+		}
+		exp1Vals[i] = fp16.FromFloat64(a)
+	}
+	exp0Bytes := fp16.EncodeLE(exp0Vals)
+	exp1Bytes := fp16.EncodeLE(exp1Vals)
+	packedOut := make([]byte, outSpan)
+	copy(packedOut[manifest.Outputs[0].Offset:], exp0Bytes)
+	copy(packedOut[manifest.Outputs[1].Offset:], exp1Bytes)
+	altPackedOut := make([]byte, outSpan)
+	for i := range altPackedOut {
+		altPackedOut[i] = packedOut[i] ^ 0x01
+	}
+
+	inPath := filepath.Join(tmp, "in.bin")
+	altInPath := filepath.Join(tmp, "alt_in.bin")
+	exp0Path := filepath.Join(tmp, "exp0.bin")
+	exp1Path := filepath.Join(tmp, "exp1.bin")
+	out0Path := filepath.Join(tmp, "out0.bin")
+	out1Path := filepath.Join(tmp, "out1.bin")
+	_ = os.WriteFile(inPath, fp16.EncodeLE(inVals), 0o644)
+	_ = os.WriteFile(altInPath, fp16.EncodeLE(altInVals), 0o644)
+	_ = os.WriteFile(exp0Path, exp0Bytes, 0o644)
+	_ = os.WriteFile(exp1Path, exp1Bytes, 0o644)
+
+	tr := ane.NewMockTransport(map[string]ane.MockDeviceSpec{
+		"/dev/accel/accel0": {ABIVersion: ane.ABIV3, ChipFamily: ane.ChipH17},
+	}, func(inputs [][]byte, _ int) []byte {
+		cp := make([]byte, len(packedOut))
+		if bytes.Equal(inputs[0], fp16.EncodeLE(altInVals)) {
+			copy(cp, altPackedOut)
+		} else {
+			copy(cp, packedOut)
+		}
+		return cp
+	})
+	var stdout, stderr bytes.Buffer
+	rc := runCLI([]string{
+		"run",
+		"--hwx", hwxPath,
+		"--manifest", manifestPath,
+		"--input", inPath,
+		"--alt-input", altInPath,
+		"--output-out", out0Path,
+		"--output-out", out1Path,
+		"--expected", exp0Path,
+		"--expected", exp1Path,
+		"--runs", "2",
+		"--json",
+	}, tr, &stdout, &stderr)
+	if rc != 0 {
+		t.Fatalf("vane-runner run packed multi-output failed rc=%d stderr=%s", rc, stderr.String())
+	}
+	var rep ane.RunReport
+	if err := json.Unmarshal(stdout.Bytes(), &rep); err != nil {
+		t.Fatalf("parse multi-output RunReport: %v\nstdout=%s", err, stdout.String())
+	}
+	if len(rep.Outputs) != 2 || rep.Outputs[0].Name != "y0" || rep.Outputs[1].Name != "y1" ||
+		rep.Outputs[0].Comparison == nil || !rep.Outputs[0].Comparison.Passed ||
+		rep.Outputs[1].Comparison == nil || !rep.Outputs[1].Comparison.Passed ||
+		rep.Outputs[0].AltOutputSHA256 == "" || rep.Outputs[1].AltOutputSHA256 == "" ||
+		rep.Outputs[0].AltOutputSHA256 == rep.Outputs[0].OutputSHA256 ||
+		rep.Outputs[1].AltOutputSHA256 == rep.Outputs[1].OutputSHA256 {
+		t.Fatalf("unexpected multi-output report: %+v", rep)
+	}
+	got0, _ := os.ReadFile(out0Path)
+	got1, _ := os.ReadFile(out1Path)
+	if !bytes.Equal(got0, exp0Bytes) || !bytes.Equal(got1, exp1Bytes) {
+		t.Fatalf("written unpacked multi-output files mismatch")
+	}
+
+	// 5. Negative manifest validation: unaligned offset & overlapping outputs rejected
+	badUnaligned := filepath.Join(tmp, "bad_unaligned.json")
+	_ = os.WriteFile(badUnaligned, []byte(`{"outputs":[{"name":"y0","offset":0,"bytes":64},{"name":"y1","offset":96,"bytes":64}]}`), 0o644)
+	stderr.Reset()
+	if rcBad := runCLI([]string{"run", "--hwx", hwxPath, "--manifest", badUnaligned, "--input", inPath}, tr, &stdout, &stderr); rcBad == 0 || !strings.Contains(stderr.String(), "64-byte aligned") {
+		t.Fatalf("expected unaligned manifest rejection, rc=%d stderr=%s", rcBad, stderr.String())
+	}
+	badOverlap := filepath.Join(tmp, "bad_overlap.json")
+	_ = os.WriteFile(badOverlap, []byte(`{"outputs":[{"name":"y0","offset":0,"bytes":128},{"name":"y1","offset":64,"bytes":128}]}`), 0o644)
+	stderr.Reset()
+	if rcBad := runCLI([]string{"run", "--hwx", hwxPath, "--manifest", badOverlap, "--input", inPath}, tr, &stdout, &stderr); rcBad == 0 || !strings.Contains(stderr.String(), "overlap") {
+		t.Fatalf("expected overlapping manifest rejection, rc=%d stderr=%s", rcBad, stderr.String())
+	}
+}
