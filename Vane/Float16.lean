@@ -79,6 +79,39 @@ def f16ToF32Bits (h : UInt16) : UInt32 :=
     let e32 : UInt32 := (exp + (127 - 15)).toUInt32
     sign ||| (e32 <<< 23) ||| (frac.toUInt32 <<< 13)
 
+/-- Exact lossless widening of IEEE-754 binary32 bits to IEEE-754 binary64 `Float`.
+    Handles normals, subnormals, `+-0`, `+-inf`, and `NaN`. -/
+def f32BitsToFloat (u : UInt32) : Float :=
+  let sign : UInt64 := ((u.toUInt64 >>> 31) &&& 1) <<< 63
+  let exp : Nat := ((u >>> 23) &&& 0xff).toNat
+  let frac : Nat := (u &&& 0x7fffff).toNat
+  if exp == 0 then
+    if frac == 0 then
+      Float.ofBits sign
+    else
+      Id.run do
+        let mut f := frac
+        let mut e : Int := -126
+        for _ in [:24] do
+          if (f &&& 0x800000) != 0 then break
+          f := f <<< 1
+          e := e - 1
+        let fNorm := f &&& 0x7fffff
+        let e64 : UInt64 := (e + 1023).toNat.toUInt64
+        return Float.ofBits (sign ||| (e64 <<< 52) ||| (fNorm.toUInt64 <<< 29))
+  else if exp == 0xff then
+    if frac == 0 then
+      Float.ofBits (sign ||| (0x7ff0000000000000 : UInt64))
+    else
+      Float.ofBits (sign ||| (0x7ff8000000000000 : UInt64) ||| (frac.toUInt64 <<< 29))
+  else
+    let e64 : UInt64 := (exp + (1023 - 127)).toUInt64
+    Float.ofBits (sign ||| (e64 <<< 52) ||| (frac.toUInt64 <<< 29))
+
+/-- Exact lossless widening of bfloat16 bits to IEEE-754 binary64 `Float`. -/
+def bf16ToFloat (b : UInt16) : Float :=
+  f32BitsToFloat (b.toUInt32 <<< 16)
+
 /-- Convert an IEEE-754 binary64 `Float` to IEEE-754 binary32 bits (round-to-nearest-even). -/
 def floatToF32Bits (f : Float) : UInt32 :=
   let bits := f.toBits

@@ -20,7 +20,7 @@ nix build .#vane .#vane-runner .#vane-runner-arm64
 `nix flake check` runs:
 
 - `lean-tests`: `vane-test`, including the cross-target smoke matrix over `Target.all`.
-- `proof-audit`: `vane-audit` loads the compiled `.olean`s and checks that every `Vane.*` constant uses only `propext`, `Classical.choice` and `Quot.sound`, declares no `axiom`, `unsafe`, `implemented_by` or `extern`, and that `Vane.Proofs` still has at least 320 theorems; `cmd/lean-guard` runs `selftest` and `forbidden` to reject `sorry`, `admit`, `native_decide`, `implemented_by`, `bv_decide`, `unsafe`, `skipKernelTC` and `extern` in Lean code; and `leanchecker Vane Vane.Proofs` replays every declaration through the Lean kernel.
+- `proof-audit`: `vane-audit` loads the compiled `.olean`s and checks that every `Vane.*` constant uses only `propext`, `Classical.choice` and `Quot.sound`, declares no `axiom`, `unsafe`, `implemented_by` or `extern`, and that `Vane.Proofs` still has at least 348 theorems; `cmd/lean-guard` runs `selftest` and `forbidden` to reject `sorry`, `admit`, `native_decide`, `implemented_by`, `bv_decide`, `unsafe`, `skipKernelTC` and `extern` in Lean code; and `leanchecker Vane Vane.Proofs` replays every declaration through the Lean kernel.
 - `tcb-check`: `cmd/lean-guard` (`tcb`) keeps the import closure of `Vane/Verify.lean` inside `Vane.Binary`, `Vane.TaskStream`, `Vane.Hwx`, `Vane.Register` and `Vane.Reach`.
 - `go-lint`: `gofmt`, `go vet`, and no `require` in `go.mod` / no `go.sum`.
 - `go-tests`: `go test -race -v ./...` against the built `vane`.
@@ -41,7 +41,8 @@ Every commit in a pull request needs a `Signed-off-by: Name <email>` trailer (`g
 
 ## Repo specifics
 
-- `Vane/Verify.lean` is the independent static safety verifier (TCB); keep it independent from lowering/codegen modules (`Vane/Conv.lean`, `Vane/Graph.lean`, `Vane/Program.lean`).
+- `Vane/Verify.lean` is the independent static safety verifier (TCB); keep it independent from lowering/codegen/frontend modules (`Vane/Conv.lean`, `Vane/Graph.lean`, `Vane/Program.lean`, `Vane/Frontend/`).
+- All ONNX and SafeTensors compilation and lowering (`vane compile-onnx`, `vane inspect-safetensors`) lives in Lean 4 (`Vane/Frontend/`); `cmd/vane-runner` is strictly the device runner and numerical reference/vector harness.
 - `Vane/Proofs.lean` must remain kernel-clean with zero `sorry`, `admit`, `axiom`, `native_decide`, or `implemented_by` shortcuts.
 - Every new verifier rejection rule must ship with both a positive test and a dedicated negative tamper test in `Test/Main.lean`.
 - Changes touching HWX emission, register lowering, tiling/legality, `Vane/Verify.lean`, or `cmd/vane-runner` require on-device Linux `accel/ane` verification (with clean `dmesg`) at the PR head SHA.

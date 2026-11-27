@@ -18,6 +18,9 @@ open Vane.Conv3x3
 open Vane.View
 open Vane.Matmul
 open Vane.Graph
+open Vane.Frontend.SafeTensors
+open Vane.Frontend.Onnx
+open Vane.Frontend.Lower
 
 private def usage : String :=
   "Usage:\n" ++
@@ -47,7 +50,11 @@ private def usage : String :=
   "                      --h <H> --w <W> --c <C> --axes <w|h|c|hw|cw|ch|chw> [--eps F] --out-dir <dir>\n" ++
   "  vane compile-view --target <h16|h17> --op <transpose|slice|concat|split|reshape> [op flags] --out-dir <dir>\n" ++
   "  vane compile-matmul --target <h16|h17> [--b <B>] --m <M> --k <K> --n <N> [--transpose-a] [--transpose-b] [--scale <F>] --out-dir <dir>\n" ++
-  "  vane compile-graph --spec <graph.json> [--strip-height <off|auto|N>] --out-dir <dir>\n"
+  "  vane compile-graph --spec <graph.json> [--strip-height <off|auto|N>] --out-dir <dir>\n" ++
+  "  vane compile-onnx --target <h16|h17> --model <path> [--safetensors <path>] [--input-shape NAME=C,H,W]...\n" ++
+  "                    [--placement auto|l2|dram] [--no-fuse] [--allow-view-ops=true|false]\n" ++
+  "                    [--emit-graph-dir <dir>] --out-dir <dir>\n" ++
+  "  vane inspect-safetensors --file <path> [--export-dir <dir>] [--strict] [--json]\n"
 
 private def requireArgValue (flag : String) (rest : List String) : Except String (String × List String) :=
   match rest with
@@ -2933,6 +2940,237 @@ private def cmdCompileGraph (args : List String) : IO UInt32 := do
   )
   return 0
 
+private def cmdCompileOnnx (args : List String) : IO UInt32 := do
+  let mut targetStr : Option String := none
+  let mut modelPath : Option String := none
+  let mut sfPath : Option String := none
+  let mut inputShapes : Array (String × TensorDims) := #[]
+  let mut placement : EdgePlacementMode := .auto
+  let mut stripMode : StripMode := .off
+  let mut noFuse : Bool := false
+  let mut allowViewOps : Bool := true
+  let mut emitGraphDirPath : Option String := none
+  let mut outDir : Option String := none
+  let mut rest := args
+
+  while !rest.isEmpty do
+    match rest with
+    | "--target" :: tl =>
+      match requireArgValue "--target" tl with
+      | .ok (v, tl') => targetStr := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--model" :: tl =>
+      match requireArgValue "--model" tl with
+      | .ok (v, tl') => modelPath := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--safetensors" :: tl =>
+      match requireArgValue "--safetensors" tl with
+      | .ok (v, tl') => sfPath := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--input-shape" :: tl =>
+      match requireArgValue "--input-shape" tl with
+      | .ok (v, tl') =>
+        match parseInputShapeOverride v with
+        | .ok entry => inputShapes := inputShapes.push entry; rest := tl'
+        | .error e => IO.eprintln s!"error: {e}"; return 1
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--placement" :: tl =>
+      match requireArgValue "--placement" tl with
+      | .ok (v, tl') =>
+        match EdgePlacementMode.parse? v with
+        | some p => placement := p; rest := tl'
+        | none => IO.eprintln s!"error: unknown placement '{v}' (expected auto, l2, or dram)"; return 1
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--strip-height" :: tl =>
+      match requireArgValue "--strip-height" tl with
+      | .ok (v, tl') =>
+        match StripMode.parse? v with
+        | some m => stripMode := m; rest := tl'
+        | none => IO.eprintln s!"error: invalid --strip-height '{v}' (expected off, auto, or positive integer)"; return 1
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--no-fuse" :: tl =>
+      noFuse := true; rest := tl
+    | "--allow-view-ops=true" :: tl =>
+      allowViewOps := true; rest := tl
+    | "--allow-view-ops=false" :: tl =>
+      allowViewOps := false; rest := tl
+    | "--allow-view-ops" :: tl =>
+      match tl with
+      | v :: tl' =>
+        if v.toLower == "true" || v.toLower == "false" || v == "1" || v == "0" then
+          match parseBoolArg "--allow-view-ops" v with
+          | .ok b => allowViewOps := b; rest := tl'
+          | .error e => IO.eprintln s!"error: {e}"; return 1
+        else
+          allowViewOps := true; rest := tl
+      | [] =>
+        allowViewOps := true; rest := []
+    | "--emit-graph-dir" :: tl =>
+      match requireArgValue "--emit-graph-dir" tl with
+      | .ok (v, tl') => emitGraphDirPath := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--out-dir" :: tl =>
+      match requireArgValue "--out-dir" tl with
+      | .ok (v, tl') => outDir := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | flag :: _ =>
+      if flag.startsWith "--allow-view-ops=" then
+        let val := (flag.drop 17).toString
+        match parseBoolArg "--allow-view-ops" val with
+        | .ok b => allowViewOps := b; rest := rest.tail
+        | .error e => IO.eprintln s!"error: {e}"; return 1
+      else
+        IO.eprintln s!"error: unknown argument '{flag}' for compile-onnx"
+        IO.eprintln usage
+        return 1
+    | [] => break
+
+  let some tStr := targetStr
+    | do IO.eprintln "error: --target <h16|h17> is required"; return 1
+  let some target := Target.parse? tStr
+    | do IO.eprintln s!"error: unknown target '{tStr}' (expected h16 or h17)"; return 1
+  let some mPath := modelPath
+    | do IO.eprintln "error: --model <path> is required"; return 1
+  let some dirStr := outDir
+    | do IO.eprintln "error: --out-dir <dir> is required"; return 1
+
+  let sf? ← match sfPath with
+    | none => pure none
+    | some sp =>
+      match ← loadSafeTensors (System.FilePath.mk sp) with
+      | .ok sf => pure (some sf)
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+
+  let model ← match ← loadOnnx (System.FilePath.mk mPath) with
+    | .ok m => pure m
+    | .error e => IO.eprintln s!"error: {e}"; return 1
+
+  let lowered ← match lowerOnnx model {
+      target := target
+      placement := placement
+      stripMode := stripMode
+      inputShapes := inputShapes
+      safeTensors := sf?
+      noFuse := noFuse
+      allowViewOps := allowViewOps
+    } with
+    | .ok r => pure r
+    | .error e => IO.eprintln s!"error: compile-onnx lowering failed: {e}"; return 1
+
+  for w in lowered.summary.warnings do
+    IO.eprintln w
+
+  if let some gDir := emitGraphDirPath then
+    match ← emitGraphDir (System.FilePath.mk gDir) lowered with
+    | .ok () => pure ()
+    | .error e => IO.eprintln s!"error: --emit-graph-dir failed: {e}"; return 1
+
+  let compiled ← match compileGraph lowered.spec with
+    | .ok c => pure c
+    | .error e => IO.eprintln s!"error: compile-onnx compilation failed: {e}"; return 1
+
+  let manifest := renderGraphManifestJson compiled
+  let dir := System.FilePath.mk dirStr
+  try
+    IO.FS.createDirAll dir
+    IO.FS.writeBinFile (dir / "program.hwx") compiled.hwx
+    IO.FS.writeBinFile (dir / "generic.bin") compiled.sections.generic
+    IO.FS.writeBinFile (dir / "operation.bin") compiled.sections.operation
+    IO.FS.writeBinFile (dir / "procedure.bin") compiled.sections.procedure
+    IO.FS.writeBinFile (dir / "text-properties.bin") compiled.sections.textProperties
+    IO.FS.writeFile (dir / "manifest.json") manifest
+  catch e =>
+    IO.eprintln s!"error: failed to write compiled outputs to '{dirStr}': {e}"
+    return 1
+
+  let sm := lowered.summary
+  let outS := sm.outputShape
+  IO.println (
+    s!"compiled {target.name} onnx ({compiled.taskCount} tasks, nodes={sm.nodeCount}, " ++
+    s!"fused_bn={sm.fusedBnCount}, fused_act={sm.fusedActCount}, fused_mm={sm.fusedMatmulCount}, " ++
+    s!"elided={sm.elidedCount}, out=[{outS.n},{outS.c},{outS.h},{outS.w}]) to {dirStr}: " ++
+    s!"hwx={compiled.hwx.size}B kernel={compiled.kernelBytes}B " ++
+    s!"scratch={compiled.scratchBytes}B l2_peak={compiled.l2PeakBytes}B"
+  )
+  return 0
+
+private def cmdInspectSafeTensors (args : List String) : IO UInt32 := do
+  let mut filePath : Option String := none
+  let mut exportDir : Option String := none
+  let mut strict : Bool := false
+  let mut asJson : Bool := false
+  let mut rest := args
+
+  while !rest.isEmpty do
+    match rest with
+    | "--file" :: tl =>
+      match requireArgValue "--file" tl with
+      | .ok (v, tl') => filePath := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--export-dir" :: tl =>
+      match requireArgValue "--export-dir" tl with
+      | .ok (v, tl') => exportDir := some v; rest := tl'
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+    | "--strict" :: tl =>
+      strict := true; rest := tl
+    | "--json" :: tl =>
+      asJson := true; rest := tl
+    | flag :: _ =>
+      IO.eprintln s!"error: unknown argument '{flag}' for inspect-safetensors"
+      IO.eprintln usage
+      return 1
+    | [] => break
+
+  let some fPath := filePath
+    | do IO.eprintln "error: --file <path> is required"; return 1
+
+  let sf ← match ← loadSafeTensors (System.FilePath.mk fPath) { strict := strict } with
+    | .ok s => pure s
+    | .error e => IO.eprintln s!"error: {e}"; return 1
+
+  let exported ← match exportDir with
+    | none => pure #[]
+    | some eDir =>
+      match ← sf.exportFp16Dir (System.FilePath.mk eDir) with
+      | .ok ex => pure ex
+      | .error e => IO.eprintln s!"error: {e}"; return 1
+
+  let totalBytes : Nat := sf.tensors.foldl (fun acc t => acc + t.byteLen) 0
+
+  if asJson then
+    let tensorJsons := sf.tensors.map fun t =>
+      Json.mkObj [
+        ("name", Json.str t.name),
+        ("dtype", Json.str t.dtype),
+        ("shape", Json.arr (t.shape.map fun (d : Nat) => Json.num d)),
+        ("data_offsets", Json.arr #[Json.num t.beginOff, Json.num t.endOff]),
+        ("byte_len", Json.num t.byteLen)
+      ]
+    let metaFields := if sf.metadata.isEmpty then [] else
+      [("metadata", Json.mkObj (sf.metadata.toList.map fun (k, v) => (k, Json.str v)))]
+    let exportFields := if exported.isEmpty then [] else
+      [("exported", Json.arr (exported.map fun e => Json.mkObj [
+        ("name", Json.str e.name),
+        ("dtype", Json.str e.dtype),
+        ("shape", Json.arr (e.shape.map fun (d : Nat) => Json.num d)),
+        ("file", Json.str e.file),
+        ("out_bytes", Json.num e.outBytes)
+      ]))]
+    let rep := Json.mkObj ([
+      ("file", Json.str fPath),
+      ("tensor_count", Json.num sf.tensors.size),
+      ("total_bytes", Json.num totalBytes)
+    ] ++ metaFields ++ [("tensors", Json.arr tensorJsons)] ++ exportFields)
+    IO.println rep.pretty
+    return 0
+
+  IO.println s!"safetensors: {fPath} ({sf.tensors.size} tensors, {totalBytes} bytes)"
+  for info in sf.tensors do
+    IO.println s!"  {info.name} dtype={info.dtype} shape={info.shape.toList} bytes={info.byteLen}"
+  if !exported.isEmpty then
+    IO.println s!"exported {exported.size} fp16 tensor files to {exportDir.getD ""}"
+  return 0
+
 def main (args : List String) : IO UInt32 := do
   match args with
   | "validate" :: rest => cmdValidate rest
@@ -2948,6 +3186,8 @@ def main (args : List String) : IO UInt32 := do
   | "compile-view" :: rest => cmdCompileView rest
   | "compile-matmul" :: rest => cmdCompileMatmul rest
   | "compile-graph" :: rest => cmdCompileGraph rest
+  | "compile-onnx" :: rest => cmdCompileOnnx rest
+  | "inspect-safetensors" :: rest => cmdInspectSafeTensors rest
   | "--help" :: _ | "-h" :: _ | [] =>
     IO.println usage
     return 0

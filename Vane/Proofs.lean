@@ -12,6 +12,8 @@ import Vane.View
 import Vane.Matmul
 import Vane.Conv
 import Vane.Conv3x3
+import Vane.Frontend.SafeTensors
+import Vane.Frontend.Lower
 
 namespace Vane.Proofs
 
@@ -29,6 +31,8 @@ open Vane.View
 open Vane.Matmul
 open Vane.Conv
 open Vane.Conv3x3
+open Vane.Frontend.SafeTensors
+open Vane.Frontend.Lower
 
 -- ============================================================================
 -- 1. Alignment soundness (alignUp_ge, alignUp_dvd)
@@ -5960,5 +5964,341 @@ theorem chooseConv1x1OutputSlices_sound
                   exact ⟨by omega, by omega, hfitRem⟩
           · cases htry
     · cases hok
+
+-- ============================================================================
+-- 21. Lean-Native SafeTensors & ONNX Frontend Soundness Invariants
+-- ============================================================================
+
+/-- Every recognized SafeTensors dtype has positive element width in `[1, 8]` bytes. -/
+theorem safeTensors_dtypeBytes_pos (dtype : String) (b : Nat) (h : dtypeBytes? dtype = some b) :
+    1 ≤ b ∧ b ≤ 8 := by
+  unfold dtypeBytes? at h
+  split at h <;> simp at h <;> omega
+
+/-- A validated SafeTensors span `[beginOff, endOff)` satisfies exact in-bounds slicing
+    `dataBase + beginOff ≤ dataBase + endOff ≤ fileSize`. -/
+theorem safeTensors_validSpan_bounds (dataBase fileSize : Nat) (s : TensorSpan)
+    (h : validSpan dataBase fileSize s = true) :
+    s.beginOff ≤ s.endOff ∧ dataBase + s.beginOff ≤ dataBase + s.endOff ∧ dataBase + s.endOff ≤ fileSize := by
+  simp [validSpan] at h
+  omega
+
+/-- A validated SafeTensors span whose byte length equals `numElems * elemBytes` fits
+    within `fileSize` without overflow. -/
+theorem safeTensors_validSpan_byteLen (dataBase fileSize numElems elemBytes : Nat) (s : TensorSpan)
+    (h : validSpan dataBase fileSize s = true)
+    (hlen : s.endOff - s.beginOff = numElems * elemBytes) :
+    dataBase + s.beginOff + numElems * elemBytes ≤ fileSize := by
+  simp [validSpan] at h
+  omega
+
+/-- Every span in a list is individually ordered (`beginOff ≤ endOff`). -/
+def allSpansOrdered : List TensorSpan → Prop
+  | [] => True
+  | s :: rest => s.beginOff ≤ s.endOff ∧ allSpansOrdered rest
+
+/-- If a sorted span list passes adjacent non-overlap checking, the head span ends at or before
+    every subsequent span begins. -/
+theorem safeTensors_checkSorted_head_le_all (a : TensorSpan) (rest : List TensorSpan)
+    (hCheck : checkSortedSpansNonOverlapping (a :: rest) = true)
+    (hOrd : allSpansOrdered (a :: rest)) :
+    ∀ b ∈ rest, a.endOff ≤ b.beginOff := by
+  induction rest generalizing a with
+  | nil =>
+    intro b hb
+    simp at hb
+  | cons c cs ih =>
+    simp [checkSortedSpansNonOverlapping] at hCheck
+    simp [allSpansOrdered] at hOrd
+    intro b hb
+    rcases List.mem_cons.mp hb with rfl | hmem
+    · exact hCheck.1
+    · have hcb : c.endOff ≤ b.beginOff := ih c hCheck.2 ⟨hOrd.2.1, hOrd.2.2⟩ b hmem
+      omega
+
+/-- Adjacent non-overlap checking on an ordered span list guarantees pairwise disjointness
+    for every pair of distinct indices `i < j`. -/
+theorem safeTensors_checkSorted_pairwise_disjoint (spans : List TensorSpan)
+    (hCheck : checkSortedSpansNonOverlapping spans = true)
+    (hOrd : allSpansOrdered spans)
+    (i j : Nat) (hi : i < spans.length) (hj : j < spans.length) (hij : i < j) :
+    spansDisjoint spans[i] spans[j] = true := by
+  induction spans generalizing i j with
+  | nil => simp at hi
+  | cons a rest ih =>
+    cases i with
+    | zero =>
+      cases j with
+      | zero => omega
+      | succ j' =>
+        have hmem : rest[j']'(by simp at hj; omega) ∈ rest := List.getElem_mem _
+        have hle : a.endOff ≤ (rest[j']'(by simp at hj; omega)).beginOff :=
+          safeTensors_checkSorted_head_le_all a rest hCheck hOrd _ hmem
+        simp [spansDisjoint]
+        left
+        exact hle
+    | succ i' =>
+      cases j with
+      | zero => omega
+      | succ j' =>
+        have hCheckRest : checkSortedSpansNonOverlapping rest = true := by
+          cases rest with
+          | nil => rfl
+          | cons c cs =>
+            simp [checkSortedSpansNonOverlapping] at hCheck
+            exact hCheck.2
+        simp [allSpansOrdered] at hOrd
+        exact ih hCheckRest hOrd.2 i' j' (by simp at hi; omega) (by simp at hj; omega) (by omega)
+
+/-- Sum of `n` equal split chunks of size `k` equals `n * k`. -/
+theorem split_replicate_sum (n k : Nat) : sumSizes (List.replicate n k) = n * k := by
+  induction n with
+  | zero => simp [sumSizes]
+  | succ m ih =>
+    simp [List.replicate_succ, sumSizes, ih, Nat.succ_mul]
+    omega
+
+/-- `sumSizes` distributes over list append. -/
+theorem split_append_sum (xs ys : List Nat) : sumSizes (xs ++ ys) = sumSizes xs + sumSizes ys := by
+  induction xs with
+  | nil => simp [sumSizes]
+  | cons x rest ih =>
+    simp [sumSizes, ih]
+    omega
+
+/-- `computeDefaultSplitSizes` produces exact partition sizes summing to `dim` with every chunk `≥ 1`. -/
+theorem split_defaultSizes_sound (dim n : Nat) (sizes : List Nat)
+    (h : computeDefaultSplitSizes dim n = .ok sizes) :
+    sizes.length = n ∧ sumSizes sizes = dim ∧ ∀ s ∈ sizes, 1 ≤ s := by
+  unfold computeDefaultSplitSizes at h
+  split at h
+  · simp at h
+  · split at h
+    · simp at h
+    · split at h
+      · injection h with hEq
+        subst hEq
+        rename_i hn0 hlt hmod
+        simp at hn0 hlt hmod
+        have hnPos : n > 0 := by omega
+        have hdiv : n * (dim / n) = dim := Nat.mul_div_cancel' (Nat.dvd_of_mod_eq_zero hmod)
+        refine ⟨by simp, ?_, ?_⟩
+        · rw [split_replicate_sum, hdiv]
+        · intro s hs
+          rw [List.mem_replicate] at hs
+          rw [hs.2]
+          exact Nat.div_pos (by omega) hnPos
+      · dsimp only at h
+        split at h
+        · injection h with hEq
+          subst hEq
+          rename_i hn0 hlt hmod hpre
+          simp at hn0 hlt hmod
+          have hnPos : n > 0 := by omega
+          have hchunkPos : 1 ≤ ceilDiv dim n := by
+            unfold ceilDiv
+            have hnEq : (n == 0) = false := by simp; omega
+            rw [hnEq]
+            simp only [Bool.false_eq_true, ↓reduceIte]
+            exact Nat.div_pos (by omega) hnPos
+          refine ⟨by simp; omega, ?_, ?_⟩
+          · rw [split_append_sum, split_replicate_sum]
+            simp [sumSizes]
+            have hcomm : (n - 1) * ceilDiv dim n = ceilDiv dim n * (n - 1) := Nat.mul_comm _ _
+            omega
+          · intro s hs
+            rw [List.mem_append] at hs
+            rcases hs with h1 | h2
+            · rw [List.mem_replicate] at h1
+              rw [h1.2]
+              exact hchunkPos
+            · simp at h2
+              omega
+        · simp at h
+
+/-- `sliceIntervalsAux` preserves list length. -/
+theorem split_intervals_length (acc : Nat) (sizes : List Nat) :
+    (sliceIntervalsAux acc sizes).length = sizes.length := by
+  induction sizes generalizing acc with
+  | nil => rfl
+  | cons sz rest ih =>
+    simp [sliceIntervalsAux, ih]
+
+/-- Every interval `(lo, hi)` emitted by `sliceIntervalsAux acc sizes` for positive sizes
+    lies strictly within `[acc, acc + sumSizes sizes]` with `lo < hi`. -/
+theorem split_intervals_bounds (acc : Nat) (sizes : List Nat) (hPos : ∀ s ∈ sizes, 1 ≤ s) :
+    ∀ p ∈ sliceIntervalsAux acc sizes, acc ≤ p.1 ∧ p.1 < p.2 ∧ p.2 ≤ acc + sumSizes sizes := by
+  induction sizes generalizing acc with
+  | nil =>
+    intro p hp
+    simp [sliceIntervalsAux] at hp
+  | cons sz rest ih =>
+    have hsz : 1 ≤ sz := hPos sz (List.mem_cons_self ..)
+    have hrest : ∀ s ∈ rest, 1 ≤ s := fun s hs => hPos s (List.mem_cons_of_mem sz hs)
+    intro p hp
+    simp [sliceIntervalsAux] at hp
+    rcases hp with rfl | hmem
+    · simp [sumSizes]
+      omega
+    · have hb := ih (acc + sz) hrest p hmem
+      simp [sumSizes]
+      omega
+
+/-- Adjacent slice intervals emitted for ONNX `Split` are exactly contiguous (`hi_i = lo_{i+1}`). -/
+theorem split_intervals_contiguous (acc : Nat) (sizes : List Nat) (i : Nat) (hi : i + 1 < sizes.length) :
+    ((sliceIntervalsAux acc sizes)[i]'(by rw [split_intervals_length]; omega)).2 =
+    ((sliceIntervalsAux acc sizes)[i + 1]'(by rw [split_intervals_length]; omega)).1 := by
+  induction sizes generalizing acc i with
+  | nil => simp at hi
+  | cons sz rest ih =>
+    cases i with
+    | zero =>
+      cases rest with
+      | nil => simp at hi
+      | cons sz2 rest2 =>
+        simp [sliceIntervalsAux]
+    | succ i' =>
+      exact ih (acc + sz) i' (by simp at hi; omega)
+
+/-- Any two distinct intervals `i < j` emitted by `sliceIntervalsAux` are non-overlapping (`hi_i ≤ lo_j`). -/
+theorem split_intervals_disjoint (acc : Nat) (sizes : List Nat)
+    (i j : Nat) (hi : i < sizes.length) (hj : j < sizes.length) (hij : i < j) :
+    ((sliceIntervalsAux acc sizes)[i]'(by rw [split_intervals_length]; omega)).2 ≤
+    ((sliceIntervalsAux acc sizes)[j]'(by rw [split_intervals_length]; omega)).1 := by
+  induction sizes generalizing acc i j with
+  | nil => simp at hi
+  | cons sz rest ih =>
+    cases i with
+    | zero =>
+      cases j with
+      | zero => omega
+      | succ j' =>
+        have hmem : (sliceIntervalsAux (acc + sz) rest)[j']'(by rw [split_intervals_length]; simp at hj; omega) ∈
+            sliceIntervalsAux (acc + sz) rest := List.getElem_mem _
+        have hge : ∀ (a : Nat) (ls : List Nat) (p : Nat × Nat), p ∈ sliceIntervalsAux a ls → a ≤ p.1 := by
+          intro a ls
+          induction ls generalizing a with
+          | nil => intro p hp; simp [sliceIntervalsAux] at hp
+          | cons s rs ih2 =>
+            intro p hp
+            simp [sliceIntervalsAux] at hp
+            rcases hp with rfl | hm
+            · omega
+            · have := ih2 (a + s) p hm
+              omega
+        exact hge (acc + sz) rest _ hmem
+    | succ i' =>
+      cases j with
+      | zero => omega
+      | succ j' =>
+        exact ih (acc + sz) i' j' (by simp at hi; omega) (by simp at hj; omega) (by omega)
+
+/-- W-axis split offset alignment: `start % 32 = 0` implies fp16 byte offset `2 * start` is 64-byte aligned. -/
+theorem split_w_aligned_offset (start : Nat) (h : start % 32 = 0) : (2 * start) % 64 = 0 := by
+  omega
+
+/-- Exact element-count conservation between ONNX 4D `[1, H, M, K]` and Vane head-stacked `[1, H*M, 1, K]`. -/
+theorem matmul_4d_stacked_numElems (h m k : Nat) :
+    (matmul4DShape h m k).numElems = (matmulStackedShape h m k).numElems := by
+  simp [matmul4DShape, matmulStackedShape, Shape4D.numElems, Nat.mul_assoc]
+
+/-- Exact flat element-index equality between 4D `[1, H, M, K]` and head-stacked `[1, H*M, 1, K]`. -/
+theorem matmul_4d_stacked_flatIndex_eq (m k hIdx mIdx kIdx : Nat) :
+    packHeadRow m hIdx mIdx * k + kIdx = hIdx * (m * k) + mIdx * k + kIdx := by
+  simp [packHeadRow, Nat.add_mul, Nat.mul_assoc]
+
+/-- Left inverse of `(hIdx, mIdx) ↦ hIdx * M + mIdx` bijection for `mIdx < M`. -/
+theorem matmul_headRow_unpack_pack (m hIdx mIdx : Nat) (hm : mIdx < m) :
+    unpackHeadRow m (packHeadRow m hIdx mIdx) = (hIdx, mIdx) := by
+  have hmPos : 0 < m := by omega
+  simp [unpackHeadRow, packHeadRow]
+  constructor
+  · rw [Nat.mul_comm hIdx m, Nat.mul_add_div hmPos, Nat.div_eq_of_lt hm, Nat.add_zero]
+  · exact Nat.mod_eq_of_lt hm
+
+/-- Right inverse of `(hIdx, mIdx) ↦ hIdx * M + mIdx` bijection. -/
+theorem matmul_headRow_pack_unpack (m idx : Nat) :
+    packHeadRow m (unpackHeadRow m idx).1 (unpackHeadRow m idx).2 = idx := by
+  simp [packHeadRow, unpackHeadRow]
+  have h := Nat.div_add_mod idx m
+  rw [Nat.mul_comm] at h
+  exact h
+
+/-- `packHeadRow` maps valid `(hIdx < H, mIdx < M)` into `[0, H * M)`. -/
+theorem matmul_headRow_pack_lt (h m hIdx mIdx : Nat) (hh : hIdx < h) (hm : mIdx < m) :
+    packHeadRow m hIdx mIdx < h * m := by
+  unfold packHeadRow
+  have h1 : (hIdx + 1) * m ≤ h * m := Nat.mul_le_mul_right m (by omega)
+  rw [Nat.add_mul, Nat.one_mul] at h1
+  omega
+
+/-- Exact ANE 64B-padded DRAM span equality between 4D `[1, H, M, K]` and head-stacked `[1, H*M, 1, K]`. -/
+theorem matmul_4d_stacked_span_eq (h m k : Nat) :
+    (matmul4DShape h m k).span = (matmulStackedShape h m k).span := by
+  simp [matmul4DShape, matmulStackedShape, Shape4D.span, Shape4D.batchStride,
+        Shape4D.planeStride, Shape4D.rowStride, Nat.mul_assoc]
+
+/-- Every supported `PowKind` round-trips through `powKindToF64Bits` and `classifyPowBits`. -/
+theorem pow_classify_roundTrip (k : PowKind) :
+    classifyPowBits (powKindToF64Bits k) = some k := by
+  cases k <;> decide
+
+/-- `powKindToF64Bits` is injective across all 5 supported `PowKind` variants. -/
+theorem pow_bits_injective (k1 k2 : PowKind)
+    (h : powKindToF64Bits k1 = powKindToF64Bits k2) : k1 = k2 := by
+  cases k1 <;> cases k2 <;> simp_all [powKindToF64Bits]
+
+/-- `classifyPowBits` accepts a bit pattern iff it equals `powKindToF64Bits k`. -/
+theorem pow_classify_complete (b : UInt64) (k : PowKind)
+    (h : classifyPowBits b = some k) : b = powKindToF64Bits k := by
+  unfold classifyPowBits at h
+  split at h
+  · simp at h; subst h; simp_all [powKindToF64Bits]
+  · split at h
+    · simp at h; subst h; simp_all [powKindToF64Bits]
+    · split at h
+      · simp at h; subst h; simp_all [powKindToF64Bits]
+      · split at h
+        · simp at h; subst h; simp_all [powKindToF64Bits]
+        · split at h
+          · simp at h; subst h; simp_all [powKindToF64Bits]
+          · simp at h
+
+/-- `classifyGeluApprox` accepts `""` and `"none"` as exact erf GELU. -/
+theorem geluApprox_exact_iff (s : String) :
+    classifyGeluApprox s = .ok .exact ↔ s = "" ∨ s = "none" := by
+  unfold classifyGeluApprox
+  split <;> simp_all
+
+/-- `classifyGeluApprox` explicitly rejects `"tanh"` instead of silently approximating. -/
+theorem geluApprox_tanh_rejected :
+    (classifyGeluApprox "tanh").isOk = false := by
+  decide
+
+/-- `classifyGeluApprox` rejects every value outside `{"", "none"}`. -/
+theorem geluApprox_invalid_rejected (s : String) (h1 : s ≠ "") (h2 : s ≠ "none") :
+    (classifyGeluApprox s).isOk = false := by
+  unfold classifyGeluApprox
+  split <;> simp_all [Except.isOk, Except.toBool]
+
+/-- `isValidLayerNormParamShape` rejects any parameter tensor whose rank exceeds the input rank. -/
+theorem layerNorm_paramShape_rejects_excess_rank (dims : Array Nat) (normAxis normDim inRank : Nat)
+    (h : dims.size > inRank) :
+    isValidLayerNormParamShape dims normAxis normDim inRank = false := by
+  unfold isValidLayerNormParamShape
+  simp [h]
+
+/-- `isValidLayerNormParamShape` accepts `[C]`, `[C, 1, 1]`, and `[1, C, 1, 1]` for 4D `axis=1`. -/
+theorem layerNorm_paramShape_axis1_exact (c : Nat) :
+    isValidLayerNormParamShape #[c] 1 c 4 = true ∧
+    isValidLayerNormParamShape #[c, 1, 1] 1 c 4 = true ∧
+    isValidLayerNormParamShape #[1, c, 1, 1] 1 c 4 = true := by
+  simp [isValidLayerNormParamShape]
+
+/-- `isValidLayerNormParamShape` accepts `[W]` and `[1, 1, 1, W]` for 4D `axis=3`. -/
+theorem layerNorm_paramShape_axis3_exact (w : Nat) :
+    isValidLayerNormParamShape #[w] 3 w 4 = true ∧
+    isValidLayerNormParamShape #[1, 1, 1, w] 3 w 4 = true := by
+  simp [isValidLayerNormParamShape]
 
 end Vane.Proofs
