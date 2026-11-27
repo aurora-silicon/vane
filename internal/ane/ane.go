@@ -523,6 +523,9 @@ type Transport interface {
 	BoInit(fd int, size uint64) (BoInitArgs, error)
 	BoFree(fd int, handle uint32) error
 	Submit(fd int, args SubmitArgs) error
+	ProgLoad(fd int, args ProgLoadV2, sections []SectionV2, genericBinds []GenericBindV2) (ProgLoadV2, error)
+	ProcCreate(fd int, args ProcCreateV2) (ProcCreateV2, error)
+	ExecV2(fd int, args ExecV2, ios []ExecIOV2) error
 	H16Load(fd int, hwx []byte, sections [4]struct {
 		Kind uint32
 		Data []byte
