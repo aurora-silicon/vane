@@ -43,7 +43,7 @@ open Vane.Machine
 -- Budget-Aware Per-Task Tile & L2 Staging Choosers (5 Unified AneOp Families)
 -- ============================================================================
 
-private def placeTempBuffers (occupied : List Range) : List Nat → Option (List Nat)
+def placeTempBuffers (occupied : List Range) : List Nat → Option (List Nat)
   | [] => some []
   | sz :: rest =>
     let alignedSz := alignUp sz dmaLineBytes
@@ -55,7 +55,7 @@ private def placeTempBuffers (occupied : List Range) : List Nat → Option (List
       | none => none
       | some restOffs => some (off :: restOffs)
 
-private def maxEndOfRanges (rs : List Range) : Nat :=
+def maxEndOfRanges (rs : List Range) : Nat :=
   rs.foldl (fun acc r => max acc r.hi) 0
 
 private def convStageBasesForTh
@@ -152,10 +152,19 @@ def chooseConvTaskPlan
                           }
   throw s!"no legal {target.name} conv tiling fits available L2 budget for ({sh.h}x{sh.w}, {sh.cin}->{sh.cout})"
 
+/-- Place all live L2-resident buffers via `Vane.Alloc.allocate` (first-fit interval reuse). -/
+def allocateL2Buffers (liveBufs : List LiveBuf) : List PlacedBuf :=
+  allocate true liveBufs
+
+/-- Place all spilled BAR 3 DRAM scratch buffers via `Vane.Alloc.allocate` and return `(placed, totalBytes)`. -/
+def allocateScratchBuffers (dramLiveBufs : List LiveBuf) : List PlacedBuf × Nat :=
+  let placed := allocate true dramLiveBufs
+  (placed, topOf placed)
+
 private def peStageBasesForTh
     (target : Target) (outDims hwSrc1 : TensorDims) (hwSrc2? : Option TensorDims)
     (src1IsL2 src2IsL2 resIsL2 : Bool) (occupied : List Range) (k th : Nat) :
-    Option (Nat × Nat × Nat × Nat) := Id.run do
+    Option (Nat × Nat × Nat × Nat) :=
   let twoSource := hwSrc2?.isSome
   let stripW := peStripWidth k
   let effStripW := max stripW 32
@@ -178,30 +187,36 @@ private def peStageBasesForTh
     else if direct then peDirectResBytes outDims.c drow th
     else th * du
 
-  let mut occ := occupied
-  let mut b1 := 0; let mut b2 := 0; let mut bRes := 0
-  let mut peak := maxEndOfRanges occupied
-  if !src1IsL2 then
-    let al1 := alignUp size1 dmaLineBytes
-    match findFreeOffset occ al1 l2CapacityBytes with
-    | none => return none
-    | some off =>
-      b1 := off; peak := max peak (off + al1)
-      occ := { base := off, bytes := al1 } :: occ
-  if hwSrc2?.isSome && !src2IsL2 then
-    let al2 := alignUp size2 dmaLineBytes
-    match findFreeOffset occ al2 l2CapacityBytes with
-    | none => return none
-    | some off =>
-      b2 := off; peak := max peak (off + al2)
-      occ := { base := off, bytes := al2 } :: occ
-  if !resIsL2 then
-    let alR := alignUp sizeRes dmaLineBytes
-    match findFreeOffset occ alR l2CapacityBytes with
-    | none => return none
-    | some off =>
-      bRes := off; peak := max peak (off + alR)
-  some (b1, b2, bRes, peak)
+  let need1 := !src1IsL2
+  let need2 := hwSrc2?.isSome && !src2IsL2
+  let needR := !resIsL2
+  let reqSizes : List Nat :=
+    (if need1 then [size1] else []) ++
+    (if need2 then [size2] else []) ++
+    (if needR then [sizeRes] else [])
+  match placeTempBuffers occupied reqSizes with
+  | none => none
+  | some offs =>
+    let basePeak := maxEndOfRanges occupied
+    let (b1, rest1, pk1) :=
+      if need1 then
+        match offs with
+        | o :: r => (o, r, max basePeak (o + alignUp size1 dmaLineBytes))
+        | [] => (0, [], basePeak)
+      else (0, offs, basePeak)
+    let (b2, rest2, pk2) :=
+      if need2 then
+        match rest1 with
+        | o :: r => (o, r, max pk1 (o + alignUp size2 dmaLineBytes))
+        | [] => (0, [], pk1)
+      else (0, rest1, pk1)
+    let (bRes, pk3) :=
+      if needR then
+        match rest2 with
+        | o :: _ => (o, max pk2 (o + alignUp sizeRes dmaLineBytes))
+        | [] => (0, pk2)
+      else (0, pk2)
+    some (b1, b2, bRes, pk3)
 
 private def maxPeThForOccupied
     (target : Target) (outDims hwSrc1 : TensorDims) (hwSrc2? : Option TensorDims)
@@ -422,6 +437,49 @@ private def deriveSurfaceShortNames
     inShorts := inShorts.push sn
   pure (inShorts, outShorts)
 
+/-- Pack logical output tensors sequentially at 64B-aligned byte offsets inside the single
+    ABI v3 HWX output surface, returning `(slots, totalPackedBytes)`. -/
+def packOutputSlots (shapes : Array Shape4D) (names : Array String) : Array OutputSlot × Nat :=
+  let rec go (i packOffset : Nat) (acc : Array OutputSlot) : Array OutputSlot × Nat :=
+    if h : i < shapes.size then
+      let sh := shapes[i]
+      let rSt := alignUp (2 * sh.w) dmaLineBytes
+      let pSt := sh.h * rSt
+      let bSt := sh.c * pSt
+      let sz := alignUp (sh.n * bSt) dmaLineBytes
+      let nm := names.getD i (if shapes.size == 1 then "y" else s!"y{i}")
+      let slot : OutputSlot := {
+        name := nm, shape := sh, byteOffset := packOffset, byteSize := sz,
+        rowStride := rSt, planeStride := pSt, batchStride := bSt
+      }
+      go (i + 1) (packOffset + sz) (acc.push slot)
+    else
+      (acc, packOffset)
+  termination_by shapes.size - i
+  go 0 0 (Array.mkEmpty shapes.size)
+
+/-- Pure helper computing the packed multi-output HWX output surface shape `(hwxOutShape, isHomogeneous)`. -/
+def computeHwxOutShape (outSlots : Array OutputSlot) (packOffset : Nat) : Except String (Shape4D × Bool) :=
+  if outSlots.size == 1 then
+    .ok (outSlots[0]!.shape, true)
+  else
+    let sh0 := outSlots[0]!.shape
+    let allSameHW := outSlots.all fun s => s.shape.n == 1 && s.shape.h == sh0.h && s.shape.w == sh0.w
+    let totalC := outSlots.foldl (fun acc s => acc + s.shape.c) 0
+    if allSameHW && totalC <= 65535 then
+      .ok ({ n := 1, c := totalC, h := sh0.h, w := sh0.w }, true)
+    else
+      let totalLines := packOffset / dmaLineBytes
+      let (cPack, hPack) :=
+        if totalLines <= 65535 then (totalLines, 1)
+        else
+          let hp := (totalLines + 65534) / 65535
+          ((totalLines + hp - 1) / hp, hp)
+      if cPack == 0 || cPack > 65535 || hPack == 0 || hPack > 65535 then
+        .error s!"MemoryPlan: packed multi-output size {packOffset}B exceeds HWX output surface limits"
+      else
+        .ok ({ n := 1, c := cPack, h := hPack, w := 32 }, false)
+
 -- ============================================================================
 -- Main L3 Memory Planner (`AneProgram → Except String MachineProgram`)
 -- ============================================================================
@@ -485,6 +543,93 @@ private def isLogicalBufL2Eligible
       | _ => pure ()
   let _ := vidToOwner
   return true
+
+/-- Compute `(lastReadTask, firstWriteTask)` bounds for a candidate `(inIdx -> outIdx)` donation. -/
+def computeDonationTaskBounds
+    (buffers : Array BufferStorage)
+    (machineTasks : Array MachineTask)
+    (taskOutSurfIdx : Array (Option Nat))
+    (inIdx outIdx : Nat) : Except String (Nat × Nat) := do
+  let mut lastRead? : Option Nat := none
+  let mut firstWrite? : Option Nat := none
+  for ti in [:machineTasks.size] do
+    let mt := machineTasks[ti]!
+    for inBid in mt.inputs do
+      match ← resolveBufferStorage buffers inBid with
+      | .surface sIdx .input _ _ _ _ =>
+        if sIdx == inIdx then
+          lastRead? := some (match lastRead? with | some prev => max prev ti | none => ti)
+      | _ => pure ()
+    if taskOutSurfIdx[ti]! == some outIdx then
+      firstWrite? := some (match firstWrite? with | some prev => min prev ti | none => ti)
+  let some lr := lastRead?
+    | throw s!"MemoryPlan: buffer donation ({inIdx} -> {outIdx}) has no task reading input surface {inIdx}"
+  let some fw := firstWrite?
+    | throw s!"MemoryPlan: buffer donation ({inIdx} -> {outIdx}) has no task writing output {outIdx}"
+  pure (lr, fw)
+
+/-- Total recursive validator for buffer donation lists, enforcing bounds, uniqueness,
+    exact shape & span match, and strict `lastReadTask < firstWriteTask` separation. -/
+def validateDonationsAux
+    (inputSurfs : Array SurfaceSpec)
+    (outSlots : Array OutputSlot)
+    (hwxOutSpanBytes : Nat)
+    (inSurfBufIds : Array BufferId)
+    (outSurfBufId : BufferId)
+    (buffers : Array BufferStorage)
+    (machineTasks : Array MachineTask)
+    (taskOutSurfIdx : Array (Option Nat))
+    (seenIn seenOut : List Nat)
+    (acc : Array BufferDonation) : List (Nat × Nat) → Except String (Array BufferDonation)
+  | [] => .ok acc
+  | (inIdx, outIdx) :: rest => do
+    if inIdx >= inputSurfs.size || outIdx >= outSlots.size then
+      throw s!"MemoryPlan: buffer donation ({inIdx} -> {outIdx}) out of bounds"
+    if seenIn.contains inIdx then
+      throw s!"MemoryPlan: duplicate buffer donation input index {inIdx}"
+    if seenOut.contains outIdx then
+      throw s!"MemoryPlan: duplicate buffer donation output index {outIdx}"
+    let inS := inputSurfs[inIdx]!
+    let outSl := outSlots[outIdx]!
+    if inS.channels.toNat != outSl.shape.c || inS.height.toNat != outSl.shape.h ||
+       inS.width.toNat != outSl.shape.w || inS.n.toNat != outSl.shape.n then
+      throw s!"MemoryPlan: buffer donation ({inIdx} -> {outIdx}) shape mismatch"
+    let inSpanBytes := inS.batchStride.toNat * inS.n.toNat
+    if inSpanBytes != hwxOutSpanBytes then
+      throw s!"MemoryPlan: buffer donation ({inIdx} -> {outIdx}) surface span mismatch ({inSpanBytes}B != {hwxOutSpanBytes}B)"
+    let (lr, fw) ← computeDonationTaskBounds buffers machineTasks taskOutSurfIdx inIdx outIdx
+    if lr >= fw then
+      throw s!"MemoryPlan: unsafe buffer donation ({inIdx} -> {outIdx}): input last read at task {lr} is not strictly before output first write at task {fw}"
+    let d : BufferDonation := {
+      inputSurfIdx := inIdx
+      outputSurfIdx := outIdx
+      inputBuf := inSurfBufIds[inIdx]!
+      outputBuf := outSurfBufId
+      lastReadTask := lr
+      firstWriteTask := fw
+    }
+    validateDonationsAux inputSurfs outSlots hwxOutSpanBytes inSurfBufIds outSurfBufId
+      buffers machineTasks taskOutSurfIdx (inIdx :: seenIn) (outIdx :: seenOut) (acc.push d) rest
+
+/-- Validate optional buffer donations with strict liveness safety:
+    - Reject on packed multi-output programs (`outSlots.size > 1`)
+    - Reject duplicate `inIdx` or duplicate `outIdx`
+    - Shape and surface span must match exactly
+    - `lastReadTask(inIdx) < firstWriteTask(outIdx)` strictly (never same-task or post-write read). -/
+def validateDonations
+    (rawDonations : Array (Nat × Nat))
+    (inputSurfs : Array SurfaceSpec)
+    (outSlots : Array OutputSlot)
+    (hwxOutSpanBytes : Nat)
+    (inSurfBufIds : Array BufferId)
+    (outSurfBufId : BufferId)
+    (buffers : Array BufferStorage)
+    (machineTasks : Array MachineTask)
+    (taskOutSurfIdx : Array (Option Nat)) : Except String (Array BufferDonation) := do
+  if !rawDonations.isEmpty && outSlots.size > 1 then
+    throw s!"MemoryPlan: buffer donation is unsupported on packed multi-output programs (outputs={outSlots.size})"
+  validateDonationsAux inputSurfs outSlots hwxOutSpanBytes inSurfBufIds outSurfBufId
+    buffers machineTasks taskOutSurfIdx [] [] #[] rawDonations.toList
 
 /-- Run L3 bufferization, zero-copy subview resolution, exact live-interval analysis,
     `Vane.Alloc.allocate` L2 rolling/ping-pong slot packing, selective L2↔DRAM BAR 3 spilling,
@@ -712,46 +857,16 @@ def planMemory (prog : AneProgram) : Except String MachineProgram := do
           fullSh := desc.outShape
     outLogicalShapes := outLogicalShapes.set! oi fullSh
 
-  let mut outSlots : Array OutputSlot := Array.mkEmpty g.outputs.size
-  let mut packOffset : Nat := 0
-  for oi in [:g.outputs.size] do
-    let sh := outLogicalShapes[oi]!
-    let rSt := alignUp (2 * sh.w) dmaLineBytes
-    let pSt := sh.h * rSt
-    let bSt := sh.c * pSt
-    let sz := alignUp (sh.n * bSt) dmaLineBytes
-    if sz == 0 then
+  let (outSlots, packOffset) := packOutputSlots outLogicalShapes prog.outputNames
+  for oi in [:outSlots.size] do
+    if outSlots[oi]!.byteSize == 0 then
       throw s!"MemoryPlan: logical output[{oi}] has zero byte size"
-    let nm := prog.outputNames.getD oi (if g.outputs.size == 1 then "y" else s!"y{oi}")
-    outSlots := outSlots.push {
-      name := nm, shape := sh, byteOffset := packOffset, byteSize := sz,
-      rowStride := rSt, planeStride := pSt, batchStride := bSt
-    }
-    packOffset := packOffset + sz
 
   -- Determine the single ABI v3 HWX output surface shape:
   -- - Single output: exact legacy `[1, C, H, W]` shape (zero overhead).
   -- - Multi-output homogeneous `(H, W)` with `sum(C) <= 65535`: `[1, sum(C), H, W]` (zero padding; direct zero-copy for conv1x1 & dmaView).
   -- - Multi-output heterogeneous `(H, W)`: `[1, cPack, hPack, 32]` (`rowStride=64B`, `span >= packOffset`).
-  let (hwxOutShape, isHomogeneousPack) : Shape4D × Bool ←
-    if g.outputs.size == 1 then
-      pure (outSlots[0]!.shape, true)
-    else
-      let sh0 := outSlots[0]!.shape
-      let allSameHW := outSlots.all fun s => s.shape.n == 1 && s.shape.h == sh0.h && s.shape.w == sh0.w
-      let totalC := outSlots.foldl (fun acc s => acc + s.shape.c) 0
-      if allSameHW && totalC <= 65535 then
-        pure ({ n := 1, c := totalC, h := sh0.h, w := sh0.w }, true)
-      else
-        let totalLines := packOffset / dmaLineBytes
-        let (cPack, hPack) :=
-          if totalLines <= 65535 then (totalLines, 1)
-          else
-            let hp := (totalLines + 65534) / 65535
-            ((totalLines + hp - 1) / hp, hp)
-        if cPack == 0 || cPack > 65535 || hPack == 0 || hPack > 65535 then
-          throw s!"MemoryPlan: packed multi-output size {packOffset}B exceeds HWX output surface limits"
-        pure ({ n := 1, c := cPack, h := hPack, w := 32 }, false)
+  let (hwxOutShape, isHomogeneousPack) ← computeHwxOutShape outSlots packOffset
 
   -- For multi-output programs (`g.outputs.size >= 2`), route each logical output `oi` either:
   -- 1. Zero-copy directly into `outSlots[oi].byteOffset` of the packed output surface (when homogeneous,
@@ -1132,7 +1247,7 @@ def planMemory (prog : AneProgram) : Except String MachineProgram := do
       last := lastTaskOf[rep]!
       priority := lastTaskOf[rep]! - firstTaskOf[rep]!
     }
-    let trialPlaced := allocate true liveBufs
+    let trialPlaced := allocateL2Buffers liveBufs
     let l2Top := topOf trialPlaced
     let attempt : Except (Option Nat × String) (Array MachineTilePlan × Nat) :=
       if l2Top > l2CapacityBytes then
@@ -1201,8 +1316,7 @@ def planMemory (prog : AneProgram) : Except String MachineProgram := do
     last := lastTaskOf[rep]!
     priority := lastTaskOf[rep]! - firstTaskOf[rep]!
   }
-  let placedScratch := allocate true dramLiveBufs
-  let scratchBytes := topOf placedScratch
+  let (placedScratch, scratchBytes) := allocateScratchBuffers dramLiveBufs
 
   -- Build SurfaceSpecs: 1..3 input surfaces + SINGLE ABI v3 HWX output surface (`buf_id = 4`)
   let mut inputSurfs : Array SurfaceSpec := Array.mkEmpty g.inputs.size
@@ -1469,58 +1583,9 @@ def planMemory (prog : AneProgram) : Except String MachineProgram := do
       liveL2Mask := l2Mask
     }
 
-  -- 6. Validate optional buffer donations with strict liveness safety:
-  --    - Reject on packed multi-output programs (shared output surface is larger & written by other outputs)
-  --    - Reject duplicate `inIdx` or duplicate `outIdx`
-  --    - Shape and surface span must match exactly
-  --    - `lastReadTask(inIdx) < firstWriteTask(outIdx)` strictly (never same-task or post-write read!)
-  if !prog.donations.isEmpty && outSlots.size > 1 then
-    throw s!"MemoryPlan: buffer donation is unsupported on packed multi-output programs (outputs={outSlots.size})"
-  let mut donations : Array BufferDonation := #[]
-  let mut seenDonateIn : Array Nat := #[]
-  let mut seenDonateOut : Array Nat := #[]
-  for (inIdx, outIdx) in prog.donations do
-    if inIdx >= inputSurfs.size || outIdx >= outSlots.size then
-      throw s!"MemoryPlan: buffer donation ({inIdx} -> {outIdx}) out of bounds"
-    if seenDonateIn.contains inIdx then
-      throw s!"MemoryPlan: duplicate buffer donation input index {inIdx}"
-    if seenDonateOut.contains outIdx then
-      throw s!"MemoryPlan: duplicate buffer donation output index {outIdx}"
-    seenDonateIn := seenDonateIn.push inIdx
-    seenDonateOut := seenDonateOut.push outIdx
-    let inS := inputSurfs[inIdx]!
-    let outSl := outSlots[outIdx]!
-    if inS.channels.toNat != outSl.shape.c || inS.height.toNat != outSl.shape.h || inS.width.toNat != outSl.shape.w || inS.n.toNat != outSl.shape.n then
-      throw s!"MemoryPlan: buffer donation ({inIdx} -> {outIdx}) shape mismatch"
-    let inSpanBytes := inS.batchStride.toNat * inS.n.toNat
-    if inSpanBytes != hwxOutSpanBytes then
-      throw s!"MemoryPlan: buffer donation ({inIdx} -> {outIdx}) surface span mismatch ({inSpanBytes}B != {hwxOutSpanBytes}B)"
-    let mut lastRead? : Option Nat := none
-    let mut firstWrite? : Option Nat := none
-    for ti in [:machineTasks.size] do
-      let mt := machineTasks[ti]!
-      for inBid in mt.inputs do
-        match ← resolveBufferStorage buffers inBid with
-        | .surface sIdx .input _ _ _ _ =>
-          if sIdx == inIdx then
-            lastRead? := some (match lastRead? with | some prev => max prev ti | none => ti)
-        | _ => pure ()
-      if taskOutSurfIdx[ti]! == some outIdx then
-        firstWrite? := some (match firstWrite? with | some prev => min prev ti | none => ti)
-    let some lr := lastRead?
-      | throw s!"MemoryPlan: buffer donation ({inIdx} -> {outIdx}) has no task reading input surface {inIdx}"
-    let some fw := firstWrite?
-      | throw s!"MemoryPlan: buffer donation ({inIdx} -> {outIdx}) has no task writing output {outIdx}"
-    if lr >= fw then
-      throw s!"MemoryPlan: unsafe buffer donation ({inIdx} -> {outIdx}): input last read at task {lr} is not strictly before output first write at task {fw}"
-    donations := donations.push {
-      inputSurfIdx := inIdx
-      outputSurfIdx := outIdx
-      inputBuf := inSurfBufIds[inIdx]!
-      outputBuf := outSurfBufId
-      lastReadTask := lr
-      firstWriteTask := fw
-    }
+  -- 6. Validate optional buffer donations with strict liveness safety
+  let donations ← validateDonations prog.donations inputSurfs outSlots hwxOutSpanBytes
+    inSurfBufIds outSurfBufId buffers machineTasks taskOutSurfIdx
 
   let witness : MemoryPlanWitness := {
     l2Placed := placedL2

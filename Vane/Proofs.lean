@@ -23,6 +23,10 @@ import Vane.IR.Rewrite
 import Vane.IR.Passes.DCE
 import Vane.IR.Passes.ViewSimplify
 import Vane.IR.Pipeline
+import Vane.Proofs.C3Backend
+import Vane.Proofs.C3MemoryPlan
+import Vane.Proofs.C3Sync
+import Vane.Proofs.C3Emit
 
 namespace Vane.Proofs
 
@@ -9570,5 +9574,536 @@ theorem mkCoreSemantics_lawful {α : Type}
   · intro op ax ts outTy h
     have heq : op = .concat ax := Option.some.inj h
     subst heq; rfl
+
+-- ============================================================================
+-- 24. End-to-End Milestone C3 Compiler-to-Verifier Soundness Composition
+-- ============================================================================
+
+/-- Pillar 1 end-to-end: for ANY `WellFormed` `HighOp` graph `g` (with standard BN/LN output arity),
+    `decomposeGraph g allowViewOps = .ok (g', elided)` directly preserves the graph signature,
+    preserves `WellFormed g'` (with ZERO `validateGraph` assumption!), guarantees strict SSA
+    acyclicity (`j < i`), and has zero uninitialized SSA reads. -/
+theorem c3_decompose_wellFormed_acyclic
+    (g : SSAGraph HighOp) (allowViewOps : Bool) (g' : SSAGraph CoreOp) (elided : Nat)
+    (hwfIn : WellFormed g)
+    (hArity : C3Backend.ValidHighOpOutputArity g)
+    (hDec : Vane.IR.decomposeGraph g allowViewOps = .ok (g', elided)) :
+    g'.target = g.target ∧ g'.inputs = g.inputs ∧ g'.outputs.size = g.outputs.size ∧
+    WellFormed g' ∧
+    (∀ {i j : Nat} (hi : i < g'.nodes.size) (hj : j < g'.nodes.size) {v : ValueId},
+      v ∈ g'.nodes[i].inputs.toList → v ∈ g'.nodes[j].outputIds → j < i) ∧
+    (∀ i (hi : i < g'.nodes.size) v, v ∈ g'.nodes[i].inputs.toList →
+      v ∈ g'.inputIds ∨
+      ∃ j : Nat, ∃ hj : j < i, v ∈ (g'.nodes[j]'(Nat.lt_trans hj hi)).outputIds) := by
+  have hSig := C3Backend.decomposeGraph_preserves_signature g allowViewOps g' elided hDec
+  have hWf := C3Backend.decomposeGraph_preserves_wellFormed g allowViewOps g' elided hwfIn hArity hDec
+  refine ⟨hSig.1, hSig.2.1, hSig.2.2, hWf,
+    fun {i j} hi hj {v} huse hdef => wellFormed_acyclic hWf hi hj huse hdef,
+    C3Sync.no_uninitialized_ssa_reads hWf⟩
+
+/-- Pillar 1 end-to-end SOK ChannelSplit composition: for any `cout > 0` and kernel cap `bestDc > 0`,
+    `balancedSlices cout (ceilDiv cout bestDc)` produces positive slices bounded by `bestDc`,
+    summing to `cout`, assigning every output channel `c < cout` a unique owner slice, and
+    allocating strictly fresh `weightGroupId`s across all existing nodes in `g`. -/
+theorem c3_channelSplit_sok_complete_soundness
+    (cout bestDc : Nat) (hCap : bestDc > 0) (hCout : cout > 0)
+    (g : SSAGraph Vane.Ane.AneOp) :
+    let k := ceilDiv cout bestDc
+    let slices := Vane.Backend.ChannelSplit.balancedSlices cout k
+    sumSizes slices = cout ∧
+    (∀ dc ∈ slices, 0 < dc ∧ dc ≤ bestDc) ∧
+    (∀ c < cout, ∃ si : Nat, ∃ hsi : si < slices.length,
+      let c0 := sumSizes (slices.take si)
+      c0 ≤ c ∧ c < c0 + slices[si] ∧
+      ∀ sj (hsj : sj < slices.length),
+        sumSizes (slices.take sj) ≤ c →
+        c < sumSizes (slices.take sj) + slices[sj] → sj = si) ∧
+    (∀ nd ∈ g.nodes.toList,
+      Vane.Backend.ChannelSplit.opWeightGroupId nd.op ≤
+        Vane.Backend.ChannelSplit.maxExistingWeightGroupId g) := by
+  intro k slices
+  have hCapNe : (bestDc == 0) = false := by simp [Nat.ne_of_gt hCap]
+  have hkPos : k > 0 := by
+    dsimp only [k, ceilDiv]
+    rw [hCapNe]
+    simp only [Bool.false_eq_true, ↓reduceIte]
+    exact Nat.div_pos (by omega) hCap
+  have hkLe : k ≤ cout := by
+    dsimp only [k, ceilDiv]
+    rw [hCapNe]
+    simp only [Bool.false_eq_true, ↓reduceIte]
+    have h1 : cout + bestDc - 1 ≤ cout * bestDc + (bestDc - 1) := by
+      have : cout ≤ cout * bestDc := Nat.le_mul_of_pos_right cout hCap
+      omega
+    have h2 : (cout * bestDc + (bestDc - 1)) / bestDc = cout := by
+      rw [Nat.mul_comm, Nat.mul_add_div hCap, Nat.div_eq_of_lt (by omega), Nat.add_zero]
+    exact Nat.le_trans (Nat.div_le_div_right h1) (Nat.le_of_eq h2)
+  have hSum := C3Backend.balancedSlices_sum cout k hkPos
+  refine ⟨hSum, ?_, ?_, C3Backend.opWeightGroupId_le_maxExisting g⟩
+  · intro dc hdc
+    exact ⟨C3Backend.balancedSlices_pos cout k hkPos hkLe dc hdc,
+           C3Backend.balancedSlices_le_cap cout bestDc hCap hCout dc hdc⟩
+  · intro c hc
+    rw [← hSum] at hc
+    exact C3Backend.sok_channel_unique_owner slices c hc
+
+/-- Pillar 1 end-to-end Cascade H-strip composition: every output row `r < hFull` belongs to
+    a unique strip `s`, distinct strips are pairwise disjoint, every strip's halo input band
+    lies within `[0, hFull)`, and every 3×3 strip satisfies exact height & tap boundary soundness. -/
+theorem c3_cascade_hStrip_complete_soundness (hFull step : Nat)
+    (hFullPos : hFull > 0) (hStep : step > 0) :
+    (∀ r < hFull,
+      let s := r / step
+      s < ceilDiv hFull step ∧
+      (Vane.Backend.Cascade.stripOutBand hFull step s).1 ≤ r ∧
+      r < (Vane.Backend.Cascade.stripOutBand hFull step s).2 ∧
+      ∀ s', (Vane.Backend.Cascade.stripOutBand hFull step s').1 ≤ r →
+        r < (Vane.Backend.Cascade.stripOutBand hFull step s').2 → s' = s) ∧
+    (∀ s < ceilDiv hFull step,
+      let (lo, hi) := Vane.Backend.Cascade.stripOutBand hFull step s
+      let (inLo, inHi) := Vane.Backend.Cascade.haloInBand hFull 1 lo hi
+      inLo ≤ lo ∧ hi ≤ inHi ∧ inHi ≤ hFull ∧
+      (inHi - inLo) + Vane.Backend.Cascade.stripPadTop lo + Vane.Backend.Cascade.stripPadBot hi hFull =
+        (hi - lo) + 2) := by
+  refine ⟨fun r hr => C3Backend.stripOutBand_unique_coverage hFull step r hStep hr, ?_⟩
+  intro s hs
+  have hBand := C3Backend.stripOutBand_valid hFull step s hFullPos hStep hs
+  have hHalo := C3Backend.haloInBand_in_bounds hFull 1
+    (Vane.Backend.Cascade.stripOutBand hFull step s).1
+    (Vane.Backend.Cascade.stripOutBand hFull step s).2 hBand.1 hBand.2.1
+  have hHt := C3Backend.conv3x3_strip_pad_exact_height hFull
+    (Vane.Backend.Cascade.stripOutBand hFull step s).1
+    (Vane.Backend.Cascade.stripOutBand hFull step s).2 hBand.1 hBand.2.1
+  exact ⟨hHalo.1, hHalo.2.1, hHalo.2.2.2, hHt⟩
+
+/-- Pillar 2 end-to-end L2 memory plan soundness directly on `allocateL2Buffers` (called by `planMemory`):
+    produces live-disjoint, 64B-aligned placements whose live sum at every task `t` is bounded by
+    `w.l2Capacity` whenever `MemoryPlanWitness.l2WithinCapacity` holds. -/
+theorem c3_memoryPlan_l2_complete_soundness
+    (bs : List LiveBuf) (w : Vane.Machine.MemoryPlanWitness)
+    (hPlaced : w.l2Placed = Vane.Backend.MemoryPlan.allocateL2Buffers bs)
+    (hSizes : ∀ b ∈ bs, b.bytes % 64 = 0)
+    (hCap : w.l2WithinCapacity = true) :
+    Disjoint w.l2Placed ∧
+    (∀ p ∈ w.l2Placed, p.base % 64 = 0 ∧ p.hi % 64 = 0 ∧ p.hi ≤ w.l2Capacity) ∧
+    (∀ t, bytesOf (liveAt w.l2Placed t) ≤ w.l2Capacity) := by
+  have hDisj : Disjoint w.l2Placed := by
+    rw [hPlaced]; unfold Vane.Backend.MemoryPlan.allocateL2Buffers; exact allocate_disjoint true bs
+  have hAl : ∀ p ∈ w.l2Placed, p.base % 64 = 0 ∧ p.hi % 64 = 0 := by
+    rw [hPlaced]; exact C3MemoryPlan.allocateL2Buffers_aligned_64 bs hSizes
+  have hW := C3MemoryPlan.witness_l2WithinCapacity_sound w hCap
+  have hLeCap : ∀ p ∈ w.l2Placed, p.hi ≤ w.l2Capacity := by
+    intro p hp
+    have hLeTop : ∀ ps : List PlacedBuf, ∀ q ∈ ps, q.hi ≤ topOf ps := by
+      intro ps
+      induction ps with
+      | nil => intro _ h; cases h
+      | cons hd tl ih =>
+        intro q hq
+        simp only [topOf]
+        rcases List.mem_cons.mp hq with rfl | htl
+        · exact Nat.le_max_left _ _
+        · exact Nat.le_trans (ih q htl) (Nat.le_max_right _ _)
+    exact Nat.le_trans (hLeTop w.l2Placed p hp) hW.2.1
+  refine ⟨hDisj, ?_, ?_⟩
+  · intro p hp
+    exact ⟨(hAl p hp).1, (hAl p hp).2, hLeCap p hp⟩
+  · intro t
+    exact liveAt_sum w.l2Placed t w.l2Capacity hDisj hLeCap
+
+/-- Pillar 2 end-to-end packed multi-output soundness: `packOutputSlots` + `computeHwxOutShape`
+    guarantee every logical `OutputSlot` is 64B-aligned, strictly within `hwxShape.span`, and
+    pairwise disjoint across all logical outputs! -/
+theorem c3_memoryPlan_multiOutput_pack_complete_soundness
+    (shapes : Array Shape4D) (names : Array String)
+    (hwxShape : Shape4D) (isHomog : Bool)
+    (hNonEmpty : shapes.size > 0)
+    (hHwx : Vane.Backend.MemoryPlan.computeHwxOutShape
+              (Vane.Backend.MemoryPlan.packOutputSlots shapes names).1
+              (Vane.Backend.MemoryPlan.packOutputSlots shapes names).2 = .ok (hwxShape, isHomog)) :
+    let (slots, totalBytes) := Vane.Backend.MemoryPlan.packOutputSlots shapes names
+    slots.size = shapes.size ∧
+    totalBytes % 64 = 0 ∧
+    totalBytes ≤ hwxShape.span ∧
+    (∀ k (hk : k < slots.size),
+      slots[k].byteOffset % 64 = 0 ∧
+      slots[k].byteSize % 64 = 0 ∧
+      slots[k].byteOffset + slots[k].byteSize ≤ hwxShape.span) ∧
+    (∀ i j (hi : i < slots.size) (hj : j < slots.size), i < j →
+      slots[i].byteOffset + slots[i].byteSize ≤ slots[j].byteOffset) := by
+  have hS := C3MemoryPlan.packOutputSlots_sound shapes names
+  have hTotalEq := C3MemoryPlan.packOutputSlots_total_eq_sum shapes names
+  have hSpanEq : ∀ k (hk : k < (Vane.Backend.MemoryPlan.packOutputSlots shapes names).1.size),
+      (Vane.Backend.MemoryPlan.packOutputSlots shapes names).1[k].byteSize =
+      (Vane.Backend.MemoryPlan.packOutputSlots shapes names).1[k].shape.span := by
+    have hGo : ∀ rem i off (acc : Array Vane.Machine.OutputSlot),
+        rem = shapes.size - i → i ≤ shapes.size →
+        (∀ k (hk : k < acc.size), acc[k].byteSize = acc[k].shape.span) →
+        ∀ k (hk : k < (Vane.Backend.MemoryPlan.packOutputSlots.go shapes names i off acc).1.size),
+          (Vane.Backend.MemoryPlan.packOutputSlots.go shapes names i off acc).1[k].byteSize =
+          (Vane.Backend.MemoryPlan.packOutputSlots.go shapes names i off acc).1[k].shape.span := by
+      intro rem
+      induction rem with
+      | zero =>
+        intro i off acc hrem hi hInv
+        have : i = shapes.size := by omega
+        subst this
+        unfold Vane.Backend.MemoryPlan.packOutputSlots.go
+        simp only [Nat.lt_irrefl, ↓reduceDIte]
+        exact hInv
+      | succ r ih =>
+        intro i off acc hrem hi hInv
+        have hlt : i < shapes.size := by omega
+        unfold Vane.Backend.MemoryPlan.packOutputSlots.go
+        simp only [hlt, ↓reduceDIte]
+        apply ih (i + 1) _ _ (by omega) (by omega)
+        intro k hk
+        simp only [Array.size_push] at hk
+        by_cases hkl : k < acc.size
+        · rw [Array.getElem_push_lt hkl]
+          exact hInv k hkl
+        · have hkEq : k = acc.size := by omega
+          subst hkEq
+          rw [Array.getElem_push_eq]
+          dsimp only
+          have hSpan64 : shapes[i].span % 64 = 0 := (C3MemoryPlan.shape4D_strides_dvd_64 shapes[i]).2.2.2
+          change alignUp shapes[i].span 64 = shapes[i].span
+          unfold alignUp
+          simp [hSpan64]
+    exact hGo shapes.size 0 0 (Array.mkEmpty shapes.size) (by omega) (Nat.zero_le _)
+      (fun k hk => by simp at hk)
+  have hCov := C3MemoryPlan.computeHwxOutShape_span_covers_packed
+    (Vane.Backend.MemoryPlan.packOutputSlots shapes names).1
+    (Vane.Backend.MemoryPlan.packOutputSlots shapes names).2
+    hwxShape isHomog (by omega) hS.2.1 hTotalEq hSpanEq hHwx
+  refine ⟨hS.1, hS.2.1, hCov, ?_, hS.2.2.2⟩
+  intro k hk
+  have hkS := hS.2.2.1 k hk
+  exact ⟨hkS.1, hkS.2.1, Nat.le_trans hkS.2.2.2.2.2 hCov⟩
+
+/-- Pillar 2 end-to-end temp staging soundness (covers NE conv/act/view/matmul AND `peStageBasesForTh`):
+    whenever `placeTempBuffers (liveAt l2Placed t) temps = some offs` and `l2Placed` is live-disjoint
+    within `l2CapacityBytes` with 64B-aligned ranges, the union of temp ranges and live L2 ranges is
+    pairwise `Apart`, 64B-aligned, strictly within `l2CapacityBytes`, and sums to `≤ l2CapacityBytes`! -/
+theorem c3_memoryPlan_tempStaging_complete_soundness
+    (l2Placed : List PlacedBuf) (t : Nat) (temps offs : List Nat)
+    (hDisj : Disjoint l2Placed)
+    (hCap : ∀ p ∈ l2Placed, p.hi ≤ l2CapacityBytes)
+    (hOcc64 : ∀ r ∈ liveAt l2Placed t, r.hi % 64 = 0)
+    (hOk : Vane.Backend.MemoryPlan.placeTempBuffers (liveAt l2Placed t) temps = some offs) :
+    let trs := C3MemoryPlan.tempRangesOf temps offs
+    (∀ tr ∈ trs, tr.base % 64 = 0 ∧ tr.hi % 64 = 0 ∧ tr.hi ≤ l2CapacityBytes) ∧
+    (trs ++ liveAt l2Placed t).Pairwise Apart ∧
+    bytesOf (trs ++ liveAt l2Placed t) ≤ l2CapacityBytes := by
+  intro trs
+  have hS := C3MemoryPlan.placeTempBuffers_sound (liveAt l2Placed t) temps offs hOk
+  have hA := C3MemoryPlan.placeTempBuffers_aligned_64 (liveAt l2Placed t) temps offs hOcc64 hOk
+  have hPackLive : Packed l2CapacityBytes (liveAt l2Placed t) := by
+    refine ⟨liveAt_pairwise l2Placed t hDisj, ?_⟩
+    intro r hr
+    unfold liveAt at hr
+    rw [List.mem_map] at hr
+    obtain ⟨p, hp, rfl⟩ := hr
+    rw [List.mem_filter] at hp
+    exact hCap p hp.1
+  have hPackUnion := C3MemoryPlan.placeTempBuffers_packed (liveAt l2Placed t) temps offs hPackLive hOk
+  refine ⟨?_, hPackUnion.1, sum_le_of_packed l2CapacityBytes _ hPackUnion⟩
+  intro tr htr
+  exact ⟨(hA tr htr).1, (hA tr htr).2, hS.2.1 tr htr⟩
+
+/-- Pillar 2 end-to-end BAR 3 scratch soundness directly on `allocateScratchBuffers` (called by `planMemory`):
+    spilled scratch allocations are live-disjoint, 64B-aligned, bounded by `scratchBytes`, and have
+    live sum at every task `t` bounded by `scratchBytes`. -/
+theorem c3_memoryPlan_scratch_complete_soundness
+    (bs : List LiveBuf) (hSizes : ∀ b ∈ bs, b.bytes % 64 = 0) :
+    let (ps, scratchBytes) := Vane.Backend.MemoryPlan.allocateScratchBuffers bs
+    Disjoint ps ∧
+    scratchBytes % 64 = 0 ∧
+    (∀ p ∈ ps, p.base % 64 = 0 ∧ p.hi % 64 = 0 ∧ p.hi ≤ scratchBytes) ∧
+    (∀ t, bytesOf (liveAt ps t) ≤ scratchBytes) := by
+  have hSc := C3MemoryPlan.allocateScratchBuffers_aligned_and_bounded bs hSizes
+  have hDisj : Disjoint (Vane.Backend.MemoryPlan.allocateScratchBuffers bs).1 := allocate_disjoint true bs
+  refine ⟨hDisj, hSc.1, hSc.2, ?_⟩
+  intro t
+  exact liveAt_sum (Vane.Backend.MemoryPlan.allocateScratchBuffers bs).1 t _ hDisj (fun p hp => (hSc.2 p hp).2.2)
+
+/-- Pillar 3 end-to-end S1/S2 soundness directly from `syncStateConverged` (called inside `computeSynchronization`):
+    EVERY overlapping DRAM/BAR 3 WAR or WAW access pair `(k < i)` satisfies `HappensBefore fps k i`
+    (both before AND after `cleanupRedundantHandoffs`)! -/
+theorem c3_sync_s1_s2_dram_war_waw_happensBefore
+    (pre : Array Vane.Backend.SyncAndEmit.PreparedEmitTask)
+    (donations : Array Vane.Machine.BufferDonation)
+    (syncs : Array TaskSyncInfo)
+    (hConv : Vane.Backend.SyncAndEmit.syncStateConverged pre donations syncs = true)
+    (k i : Nat) (hi : i < pre.size) (hki : k < i)
+    (ia : Nat) (hia : ia < (Vane.Backend.SyncAndEmit.buildSyncFootprints pre syncs)[k]!.dramAccesses.size)
+    (ib : Nat) (hib : ib < (Vane.Backend.SyncAndEmit.buildSyncFootprints pre syncs)[i]!.dramAccesses.size)
+    (hRes : (Vane.Backend.SyncAndEmit.buildSyncFootprints pre syncs)[k]!.dramAccesses[ia]!.resource =
+            (Vane.Backend.SyncAndEmit.buildSyncFootprints pre syncs)[i]!.dramAccesses[ib]!.resource)
+    (hBW : (Vane.Backend.SyncAndEmit.buildSyncFootprints pre syncs)[i]!.dramAccesses[ib]!.isWrite = true)
+    (hPort : (Vane.Backend.SyncAndEmit.buildSyncFootprints pre syncs)[i]!.dramAccesses[ib]!.port = .resDma)
+    (hOvl : vIntervalsOverlap
+      (Vane.Backend.SyncAndEmit.buildSyncFootprints pre syncs)[k]!.dramAccesses[ia]!.lo
+      (Vane.Backend.SyncAndEmit.buildSyncFootprints pre syncs)[k]!.dramAccesses[ia]!.hi
+      (Vane.Backend.SyncAndEmit.buildSyncFootprints pre syncs)[i]!.dramAccesses[ib]!.lo
+      (Vane.Backend.SyncAndEmit.buildSyncFootprints pre syncs)[i]!.dramAccesses[ib]!.hi = true) :
+    let fps := Vane.Backend.SyncAndEmit.buildSyncFootprints pre syncs
+    HappensBefore fps k i ∧ HappensBefore (C3Sync.cleanupFootprints fps) k i := by
+  intro fps
+  have hSz : fps.size = pre.size := by simp [fps, Vane.Backend.SyncAndEmit.buildSyncFootprints]
+  have hiF : i < fps.size := hSz ▸ hi
+  have hReach := C3Sync.syncStateConverged_s1_s2_dram_war_waw_hb pre donations syncs hConv i hi k hki ia hia ib hib hRes hBW hPort hOvl
+  have hHb : HappensBefore fps k i := (buildHBReachTables_hb_iff fps k i hiF).mp hReach
+  have hClean : HappensBefore (C3Sync.cleanupFootprints fps) k i :=
+    (buildHBReachTables_hb_iff (C3Sync.cleanupFootprints fps) k i (by simp [C3Sync.cleanupFootprints, hiF])).mp (by
+      rw [C3Sync.cleanupFootprints_preserves_buildHBReachTables]; exact hReach)
+  exact ⟨hHb, hClean⟩
+
+/-- Pillar 3 end-to-end S3/S4 L2 slot-reuse soundness directly from `syncStateConverged`:
+    EVERY overlapping L2 WAR/WAW slot-reuse pair `(k < i)` writing an L2-resident slot satisfies
+    `HappensBeforeL2 fps k i` (both before AND after `cleanupRedundantHandoffs`)! -/
+theorem c3_sync_s3_s4_l2_slot_reuse_happensBeforeL2
+    (pre : Array Vane.Backend.SyncAndEmit.PreparedEmitTask)
+    (donations : Array Vane.Machine.BufferDonation)
+    (syncs : Array TaskSyncInfo)
+    (hConv : Vane.Backend.SyncAndEmit.syncStateConverged pre donations syncs = true)
+    (k i : Nat) (hi : i < pre.size) (hki : k < i)
+    (ia : Nat) (hia : ia < (Vane.Backend.SyncAndEmit.buildSyncFootprints pre syncs)[k]!.l2Accesses.size)
+    (ib : Nat) (hib : ib < (Vane.Backend.SyncAndEmit.buildSyncFootprints pre syncs)[i]!.l2Accesses.size)
+    (hResL2 : (Vane.Backend.SyncAndEmit.buildSyncFootprints pre syncs)[i]!.l2Accesses[ib]!.role = .resL2)
+    (hBW : (Vane.Backend.SyncAndEmit.buildSyncFootprints pre syncs)[i]!.l2Accesses[ib]!.isWrite = true)
+    (hOvl : vIntervalsOverlap
+      (Vane.Backend.SyncAndEmit.buildSyncFootprints pre syncs)[k]!.l2Accesses[ia]!.lo
+      (Vane.Backend.SyncAndEmit.buildSyncFootprints pre syncs)[k]!.l2Accesses[ia]!.hi
+      (Vane.Backend.SyncAndEmit.buildSyncFootprints pre syncs)[i]!.l2Accesses[ib]!.lo
+      (Vane.Backend.SyncAndEmit.buildSyncFootprints pre syncs)[i]!.l2Accesses[ib]!.hi = true) :
+    let fps := Vane.Backend.SyncAndEmit.buildSyncFootprints pre syncs
+    HappensBeforeL2 fps k i ∧ HappensBeforeL2 (C3Sync.cleanupFootprints fps) k i := by
+  intro fps
+  have hSz : fps.size = pre.size := by simp [fps, Vane.Backend.SyncAndEmit.buildSyncFootprints]
+  have hiF : i < fps.size := hSz ▸ hi
+  have hReach := C3Sync.syncStateConverged_s3_s4_l2_slot_reuse_hbl pre donations syncs hConv i hi k hki ia hia ib hib hResL2 hBW hOvl
+  have hHbl : HappensBeforeL2 fps k i := (buildHBReachTables_hbl_iff fps k i hiF).mp hReach
+  have hClean : HappensBeforeL2 (C3Sync.cleanupFootprints fps) k i :=
+    (buildHBReachTables_hbl_iff (C3Sync.cleanupFootprints fps) k i (by simp [C3Sync.cleanupFootprints, hiF])).mp (by
+      rw [C3Sync.cleanupFootprints_preserves_buildHBReachTables]; exact hReach)
+  exact ⟨hHbl, hClean⟩
+
+/-- Pillar 3 end-to-end S5, SSA initialization & donation barrier soundness (NO `verifyProgramHazards` assumption!):
+    1. Every active `BufferDonation` under `syncStateConverged` has `HappensBefore` both before and
+       after `cleanupRedundantHandoffs`.
+    2. Every node input in a `WellFormed` SSA graph is either a graph input or produced by a strictly
+       earlier node `p < i` (no uninitialized reads).
+    3. Any BAR 3 scratch read `[b.lo, b.hi)` at task `i` covered by a strictly earlier dense scratch
+       write `[a.lo, a.hi)` at task `p < i` (`a.lo ≤ b.lo ∧ b.hi ≤ a.hi`, `b.lo < b.hi`) satisfies
+       BOTH `Vane.Verify.intervalsCover ivs b.lo b.hi = true` AND `Vane.Verify.vDramPairOrdered = true`! -/
+theorem c3_sync_s5_donation_and_scratch_soundness
+    {Op : Type} (g : SSAGraph Op) (hwf : WellFormed g)
+    (pre : Array Vane.Backend.SyncAndEmit.PreparedEmitTask)
+    (donations : Array Vane.Machine.BufferDonation)
+    (syncs : Array TaskSyncInfo)
+    (hConv : Vane.Backend.SyncAndEmit.syncStateConverged pre donations syncs = true) :
+    let fps := Vane.Backend.SyncAndEmit.buildSyncFootprints pre syncs
+    (∀ di (hdi : di < donations.size),
+      donations[di].lastReadTask < donations[di].firstWriteTask →
+      donations[di].firstWriteTask < pre.size →
+      HappensBefore fps donations[di].lastReadTask donations[di].firstWriteTask ∧
+      HappensBefore (C3Sync.cleanupFootprints fps) donations[di].lastReadTask donations[di].firstWriteTask) ∧
+    (∀ j (hj : j < g.nodes.size) v, v ∈ g.nodes[j].inputs.toList →
+      v ∈ g.inputIds ∨ ∃ p : Nat, ∃ hp : p < j, v ∈ (g.nodes[p]'(Nat.lt_trans hp hj)).outputIds) ∧
+    (∀ p i, i < pre.size → p < i →
+      ∀ (ia : Nat), ia < fps[p]!.dramAccesses.size →
+      ∀ (ib : Nat), ib < fps[i]!.dramAccesses.size →
+      ∀ (ivs : List (Nat × Nat)),
+      let a := fps[p]!.dramAccesses[ia]!
+      let b := fps[i]!.dramAccesses[ib]!
+      a.resource = .scratch → b.resource = .scratch →
+      a.isWrite = true → b.isWrite = false →
+      b.lo < b.hi → a.lo ≤ b.lo → b.hi ≤ a.hi →
+      (a.lo, a.hi) ∈ ivs →
+      (b.port = .kernel → fps[i]!.extProducerTask.isSome = true) →
+      (fps[i]!.engine = .ne → b.port = .src1Dma → fps[i]!.sync.hasSrc1Dma = true) →
+      intervalsCover ivs b.lo b.hi = true ∧
+      vDramPairOrdered fps (buildHBReachTables fps).1 (vLatestEngArrays fps).2[i]! p i a b = true) := by
+  intro fps
+  have hSz : fps.size = pre.size := by simp [fps, Vane.Backend.SyncAndEmit.buildSyncFootprints]
+  refine ⟨?_, C3Sync.no_uninitialized_ssa_reads hwf, ?_⟩
+  · intro di hdi hlt hfw
+    have hfwF : donations[di].firstWriteTask < fps.size := hSz ▸ hfw
+    have hReach := C3Sync.syncStateConverged_donation_hb pre donations syncs hConv di hdi hlt hfw
+    have hHb := (buildHBReachTables_hb_iff fps donations[di].lastReadTask donations[di].firstWriteTask hfwF).mp hReach
+    have hClean := (buildHBReachTables_hb_iff (C3Sync.cleanupFootprints fps)
+      donations[di].lastReadTask donations[di].firstWriteTask (by simp [C3Sync.cleanupFootprints, hfwF])).mp (by
+        rw [C3Sync.cleanupFootprints_preserves_buildHBReachTables]; exact hReach)
+    exact ⟨hHb, hClean⟩
+  · intro p i hi hpi ia hia ib hib ivs a b hARes hBRes hAW hBR hNonEmpty hLo hHi hMem hKern hNeS1
+    have hCov := C3Sync.dense_writer_covers_scratch_read ivs a.lo a.hi b.lo b.hi hMem hLo hHi
+    have hOv : vIntervalsOverlap a.lo a.hi b.lo b.hi = true := by
+      unfold vIntervalsOverlap
+      simp only [Bool.and_eq_true, decide_eq_true_eq]
+      omega
+    have hOrd := C3Sync.syncStateConverged_s1_s2_dram_ordered pre donations syncs hConv i hi p hpi ia hia ib hib
+      (by rw [hARes, hBRes]) (Or.inl hAW) hOv
+      (fun hk => ⟨hAW, hKern hk⟩) (fun he hs => ⟨hAW, hNeS1 he hs⟩)
+    exact ⟨hCov, hOrd⟩
+
+/-- Pillar 4 end-to-end `neConv` (fp16 & quantized) register + chunk soundness directly on the REAL
+    emitters (`encodeNeConvCommonWord`, `encodeNeConvQuantCfgWord`, `encodeNeConvTileWord`) and
+    `Vane.Verify` rules (quantized `sparse = 0`, palette rejects `hasZP = true`, `h17Flag = h17 && !hasZP`,
+    `kind = 0`, `shMin = shPref ≤ shMax ≤ 4`, `neCommonQuantBit27`, `expectedQuantChunkSize % 64 = 0`)! -/
+theorem c3_emit_neConv_fp16_and_quant_complete_soundness
+    (target : Target) (fmt : QuantFormat) (hFmt : fmt.isValid = true)
+    (wide3x3 hasZP : Bool) (hNoPalZP : fmt.isPalette = true → hasZP = false)
+    (shPref shMax f ocg fat wu : Nat)
+    (hSh : shPref ≤ shMax) (hMax : shMax ≤ 4) (hf : f ≤ 4)
+    (hocg : ocg ≤ 4) (hfat : fat ≤ 1) (hwu : wu ≤ 3)
+    (cin taps : Nat) (perLaneScale biasInKernel : Bool) (blocks : Array (Nat × Nat)) :
+    isLegalNeWeightFormat fmt.wKind fmt.wWidth = true ∧
+    (∃ wCom, Vane.Backend.SyncAndEmit.encodeNeConvCommonWord shPref shMax f
+        (neCommonQuantBit27 wide3x3 hasZP fmt.wKind) = .ok wCom ∧
+      decodeFieldChecked neCommonLayout wCom "kind" = .ok 0 ∧
+      decodeFieldChecked neCommonLayout wCom "shPref" = .ok shPref.toUInt32 ∧
+      decodeFieldChecked neCommonLayout wCom "shMin" = .ok shPref.toUInt32 ∧
+      decodeFieldChecked neCommonLayout wCom "shMax" = .ok shMax.toUInt32 ∧
+      decodeFieldChecked neCommonLayout wCom "wide3x3" =
+        .ok (neCommonQuantBit27 wide3x3 hasZP fmt.wKind)) ∧
+    (∃ wCfg, Vane.Backend.SyncAndEmit.encodeNeConvQuantCfgWord target fmt.wKind fmt.wWidth hasZP = .ok wCfg ∧
+      decodeFieldChecked neCfgQuantLayout wCfg "wKind" = .ok fmt.wKind ∧
+      decodeFieldChecked neCfgQuantLayout wCfg "wWidth" = .ok fmt.wWidth.toUInt32 ∧
+      decodeFieldChecked neCfgQuantLayout wCfg "sparse" = .ok 0 ∧
+      decodeFieldChecked neCfgQuantLayout wCfg "dynKern" = .ok 0 ∧
+      decodeFieldChecked neCfgQuantLayout wCfg "hasZP" = .ok (if hasZP then 1 else 0) ∧
+      decodeFieldChecked neCfgQuantLayout wCfg "h17Flag" =
+        .ok (if target == .h17 && !hasZP then 1 else 0)) ∧
+    (∃ wTile, Vane.Backend.SyncAndEmit.encodeNeConvTileWord ocg fat wu = .ok wTile ∧
+      decodeFieldChecked neTileLayout wTile "ocg" = .ok ocg.toUInt32 ∧
+      decodeFieldChecked neTileLayout wTile "fat" = .ok fat.toUInt32 ∧
+      decodeFieldChecked neTileLayout wTile "WU" = .ok wu.toUInt32) ∧
+    expectedQuantChunkSize fmt.wKind fmt.wWidth cin taps perLaneScale biasInKernel hasZP blocks % 64 = 0 := by
+  have hB27 := C3Emit.neConv_quant_bit27_legal wide3x3 hasZP fmt.wKind
+  have hCom := C3Emit.encodeNeConvCommonWord_verifier_sound shPref shMax f
+    (neCommonQuantBit27 wide3x3 hasZP fmt.wKind) hSh hMax hf hB27.1
+  have hCfg := C3Emit.encodeNeConvQuantCfgWord_verifier_sound target fmt hFmt hasZP hNoPalZP
+  have hTile := C3Emit.encodeNeConvTileWord_verifier_sound ocg fat wu hocg hfat hwu
+  obtain ⟨wCom, hCE, hCK, hCP, hCMn, hCMx, _, hCW⟩ := hCom
+  obtain ⟨wCfg, hQE, hQW1, hQW2, hQSp, hQDyn, hQZp, hQH17, hLeg, _⟩ := hCfg
+  exact ⟨hLeg,
+         ⟨wCom, hCE, hCK, hCP, hCMn, hCMx, hCW⟩,
+         ⟨wCfg, hQE, hQW1, hQW2, hQSp, hQDyn, hQZp, hQH17⟩,
+         hTile,
+         expectedQuantChunkSize_dvd_64 fmt.wKind fmt.wWidth cin taps perLaneScale biasInKernel hasZP blocks⟩
+
+/-- Pillar 4 end-to-end `pe` & `neAct` soundness directly on the REAL emitters
+    (`encodePeTileWord`, `encodePeBcastWord`, `encodeNeActOpWord`, `encodeNeActLutCfgWord`). -/
+theorem c3_emit_pe_and_neAct_complete_soundness
+    (twoSource hasShift isRelu isLut : Bool) (k th taskId : Nat)
+    (hkLo : 4 ≤ k) (hkHi : k ≤ peMaxK twoSource) (ht : taskId < 255)
+    (s1 s2 out : TensorDims) (hBcast : broadcastDims s1 s2 = .ok out) :
+    (∃ wTile, Vane.Backend.SyncAndEmit.encodePeTileWord twoSource k th = .ok wTile ∧
+      decodeFieldChecked peTileLayout wTile "k" = .ok k.toUInt32 ∧
+      decodeFieldChecked peTileLayout wTile "m" = .ok (peTileM twoSource k th).toUInt32) ∧
+    (∃ wBcast, Vane.Backend.SyncAndEmit.encodePeBcastWord s1 s2 out = .ok wBcast ∧
+      ¬ (s1.w != out.w ∧ s2.w != out.w) ∧ ¬ (s1.h != out.h ∧ s2.h != out.h) ∧
+      ¬ (s1.c != out.c ∧ s2.c != out.c)) ∧
+    (∃ wOp, Vane.Backend.SyncAndEmit.encodeNeActOpWord hasShift isRelu isLut = .ok wOp ∧
+      decodeFieldChecked neActOpLayout wOp "noShift" = .ok (if hasShift then 0 else 1) ∧
+      decodeFieldChecked neActOpLayout wOp "relu" = .ok (if isRelu then 1 else 0) ∧
+      decodeFieldChecked neActOpLayout wOp "lut" = .ok (if isLut then 1 else 0)) ∧
+    lutTableBytes = 128 ∧
+    (Vane.Backend.SyncAndEmit.encodeNeActLutCfgWord taskId).isOk = true := by
+  have hTile := C3Emit.encodePeTileWord_verifier_sound twoSource k th hkLo hkHi
+  have hBc := C3Emit.encodePeBcastWord_verifier_sound s1 s2 out hBcast
+  have hOp := C3Emit.neAct_control_regs_sound hasShift isRelu isLut
+  have hLut := C3Emit.neAct_lut_table_and_cfg_sound taskId ht
+  obtain ⟨wBc, hBcE, _, _, _, _, _, _, hNW, hNH, hNC⟩ := hBc
+  exact ⟨hTile, ⟨wBc, hBcE, hNW, hNH, hNC⟩, hOp.2, hLut.1, hLut.2.2⟩
+
+/-- Pillar 4 end-to-end `dmaView` soundness directly on `encodeDmaViewCommonWord`, T-mode
+    `groupCode`/`groupCodeLog2` verifier bounds, and `pack_out` (`n ≥ 1` batch stride) DMA tile bounds! -/
+theorem c3_emit_dmaView_complete_soundness
+    (n c h w : Nat) (hn : n > 0) (hc : c > 0) (hc128 : c ≤ 128) (hh : h > 0)
+    (shPref shMax f : Nat) (transposeOut transposeWideGroup : Bool)
+    (hSh : shPref ≤ shMax) (hMax : shMax ≤ 4) (hf : f ≤ 4) :
+    (∃ wCom, Vane.Backend.SyncAndEmit.encodeDmaViewCommonWord shPref shMax f transposeOut transposeWideGroup = .ok wCom ∧
+      decodeFieldChecked neViewCommonLayout wCom "kind" = .ok 0 ∧
+      decodeFieldChecked neViewCommonLayout wCom "shMin" = .ok shPref.toUInt32 ∧
+      decodeFieldChecked neViewCommonLayout wCom "transposeOut" = .ok (if transposeOut then 1 else 0) ∧
+      decodeFieldChecked neViewCommonLayout wCom "transposeWideGroup" = .ok (if transposeWideGroup then 1 else 0)) ∧
+    (groupCode c = (1 : Nat) <<< groupCodeLog2 c ∧ c ≤ (1 : Nat) <<< (4 + groupCodeLog2 c)) ∧
+    (let rSt := alignUp (2 * w) 64
+     let pSt := h * rSt
+     let bSt := c * pSt
+     let rawExt := 2 * w + (h - 1) * rSt + (c - 1) * pSt + (n - 1) * bSt
+     alignUp rawExt 64 % 64 = 0 ∧ alignUp rawExt 64 = n * bSt) := by
+  have hCom := C3Emit.encodeDmaViewCommonWord_verifier_sound shPref shMax f transposeOut transposeWideGroup hSh hMax hf
+  have hTm := C3Emit.dmaView_tmode_matches_verifier c
+  have hDma := C3Emit.dmaView_packOut_dma_tile_bounds n c h w hn hc hh
+  obtain ⟨wCom, hEnc, hK, _, hMin, _, _, hTr, hWg⟩ := hCom
+  exact ⟨⟨wCom, hEnc, hK, hMin, hTr, hWg⟩, ⟨hTm.1, hTm.2.2 hc128⟩, hDma⟩
+
+/-- Pillar 4 end-to-end `neMatmul` soundness directly on `encodeMatmulCommonWord` and
+    `encodeMatmulKernelStageWord` (called inside `Vane.Matmul.buildMatmulTaskMulti`), matching
+    EVERY `Vane.Verify` rule (`isDyn := m * b > 1`, `lo2 = if alignUp n 8 ≤ 64 then 1 else 0`,
+    `shMin = shPref ≤ shMax ≤ 4`, `h17Dyn = target.profile.dynKernelStageBit && isDyn`,
+    `f = ceilLog2 m ≤ 4`, `stage = taskId + 1`, and 64B kernel offset alignment)! -/
+theorem c3_emit_neMatmul_complete_soundness
+    (target : Target) (b m m0 k n taskId : Nat) (isLast : Bool)
+    (hm1 : 1 ≤ m) (hm16 : m ≤ 16) (ht : taskId < 255)
+    (shPref shMax : Nat) (hSh : shPref ≤ shMax) (hMax : shMax ≤ 4) :
+    let f := ceilLog2 m
+    let isDyn : Bool := decide (m * b > 1)
+    f ≤ 4 ∧ m ≤ (1 : Nat) <<< f ∧
+    (∃ wCom, encodeMatmulCommonWord n shPref shMax f isDyn = .ok wCom ∧
+      decodeFieldChecked neMatmulCommonLayout wCom "lo2" = .ok (if alignUp n 8 ≤ 64 then 1 else 0) ∧
+      decodeFieldChecked neMatmulCommonLayout wCom "shMin" = .ok shPref.toUInt32 ∧
+      decodeFieldChecked neMatmulCommonLayout wCom "F" = .ok f.toUInt32 ∧
+      decodeFieldChecked neMatmulCommonLayout wCom "dynKern" = .ok (if isDyn then 1 else 0)) ∧
+    (decodeFieldChecked (neMatmulCfgLayout target) (neCfgDynValue target) "dynKern" = .ok 1) ∧
+    (∃ wKs, encodeMatmulKernelStageWord target isLast isDyn taskId = .ok wKs ∧
+      decodeFieldChecked kernelStageDynLayout wKs "sparse" = .ok 0 ∧
+      decodeFieldChecked kernelStageDynLayout wKs "kernEn" = .ok 1 ∧
+      decodeFieldChecked kernelStageDynLayout wKs "isLast" = .ok (if isLast then 1 else 0) ∧
+      decodeFieldChecked kernelStageDynLayout wKs "kernCfg" = .ok 1 ∧
+      decodeFieldChecked kernelStageDynLayout wKs "h17Dyn" =
+        .ok (if target.profile.dynKernelStageBit && isDyn then 1 else 0) ∧
+      decodeFieldChecked kernelStageDynLayout wKs "stage" = .ok (taskId + 1).toUInt32) ∧
+    (m0 * matmulChunkSize k) % 64 = 0 := by
+  intro f isDyn
+  have hF := C3Emit.neMatmul_m_slice_f_sound m hm1 hm16
+  have hSt := C3Emit.neMatmul_static_regs_sound target
+  have hOff := C3Emit.neMatmul_kernel_offset_aligned_64 m0 k
+  have hCom := C3Emit.encodeMatmulCommonWord_verifier_sound n shPref shMax f isDyn hSh hMax hF.1
+  have hKsEq := C3Emit.encodeMatmulKernelStageWord_verifier_sound target isLast isDyn taskId ht
+  have hs256 : (taskId + 1).toUInt32 < 256 := by
+    have hMod : (taskId + 1).toUInt32.toNat = taskId + 1 := Nat.mod_eq_of_lt (by omega)
+    exact (UInt32.lt_iff_toNat_lt).mpr (by rw [hMod, show (256 : UInt32).toNat = 256 from rfl]; omega)
+  have hLast2 : (if isLast then (1 : UInt32) else 0) < 2 := by cases isLast <;> decide
+  have h17D2 : (if target.profile.dynKernelStageBit && isDyn then (1 : UInt32) else 0) < 2 := by
+    cases target <;> cases isDyn <;> decide
+  have hKsRT := kernelStageDyn_roundTrip 0 1 (if isLast then 1 else 0) 1
+    (if target.profile.dynKernelStageBit && isDyn then 1 else 0) (taskId + 1).toUInt32
+    (by decide) (by decide) hLast2 (by decide) h17D2 hs256
+  obtain ⟨wCom, hCE, hLo, _, hMin, _, hCF, hCD⟩ := hCom
+  obtain ⟨wKs, hKSEnc, hSp, hEn, hLa, hCfg, h17D, hStg⟩ := hKsRT
+  have hWksEq : encodeMatmulKernelStageWord target isLast isDyn taskId = .ok wKs := by
+    rw [hKsEq]
+    have hEncOk : encodeWord kernelStageDynLayout #[
+        ("sparse", 0), ("kernEn", 1), ("isLast", if isLast then 1 else 0), ("kernCfg", 1),
+        ("h17Dyn", if target.profile.dynKernelStageBit && isDyn then 1 else 0),
+        ("stage", (taskId + 1).toUInt32)
+      ] = .ok (((((((0 : UInt32) ||| ((0 : UInt32) <<< 5)) ||| ((1 : UInt32) <<< 6)) |||
+        ((if isLast then (1 : UInt32) else 0) <<< 7)) ||| ((1 : UInt32) <<< 9)) |||
+        ((if target.profile.dynKernelStageBit && isDyn then (1 : UInt32) else 0) <<< 10)) |||
+        ((taskId + 1).toUInt32 <<< 16)) := by
+      have hT := hKsEq
+      unfold encodeMatmulKernelStageWord at hT
+      have h1 : natToU32Checked (taskId + 1) "kernelStage.stage" = .ok (taskId + 1).toUInt32 := by
+        unfold natToU32Checked; have : ¬ (taskId + 1 > maxU32Nat) := by unfold maxU32Nat; omega
+        simp [this]
+      simpa [bind, Except.bind, h1] using hT
+    rw [hEncOk] at hKSEnc
+    exact hKSEnc
+  exact ⟨hF.1, hF.2, ⟨wCom, hCE, hLo, hMin, hCF, hCD⟩, hSt.2.1,
+         ⟨wKs, hWksEq, hSp, hEn, hLa, hCfg, h17D, hStg⟩, hOff.2⟩
 
 end Vane.Proofs

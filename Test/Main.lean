@@ -9726,6 +9726,65 @@ private def runC2Tests : IO (Array TestResult) := do
       validateSectionsWithInfo g.info g.sections
   ))
 
+  -- 21. C3 soundness helpers & witnesses: SOK balancedSlices, Cascade strip/halo, packOutputSlots + computeHwxOutShape, cleanupRedundantHandoffs
+  results := results.push (checkOk "c3 witnesses: SOK slices, Cascade strips/halo, multi-output packing, and handoff cleanup invariants" (do
+    -- 1. SOK balancedSlices conservation & cap
+    for (cout, bestDc) in #[(64, 64), (128, 48), (255, 32), (513, 64)] do
+      let k := Vane.Tiling.ceilDiv cout bestDc
+      let sl := Vane.Backend.ChannelSplit.balancedSlices cout k
+      let total := sl.foldl (· + ·) 0
+      if total != cout then
+        throw s!"balancedSlices({cout}, {k}) sum={total} != {cout}"
+      if sl.any (fun dc => dc == 0 || dc > bestDc) then
+        throw s!"balancedSlices({cout}, {k}) out of bounds (0, {bestDc}]: {repr sl}"
+    -- 2. Cascade stripOutBand + haloInBand exact 3x3 height invariant
+    for (hFull, step) in #[(16, 4), (17, 6), (64, 10), (33, 7)] do
+      let nStrips := Vane.Tiling.ceilDiv hFull step
+      let mut prevHi := 0
+      for s in [0:nStrips] do
+        let (lo, hi) := Vane.Backend.Cascade.stripOutBand hFull step s
+        if lo != prevHi || lo >= hi || hi > hFull then
+          throw s!"stripOutBand({hFull}, {step}, {s}) = ({lo}, {hi}), expected lo={prevHi}"
+        let (inLo, inHi) := Vane.Backend.Cascade.haloInBand hFull 1 lo hi
+        let pt := Vane.Backend.Cascade.stripPadTop lo
+        let pb := Vane.Backend.Cascade.stripPadBot hi hFull
+        if inLo > lo || hi > inHi || inHi > hFull || (inHi - inLo) + pt + pb != (hi - lo) + 2 then
+          throw s!"haloInBand3x3({hFull}, {lo}, {hi}) failed exact height invariant"
+        prevHi := hi
+      if prevHi != hFull then
+        throw s!"stripOutBand({hFull}, {step}) did not cover full H (end={prevHi})"
+    -- 3. packOutputSlots + computeHwxOutShape alignment, disjointness & coverage
+    let shapes : Array Vane.View.Shape4D := #[
+      { n := 2, c := 16, h := 8, w := 16 },
+      { n := 1, c := 32, h := 4, w := 32 },
+      { n := 4, c := 8, h := 2, w := 8 }
+    ]
+    let (slots, totalBytes) := Vane.Backend.MemoryPlan.packOutputSlots shapes #["a", "b", "c"]
+    let (hwxShape, _) ← Vane.Backend.MemoryPlan.computeHwxOutShape slots totalBytes
+    if totalBytes % 64 != 0 || totalBytes > hwxShape.span then
+      throw s!"packOutputSlots totalBytes={totalBytes} failed 64B align or hwxShape.span={hwxShape.span}"
+    for i in [0:slots.size] do
+      let sl := slots[i]!
+      if sl.byteOffset % 64 != 0 || sl.byteSize % 64 != 0 || sl.byteOffset + sl.byteSize > hwxShape.span then
+        throw s!"slot {i} alignment/bounds failed: {repr sl}"
+      if i + 1 < slots.size && sl.byteOffset + sl.byteSize > slots[i + 1]!.byteOffset then
+        throw s!"slots {i} and {i+1} overlap"
+    -- 4. cleanupRedundantHandoffs preserves wait flags and clears dominated handoff flags
+    let s0 : Vane.Verify.TaskSyncInfo := {
+      src1WaitNe5 := true, src1WaitPe22 := true,
+      src1HandoffNe := true, src1HandoffPe := true,
+      src2WaitNe5 := true, src2HandoffNe := true
+    }
+    let s1 := Vane.Backend.SyncAndEmit.cleanupRedundantHandoffs s0
+    if !s1.src1WaitNe5 || !s1.src1WaitPe22 || s1.src1HandoffNe || s1.src1HandoffPe || s1.src2HandoffNe then
+      throw s!"cleanupRedundantHandoffs did not preserve waits / clear dominated handoffs: {repr s1}"
+    let s2 := Vane.Backend.SyncAndEmit.cleanupRedundantHandoffs s1
+    if s2.src1WaitNe5 != s1.src1WaitNe5 || s2.src1WaitPe22 != s1.src1WaitPe22 ||
+       s2.src1HandoffNe != s1.src1HandoffNe || s2.src1HandoffPe != s1.src1HandoffPe ||
+       s2.src2WaitNe5 != s1.src2WaitNe5 || s2.src2HandoffNe != s1.src2HandoffNe then
+      throw s!"cleanupRedundantHandoffs not idempotent"
+  ))
+
   pure results
 
 end C2Tests

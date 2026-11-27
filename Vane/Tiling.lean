@@ -443,26 +443,46 @@ def validateConvShape (sh : ConvSpec) : Except String Unit := do
       throw s!"invalid 3x3 output shape ({sh.outH}x{sh.outW}): Ho and Wo must be >= 1"
   pure ()
 
+/-- Compute the 64B-aligned `__KERN_0` dense chunk byte size for output group `g`. -/
+def convDenseGroupChunkBytes
+    (sh : ConvSpec) (t : Tiling)
+    (extraChunkBytes : Nat := 0) (hasBiasInKernel : Bool := false) (g : Nat) : Nat :=
+  let wordsPerOut := sh.cinW * sh.taps + (if hasBiasInKernel then 1 else 0)
+  let blocks := groupOutputBlocksConv sh t g
+  let groupOuts : Nat := blocks.foldl (fun (acc : Nat) (_, n) => acc + n) 0
+  alignUp (extraChunkBytes + 2 * groupOuts * wordsPerOut) 64
+
+/-- Total recursive helper checking every group `g ∈ [g0, groups)` against `maxKernelChunkBytes`. -/
+def checkConvDenseChunks64KLoop
+    (sh : ConvSpec) (t : Tiling)
+    (extraChunkBytes : Nat) (hasBiasInKernel : Bool)
+    (groups g : Nat) : Except String Unit :=
+  if g < groups then
+    let blocks := groupOutputBlocksConv sh t g
+    let groupOuts : Nat := blocks.foldl (fun (acc : Nat) (_, n) => acc + n) 0
+    if groupOuts > 0 then
+      let chunkBytes := convDenseGroupChunkBytes sh t extraChunkBytes hasBiasInKernel g
+      if chunkBytes > maxKernelChunkBytes then
+        .error s!"illegal tiling: group {g} weight chunk {chunkBytes}B exceeds {maxKernelChunkBytes}B (64 KiB)"
+      else
+        checkConvDenseChunks64KLoop sh t extraChunkBytes hasBiasInKernel groups (g + 1)
+    else
+      checkConvDenseChunks64KLoop sh t extraChunkBytes hasBiasInKernel groups (g + 1)
+  else
+    .ok ()
+termination_by groups - g
+
 /-- Check stride-1 dense per-group kernel chunk size cap (`<= 64 KiB`), accounting for
     optional prepended LUT overhead (`extraChunkBytes`) and kernel bias words. -/
 def checkConvDenseChunks64K
     (sh : ConvSpec)
     (t : Tiling)
     (extraChunkBytes : Nat := 0)
-    (hasBiasInKernel : Bool := false) : Except String Unit := do
+    (hasBiasInKernel : Bool := false) : Except String Unit :=
   if sh.stride == 1 then
-    let cinW := sh.cinW
-    let taps := sh.taps
-    let wordsPerOut := cinW * taps + (if hasBiasInKernel then 1 else 0)
-    let groups := (1 : Nat) <<< t.f
-    for g in [:groups] do
-      let blocks := groupOutputBlocksConv sh t g
-      let groupOuts := blocks.foldl (fun acc (_, n) => acc + n) 0
-      if groupOuts > 0 then
-        let chunkBytes := alignUp (extraChunkBytes + 2 * groupOuts * wordsPerOut) 64
-        if chunkBytes > maxKernelChunkBytes then
-          throw s!"illegal tiling: group {g} weight chunk {chunkBytes}B exceeds {maxKernelChunkBytes}B (64 KiB)"
-  pure ()
+    checkConvDenseChunks64KLoop sh t extraChunkBytes hasBiasInKernel ((1 : Nat) <<< t.f) 0
+  else
+    .ok ()
 
 /-- Hardware `ocg` safety bounds for single-task NE conv. -/
 def validateConvOcgSafety (target : Target) (sh : ConvSpec) (t : Tiling) : Except String Unit :=

@@ -61,7 +61,7 @@ structure CompiledMachineProgram where
 -- Register & Sync Bit Encoders (Single Source of Truth)
 -- ============================================================================
 
-private def encodeSrcPortCfgMulti
+def encodeSrcPortCfgMulti
     (name : String) (isFirst isL2 waitNe5 waitPe22 handoffNe handoffPe : Bool) : Except String UInt32 :=
   encodeWord (portCfgMultiLayout name) #[
     ("mode", if isL2 then portModeL2 else portModeDma),
@@ -75,7 +75,7 @@ private def encodeSrcPortCfgMulti
     ("waitPe22", if isFirst || waitPe22 then 1 else 0)
   ]
 
-private def encodeResPortCfgMulti (isFirst isL2 direct : Bool) : Except String UInt32 :=
+def encodeResPortCfgMulti (isFirst isL2 direct : Bool) : Except String UInt32 :=
   encodeWord resCfgMultiLayout #[
     ("mode", if isL2 then portModeL2 else portModeDma),
     ("direct", if !isL2 && direct then 1 else 0),
@@ -87,7 +87,7 @@ private def encodeResPortCfgMulti (isFirst isL2 direct : Bool) : Except String U
     ("waitPe22", if isFirst then 1 else 0)
   ]
 
-private def encodeSrcDepMulti (name : String) (taskId depKind depDist : Nat) : Except String UInt32 := do
+def encodeSrcDepMulti (name : String) (taskId depKind depDist : Nat) : Except String UInt32 := do
   let tU32 ← natToU32Checked taskId s!"{name} task"
   let kU32 ← natToU32Checked depKind s!"{name} depKind"
   let dU32 ← natToU32Checked depDist s!"{name} depDist"
@@ -95,14 +95,14 @@ private def encodeSrcDepMulti (name : String) (taskId depKind depDist : Nat) : E
     ("code", srcDepCodeDma), ("task", tU32), ("depDist", dU32), ("depKind", kU32)
   ]
 
-private def encodeKernelStageMulti (taskId : Nat) (isLast isSparse : Bool) : Except String UInt32 := do
+def encodeKernelStageMulti (taskId : Nat) (isLast isSparse : Bool) : Except String UInt32 := do
   let stageU32 ← natToU32Checked (taskId + 1) "kernelStage.stage"
   encodeWord kernelStageMultiLayout #[
     ("sparse", if isSparse then 1 else 0), ("kernEn", 1),
     ("isLast", if isLast then 1 else 0), ("kernCfg", 1), ("stage", stageU32)
   ]
 
-private def outputStageWrites (taskId : Nat) : Except String (Array RegWrite) := do
+def outputStageWrites (taskId : Nat) : Except String (Array RegWrite) := do
   let taskIdU32 ← natToU32Checked taskId "out2 taskId"
   let wOut2 ← encodeWord out2Layout #[("form", out2FormValue), ("task", taskIdU32)]
   pure #[
@@ -114,7 +114,7 @@ private def outputStageWrites (taskId : Nat) : Except String (Array RegWrite) :=
     { byteAddr := regOut5, value := out5Value }
   ]
 
-private def dramSpanDims (c h w : Nat) : Nat :=
+def dramSpanDims (c h w : Nat) : Nat :=
   let row := alignUp (2 * w) dmaLineBytes
   c * h * row
 
@@ -122,7 +122,7 @@ private def dramSpanDims (c h w : Nat) : Nat :=
 -- Phase 1: Kernel Packing & Exact L2/DRAM Access Footprint Extraction
 -- ============================================================================
 
-private structure ConvKernCacheKey where
+structure ConvKernCacheKey where
   weightGroupId : Nat
   kernelSize : Nat
   mode : Conv3x3Mode
@@ -138,7 +138,7 @@ private structure ConvKernCacheKey where
   ocg : Nat
   deriving BEq
 
-private structure PreparedEmitTask where
+structure PreparedEmitTask where
   task : MachineTask
   src1Storage : ResolvedStorage
   src2Storage? : Option ResolvedStorage
@@ -646,16 +646,16 @@ private def buildPreparedEmitTasks (mp : MachineProgram) :
 -- Phase 2: Unified S1–S5 Synchronization & Barrier Fixpoint Solver
 -- ============================================================================
 
-private def intervalsOverlap (lo1 hi1 lo2 hi2 : Nat) : Bool :=
+def intervalsOverlap (lo1 hi1 lo2 hi2 : Nat) : Bool :=
   lo1 < hi2 && lo2 < hi1
 
-private def latestEngineBefore (pre : Array PreparedEmitTask) (eng : Engine) (i : Nat) : Option Nat := Id.run do
+def latestEngineBefore (pre : Array PreparedEmitTask) (eng : Engine) (i : Nat) : Option Nat := Id.run do
   let mut best : Option Nat := none
   for j in [:i] do
     if pre[j]!.task.engine == eng then best := some j
   return best
 
-private def latestScratchWriterBefore (pre : Array PreparedEmitTask) (i lo hi : Nat) : Option Nat := Id.run do
+def latestScratchWriterBefore (pre : Array PreparedEmitTask) (i lo hi : Nat) : Option Nat := Id.run do
   let mut latestW? : Option Nat := none
   for j in [:i] do
     for a in pre[j]!.dramAccesses do
@@ -663,7 +663,7 @@ private def latestScratchWriterBefore (pre : Array PreparedEmitTask) (i lo hi : 
         latestW? := some j
   return latestW?
 
-private def anyActiveMultiBatchScratchWriterBefore (pre : Array PreparedEmitTask) (i lo hi : Nat) : Bool := Id.run do
+def anyActiveMultiBatchScratchWriterBefore (pre : Array PreparedEmitTask) (i lo hi : Nat) : Bool := Id.run do
   let mut writers : Array (Nat × VerifiedDramAccess) := #[]
   for j in [:i] do
     for a in pre[j]!.dramAccesses do
@@ -689,7 +689,7 @@ private def anyActiveMultiBatchScratchWriterBefore (pre : Array PreparedEmitTask
       if !intervalsCover laterIvs ovLo ovHi then return true
   return false
 
-private def taskKindOf (mt : MachineTask) : TaskKind :=
+def taskKindOf (mt : MachineTask) : TaskKind :=
   match mt.tilePlan with
   | .neConv .. => .neConv
   | .neAct .. => .neAct
@@ -701,10 +701,218 @@ private def taskKindOf (mt : MachineTask) : TaskKind :=
   | .pePool .. => .pePool
   | .peReduce .. => .peReduce
 
+/-- Clear redundant L2 handoff bits when stronger whole-task wait bits (`waitNe5`/`waitPe22`) are set. -/
+def cleanupRedundantHandoffs (s : TaskSyncInfo) : TaskSyncInfo :=
+  { s with
+    src1HandoffNe := s.src1HandoffNe && !s.src1WaitNe5
+    src1HandoffPe := s.src1HandoffPe && !s.src1WaitPe22
+    src2HandoffNe := s.src2HandoffNe && !s.src2WaitNe5
+    src2HandoffPe := s.src2HandoffPe && !s.src2WaitPe22 }
+
+/-- Assemble `VerifiedTaskFootprint` array from prepared tasks and current `TaskSyncInfo`s. -/
+def buildSyncFootprints (pre : Array PreparedEmitTask) (syncs : Array TaskSyncInfo) : Array VerifiedTaskFootprint :=
+  Array.ofFn (n := pre.size) fun i => {
+    taskIndex := i.val
+    kind := taskKindOf pre[i.val]!.task
+    engine := pre[i.val]!.task.engine
+    isNeCompute := pre[i.val]!.task.isNeCompute
+    isMultiBatch := pre[i.val]!.task.isMultiBatch
+    extProducerTask := pre[i.val]!.extProducerTask?
+    l2Accesses := pre[i.val]!.l2Accesses
+    dramAccesses := pre[i.val]!.dramAccesses
+    sync := syncs[i.val]!
+  }
+
+/-- Required `src1DepKind` (`1` for multi-batch scratch coherence, else `2`) on an NE `src1Dma` read. -/
+def syncDramWantDepKind (pre : Array PreparedEmitTask) (ti : VerifiedTaskFootprint) (i : Nat)
+    (b : VerifiedDramAccess) : Nat :=
+  if b.resource == .scratch then
+    if ti.isMultiBatch || anyActiveMultiBatchScratchWriterBefore pre i b.lo b.hi then 1 else 2
+  else 2
+
+/-- Pure predicate checked by `computeSynchronization` for a conflicting DRAM pair `(a, b)` on `k < i`. -/
+def syncDramPairSatisfied
+    (pre : Array PreparedEmitTask) (fps : Array VerifiedTaskFootprint)
+    (hbTbl : Array (Array Bool)) (latestPe : Option Nat)
+    (k i : Nat) (a b : VerifiedDramAccess) : Bool :=
+  let ti := fps[i]!
+  let hb := fun x y => reachB hbTbl x y
+  let hbEq := fun x y => x == y || hb x y
+  if b.port == .kernel then
+    match ti.extProducerTask with
+    | some p => hbEq k p
+    | none => true
+  else if ti.engine == .ne && b.port == .src1Dma then
+    let wantDepKind := syncDramWantDepKind pre ti i b
+    ti.sync.src1DepKind == wantDepKind && ti.sync.src1DepDist == 0 && hbEq k (i - 1)
+  else if ti.engine == .pe && b.port == .src2Dma then
+    vSrc2Kind fps hbEq k i || vSrc2Wait22 ti hbEq latestPe k || vSrc2Wait5 fps hbEq k i || vDramRawKind fps hbEq k i
+  else if a.isWrite && !b.isWrite then
+    hb k i || vDramRawKind fps hbEq k i
+  else
+    hb k i
+
+/-- Pure predicate checked by `computeSynchronization` for a conflicting L2 pair `(a, b)` on `k < i`. -/
+def syncL2PairSatisfied
+    (fps : Array VerifiedTaskFootprint) (hbTbl hblTbl : Array (Array Bool))
+    (latestNe latestPe : Option Nat) (k i : Nat) (a b : VerifiedL2Access) : Bool :=
+  let ti := fps[i]!
+  let hbEq := fun x y => x == y || reachB hbTbl x y
+  let hbl := fun x y => reachB hblTbl x y
+  let hblEq := fun x y => x == y || hbl x y
+  let handoff2 : Bool :=
+    a.isWrite &&
+    ((b.role == .src1L2 && ti.sync.src1HandoffNe) || (b.role == .src2L2 && ti.sync.src2HandoffNe)) &&
+    match latestNe with | some j => hblEq k j | none => false
+  let handoff3 : Bool :=
+    a.isWrite && b.role == .src1L2 && ti.sync.src1HandoffPe &&
+    match latestPe with | some j => hblEq k j | none => false
+  if ti.engine == .pe && (b.role == .src2Stage || b.role == .src2L2) then
+    vSrc2Wait22 ti hbEq latestPe k || vSrc2Wait5 fps hbEq k i || vSrc2Kind fps hbEq k i ||
+      (b.role == .src2L2 && handoff2)
+  else if b.role == .src1Stage && a.role == .resStage then
+    vSrc2Wait5 fps hbEq k i || vSrc2Wait22 ti hbEq latestPe k
+  else
+    hbl k i || handoff2 || handoff3
+
+/-- Pure predicate checked by `computeSynchronization` for a `BufferDonation` barrier. -/
+def syncDonationSatisfied (hbTbl : Array (Array Bool)) (d : BufferDonation) : Bool :=
+  reachB hbTbl d.lastReadTask d.firstWriteTask
+
+/-- Monotone wait-bit update on `src1` for prior engine `eng`, clearing dominated handoff bits. -/
+def syncSetSrc1Wait (s : TaskSyncInfo) (eng : Engine) : TaskSyncInfo × Bool :=
+  match eng with
+  | .ne =>
+    if !s.src1WaitNe5 then ({ s with src1WaitNe5 := true, src1HandoffNe := false }, true)
+    else (s, false)
+  | .pe =>
+    if !s.src1WaitPe22 then ({ s with src1WaitPe22 := true, src1HandoffPe := false }, true)
+    else (s, false)
+
+/-- Monotone wait-bit update on `src2` for prior engine `eng`. -/
+def syncSetSrc2Wait (s : TaskSyncInfo) (eng : Engine) : TaskSyncInfo × Bool :=
+  match eng with
+  | .ne =>
+    if !s.src2WaitNe5 then ({ s with src2WaitNe5 := true }, true)
+    else (s, false)
+  | .pe =>
+    if !s.src2WaitPe22 then ({ s with src2WaitPe22 := true }, true)
+    else (s, false)
+
+/-- Total bounded universal quantifier over `0 ≤ i < n` (matching `Vane.Verify.allLt`). -/
+def syncAllLt (p : Nat → Bool) : Nat → Bool
+  | 0 => true
+  | n + 1 => syncAllLt p n && p n
+
+/-- Exact convergence predicate of `computeSynchronization`: returns `true` iff every conflicting
+    DRAM pair, conflicting L2 pair, and active `BufferDonation` is already satisfied under
+    `buildHBReachTables (buildSyncFootprints pre syncs)`. -/
+def syncStateConverged
+    (pre : Array PreparedEmitTask) (donations : Array BufferDonation)
+    (syncs : Array TaskSyncInfo) : Bool :=
+  let fps := buildSyncFootprints pre syncs
+  let (hbTbl, hblTbl) := buildHBReachTables fps
+  let (latestNeArr, latestPeArr) := vLatestEngArrays fps
+  let n := fps.size
+  syncAllLt (fun i =>
+    if i == 0 then true
+    else
+      let ti := fps[i]!
+      let latestNe := latestNeArr[i]!
+      let latestPe := latestPeArr[i]!
+      syncAllLt (fun k =>
+        let tk := fps[k]!
+        let dramOk :=
+          syncAllLt (fun ia =>
+            let a := tk.dramAccesses[ia]!
+            syncAllLt (fun ib =>
+              let b := ti.dramAccesses[ib]!
+              if a.resource == b.resource && (a.isWrite || b.isWrite) && vIntervalsOverlap a.lo a.hi b.lo b.hi then
+                syncDramPairSatisfied pre fps hbTbl latestPe k i a b
+              else true) ti.dramAccesses.size) tk.dramAccesses.size
+        let l2Ok :=
+          syncAllLt (fun ia =>
+            let a := tk.l2Accesses[ia]!
+            syncAllLt (fun ib =>
+              let b := ti.l2Accesses[ib]!
+              if (a.isWrite || b.isWrite) && vIntervalsOverlap a.lo a.hi b.lo b.hi then
+                syncL2PairSatisfied fps hbTbl hblTbl latestNe latestPe k i a b
+              else true) ti.l2Accesses.size) tk.l2Accesses.size
+        dramOk && l2Ok) i) n &&
+  syncAllLt (fun di =>
+    let d := donations[di]!
+    if d.firstWriteTask < n && d.lastReadTask < d.firstWriteTask then
+      syncDonationSatisfied hbTbl d
+    else true) donations.size
+
+/-- One monotone fixpoint iteration of `computeSynchronization`. -/
+def syncStep
+    (pre : Array PreparedEmitTask) (donations : Array BufferDonation)
+    (initSyncs : Array TaskSyncInfo) : Array TaskSyncInfo × Bool := Id.run do
+  let n := pre.size
+  let mut syncs := initSyncs
+  let fps := buildSyncFootprints pre syncs
+  let (hbTbl, hblTbl) := buildHBReachTables fps
+  let (latestNeArr, latestPeArr) := vLatestEngArrays fps
+  let hbEq := fun a b => a == b || reachB hbTbl a b
+  let mut changed := false
+
+  for i in [1 : n] do
+    let ti := fps[i]!
+    let latestNe := latestNeArr[i]!
+    let latestPe := latestPeArr[i]!
+    for k in [:i] do
+      let tk := fps[k]!
+
+      -- A. DRAM conflicts
+      for a in tk.dramAccesses do
+        for b in ti.dramAccesses do
+          if a.resource == b.resource && (a.isWrite || b.isWrite) && vIntervalsOverlap a.lo a.hi b.lo b.hi then
+            if !syncDramPairSatisfied pre fps hbTbl latestPe k i a b then
+              if b.port == .kernel then
+                if let some p := ti.extProducerTask then
+                  let (s', ch) := syncSetSrc1Wait syncs[p]! tk.engine
+                  if ch then syncs := syncs.set! p s'; changed := true
+              else if ti.engine == .ne && b.port == .src1Dma then
+                let wantDepKind := syncDramWantDepKind pre ti i b
+                if syncs[i]!.src1DepKind != wantDepKind || syncs[i]!.src1DepDist != 0 then
+                  syncs := syncs.set! i { syncs[i]! with src1DepKind := wantDepKind, src1DepDist := 0 }; changed := true
+                if !hbEq k (i - 1) then
+                  let prev := i - 1
+                  let (s', ch) := syncSetSrc1Wait syncs[prev]! tk.engine
+                  if ch then syncs := syncs.set! prev s'; changed := true
+              else if ti.engine == .pe && b.port == .src2Dma then
+                let (s', ch) := syncSetSrc2Wait syncs[i]! tk.engine
+                if ch then syncs := syncs.set! i s'; changed := true
+              else
+                let (s', ch) := syncSetSrc1Wait syncs[i]! tk.engine
+                if ch then syncs := syncs.set! i s'; changed := true
+
+      -- B. L2 conflicts (including cross-strip WAR/WAW when Vane.Alloc reuses rolling L2 slots!)
+      for a in tk.l2Accesses do
+        for b in ti.l2Accesses do
+          if (a.isWrite || b.isWrite) && vIntervalsOverlap a.lo a.hi b.lo b.hi then
+            if !syncL2PairSatisfied fps hbTbl hblTbl latestNe latestPe k i a b then
+              if ti.engine == .pe && (b.role == .src2Stage || b.role == .src2L2) then
+                let (s', ch) := syncSetSrc2Wait syncs[i]! tk.engine
+                if ch then syncs := syncs.set! i s'; changed := true
+              else
+                let (s', ch) := syncSetSrc1Wait syncs[i]! tk.engine
+                if ch then syncs := syncs.set! i s'; changed := true
+
+    -- C. Explicit happens-before edge for every active BufferDonation (`lastReadTask < firstWriteTask`)
+    for d in donations do
+      if d.firstWriteTask == i && d.lastReadTask < i then
+        if !syncDonationSatisfied hbTbl d then
+          let (s', ch) := syncSetSrc1Wait syncs[i]! pre[d.lastReadTask]!.task.engine
+          if ch then syncs := syncs.set! i s'; changed := true
+
+  return (syncs, changed)
+
 /-- Compute exact monotone S1–S5 barrier/dependency bits across all `MachineTask`s, uniformly
     covering DRAM RAW/WAR/WAW, L2 RAW/WAR/WAW (including cross-strip slot reuse!),
     multi-batch `depKind = 1`, BAR 3 scratch coherence, and multi-output surface writes. -/
-private def computeSynchronization (pre : Array PreparedEmitTask)
+def computeSynchronization (pre : Array PreparedEmitTask)
     (donations : Array BufferDonation := #[]) : Array TaskSyncInfo := Id.run do
   let n := pre.size
   let mut syncs : Array TaskSyncInfo := Array.ofFn (n := n) fun i => {
@@ -741,170 +949,94 @@ private def computeSynchronization (pre : Array PreparedEmitTask)
             else if b.port == .src2Dma then
               syncs := syncs.set! i { syncs[i]! with src2DepKind := depKind, src2DepDist := dist }
 
-  let mut latestNeArr : Array (Option Nat) := Array.mkEmpty n
-  let mut latestPeArr : Array (Option Nat) := Array.mkEmpty n
-  let mut lastNe : Option Nat := none
-  let mut lastPe : Option Nat := none
-  for i in [:n] do
-    latestNeArr := latestNeArr.push lastNe
-    latestPeArr := latestPeArr.push lastPe
-    match pre[i]!.task.engine with
-    | .ne => lastNe := some i
-    | .pe => lastPe := some i
-
-  -- 3. Monotone fixpoint loop (guaranteed termination in <= 8*n + 2 steps)
+  -- 3. Monotone fixpoint loop
   for _ in [:8 * n + 2] do
-    let fps : Array VerifiedTaskFootprint := Array.ofFn (n := n) fun i => {
-      taskIndex := i.val
-      kind := taskKindOf pre[i.val]!.task
-      engine := pre[i.val]!.task.engine
-      isNeCompute := pre[i.val]!.task.isNeCompute
-      isMultiBatch := pre[i.val]!.task.isMultiBatch
-      extProducerTask := pre[i.val]!.extProducerTask?
-      l2Accesses := pre[i.val]!.l2Accesses
-      dramAccesses := pre[i.val]!.dramAccesses
-      sync := syncs[i.val]!
-    }
-    let (hbTbl, hblTbl) := buildHBReachTables fps
-    let hb := fun a b => reachB hbTbl a b
-    let hbl := fun a b => reachB hblTbl a b
-    let hbEq := fun a b => a == b || hb a b
-    let hblEq := fun a b => a == b || hbl a b
-    let mut changed := false
-
-    for i in [1 : n] do
-      let ti := fps[i]!
-      let latestNe := latestNeArr[i]!
-      let latestPe := latestPeArr[i]!
-      for k in [:i] do
-        let tk := fps[k]!
-        let dramRawKind : Bool :=
-          syncs[i]!.hasSrc1Dma && (syncs[i]!.src1DepKind == 1 || syncs[i]!.src1DepKind == 2) &&
-          syncs[i]!.src1DepDist == 0 && hbEq k (i - 1)
-        let src2Kind : Bool :=
-          pre[i - 1]!.task.engine == .pe && syncs[i]!.hasSrc2Dma &&
-          (syncs[i]!.src2DepKind == 1 || syncs[i]!.src2DepKind == 2) &&
-          syncs[i]!.src2DepDist == 0 && hbEq k (i - 1)
-        let src2Wait22 : Bool :=
-          (syncs[i]!.src1WaitPe22 || syncs[i]!.src2WaitPe22) &&
-          match latestPe with | some j => hbEq k j | none => false
-        let src2Wait5 : Bool :=
-          (syncs[i]!.src1WaitNe5 || syncs[i]!.src2WaitNe5) &&
-          (if tk.engine == .ne then true
-           else Id.run do
-            let mut ok := false
-            for j in [:i] do
-              if pre[j]!.task.engine == .ne && hbEq k j then ok := true; break
-            return ok)
-
-        -- A. DRAM conflicts
-        for a in tk.dramAccesses do
-          for b in ti.dramAccesses do
-            if a.resource == b.resource && (a.isWrite || b.isWrite) && intervalsOverlap a.lo a.hi b.lo b.hi then
-              if b.port == .kernel then
-                if let some p := ti.extProducerTask then
-                  if !hbEq k p then
-                    if tk.engine == .ne then
-                      if !syncs[p]!.src1WaitNe5 then
-                        syncs := syncs.set! p { syncs[p]! with src1WaitNe5 := true, src1HandoffNe := false }; changed := true
-                    else
-                      if !syncs[p]!.src1WaitPe22 then
-                        syncs := syncs.set! p { syncs[p]! with src1WaitPe22 := true, src1HandoffPe := false }; changed := true
-              else if ti.engine == .ne && b.port == .src1Dma then
-                let wantDepKind :=
-                  if b.resource == .scratch then
-                    if ti.isMultiBatch || anyActiveMultiBatchScratchWriterBefore pre i b.lo b.hi then 1 else 2
-                  else 2
-                if syncs[i]!.src1DepKind != wantDepKind || syncs[i]!.src1DepDist != 0 then
-                  syncs := syncs.set! i { syncs[i]! with src1DepKind := wantDepKind, src1DepDist := 0 }; changed := true
-                if !hbEq k (i - 1) then
-                  let prev := i - 1
-                  if tk.engine == .ne then
-                    if !syncs[prev]!.src1WaitNe5 then
-                      syncs := syncs.set! prev { syncs[prev]! with src1WaitNe5 := true, src1HandoffNe := false }; changed := true
-                  else
-                    if !syncs[prev]!.src1WaitPe22 then
-                      syncs := syncs.set! prev { syncs[prev]! with src1WaitPe22 := true, src1HandoffPe := false }; changed := true
-              else if ti.engine == .pe && b.port == .src2Dma then
-                if !(src2Kind || src2Wait22 || src2Wait5 || dramRawKind) then
-                  if tk.engine == .ne then
-                    if !syncs[i]!.src2WaitNe5 then syncs := syncs.set! i { syncs[i]! with src2WaitNe5 := true }; changed := true
-                  else
-                    if !syncs[i]!.src2WaitPe22 then syncs := syncs.set! i { syncs[i]! with src2WaitPe22 := true }; changed := true
-              else if a.isWrite && !b.isWrite then
-                if !(hb k i || dramRawKind) then
-                  if tk.engine == .ne then
-                    if !syncs[i]!.src1WaitNe5 then
-                      syncs := syncs.set! i { syncs[i]! with src1WaitNe5 := true, src1HandoffNe := false }; changed := true
-                  else
-                    if !syncs[i]!.src1WaitPe22 then
-                      syncs := syncs.set! i { syncs[i]! with src1WaitPe22 := true, src1HandoffPe := false }; changed := true
-              else
-                if !hb k i then
-                  if tk.engine == .ne then
-                    if !syncs[i]!.src1WaitNe5 then
-                      syncs := syncs.set! i { syncs[i]! with src1WaitNe5 := true, src1HandoffNe := false }; changed := true
-                  else
-                    if !syncs[i]!.src1WaitPe22 then
-                      syncs := syncs.set! i { syncs[i]! with src1WaitPe22 := true, src1HandoffPe := false }; changed := true
-
-        -- B. L2 conflicts (including cross-strip WAR/WAW when Vane.Alloc reuses rolling L2 slots!)
-        for a in tk.l2Accesses do
-          for b in ti.l2Accesses do
-            if (a.isWrite || b.isWrite) && intervalsOverlap a.lo a.hi b.lo b.hi then
-              let handoff2 : Bool :=
-                a.isWrite &&
-                ((b.role == .src1L2 && syncs[i]!.src1HandoffNe) || (b.role == .src2L2 && syncs[i]!.src2HandoffNe)) &&
-                match latestNe with | some j => hblEq k j | none => false
-              let handoff3 : Bool :=
-                a.isWrite && b.role == .src1L2 && syncs[i]!.src1HandoffPe &&
-                match latestPe with | some j => hblEq k j | none => false
-              if ti.engine == .pe && (b.role == .src2Stage || b.role == .src2L2) then
-                if !(src2Wait22 || src2Wait5 || src2Kind || (b.role == .src2L2 && handoff2)) then
-                  if tk.engine == .ne then
-                    if !syncs[i]!.src2WaitNe5 then syncs := syncs.set! i { syncs[i]! with src2WaitNe5 := true }; changed := true
-                  else
-                    if !syncs[i]!.src2WaitPe22 then syncs := syncs.set! i { syncs[i]! with src2WaitPe22 := true }; changed := true
-              else if b.role == .src1Stage && a.role == .resStage then
-                if !(src2Wait5 || src2Wait22) then
-                  if tk.engine == .ne then
-                    if !syncs[i]!.src1WaitNe5 then
-                      syncs := syncs.set! i { syncs[i]! with src1WaitNe5 := true, src1HandoffNe := false }; changed := true
-                  else
-                    if !syncs[i]!.src1WaitPe22 then
-                      syncs := syncs.set! i { syncs[i]! with src1WaitPe22 := true, src1HandoffPe := false }; changed := true
-              else
-                if !(hbl k i || handoff2 || handoff3) then
-                  if tk.engine == .ne then
-                    if !syncs[i]!.src1WaitNe5 then
-                      syncs := syncs.set! i { syncs[i]! with src1WaitNe5 := true, src1HandoffNe := false }; changed := true
-                  else
-                    if !syncs[i]!.src1WaitPe22 then
-                      syncs := syncs.set! i { syncs[i]! with src1WaitPe22 := true, src1HandoffPe := false }; changed := true
-
-      -- C. Explicit happens-before edge for every active BufferDonation (`lastReadTask < firstWriteTask`)
-      for d in donations do
-        if d.firstWriteTask == i && d.lastReadTask < i then
-          if !hb d.lastReadTask i then
-            if pre[d.lastReadTask]!.task.engine == .ne then
-              if !syncs[i]!.src1WaitNe5 then
-                syncs := syncs.set! i { syncs[i]! with src1WaitNe5 := true, src1HandoffNe := false }; changed := true
-            else
-              if !syncs[i]!.src1WaitPe22 then
-                syncs := syncs.set! i { syncs[i]! with src1WaitPe22 := true, src1HandoffPe := false }; changed := true
+    if syncStateConverged pre donations syncs then break
+    let (nextSyncs, changed) := syncStep pre donations syncs
+    syncs := nextSyncs
     if !changed then break
 
   -- Clean up redundant handoff bits when stronger whole-task wait bits are set
   for i in [:n] do
-    let s := syncs[i]!
-    syncs := syncs.set! i {
-      s with
-      src1HandoffNe := s.src1HandoffNe && !s.src1WaitNe5
-      src1HandoffPe := s.src1HandoffPe && !s.src1WaitPe22
-      src2HandoffNe := s.src2HandoffNe && !s.src2WaitNe5
-      src2HandoffPe := s.src2HandoffPe && !s.src2WaitPe22
-    }
+    syncs := syncs.set! i (cleanupRedundantHandoffs syncs[i]!)
   return syncs
+
+-- ============================================================================
+-- Pure Per-Engine Register-Word Encoders (Called by Emitters & Formal Proofs)
+-- ============================================================================
+
+/-- Encode `neCfg` (`0x4900`) for quantized `AneOp.neConv`. -/
+def encodeNeConvQuantCfgWord (target : Target) (wKind : UInt32) (wWidth : Nat) (hasZeroPoint : Bool) :
+    Except String UInt32 := do
+  encodeWord neCfgQuantLayout #[
+    ("wKind", wKind), ("wWidth", ← natToU32Checked wWidth "wWidth"),
+    ("sparse", 0), ("dynKern", 0), ("hasZP", if hasZeroPoint then 1 else 0),
+    ("h17Flag", if target == .h17 && !hasZeroPoint then 1 else 0)
+  ]
+
+/-- Encode `neOp` (`0x4904`) for quantized `AneOp.neConv`. -/
+def encodeNeConvQuantOpWord (biasInKernel isPalette perLaneScale isRelu : Bool) : Except String UInt32 :=
+  encodeWord neOpQuantLayout #[
+    ("biasInKernel", if biasInKernel then 1 else 0),
+    ("unscaled", if isPalette then neOpUnscaledBits else 0),
+    ("perLaneScale", if perLaneScale then 1 else 0),
+    ("relu", if isRelu then 1 else 0), ("lut", 0), ("base20", 1)
+  ]
+
+/-- Encode `neCommon` (`0x003c`) for `AneOp.neConv`. -/
+def encodeNeConvCommonWord (shPref shMax f : Nat) (bit27Val : UInt32) : Except String UInt32 := do
+  encodeWord neCommonLayout #[
+    ("kind", 0), ("shPref", ← natToU32Checked shPref "shPref"),
+    ("shMin", ← natToU32Checked shPref "shMin"), ("shMax", ← natToU32Checked shMax "shMax"),
+    ("F", ← natToU32Checked f "F"), ("wide3x3", bit27Val)
+  ]
+
+/-- Encode `neTile` (`0x0040`) for `AneOp.neConv`. -/
+def encodeNeConvTileWord (ocg fat wu : Nat) : Except String UInt32 := do
+  encodeWord neTileLayout #[
+    ("ocg", ← natToU32Checked ocg "ocg"),
+    ("fat", ← natToU32Checked fat "fat"),
+    ("WU", ← natToU32Checked wu "WU")
+  ]
+
+/-- Encode `neOp` (`0x4904`) for standalone `AneOp.neAct`. -/
+def encodeNeActOpWord (hasShift isRelu isLut : Bool) : Except String UInt32 :=
+  encodeWord neActOpLayout #[
+    ("noShift", if hasShift then 0 else 1),
+    ("relu", if isRelu then 1 else 0),
+    ("lut", if isLut then 1 else 0)
+  ]
+
+/-- Encode `lutCfg` (`0x5580`) for `AneOp.neAct` LUT tasks. -/
+def encodeNeActLutCfgWord (taskId : Nat) : Except String UInt32 := do
+  encodeWord chunkSlotLayout #[("enable", 1), ("on20", 1), ("task", ← natToU32Checked taskId "taskId")]
+
+/-- Encode `neCommon` (`0x003c`) for `AneOp.dmaView`. -/
+def encodeDmaViewCommonWord (shPref shMax f : Nat) (transposeOut transposeWideGroup : Bool) :
+    Except String UInt32 := do
+  encodeWord neViewCommonLayout #[
+    ("kind", 0), ("shPref", ← natToU32Checked shPref "shPref"),
+    ("shMin", ← natToU32Checked shPref "shMin"), ("shMax", ← natToU32Checked shMax "shMax"),
+    ("F", ← natToU32Checked f "F"),
+    ("transposeOut", if transposeOut then 1 else 0),
+    ("transposeWideGroup", if transposeWideGroup then 1 else 0)
+  ]
+
+/-- Encode `peTile` (`0x0040`) for `AneOp.pe` unary/binary tasks. -/
+def encodePeTileWord (twoSource : Bool) (k th : Nat) : Except String UInt32 := do
+  let m := peTileM twoSource k th
+  encodeWord peTileLayout #[("k", ← natToU32Checked k "k"), ("m", ← natToU32Checked m "m")]
+
+/-- Encode `peBcast` (`0x0044`) for two-source `AneOp.pe` binary tasks. -/
+def encodePeBcastWord (hw1 hw2 outDims : TensorDims) : Except String UInt32 :=
+  encodeWord peBcastLayout #[
+    ("src1W", if hw1.w != outDims.w then 1 else 0),
+    ("src1H", if hw1.h != outDims.h then 1 else 0),
+    ("src1C", if hw1.c != outDims.c then 1 else 0),
+    ("src2W", if hw2.w != outDims.w then 1 else 0),
+    ("src2H", if hw2.h != outDims.h then 1 else 0),
+    ("src2C", if hw2.c != outDims.c then 1 else 0)
+  ]
 
 -- ============================================================================
 -- Phase 3: Unified Emitters — One Clean Emitter per `AneOp` Family
@@ -960,17 +1092,8 @@ private def emitNeConvTask
     | some pq =>
       let wide3x3 := computeWide3x3Conv target sh cp.tiling
       let b27 := neCommonQuantBit27 wide3x3 pq.hasZeroPoint pq.format.wKind
-      let wCfg ← encodeWord neCfgQuantLayout #[
-        ("wKind", pq.format.wKind), ("wWidth", ← natToU32Checked pq.format.wWidth "wWidth"),
-        ("sparse", 0), ("dynKern", 0), ("hasZP", if pq.hasZeroPoint then 1 else 0),
-        ("h17Flag", if target == .h17 && !pq.hasZeroPoint then 1 else 0)
-      ]
-      let wOp ← encodeWord neOpQuantLayout #[
-        ("biasInKernel", if pq.biasInKernel then 1 else 0),
-        ("unscaled", if pq.format.isPalette then neOpUnscaledBits else 0),
-        ("perLaneScale", if pq.perLaneScale then 1 else 0),
-        ("relu", if act.isRelu then 1 else 0), ("lut", 0), ("base20", 1)
-      ]
+      let wCfg ← encodeNeConvQuantCfgWord target pq.format.wKind pq.format.wWidth pq.hasZeroPoint
+      let wOp ← encodeNeConvQuantOpWord pq.biasInKernel pq.format.isPalette pq.perLaneScale act.isRelu
       let wSc ← encodeWord neScaleExtLayout #[
         ("val", pq.tensorScaleFp16.toUInt32), ("pexp", ← natToU32Checked pq.scalePexp "scalePexp")
       ]
@@ -995,16 +1118,8 @@ private def emitNeConvTask
         else pure none
       pure (if wide3x3 then 1 else 0, wCfg, wOp, wSc, sb?, packed.slots)
 
-  let wNeCommon ← encodeWord neCommonLayout #[
-    ("kind", 0), ("shPref", ← natToU32Checked cp.tiling.shPref "shPref"),
-    ("shMin", ← natToU32Checked cp.tiling.shPref "shMin"), ("shMax", ← natToU32Checked cp.tiling.shMax "shMax"),
-    ("F", ← natToU32Checked cp.tiling.f "F"), ("wide3x3", bit27Val)
-  ]
-  let wNeTile ← encodeWord neTileLayout #[
-    ("ocg", ← natToU32Checked (effOcgConv sh cp.tiling) "ocg"),
-    ("fat", ← natToU32Checked cp.tiling.fat "fat"),
-    ("WU", ← natToU32Checked cp.tiling.wu "WU")
-  ]
+  let wNeCommon ← encodeNeConvCommonWord cp.tiling.shPref cp.tiling.shMax cp.tiling.f bit27Val
+  let wNeTile ← encodeNeConvTileWord (effOcgConv sh cp.tiling) cp.tiling.fat cp.tiling.wu
   let wResCfg ← encodeResPortCfgMulti isFirst resIsL2 cp.direct
   let wKernStage ← encodeKernelStageMulti taskId isLast sparse
 
@@ -1150,15 +1265,10 @@ private def emitNeActTask
     let cU32 ← natToU32Checked dims.c "C"
     let wDwGroups ← encodeWord dwGroupsLayout #[("perGroupIn", 1)]
     let wTH ← encodeWord (dim16Layout "TH") #[("val", ← natToU32Checked t.tileHeight "TH")]
-    let wNeCommon ← encodeWord neCommonLayout #[
-      ("kind", 0), ("shPref", ← natToU32Checked t.shPref "shPref"), ("shMin", ← natToU32Checked t.shPref "shMin"),
-      ("shMax", ← natToU32Checked t.shMax "shMax"), ("F", ← natToU32Checked t.f "F"), ("wide3x3", 0)
-    ]
-    let wNeTile ← encodeWord neTileLayout #[("ocg", 0), ("fat", ← natToU32Checked t.fat "fat"), ("WU", ← natToU32Checked t.wu "WU")]
+    let wNeCommon ← encodeNeConvCommonWord t.shPref t.shMax t.f 0
+    let wNeTile ← encodeNeConvTileWord 0 t.fat t.wu
     let wResCfg ← encodeResPortCfgMulti isFirst resIsL2 lp.direct
-    let wNeActOp ← encodeWord neActOpLayout #[
-      ("noShift", if shiftBits?.isSome then 0 else 1), ("relu", if isRelu then 1 else 0), ("lut", if isLut then 1 else 0)
-    ]
+    let wNeActOp ← encodeNeActOpWord shiftBits?.isSome isRelu isLut
     let wNeScale ← encodeWord neScaleLayout #[("val", preScaleBits.toUInt32)]
 
     let mut plain : Array RegWrite := #[
@@ -1181,7 +1291,7 @@ private def emitNeActTask
     let mut relocs : Array TaskReloc := #[]
     if isLut then
       let wKernStage ← encodeKernelStageMulti taskId isLast false
-      let wLutCfg ← encodeWord chunkSlotLayout #[("enable", 1), ("on20", 1), ("task", taskIdU32)]
+      let wLutCfg ← encodeNeActLutCfgWord taskId
       plain := plain ++ #[
         { byteAddr := regNeCfg, value := neActCfgValue }, { byteAddr := regKernelStage, value := wKernStage },
         { byteAddr := regLutCfg, value := wLutCfg }, { byteAddr := regLutSize, value := lutTableBytes.toUInt32 }
@@ -1346,14 +1456,8 @@ private def emitDmaViewTask
   let wBatchN ← encodeWord (dim16Layout "BatchN") #[("val", 1)]
   let wDw ← encodeWord dwGroupsLayout #[("perGroupIn", 1)]
   let wTH ← encodeWord (dim16Layout "TH") #[("val", ← natToU32Checked t.tileHeight "TH")]
-  let wNeCommon ← encodeWord neViewCommonLayout #[
-    ("kind", 0), ("shPref", ← natToU32Checked t.shPref "shPref"), ("shMin", ← natToU32Checked t.shPref "shMin"),
-    ("shMax", ← natToU32Checked t.shMax "shMax"), ("F", ← natToU32Checked t.f "F"),
-    ("transposeOut", 0), ("transposeWideGroup", 0)
-  ]
-  let wNeTile ← encodeWord neTileLayout #[
-    ("ocg", ← natToU32Checked t.ocg "ocg"), ("fat", ← natToU32Checked t.fat "fat"), ("WU", ← natToU32Checked t.wu "WU")
-  ]
+  let wNeCommon ← encodeDmaViewCommonWord t.shPref t.shMax t.f false false
+  let wNeTile ← encodeNeConvTileWord t.ocg t.fat t.wu
   let wSrc1Cfg ← encodeSrcPortCfgMulti "src1Cfg" isFirst srcIsL2
     sync.src1WaitNe5 sync.src1WaitPe22 sync.src1HandoffNe sync.src1HandoffPe
   let wResCfg ← encodeResPortCfgMulti isFirst resIsL2 vp.direct
@@ -1469,13 +1573,12 @@ private def emitPeTask
     let dims := pp.outDims
     let stripW := peStripWidth pp.tiling.k
     let th := pp.tiling.tileHeight
-    let m := peTileM false pp.tiling.k th
     let wWin ← encodeWord (dim16Layout "Win") #[("val", ← natToU32Checked dims.w "W")]
     let wHin ← encodeWord (dim16Layout "Hin") #[("val", ← natToU32Checked dims.h "H")]
     let cU32 ← natToU32Checked dims.c "C"
     let wTH ← encodeWord (dim16Layout "TH") #[("val", ← natToU32Checked th "TH")]
     let wPeCommon ← encodeWord peCommonLayout #[("mode", peCommonOneSrcValue)]
-    let wPeTile ← encodeWord peTileLayout #[("k", ← natToU32Checked pp.tiling.k "k"), ("m", ← natToU32Checked m "m")]
+    let wPeTile ← encodePeTileWord false pp.tiling.k th
     let wResCfg ← encodeResPortCfgMulti isFirst resIsL2 pp.direct
 
     let mut plain : Array RegWrite := #[
@@ -1586,7 +1689,6 @@ private def emitPeTask
     let hw2 := pp.hwSrc2?.getD outDims
     let stripW := peStripWidth pp.tiling.k
     let th := pp.tiling.tileHeight
-    let m := peTileM true pp.tiling.k th
     let s2St := pt.src2Storage?.get!
     let src2IsL2 := match s2St with | .l2 _ _ => true | _ => false
     let wSrc2Cfg ← encodeSrcPortCfgMulti "src2Cfg" isFirst src2IsL2
@@ -1596,11 +1698,8 @@ private def emitPeTask
     let cU32 ← natToU32Checked outDims.c "C"
     let wTH ← encodeWord (dim16Layout "TH") #[("val", ← natToU32Checked th "TH")]
     let wPeCommon ← encodeWord peCommonLayout #[("mode", peCommonTwoSrcValue)]
-    let wPeTile ← encodeWord peTileLayout #[("k", ← natToU32Checked pp.tiling.k "k"), ("m", ← natToU32Checked m "m")]
-    let wPeBcast ← encodeWord peBcastLayout #[
-      ("src1W", if hw1.w != outDims.w then 1 else 0), ("src1H", if hw1.h != outDims.h then 1 else 0), ("src1C", if hw1.c != outDims.c then 1 else 0),
-      ("src2W", if hw2.w != outDims.w then 1 else 0), ("src2H", if hw2.h != outDims.h then 1 else 0), ("src2C", if hw2.c != outDims.c then 1 else 0)
-    ]
+    let wPeTile ← encodePeTileWord true pp.tiling.k th
+    let wPeBcast ← encodePeBcastWord hw1 hw2 outDims
     let wResCfg ← encodeResPortCfgMulti isFirst resIsL2 pp.direct
 
     let mut plain : Array RegWrite := #[

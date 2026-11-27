@@ -123,7 +123,7 @@ def liveBufBefore (a b : LiveBuf) : Bool :=
     when `firstFit = false`, stacks above the highest conflicting live buffer.
     If all input `bytes` are multiples of 64, every returned `base` is automatically 64-byte aligned. -/
 def allocate (firstFit : Bool) (bs : List LiveBuf) : List PlacedBuf :=
-  let sorted := (bs.toArray.qsort liveBufBefore).toList
+  let sorted := bs.mergeSort liveBufBefore
   (placeAll firstFit sorted []).reverse
 
 /-- Find the lowest offset in `[0, cap)` (at `0` or an existing `r.hi`) where a temporary
