@@ -221,6 +221,28 @@ def chooseMatmulTaskPlan
     | none =>
       .error s!"no legal {target.name} dynamic matmul tiling fits 2 MiB L2 for (M={m}, K={k}, N={n})"
 
+/-- Encode `neCommon` (`0x003c`) for dynamic runtime-kernel `neMatmul`. -/
+def encodeMatmulCommonWord (n shPref shMax f : Nat) (isDyn : Bool) : Except String UInt32 := do
+  encodeWord neMatmulCommonLayout #[
+    ("lo2", if alignUp n 8 <= 64 then 1 else 0),
+    ("shPref", ← natToU32Checked shPref "shPref"),
+    ("shMin", ← natToU32Checked shPref "shMin"),
+    ("shMax", ← natToU32Checked shMax "shMax"),
+    ("F", ← natToU32Checked f "F"),
+    ("dynKern", if isDyn then 1 else 0)
+  ]
+
+/-- Encode `kernelStage` (`0x5500`) for dynamic runtime-kernel `neMatmul`. -/
+def encodeMatmulKernelStageWord (target : Target) (isLast isDyn : Bool) (taskId : Nat) : Except String UInt32 := do
+  encodeWord kernelStageDynLayout #[
+    ("sparse", 0),
+    ("kernEn", 1),
+    ("isLast", if isLast then 1 else 0),
+    ("kernCfg", 1),
+    ("h17Dyn", if target.profile.dynKernelStageBit && isDyn then 1 else 0),
+    ("stage", ← natToU32Checked (taskId + 1) "kernelStage.stage")
+  ]
+
 /-- Lower one dynamic runtime-kernel NE `MatMul` task (`1 <= m <= 16`, full matrix rows `totalM >= m`)
     into a multi-task `TaskDesc`. -/
 def buildMatmulTaskMulti
@@ -270,25 +292,11 @@ def buildMatmulTaskMulti
     ("kw", 1), ("kh", 1), ("sx", 1), ("sy", 1), ("pl", 0), ("pt", 0), ("hx", 1), ("vy", 1)
   ]
   let wTH ← encodeWord (dim16Layout "TH") #[("val", 1)]
-  let wNeCommon ← encodeWord neMatmulCommonLayout #[
-    ("lo2", if alignUp n 8 <= 64 then 1 else 0),
-    ("shPref", ← natToU32Checked t.shPref "shPref"),
-    ("shMin", ← natToU32Checked t.shPref "shMin"),
-    ("shMax", ← natToU32Checked t.shMax "shMax"),
-    ("F", ← natToU32Checked t.f "F"),
-    ("dynKern", if isDyn then 1 else 0)
-  ]
+  let wNeCommon ← encodeMatmulCommonWord n t.shPref t.shMax t.f isDyn
   let wNeTile ← encodeWord neTileLayout #[("ocg", 0), ("fat", 0), ("WU", 0)]
   let wNeCfg ← encodeWord (neMatmulCfgLayout target) #[("dynKern", 1)]
   let wNeScale ← encodeWord neScaleLayout #[("val", scaleBits.toUInt32)]
-  let wKernStage ← encodeWord kernelStageDynLayout #[
-    ("sparse", 0),
-    ("kernEn", 1),
-    ("isLast", if isLast then 1 else 0),
-    ("kernCfg", 1),
-    ("h17Dyn", if target.profile.dynKernelStageBit && isDyn then 1 else 0),
-    ("stage", ← natToU32Checked (taskId + 1) "kernelStage.stage")
-  ]
+  let wKernStage ← encodeMatmulKernelStageWord target isLast isDyn taskId
   let wSrc1Cfg ← encodeWord (portCfgMultiLayout "src1Cfg") #[
     ("mode", if src1IsL2 then portModeL2 else portModeDma),
     ("handoffNe", if !isFirst && src1IsL2 && sync.src1HandoffNe then 1 else 0),

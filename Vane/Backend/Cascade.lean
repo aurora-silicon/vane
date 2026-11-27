@@ -56,6 +56,47 @@ structure CascadePlan where
   deriving Repr, BEq, Inhabited
 
 -- ============================================================================
+-- Pure Strip-Window & Halo Geometry Primitives (Shared with Formal Proofs)
+-- ============================================================================
+
+/-- Disjoint output row (or column) band `[lo, hi)` for strip `s` of extent `full` at strip size `step`. -/
+def stripOutBand (full step s : Nat) : Nat × Nat :=
+  let lo := s * step
+  (lo, min full (lo + step))
+
+/-- Clamped input halo interval `[inLo, inHi)` required to produce output rows `[lo, hi)` with radius `rad`. -/
+def haloInBand (hFull rad lo hi : Nat) : Nat × Nat :=
+  let inLo := if lo >= rad then lo - rad else 0
+  let inHi := min hFull (hi + rad)
+  (inLo, inHi)
+
+/-- Top boundary zero-padding (`1` at top edge `outLo = 0`, `0` for interior/bottom strips). -/
+def stripPadTop (outLo : Nat) : Nat :=
+  if outLo == 0 then 1 else 0
+
+/-- Bottom boundary zero-padding (`1` at bottom edge `outHi = hFull`, `0` for top/interior strips). -/
+def stripPadBot (outHi hFull : Nat) : Nat :=
+  if outHi == hFull then 1 else 0
+
+/-- Compute cumulative wavefront lag per layer for rolling halo cascades:
+    layer `0` has lag `0`, and each subsequent layer `l > 0` advances lag by `+1` iff `radii[l] > 0`. -/
+def rollingHaloLayerLagsAux (radii : Array Nat) (l accLag : Nat) (acc : Array Nat) : Array Nat :=
+  if h : l < radii.size then
+    let nextLag := if l > 0 && radii[l] > 0 then accLag + 1 else accLag
+    rollingHaloLayerLagsAux radii (l + 1) nextLag (acc.push nextLag)
+  else
+    acc
+termination_by radii.size - l
+
+/-- Cumulative wavefront lag array for `unrollRollingHaloCascade`. -/
+def rollingHaloLayerLags (radii : Array Nat) : Array Nat :=
+  rollingHaloLayerLagsAux radii 0 0 (Array.mkEmpty radii.size)
+
+/-- Wavefront step at which layer `l` executes strip `s` under lag schedule `lags`. -/
+def rollingHaloWave (lags : Array Nat) (l s : Nat) : Nat :=
+  s + lags[l]!
+
+-- ============================================================================
 -- Geometry & Eligibility Helpers
 -- ============================================================================
 
@@ -111,8 +152,7 @@ def propagateStripIntervals
     let some (lo, hi) := reqOut[u]!
       | throw s!"spatial strip fusion: node '{g.nodes[u]!.name}' is unreachable from output"
     let rad := radii[u]!
-    let inLo := if lo >= rad then lo - rad else 0
-    let inHi := min hFull (hi + rad)
+    let (inLo, inHi) := haloInBand hFull rad lo hi
     if inLo >= inHi then
       throw s!"spatial strip fusion: empty input interval [{inLo}, {inHi}) on node '{g.nodes[u]!.name}'"
     reqIn := reqIn.set! u (inLo, inHi)
@@ -310,8 +350,7 @@ def unrollHStripCascade (prog : AneProgram) (hFull : Nat) (radii : Array Nat)
   let mut finalOutVids : Array ValueId := Array.replicate g.outputs.size 0
 
   for s in [:sCount] do
-    let y0 := s * hOut
-    let y1 := min hFull (y0 + hOut)
+    let (y0, y1) := stripOutBand hFull hOut s
     let suffix := if sCount > 1 then s!"_s{s}" else ""
     let (outIntervals, inIntervals) ← propagateStripIntervals g radii hFull y0 y1
     let mut stripVidMap : Array ValueId := Array.replicate m 0
@@ -330,8 +369,8 @@ def unrollHStripCascade (prog : AneProgram) (hFull : Nat) (radii : Array Nat)
           if kh == 1 && kw == 1 then
             .neConv 1 1 sh sw .same mode cin cout w b act til wgId lbl
           else
-            let pt := if outLo == 0 then 1 else 0
-            let pb := if outHi == hFull then 1 else 0
+            let pt := stripPadTop outLo
+            let pb := stripPadBot outHi hFull
             .neConv 3 3 sh sw (.strip pt pb) mode cin cout w b act til wgId lbl
         | other => other
 
@@ -515,9 +554,7 @@ def unrollRollingHaloCascade (prog : AneProgram) (hOut : Nat) : Except String An
 
   -- Compute per-strip disjoint row ranges `[(y0, y1)]`
   let stripBounds : Array (Nat × Nat) := Array.ofFn (n := sCount) fun s =>
-    let y0 := s.val * hOut
-    let y1 := min hFull (y0 + hOut)
-    (y0, y1)
+    stripOutBand hFull hOut s.val
 
   -- `produced[l][s]` = SSA ValueId for strip `s` of layer `l` (valid once produced)
   -- Emit in wavefront order so strip `s` of layer `l` runs as soon as strips `s-1, s, s+1` of `l-1` exist!
@@ -526,12 +563,8 @@ def unrollRollingHaloCascade (prog : AneProgram) (hOut : Nat) : Except String An
 
   -- Layer-wavefront schedule: advance layer 0 by 1 strip ahead of each 3x3 layer
   -- Total wavefront steps = sCount + sum(radii)
-  let mut lag : Array Nat := Array.replicate m 0
-  let mut accLag : Nat := 0
-  for l in [:m] do
-    if l > 0 && radii[l]! > 0 then
-      accLag := accLag + 1
-    lag := lag.set! l accLag
+  let lag : Array Nat := rollingHaloLayerLags radii
+  let accLag : Nat := if m > 0 then lag[m - 1]! else 0
   let totalWaves := sCount + accLag
 
   for wave in [:totalWaves] do
@@ -549,7 +582,7 @@ def unrollRollingHaloCascade (prog : AneProgram) (hOut : Nat) : Except String An
         let (effInVid, src1Win) ←
           if l == 0 then
             let rad := radii[0]!
-            let inLo := if y0 >= rad then y0 - rad else 0
+            let (inLo, _) := haloInBand hFull rad y0 y1
             pure (g.inputs[0]!.1, ({ rowOffset := inLo, fullH := hFull } : AneSurfaceWindow))
           else if radii[l]! == 0 then
             -- Zero halo -> ZERO extra DMA! Direct L2 feed from strip `s` of layer `l - 1`!
@@ -610,8 +643,8 @@ def unrollRollingHaloCascade (prog : AneProgram) (hOut : Nat) : Except String An
 
         let newOp : AneOp := match nd.op with
           | .neConv 3 3 sh sw _ mode cin cout w b act til wgId lbl =>
-            let pt := if y0 == 0 then 1 else 0
-            let pb := if y1 == hFull then 1 else 0
+            let pt := stripPadTop y0
+            let pb := stripPadBot y1 hFull
             .neConv 3 3 sh sw (.strip pt pb) mode cin cout w b act til wgId lbl
           | other => other
 
@@ -722,8 +755,7 @@ def unrollWStripCascade (prog : AneProgram) (stripW : Nat) : Except String AnePr
   let mut finalOutVids : Array ValueId := Array.replicate g.outputs.size 0
 
   for s in [:sCount] do
-    let w0 := s * stripW
-    let w1 := min wFull (w0 + stripW)
+    let (w0, w1) := stripOutBand wFull stripW s
     let curW := w1 - w0
     -- 1. Slice each graph input along W [w0, w1) via dmaView (Surface -> L2!)
     let mut slicedInVids : Array ValueId := Array.mkEmpty g.inputs.size

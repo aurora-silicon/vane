@@ -26,9 +26,12 @@ def standardAxioms : List Name := [``propext, ``Classical.choice, ``Quot.sound]
 
 /-- Lower bound on user-declared theorems in `Vane.Proofs`; guards against an
 empty or truncated audit passing silently. -/
-def minProofTheorems : Nat := 461
+def minProofTheorems : Nat := 672
 
 def proofsModule : Name := `Vane.Proofs
+
+def isProofsModule (m : Name) : Bool :=
+  m == proofsModule || proofsModule.isPrefixOf m
 
 def isVaneModule (m : Name) : Bool :=
   m == `Vane || (`Vane).isPrefixOf m
@@ -75,7 +78,7 @@ def audit : CoreM Report := do
     if let .thmInfo _ := ci then
       if ← isUserTheorem n then
         r := { r with vaneTheorems := r.vaneTheorems + 1 }
-        if m == proofsModule then
+        if isProofsModule m then
           r := { r with proofsTheorems := r.proofsTheorems + 1 }
   if r.proofsTheorems < minProofTheorems then
     let msg := s!"only {r.proofsTheorems} theorems found in {proofsModule}; expected at least {minProofTheorems}"

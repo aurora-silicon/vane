@@ -25,6 +25,23 @@ open Vane.Ane
 -- L2 Pass: General SOK Output-Channel Splitting on `SSAGraph AneOp`
 -- ============================================================================
 
+/-- Partition `cout` output channels into `numSlices` balanced contiguous slice widths
+    differing by at most 1 (`base + 1` for the first `cout % numSlices` slices, then `base`). -/
+def balancedSlices (cout numSlices : Nat) : List Nat :=
+  let base := cout / numSlices
+  let rem := cout % numSlices
+  (List.range numSlices).map fun i => base + if i < rem then 1 else 0
+
+/-- Extract the weight group identifier of an `AneOp` (`0` if weightless / ungrouped). -/
+def opWeightGroupId : AneOp → Nat
+  | .neConv _ _ _ _ _ _ _ _ _ _ _ _ wg _ => wg
+  | .neAct _ _ wg => wg
+  | _ => 0
+
+/-- Maximum existing `weightGroupId` across all nodes in an `SSAGraph AneOp`. -/
+def maxExistingWeightGroupId (g : SSAGraph AneOp) : Nat :=
+  g.nodes.foldl (fun acc nd => max acc (opWeightGroupId nd.op)) 0
+
 /-- Check whether a single-task `3x3` dense stride-1 fp16 conv fits within 64 KiB kernel chunks. -/
 private def conv3x3SingleTaskFits (target : Target) (sh : ConvSpec)
     (extraLutBytes : Nat) (biasInKernel : Bool) : Bool := Id.run do
@@ -68,12 +85,7 @@ private def chooseConv3x3OutputSlices
   if bestDc == 0 then
     throw s!"SOK conv3x3 split: even Cout=1 exceeds 64 KiB kernel chunk cap for Cin={cin}"
   let numSlices := ceilDiv cout bestDc
-  let base := cout / numSlices
-  let rem := cout % numSlices
-  let mut slices : Array Nat := Array.mkEmpty numSlices
-  for i in [:numSlices] do
-    slices := slices.push (base + if i < rem then 1 else 0)
-  pure slices
+  pure (balancedSlices cout numSlices).toArray
 
 /-- Check whether a single-task quantized `3x3` dense stride-1 conv fits within 64 KiB kernel chunks. -/
 private def conv3x3SingleTaskFitsQuant (target : Target) (sh : ConvSpec)
@@ -118,12 +130,7 @@ private def chooseConv3x3OutputSlicesQuant
   if bestDc == 0 then
     throw s!"SOK quantized conv3x3 split: even Cout=1 exceeds 64 KiB kernel chunk cap for Cin={cin}"
   let numSlices := ceilDiv cout bestDc
-  let base := cout / numSlices
-  let rem := cout % numSlices
-  let mut slices : Array Nat := Array.mkEmpty numSlices
-  for i in [:numSlices] do
-    slices := slices.push (base + if i < rem then 1 else 0)
-  pure slices
+  pure (balancedSlices cout numSlices).toArray
 
 /-- Pure SSA SOK (Split-Output-Channels) pass on `AneProgram` (`SSAGraph AneOp`).
     Splits any wide-`Cout` `neConv` node (1x1 fp16/quant, or 3x3 dense stride-1 fp16/quant)
@@ -133,11 +140,7 @@ private def chooseConv3x3OutputSlicesQuant
 def channelSplitPass (prog : AneProgram) : Except String AneProgram := do
   let g := prog.graph
   let mut nextVid := g.nextValueId
-  let maxExistingWgId : Nat := g.nodes.foldl (fun acc nd =>
-    max acc (match nd.op with
-      | .neConv _ _ _ _ _ _ _ _ _ _ _ _ wg _ => wg
-      | .neAct _ _ wg => wg
-      | _ => 0)) 0
+  let maxExistingWgId : Nat := maxExistingWeightGroupId g
   let mut nextWgId : Nat := maxExistingWgId + 1
   let mut newNodes : Array (IRNode AneOp) := Array.mkEmpty g.nodes.size
   let mut newMeta : Array AneNodeMeta := Array.mkEmpty g.nodes.size
