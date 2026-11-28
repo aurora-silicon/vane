@@ -56,7 +56,7 @@ private def lookupConstHigh (g : SSAGraph HighOp) (v : ValueId) : Option (Tensor
   | _ => none
 
 /-- Single pass folding single-consumer `Conv + BatchNorm` in exact float64. -/
-private def fuseConvBatchNormPass (g : SSAGraph HighOp) : Except String (SSAGraph HighOp × Nat) := do
+def fuseConvBatchNormPass (g : SSAGraph HighOp) : Except String (SSAGraph HighOp × Nat) := do
   let mut cur := g
   let mut fused : Nat := 0
   let maxSteps := g.nodes.size + 1
@@ -176,7 +176,7 @@ private def fuseConvBatchNormPass (g : SSAGraph HighOp) : Except String (SSAGrap
 
 /-- Fold single-consumer `Conv + Gelu` → `CoreOp.conv` with fused `.lut .gelu` epilogue
     (skipping quantized `dequantize` weights to respect M8A no-fused-LUT hardware legality). -/
-private def fuseConvGeluPass (g : SSAGraph HighOp) : SSAGraph HighOp × Nat := Id.run do
+def fuseConvGeluPass (g : SSAGraph HighOp) : SSAGraph HighOp × Nat := Id.run do
   let mut cur := g
   let mut fused : Nat := 0
   let maxSteps := g.nodes.size + 1

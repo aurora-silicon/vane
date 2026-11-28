@@ -28,7 +28,7 @@ private def lookupConstCore (g : SSAGraph CoreOp) (v : ValueId) : Option (Tensor
   | _ => none
 
 /-- 1. Collapse single-consumer `Mul(x, Sigmoid(x))` / `Mul(Sigmoid(x), x)` → `lut (.lut .silu)`. -/
-private def fuseSiluCore (g : SSAGraph CoreOp) : SSAGraph CoreOp := Id.run do
+def fuseSiluCore (g : SSAGraph CoreOp) : SSAGraph CoreOp := Id.run do
   let mut cur := g
   let maxSteps := g.nodes.size + 1
   for _ in [:maxSteps] do
@@ -58,7 +58,7 @@ private def fuseSiluCore (g : SSAGraph CoreOp) : SSAGraph CoreOp := Id.run do
       cur := dce { cur with nodes := nodes' }
   return cur
 
-private def isChannelBiasShapeCore (dims convOutShape : Array Nat) : Bool :=
+def isChannelBiasShapeCore (dims convOutShape : Array Nat) : Bool :=
   if convOutShape.size == 2 then
     let cout := convOutShape[1]!
     if cout == 0 then false
@@ -75,7 +75,7 @@ private def isChannelBiasShapeCore (dims convOutShape : Array Nat) : Bool :=
 /-- 2. Fold single-consumer bias-free `Conv(x, w) + Add(const channel bias)` into `Conv(x, w, bias)`.
        Rejects non-channel spatial constants (e.g. `[1, 1, 2, 2]`) and 1D/2D W-broadcast constants
        on 4D Conv (e.g. `[Cout]` or `[1, Cout]`) so they are never misfolded. -/
-private def fuseConvAddBiasCore (g : SSAGraph CoreOp) : SSAGraph CoreOp := Id.run do
+def fuseConvAddBiasCore (g : SSAGraph CoreOp) : SSAGraph CoreOp := Id.run do
   let mut cur := g
   let maxSteps := g.nodes.size + 1
   for _ in [:maxSteps] do
@@ -139,7 +139,7 @@ private def fuseConvAddBiasCore (g : SSAGraph CoreOp) : SSAGraph CoreOp := Id.ru
 
 /-- 3. Fuse single-consumer `Conv + ReLU/LUT` epilogue (respecting M8A rule: do NOT fuse `.lut`
        onto a `dequantize`-weighted conv, only `.relu`). -/
-private def fuseConvActCore (g : SSAGraph CoreOp) : SSAGraph CoreOp × Nat := Id.run do
+def fuseConvActCore (g : SSAGraph CoreOp) : SSAGraph CoreOp × Nat := Id.run do
   let mut cur := g
   let mut fused : Nat := 0
   let maxSteps := g.nodes.size + 1
@@ -190,7 +190,7 @@ private def fuseConvActCore (g : SSAGraph CoreOp) : SSAGraph CoreOp × Nat := Id
 
 /-- 4. Fuse single-consumer validated `Transpose` inputs and post-`MatMul` scalar `Mul`/`Div`
        into `CoreOp.matmul`. -/
-private def fuseMatmulCore (g : SSAGraph CoreOp) : Except String (SSAGraph CoreOp × Nat) := do
+def fuseMatmulCore (g : SSAGraph CoreOp) : Except String (SSAGraph CoreOp × Nat) := do
   let mut cur := g
   let mut folded : Nat := 0
 
@@ -234,7 +234,9 @@ private def fuseMatmulCore (g : SSAGraph CoreOp) : Except String (SSAGraph CoreO
                           pure none
                       else pure none
                     else if aTy.shape.size == 4 && bTy.shape.size == 4 then
-                      if perm == #[0, 3, 2, 1] then pure (some origInId)
+                      let isMultiHeadStacked := !trA && !trB && aTy.shape[3]! > 0 &&
+                        bTy.shape[1]! > aTy.shape[3]! && bTy.shape[1]! % aTy.shape[3]! == 0
+                      if !isMultiHeadStacked && perm == #[0, 3, 2, 1] then pure (some origInId)
                       else pure none
                     else
                       pure none
