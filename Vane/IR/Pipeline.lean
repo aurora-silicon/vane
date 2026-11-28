@@ -4,6 +4,7 @@ import Vane.IR.Passes.ConstFold
 import Vane.IR.Passes.HighFuse
 import Vane.IR.Passes.Decompose
 import Vane.IR.Passes.CoreFuse
+import Vane.IR.Passes.DecomposeConv
 import Vane.IR.Passes.Quantize
 
 namespace Vane.IR
@@ -66,7 +67,8 @@ def runStandardPipeline (g : SSAGraph HighOp) (cfg : PassConfig := {}) :
   let (c3, coreActCnt, mmCnt) ←
     if cfg.enableFusion then coreFuse c2
     else pure (c2, 0, 0)
-  let (c4, qCnt) ← quantizePass c3 cfg.quantize
+  let c3b ← decomposeConvPass c3
+  let (c4, qCnt) ← quantizePass c3b cfg.quantize
   let c5 ← constFold (viewSimplify (dce c4) cfg.viewSimplifyFuel)
 
   validateGraph c5

@@ -623,14 +623,54 @@ def coreGraphToGraphSpec
       let rAxes : ReduceAxes := { reduceC := rc, reduceH := rh, reduceW := rw }
       if rAxes.isEmpty then
         throw s!"{ctx}: reduce resolved to empty axes"
-      let rspec : ReduceSpec := {
-        target := g.target, op := op
-        dims := { c := xSh.c, h := xSh.h, w := xSh.w }
-        axes := rAxes, eps := eps
-      }
-      let _ ← resolveReduceBackend rspec
       let (outVid, outTy) := nd.outputs[0]!
-      vaneNodes := vaneNodes.push { id := baseId, inputs := #[xGid], op := .reduce op rAxes eps }
+      if rAxes.reduceC && !rAxes.reduceH && !rAxes.reduceW && xSh.w > 1 && !op.isNeChannelSupported then
+        match op with
+        | .rsqrtMeanSquare | .rsqrtSumSquare =>
+          if !f16IsFinite eps || ((eps &&& 0x8000) != 0 && (eps &&& 0x7fff) != 0) then
+            throw s!"{ctx}: reduce {op.name} eps must be finite and >= 0"
+          let redOp : ReduceOp := if op == .rsqrtMeanSquare then .mean else .sum
+          let (sqId, u1) := sanitizeGraphId s!"{baseId}_sq" usedIds
+          let (rdId, u2) := sanitizeGraphId s!"{baseId}_red" u1
+          let (epId, u3) := sanitizeGraphId s!"{baseId}_eps" u2
+          usedIds := u3
+          vaneNodes := vaneNodes.push { id := sqId, inputs := #[xGid], op := .pe1 .square }
+          vaneNodes := vaneNodes.push { id := rdId, inputs := #[sqId], op := .reduce redOp rAxes 0 }
+          let preId := if (eps &&& 0x7fff) == 0 then rdId else epId
+          if (eps &&& 0x7fff) != 0 then
+            vaneNodes := vaneNodes.push { id := epId, inputs := #[rdId], op := .pe1 (.scalarAdd eps) }
+          vaneNodes := vaneNodes.push { id := baseId, inputs := #[preId], op := .lut (.lut (.rsqrt 0.0)) }
+        | .sumSquare =>
+          let (sqId, u1) := sanitizeGraphId s!"{baseId}_sq" usedIds; usedIds := u1
+          vaneNodes := vaneNodes.push { id := sqId, inputs := #[xGid], op := .pe1 .square }
+          vaneNodes := vaneNodes.push { id := baseId, inputs := #[sqId], op := .reduce .sum rAxes 0 }
+        | .l2 =>
+          let (sqId, u1) := sanitizeGraphId s!"{baseId}_sq" usedIds
+          let (rdId, u2) := sanitizeGraphId s!"{baseId}_sum" u1
+          usedIds := u2
+          vaneNodes := vaneNodes.push { id := sqId, inputs := #[xGid], op := .pe1 .square }
+          vaneNodes := vaneNodes.push { id := rdId, inputs := #[sqId], op := .reduce .sum rAxes 0 }
+          vaneNodes := vaneNodes.push { id := baseId, inputs := #[rdId], op := .lut (.lut .sqrt) }
+        | .invSum =>
+          let (rdId, u1) := sanitizeGraphId s!"{baseId}_sum" usedIds; usedIds := u1
+          vaneNodes := vaneNodes.push { id := rdId, inputs := #[xGid], op := .reduce .sum rAxes 0 }
+          vaneNodes := vaneNodes.push { id := baseId, inputs := #[rdId], op := .lut (.lut .inverse) }
+        | _ =>
+          let rspec : ReduceSpec := {
+            target := g.target, op := op
+            dims := { c := xSh.c, h := xSh.h, w := xSh.w }
+            axes := rAxes, eps := eps
+          }
+          let _ ← resolveReduceBackend rspec
+          throw s!"{ctx}: unsupported channel reduce op {op.name}"
+      else
+        let rspec : ReduceSpec := {
+          target := g.target, op := op
+          dims := { c := xSh.c, h := xSh.h, w := xSh.w }
+          axes := rAxes, eps := eps
+        }
+        let _ ← resolveReduceBackend rspec
+        vaneNodes := vaneNodes.push { id := baseId, inputs := #[xGid], op := .reduce op rAxes eps }
       idMap := idMap.push (outVid, baseId)
       typeMap := typeMap.push (outVid, outTy)
 

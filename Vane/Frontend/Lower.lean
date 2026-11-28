@@ -446,6 +446,8 @@ def decodeOnnxToHighGraph (model : OnnxModel) (opts : LowerOptions := {}) :
   let opset := model.defaultOpsetVersion
   let legacySoftmax := opset > 0 && opset < 13
   let mut aliases : Array (String × String) := #[]
+  -- Virtual 5D GQA tensors: `(name, base4DVid, base4DShape, shape5D, unsqAxis, repeatFactor)`
+  let mut virt5D : Array (String × ValueId × Array Nat × Array Nat × Nat × Nat) := #[]
   let mut nodes : Array (IRNode HighOp) := #[]
   let mut elidedCount : Nat := 0
 
@@ -611,13 +613,15 @@ def decodeOnnxToHighGraph (model : OnnxModel) (opts : LowerOptions := {}) :
 
       | "Conv" =>
         if inps.size < 2 then throw s!"{ctx}: expected at least 2 inputs (X, W)"
-        let (xVid, xTy) ← lookupRuntime valOf tyOf inps[0]! ctx
-        if xTy.shape.size != 4 then
-          throw s!"{ctx}: Conv requires 4D [1,C,H,W] input, got rank {xTy.shape.size} ({xTy.shape.toList})"
-        let cin := xTy.shape[1]!; let h := xTy.shape[2]!; let w := xTy.shape[3]!
+        let (xVid0, xTy0) ← lookupRuntime valOf tyOf inps[0]! ctx
+        if xTy0.shape.size != 4 && xTy0.shape.size != 3 then
+          throw s!"{ctx}: Conv requires 4D [1,C,H,W] or 3D [1,C,L] input, got rank {xTy0.shape.size} ({xTy0.shape.toList})"
+        let isConv1d := xTy0.shape.size == 3
+        if xTy0.shape[0]! != 1 then
+          throw s!"{ctx}: Conv batch dimension N={xTy0.shape[0]!} != 1"
 
         -- Weight may already be an SSA value (e.g. from DequantizeLinear) or a raw constant
-        let (wVid, wTy) ← match lookupAssoc valOf inps[1]! with
+        let (wVid0, wTy0) ← match lookupAssoc valOf inps[1]! with
           | some existingW =>
             let wt ← getTy tyOf existingW ctx
             pure (existingW, wt)
@@ -628,31 +632,72 @@ def decodeOnnxToHighGraph (model : OnnxModel) (opts : LowerOptions := {}) :
             let wt ← getTy tyOf wv ctx
             pure (wv, wt)
 
-        if wTy.shape.size != 4 then
-          throw s!"{ctx}: weight must be 4D [Cout,Cin/G,kH,kW], got shape {wTy.shape.toList}"
-        let cout := wTy.shape[0]!; let cinPerG := wTy.shape[1]!
-        let kh := wTy.shape[2]!; let kw := wTy.shape[3]!
+        -- Lift 3D Conv1d `[1,C,L]` + `[Cout,Cin/G,K]` cleanly to 4D `[1,C,1,L]` + `[Cout,Cin/G,1,K]`
+        let (xVid, wVid, cin, h, w, cout, cinPerG, kh, kw, sh, sw, pads, ho, wo) ←
+          if isConv1d then
+            if wTy0.shape.size != 3 then
+              throw s!"{ctx}: Conv1d weight must be 3D [Cout,Cin/G,K], got shape {wTy0.shape.toList}"
+            let cin1 := xTy0.shape[1]!; let w1 := xTy0.shape[2]!
+            let cout1 := wTy0.shape[0]!; let cinPerG1 := wTy0.shape[1]!; let kw1 := wTy0.shape[2]!
+            if let some dils := nd.attrInts? "dilations" then
+              if dils.size != 1 || dils[0]! != 1 then
+                throw s!"{ctx}: Conv1d unsupported dilations {dils.toList} (only [1] is supported)"
+            let sw1 ← match nd.attrInts? "strides" with
+              | some st =>
+                if st.size != 1 || st[0]! <= 0 then
+                  throw s!"{ctx}: Conv1d strides must be 1 positive int, got {st.toList}"
+                pure st[0]!.toNat
+              | none => pure 1
+            let autoPad := (← nd.attrStringChecked "auto_pad" "NOTSET").toUpper
+            let rawPads4 : Array Int ← match nd.attrInts? "pads" with
+              | some ps =>
+                if ps.size != 2 then throw s!"{ctx}: Conv1d pads must have length 2, got {ps.toList}"
+                pure #[0, ps[0]!, 0, ps[1]!]
+              | none => pure #[0, 0, 0, 0]
+            let (pads4, ho1, wo1) ← computeConcreteConvPads 1 w1 1 kw1 1 sw1 autoPad rawPads4 ctx
+            let x4Vid := nextId; nextId := nextId + 1
+            let x4Ty : TensorType := { shape := #[1, cin1, 1, w1], dtype := xTy0.dtype }
+            nodes := nodes.push {
+              name := s!"{lbl}_in4d", op := .core (.reshape x4Ty.shape), inputs := #[xVid0], outputs := #[(x4Vid, x4Ty)]
+            }
+            tyOf := tyOf.push (x4Vid, x4Ty)
+            let w4Vid := nextId; nextId := nextId + 1
+            let w4Ty : TensorType := { shape := #[cout1, cinPerG1, 1, kw1], dtype := wTy0.dtype }
+            nodes := nodes.push {
+              name := s!"{lbl}_w4d", op := .core (.reshape w4Ty.shape), inputs := #[wVid0], outputs := #[(w4Vid, w4Ty)]
+            }
+            tyOf := tyOf.push (w4Vid, w4Ty)
+            pure (x4Vid, w4Vid, cin1, 1, w1, cout1, cinPerG1, 1, kw1, 1, sw1, pads4, ho1, wo1)
+          else
+            if wTy0.shape.size != 4 then
+              throw s!"{ctx}: weight must be 4D [Cout,Cin/G,kH,kW], got shape {wTy0.shape.toList}"
+            let cin2 := xTy0.shape[1]!; let h2 := xTy0.shape[2]!; let w2 := xTy0.shape[3]!
+            let cout2 := wTy0.shape[0]!; let cinPerG2 := wTy0.shape[1]!
+            let kh2 := wTy0.shape[2]!; let kw2 := wTy0.shape[3]!
+            if let some dils := nd.attrInts? "dilations" then
+              if dils.size != 2 || dils[0]! != 1 || dils[1]! != 1 then
+                throw s!"{ctx}: unsupported dilations {dils.toList} (only [1,1] is supported)"
+            let (sh2, sw2) ← match nd.attrInts? "strides" with
+              | some st =>
+                if st.size != 2 || st[0]! <= 0 || st[1]! <= 0 then
+                  throw s!"{ctx}: strides must be 2 positive ints, got {st.toList}"
+                pure (st[0]!.toNat, st[1]!.toNat)
+              | none => pure (1, 1)
+            let autoPad := (← nd.attrStringChecked "auto_pad" "NOTSET").toUpper
+            let rawPads ← match nd.attrInts? "pads" with
+              | some ps =>
+                if ps.size != 4 then throw s!"{ctx}: pads must have length 4, got {ps.toList}"
+                pure ps
+              | none => pure #[0, 0, 0, 0]
+            let (pads4, ho2, wo2) ← computeConcreteConvPads h2 w2 kh2 kw2 sh2 sw2 autoPad rawPads ctx
+            pure (xVid0, wVid0, cin2, h2, w2, cout2, cinPerG2, kh2, kw2, sh2, sw2, pads4, ho2, wo2)
+
+        let _ := (h, w)
         let groupInt := nd.attrInt "group" 1
         if groupInt <= 0 then throw s!"{ctx}: invalid group={groupInt}"
         let group := groupInt.toNat
         if cin % group != 0 || cout % group != 0 || cin / group != cinPerG then
           throw s!"{ctx}: incompatible Conv channels cin={cin} cout={cout} group={group} weight_cin_per_g={cinPerG}"
-        if let some dils := nd.attrInts? "dilations" then
-          if dils.size != 2 || dils[0]! != 1 || dils[1]! != 1 then
-            throw s!"{ctx}: unsupported dilations {dils.toList} (only [1,1] is supported)"
-        let (sh, sw) ← match nd.attrInts? "strides" with
-          | some st =>
-            if st.size != 2 || st[0]! <= 0 || st[1]! <= 0 then
-              throw s!"{ctx}: strides must be 2 positive ints, got {st.toList}"
-            pure (st[0]!.toNat, st[1]!.toNat)
-          | none => pure (1, 1)
-        let autoPad := (← nd.attrStringChecked "auto_pad" "NOTSET").toUpper
-        let rawPads ← match nd.attrInts? "pads" with
-          | some ps =>
-            if ps.size != 4 then throw s!"{ctx}: pads must have length 4, got {ps.toList}"
-            pure ps
-          | none => pure #[0, 0, 0, 0]
-        let (pads, ho, wo) ← computeConcreteConvPads h w kh kw sh sw autoPad rawPads ctx
 
         let mut convInps : Array ValueId := #[xVid, wVid]
         let mut hasBias := false
@@ -666,22 +711,64 @@ def decodeOnnxToHighGraph (model : OnnxModel) (opts : LowerOptions := {}) :
           convInps := convInps.push bVid
           hasBias := true
 
-        let outVid := nextId; nextId := nextId + 1
-        let outTy : TensorType := { shape := #[1, cout, ho, wo], dtype := .fp16 }
+        let convOutVid := nextId; nextId := nextId + 1
+        let convOutTy : TensorType := { shape := #[1, cout, ho, wo], dtype := .fp16 }
         nodes := nodes.push {
-          name := lbl
+          name := if isConv1d then s!"{lbl}_conv" else lbl
           op := .core (.conv kh kw sh sw pads group hasBias .none)
           inputs := convInps
-          outputs := #[(outVid, outTy)]
+          outputs := #[(convOutVid, convOutTy)]
         }
-        tyOf := tyOf.push (outVid, outTy)
-        valOf := setAssoc valOf out0 outVid
+        tyOf := tyOf.push (convOutVid, convOutTy)
+        if isConv1d then
+          let out3Vid := nextId; nextId := nextId + 1
+          let out3Ty : TensorType := { shape := #[1, cout, wo], dtype := .fp16 }
+          nodes := nodes.push {
+            name := lbl, op := .core (.reshape out3Ty.shape), inputs := #[convOutVid], outputs := #[(out3Vid, out3Ty)]
+          }
+          tyOf := tyOf.push (out3Vid, out3Ty)
+          valOf := setAssoc valOf out0 out3Vid
+        else
+          valOf := setAssoc valOf out0 convOutVid
 
       | "BatchNormalization" =>
         if inps.size < 5 then throw s!"{ctx}: expected 5 inputs (X, scale, B, mean, var)"
         if nd.attrInt "training_mode" 0 != 0 then
           throw s!"{ctx}: BatchNormalization training_mode != 0 is not supported (inference mode only)"
-        let (xVid, xTy) ← lookupRuntime valOf tyOf inps[0]! ctx
+        let (xVid0, xTy0) ← lookupRuntime valOf tyOf inps[0]! ctx
+        let is3D := xTy0.shape.size == 3
+        let (xVid, xTy) ←
+          if is3D then
+            if xTy0.shape[0]! != 1 then
+              throw s!"{ctx}: 3D BatchNormalization batch dimension N={xTy0.shape[0]!} != 1"
+            let x4Shape := #[1, xTy0.shape[1]!, 1, xTy0.shape[2]!]
+            -- Bypass round-trip 4D->3D->4D reshape so HighFuse folds Conv1d+BN1d in exact f64
+            let bypassed? : Option (ValueId × TensorType) := Id.run do
+              for prevNd in nodes do
+                if prevNd.outputs.size == 1 && prevNd.outputs[0]!.1 == xVid0 then
+                  match prevNd.op with
+                  | .core (.reshape _) =>
+                    if prevNd.inputs.size == 1 then
+                      let origVid := prevNd.inputs[0]!
+                      match tyOf.find? (fun p => p.1 == origVid) with
+                      | some (_, origTy) =>
+                        if origTy.shape == x4Shape then
+                          return some (origVid, origTy)
+                      | none => pure ()
+                  | _ => pure ()
+              return none
+            match bypassed? with
+            | some pair => pure pair
+            | none =>
+              let x4Vid := nextId; nextId := nextId + 1
+              let x4Ty : TensorType := { shape := x4Shape, dtype := xTy0.dtype }
+              nodes := nodes.push {
+                name := s!"{lbl}_in4d", op := .core (.reshape x4Ty.shape), inputs := #[xVid0], outputs := #[(x4Vid, x4Ty)]
+              }
+              tyOf := tyOf.push (x4Vid, x4Ty)
+              pure (x4Vid, x4Ty)
+          else
+            pure (xVid0, xTy0)
         let mut bnInps : Array ValueId := #[xVid]
         for slot in [1:5] do
           let (cv, vm, tm, nds, nid, sfc, sfs) ←
@@ -689,15 +776,23 @@ def decodeOnnxToHighGraph (model : OnnxModel) (opts : LowerOptions := {}) :
           valOf := vm; tyOf := tm; nodes := nds; nextId := nid; sfUsed := sfc; sfCounted := sfs
           bnInps := bnInps.push cv
         let eps := nd.attrFloat "epsilon" 1e-5
-        let outVid := nextId; nextId := nextId + 1
+        let bnOutVid := nextId; nextId := nextId + 1
         nodes := nodes.push {
-          name := lbl
+          name := if is3D then s!"{lbl}_bn" else lbl
           op := .batchNorm eps
           inputs := bnInps
-          outputs := #[(outVid, xTy)]
+          outputs := #[(bnOutVid, xTy)]
         }
-        tyOf := tyOf.push (outVid, xTy)
-        valOf := setAssoc valOf out0 outVid
+        tyOf := tyOf.push (bnOutVid, xTy)
+        if is3D then
+          let out3Vid := nextId; nextId := nextId + 1
+          nodes := nodes.push {
+            name := lbl, op := .core (.reshape xTy0.shape), inputs := #[bnOutVid], outputs := #[(out3Vid, xTy0)]
+          }
+          tyOf := tyOf.push (out3Vid, xTy0)
+          valOf := setAssoc valOf out0 out3Vid
+        else
+          valOf := setAssoc valOf out0 bnOutVid
 
       | "Gemm" =>
         if inps.size < 2 then throw s!"{ctx}: expected at least 2 inputs"
@@ -1133,6 +1228,87 @@ def decodeOnnxToHighGraph (model : OnnxModel) (opts : LowerOptions := {}) :
         tyOf := tyOf.push (outVid, xTy)
         valOf := setAssoc valOf out0 outVid
 
+      | "RMSNormalization" =>
+        if inps.size < 1 then throw s!"{ctx}: RMSNormalization requires at least 1 input (X[, scale])"
+        let (xVid, xTy) ← lookupRuntime valOf tyOf inps[0]! ctx
+        let axis := nd.attrInt "axis" (-1)
+        let eps := nd.attrFloat "epsilon" 1e-5
+        let rank := xTy.shape.size
+        let axNat ← resolveRmsNormAxis rank axis ctx
+        -- Match ONNX opset-23 suffix semantics (`X.shape[axis:]`), identical to LayerNormalization:
+        -- only the last axis (`rank - 1`) is supported in general, plus 4D `axis = 1` when `H = 1, W = 1`.
+        if rank == 4 then
+          if axNat == 1 then
+            if xTy.shape[2]! != 1 || xTy.shape[3]! != 1 then
+              throw s!"{ctx}: 4D RMSNormalization with axis=1 normalizes over [C,H,W]={xTy.shape.extract 1 4 |>.toList}, which is only supported when H=1 and W=1 (got H={xTy.shape[2]!}, W={xTy.shape[3]!}); use axis=-1 (W) or reshape/transpose so the normalized axis is last"
+          else if axNat != 3 then
+            throw s!"{ctx}: 4D RMSNormalization axis {axis} not supported (supported: C [axis=1 with H=W=1] or W [axis=3/-1])"
+        else if rank == 3 then
+          if axNat != 2 then
+            throw s!"{ctx}: 3D RMSNormalization axis {axis} not supported (expected -1 or 2)"
+        else if rank == 2 then
+          if axNat != 1 then
+            throw s!"{ctx}: 2D RMSNormalization axis {axis} not supported (expected -1 or 1)"
+        else
+          throw s!"{ctx}: RMSNormalization requires 4D, 3D, or 2D input, got rank {rank}"
+        let normDim := xTy.shape[axNat]!
+        let mut rmsInps : Array ValueId := #[xVid]
+        let mut hasScale := false
+        if inps.size >= 2 && !inps[1]!.isEmpty then
+          let scName := inps[1]!
+          let scVid ← match lookupAssoc valOf scName with
+            | some sv =>
+              let svTy ← getTy tyOf sv ctx
+              if !isValidRmsNormScaleShape svTy.shape axNat normDim rank then
+                throw s!"{ctx}: RMSNorm Scale shape {svTy.shape.toList} incompatible with normalized axis {axNat} (normDim={normDim}, input rank {rank})"
+              -- Canonicalize shared 1D scale `[normDim]` onto `axNat` so it never right-aligns to the wrong axis!
+              let canonShape : Array Nat :=
+                if svTy.numElems == 1 then #[]
+                else (Array.replicate rank 1).set! axNat normDim
+              if svTy.numElems > 1 && svTy.shape != canonShape then
+                let rsVid := nextId; nextId := nextId + 1
+                let rsTy : TensorType := { shape := canonShape, dtype := svTy.dtype }
+                nodes := nodes.push {
+                  name := s!"{lbl}_scale_canon"
+                  op := .core (.reshape canonShape)
+                  inputs := #[sv]
+                  outputs := #[(rsVid, rsTy)]
+                }
+                tyOf := tyOf.push (rsVid, rsTy)
+                pure rsVid
+              else
+                pure sv
+            | none =>
+              let some cs := lookupAssoc consts scName
+                | throw s!"{ctx}: unknown RMSNormalization scale '{scName}'"
+              if !isValidRmsNormScaleShape cs.dims axNat normDim rank then
+                throw s!"{ctx}: RMSNorm Scale shape {cs.dims.toList} incompatible with normalized axis {axNat} (normDim={normDim}, input rank {rank})"
+              let vals ← cs.float64s
+              if cs.isFromSafeTensors && !sfCounted.contains scName then
+                sfUsed := sfUsed + 1; sfCounted := sfCounted.push scName
+              -- Canonicalize non-scalar scale shape onto `axNat` so numpy broadcasting aligns with `axNat`!
+              let scShape : Array Nat :=
+                if vals.size == 1 then #[]
+                else (Array.replicate rank 1).set! axNat normDim
+              let sv := nextId; nextId := nextId + 1
+              let scTy : TensorType := { shape := scShape, dtype := .f32 }
+              nodes := nodes.push {
+                name := scName, op := .core (.const (.f32 vals)), inputs := #[], outputs := #[(sv, scTy)]
+              }
+              tyOf := tyOf.push (sv, scTy)
+              pure sv
+          rmsInps := rmsInps.push scVid
+          hasScale := true
+        let yVid := nextId; nextId := nextId + 1
+        nodes := nodes.push {
+          name := lbl
+          op := .rmsNorm axis eps hasScale
+          inputs := rmsInps
+          outputs := #[(yVid, xTy)]
+        }
+        tyOf := tyOf.push (yVid, xTy)
+        valOf := setAssoc valOf out0 yVid
+
       | "LayerNormalization" =>
         if inps.size < 2 then throw s!"{ctx}: LayerNormalization requires at least 2 inputs (X, Scale[, B])"
         let (xVid, xTy) ← lookupRuntime valOf tyOf inps[0]! ctx
@@ -1302,21 +1478,414 @@ def decodeOnnxToHighGraph (model : OnnxModel) (opts : LowerOptions := {}) :
         tyOf := tyOf.push (outVid, outTy)
         valOf := setAssoc valOf out0 outVid
 
-      | "Reshape" =>
-        if inps.size != 2 then throw s!"{ctx}: Reshape requires 2 inputs (data, shape)"
+      | "Unsqueeze" =>
+        if inps.size < 1 then throw s!"{ctx}: Unsqueeze missing data input"
         let (xVid, xTy) ← lookupRuntime valOf tyOf inps[0]! ctx
-        let some sc := lookupAssoc consts inps[1]!
-          | throw s!"{ctx}: Reshape target shape '{inps[1]!}' must be a constant int64 tensor"
-        let rawTarget ← sc.int64s
-        let allowZero := nd.attrInt "allowzero" 0 != 0
-        let outShape ← resolveReshapeShapeIR xTy.shape rawTarget allowZero ctx
+        let rawAxes ← match nd.attrInts? "axes" with
+          | some ax => pure ax
+          | none =>
+            if inps.size >= 2 && !inps[1]!.isEmpty then
+              let some ac := lookupAssoc consts inps[1]!
+                | throw s!"{ctx}: Unsqueeze axes '{inps[1]!}' must be a constant int64 tensor"
+              ac.int64s
+            else throw s!"{ctx}: Unsqueeze missing axes attribute/input"
+        let outRank := xTy.shape.size + rawAxes.size
+        let mut normAxes : Array Nat := Array.mkEmpty rawAxes.size
+        for a0 in rawAxes do
+          let aInt := if a0 < 0 then a0 + (outRank : Int) else a0
+          if aInt < 0 || aInt >= (outRank : Int) then
+            throw s!"{ctx}: Unsqueeze axis {a0} out of range for output rank {outRank}"
+          let aNat := aInt.toNat
+          if normAxes.contains aNat then
+            throw s!"{ctx}: Unsqueeze duplicate axis {aNat}"
+          normAxes := normAxes.push aNat
+        let mut outShape : Array Nat := Array.mkEmpty outRank
+        let mut xIdx : Nat := 0
+        for i in [:outRank] do
+          if normAxes.contains i then
+            outShape := outShape.push 1
+          else
+            outShape := outShape.push xTy.shape[xIdx]!
+            xIdx := xIdx + 1
+        if outRank == 5 && xTy.shape.size == 4 && xTy.shape[0]! == 1 && normAxes == #[2] then
+          -- Virtual 5D GQA `Unsqueeze(K[1, n_kv, L, D], axes=[2]) -> [1, n_kv, 1, L, D]`
+          virt5D := virt5D.push (out0, xVid, xTy.shape, outShape, 2, 1)
+          elidedCount := elidedCount + 1
+        else if outRank == 2 || outRank == 3 || outRank == 4 then
+          if (outRank == 2 || outRank == 4) && outShape[0]! != 1 then
+            throw s!"{ctx}: Unsqueeze batch dimension N={outShape[0]!} != 1"
+          let outVid := nextId; nextId := nextId + 1
+          let outTy : TensorType := { shape := outShape, dtype := xTy.dtype }
+          nodes := nodes.push {
+            name := lbl, op := .core (.reshape outShape), inputs := #[xVid], outputs := #[(outVid, outTy)]
+          }
+          tyOf := tyOf.push (outVid, outTy)
+          valOf := setAssoc valOf out0 outVid
+        else
+          throw s!"{ctx}: Unsqueeze to rank {outRank} ({outShape.toList}) is not supported"
+
+      | "Squeeze" =>
+        if inps.size < 1 then throw s!"{ctx}: Squeeze missing data input"
+        let (xVid, xTy) ← lookupRuntime valOf tyOf inps[0]! ctx
+        let rank := xTy.shape.size
+        let rawAxes ← match nd.attrInts? "axes" with
+          | some ax => pure ax
+          | none =>
+            if inps.size >= 2 && !inps[1]!.isEmpty then
+              let some ac := lookupAssoc consts inps[1]!
+                | throw s!"{ctx}: Squeeze axes '{inps[1]!}' must be a constant int64 tensor"
+              ac.int64s
+            else pure #[]
+        let mut sqAxes : Array Nat := #[]
+        if rawAxes.isEmpty then
+          for i in [:rank] do
+            if xTy.shape[i]! == 1 then sqAxes := sqAxes.push i
+        else
+          for a0 in rawAxes do
+            let aInt := if a0 < 0 then a0 + (rank : Int) else a0
+            if aInt < 0 || aInt >= (rank : Int) then
+              throw s!"{ctx}: Squeeze axis {a0} out of range for rank {rank}"
+            let aNat := aInt.toNat
+            if sqAxes.contains aNat then
+              throw s!"{ctx}: Squeeze duplicate axis {aNat}"
+            if xTy.shape[aNat]! != 1 then
+              throw s!"{ctx}: Squeeze axis {aNat} has dim {xTy.shape[aNat]!} != 1"
+            sqAxes := sqAxes.push aNat
+        let mut outShape : Array Nat := #[]
+        for i in [:rank] do
+          if !sqAxes.contains i then outShape := outShape.push xTy.shape[i]!
+        if outShape.size != 2 && outShape.size != 3 && outShape.size != 4 then
+          throw s!"{ctx}: Squeeze output rank {outShape.size} ({outShape.toList}) not supported"
+        if (outShape.size == 2 || outShape.size == 4) && outShape[0]! != 1 then
+          throw s!"{ctx}: Squeeze output batch dimension N={outShape[0]!} != 1"
         let outVid := nextId; nextId := nextId + 1
-        let outTy : TensorType := { shape := outShape, dtype := .fp16 }
+        let outTy : TensorType := { shape := outShape, dtype := xTy.dtype }
         nodes := nodes.push {
           name := lbl, op := .core (.reshape outShape), inputs := #[xVid], outputs := #[(outVid, outTy)]
         }
         tyOf := tyOf.push (outVid, outTy)
         valOf := setAssoc valOf out0 outVid
+
+      | "Expand" =>
+        if inps.size != 2 then throw s!"{ctx}: Expand requires 2 inputs (input, shape)"
+        let some sc := lookupAssoc consts inps[1]!
+          | throw s!"{ctx}: Expand target shape '{inps[1]!}' must be a constant int64 tensor"
+        let rawShape ← sc.int64s
+        let mut targetShape : Array Nat := Array.mkEmpty rawShape.size
+        for d in rawShape do
+          if d <= 0 then throw s!"{ctx}: Expand target shape has non-positive dim {d}"
+          targetShape := targetShape.push d.toNat
+        match virt5D.find? fun e => e.1 == inps[0]! with
+        | some (_, base4DVid, base4DShape, shape5D, unsqAx, _) =>
+          let out5D ← match broadcastOnnxShapes shape5D targetShape with
+            | .ok s => pure s
+            | .error e => throw s!"{ctx}: {e}"
+          if out5D.size != 5 then
+            throw s!"{ctx}: 5D GQA Expand output rank {out5D.size} != 5"
+          for i in [:5] do
+            if i != unsqAx && out5D[i]! != shape5D[i]! then
+              throw s!"{ctx}: 5D GQA Expand only supports expanding the unsqueezed repeat axis {unsqAx} (got {shape5D.toList} -> {out5D.toList})"
+          virt5D := virt5D.push (out0, base4DVid, base4DShape, out5D, unsqAx, out5D[unsqAx]!)
+          elidedCount := elidedCount + 1
+        | none =>
+          let (xVid0, xTy0) ← lookupRuntime valOf tyOf inps[0]! ctx
+          let outShape ← match broadcastOnnxShapes xTy0.shape targetShape with
+            | .ok s => pure s
+            | .error e => throw s!"{ctx}: {e}"
+          if outShape.size != 2 && outShape.size != 3 && outShape.size != 4 then
+            throw s!"{ctx}: Expand output rank {outShape.size} ({outShape.toList}) not supported (expected 2D/3D/4D)"
+          if (outShape.size == 2 || outShape.size == 4) && outShape[0]! != 1 then
+            throw s!"{ctx}: Expand output batch dimension N={outShape[0]!} != 1"
+          if outShape == xTy0.shape then
+            aliases := setAssoc aliases out0 inps[0]!
+            elidedCount := elidedCount + 1
+          else
+            let mut curVid := xVid0
+            let mut curShape := xTy0.shape
+            if curShape.size < outShape.size then
+              let liftedShape := Array.replicate (outShape.size - curShape.size) 1 ++ curShape
+              let lv := nextId; nextId := nextId + 1
+              let lTy : TensorType := { shape := liftedShape, dtype := xTy0.dtype }
+              nodes := nodes.push {
+                name := s!"{lbl}_lift", op := .core (.reshape liftedShape), inputs := #[curVid], outputs := #[(lv, lTy)]
+              }
+              tyOf := tyOf.push (lv, lTy)
+              curVid := lv; curShape := liftedShape
+            let mut expandedCount : Nat := 0
+            for ax in [:outShape.size] do
+              if curShape[ax]! != outShape[ax]! then
+                if curShape[ax]! != 1 then
+                  throw s!"{ctx}: Expand cannot broadcast axis {ax} from {curShape[ax]!} to {outShape[ax]!}"
+                let rep := outShape[ax]!
+                let nextShape := curShape.set! ax rep
+                let nv := nextId; nextId := nextId + 1
+                let nTy : TensorType := { shape := nextShape, dtype := xTy0.dtype }
+                nodes := nodes.push {
+                  name := if expandedCount == 0 then lbl else s!"{lbl}_ax{ax}"
+                  op := .core (.concat ax)
+                  inputs := Array.replicate rep curVid
+                  outputs := #[(nv, nTy)]
+                }
+                tyOf := tyOf.push (nv, nTy)
+                curVid := nv; curShape := nextShape; expandedCount := expandedCount + 1
+            valOf := setAssoc valOf out0 curVid
+
+      | "Tile" =>
+        if inps.size != 2 then throw s!"{ctx}: Tile requires 2 inputs (input, repeats)"
+        let (xVid0, xTy0) ← lookupRuntime valOf tyOf inps[0]! ctx
+        let some rc := lookupAssoc consts inps[1]!
+          | throw s!"{ctx}: Tile repeats '{inps[1]!}' must be a constant int64 tensor"
+        let rawReps ← rc.int64s
+        if rawReps.size != xTy0.shape.size then
+          throw s!"{ctx}: Tile repeats length {rawReps.size} != input rank {xTy0.shape.size}"
+        let mut reps : Array Nat := Array.mkEmpty rawReps.size
+        for r in rawReps do
+          if r <= 0 then throw s!"{ctx}: Tile repeat {r} must be >= 1"
+          reps := reps.push r.toNat
+        if reps.all (· == 1) then
+          aliases := setAssoc aliases out0 inps[0]!
+          elidedCount := elidedCount + 1
+        else
+          let mut curVid := xVid0
+          let mut curShape := xTy0.shape
+          let mut stepCnt : Nat := 0
+          for ax in [:reps.size] do
+            let r := reps[ax]!
+            if r > 1 then
+              if (curShape.size == 2 || curShape.size == 4) && ax == 0 then
+                throw s!"{ctx}: Tile cannot repeat batch axis 0 (N must stay 1)"
+              let nextShape := curShape.set! ax (curShape[ax]! * r)
+              let nv := nextId; nextId := nextId + 1
+              let nTy : TensorType := { shape := nextShape, dtype := xTy0.dtype }
+              nodes := nodes.push {
+                name := if stepCnt == 0 then lbl else s!"{lbl}_ax{ax}"
+                op := .core (.concat ax)
+                inputs := Array.replicate r curVid
+                outputs := #[(nv, nTy)]
+              }
+              tyOf := tyOf.push (nv, nTy)
+              curVid := nv; curShape := nextShape; stepCnt := stepCnt + 1
+          valOf := setAssoc valOf out0 curVid
+
+      | "Resize" | "Upsample" =>
+        if inps.size < 1 then throw s!"{ctx}: {nd.opType} missing data input"
+        let (xVid0, xTy0) ← lookupRuntime valOf tyOf inps[0]! ctx
+        if xTy0.shape.size != 4 || xTy0.shape[0]! != 1 then
+          throw s!"{ctx}: {nd.opType} requires 4D [1,C,H,W] input, got {xTy0.shape.toList}"
+        let mode := (← nd.attrStringChecked "mode" "nearest").toLower
+        if mode != "nearest" then
+          throw s!"{ctx}: {nd.opType} mode '{mode}' is not supported (only mode='nearest' is supported)"
+        if nd.opType == "Resize" then
+          if inps.size >= 2 && !inps[1]!.isEmpty then
+            throw s!"{ctx}: Resize non-empty roi input '{inps[1]!}' is not supported"
+          if let some axAttr := nd.attrInts? "axes" then
+            if !axAttr.isEmpty then
+              throw s!"{ctx}: Resize non-empty axes attribute {axAttr.toList} is not supported"
+          if nd.attrInt "exclude_outside" 0 != 0 then
+            throw s!"{ctx}: Resize exclude_outside != 0 is not supported"
+          let policy := (← nd.attrStringChecked "keep_aspect_ratio_policy" "").toLower
+          if !policy.isEmpty && policy != "stretch" then
+            throw s!"{ctx}: Resize keep_aspect_ratio_policy '{policy}' is not supported (only 'stretch' is supported)"
+          let coordMode := (← nd.attrStringChecked "coordinate_transformation_mode" "half_pixel").toLower
+          let nearMode := (← nd.attrStringChecked "nearest_mode" "round_prefer_floor").toLower
+          let exactFloorDup : Bool :=
+            ((coordMode == "half_pixel" || coordMode == "pytorch_half_pixel") &&
+              (nearMode == "round_prefer_floor" || nearMode == "round_prefer_ceil")) ||
+            (coordMode == "asymmetric" && nearMode == "floor")
+          if !exactFloorDup then
+            throw s!"{ctx}: Resize coordinate_transformation_mode='{coordMode}' with nearest_mode='{nearMode}' is not supported (only half_pixel/pytorch_half_pixel + round_prefer_floor/round_prefer_ceil or asymmetric + floor match exact integer pixel duplication)"
+        let c := xTy0.shape[1]!; let h := xTy0.shape[2]!; let w := xTy0.shape[3]!
+        let parseIntScale := fun (f : Float) (axLbl : String) => do
+          if f.isNaN || f.isInf || f < 1.0 then
+            throw s!"{ctx}: {nd.opType} {axLbl} scale {f} must be a positive integer >= 1"
+          let n := (f + 0.5).toUInt64.toNat
+          if Float.abs (f - Float.ofNat n) > 1e-4 || n == 0 then
+            throw s!"{ctx}: {nd.opType} {axLbl} scale {f} must be an exact positive integer"
+          pure n
+        let (sh, sw) ←
+          if nd.opType == "Upsample" then
+            let scVals ←
+              if inps.size >= 2 && !inps[1]!.isEmpty then
+                let some cs := lookupAssoc consts inps[1]!
+                  | throw s!"{ctx}: Upsample scales must be constant"
+                cs.float64s
+              else if let some fs := nd.attrFloats? "scales" then pure fs
+              else throw s!"{ctx}: Upsample missing scales"
+            if scVals.size != 4 then throw s!"{ctx}: Upsample scales length {scVals.size} != 4"
+            let sn ← parseIntScale scVals[0]! "N"
+            let sc ← parseIntScale scVals[1]! "C"
+            let sh1 ← parseIntScale scVals[2]! "H"
+            let sw1 ← parseIntScale scVals[3]! "W"
+            if sn != 1 || sc != 1 then throw s!"{ctx}: Upsample only supports spatial (H,W) scaling (got N={sn}, C={sc})"
+            pure (sh1, sw1)
+          else
+            if inps.size >= 4 && !inps[3]!.isEmpty then
+              let some szCs := lookupAssoc consts inps[3]!
+                | throw s!"{ctx}: Resize sizes '{inps[3]!}' must be a constant int64 tensor"
+              let szs ← szCs.int64s
+              if szs.size != 4 then throw s!"{ctx}: Resize sizes length {szs.size} != 4"
+              if szs[0]! != 1 || szs[1]! != (c : Int) || szs[2]! <= 0 || szs[3]! <= 0 then
+                throw s!"{ctx}: Resize sizes {szs.toList} incompatible with input [1,{c},{h},{w}]"
+              let oh := szs[2]!.toNat; let ow := szs[3]!.toNat
+              if oh % h != 0 || ow % w != 0 then
+                throw s!"{ctx}: Resize nearest sizes ({oh}x{ow}) must be integer multiples of input ({h}x{w})"
+              pure (oh / h, ow / w)
+            else if inps.size >= 3 && !inps[2]!.isEmpty then
+              let some scCs := lookupAssoc consts inps[2]!
+                | throw s!"{ctx}: Resize scales '{inps[2]!}' must be a constant float tensor"
+              let scVals ← scCs.float64s
+              if scVals.size != 4 then throw s!"{ctx}: Resize scales length {scVals.size} != 4"
+              let sn ← parseIntScale scVals[0]! "N"
+              let sc ← parseIntScale scVals[1]! "C"
+              let sh1 ← parseIntScale scVals[2]! "H"
+              let sw1 ← parseIntScale scVals[3]! "W"
+              if sn != 1 || sc != 1 then throw s!"{ctx}: Resize only supports spatial (H,W) scaling (got N={sn}, C={sc})"
+              pure (sh1, sw1)
+            else
+              throw s!"{ctx}: Resize requires either constant 'scales' (input 2) or 'sizes' (input 3)"
+        if sh == 1 && sw == 1 then
+          aliases := setAssoc aliases out0 inps[0]!
+          elidedCount := elidedCount + 1
+        else
+          -- Exact pure-CoreOp nearest-neighbor upsampling (`W -> sw*W` first while H is small, then `H -> sh*H`)!
+          let emitWUpsampleBlock := fun (inV : ValueId) (bh bw : Nat) (tag : String)
+              (nds : Array (IRNode HighOp)) (tm : Array (ValueId × TensorType)) (nid : ValueId) =>
+            let t1 := nid; let t2 := nid + 1; let t3 := nid + 2; let t4 := nid + 3; let t5 := nid + 4
+            let ty1 : TensorType := { shape := #[1, c, bw, bh], dtype := xTy0.dtype }
+            let ty2 : TensorType := { shape := #[1, c * bw, 1, bh], dtype := xTy0.dtype }
+            let ty3 : TensorType := { shape := #[1, c * bw, sw, bh], dtype := xTy0.dtype }
+            let ty4 : TensorType := { shape := #[1, c, sw * bw, bh], dtype := xTy0.dtype }
+            let ty5 : TensorType := { shape := #[1, c, bh, sw * bw], dtype := xTy0.dtype }
+            let nds' := nds
+              |>.push { name := s!"{tag}_tr1", op := .core (.transpose #[0, 1, 3, 2]), inputs := #[inV], outputs := #[(t1, ty1)] }
+              |>.push { name := s!"{tag}_rs1", op := .core (.reshape ty2.shape), inputs := #[t1], outputs := #[(t2, ty2)] }
+              |>.push { name := s!"{tag}_cat", op := .core (.concat 2), inputs := Array.replicate sw t2, outputs := #[(t3, ty3)] }
+              |>.push { name := s!"{tag}_rs2", op := .core (.reshape ty4.shape), inputs := #[t3], outputs := #[(t4, ty4)] }
+              |>.push { name := s!"{tag}_tr2", op := .core (.transpose #[0, 1, 3, 2]), inputs := #[t4], outputs := #[(t5, ty5)] }
+            let tm' := tm.push (t1, ty1) |>.push (t2, ty2) |>.push (t3, ty3) |>.push (t4, ty4) |>.push (t5, ty5)
+            (t5, nds', tm', nid + 5)
+
+          let mut curVid := xVid0
+          let mut curW := w
+          if sw > 1 then
+            if h <= 128 && sw * w <= 128 then
+              let (vW, nds', tm', nid') := emitWUpsampleBlock curVid h w s!"{lbl}_w" nodes tyOf nextId
+              curVid := vW; nodes := nds'; tyOf := tm'; nextId := nid'; curW := sw * w
+            else
+              -- Chunk H into <=128 bands and W into <=maxChunkW (multiple of 32) bands so every T-mode transpose has tc <= 128
+              let hStep := min h 128
+              let rawMaxW := 128 / sw
+              let wStep := if sw * w <= 128 then w else (rawMaxW / 32) * 32
+              if wStep == 0 || sw * wStep > 128 || (w > wStep && wStep % 32 != 0) then
+                throw s!"{ctx}: Resize W scale {sw} with W={w} cannot be tiled into 64B-aligned <=128 chunks"
+              let nH := ceilDiv h hStep
+              let nW := ceilDiv w wStep
+              let mut hBandVids : Array ValueId := Array.mkEmpty nH
+              for hi in [:nH] do
+                let y0 := hi * hStep; let y1 := min h (y0 + hStep); let bh := y1 - y0
+                let mut wBandVids : Array ValueId := Array.mkEmpty nW
+                for wi in [:nW] do
+                  let x0 := wi * wStep; let x1 := min w (x0 + wStep); let bw := x1 - x0
+                  let slV := nextId; nextId := nextId + 1
+                  let slTy : TensorType := { shape := #[1, c, bh, bw], dtype := xTy0.dtype }
+                  nodes := nodes.push {
+                    name := s!"{lbl}_sl_{hi}_{wi}", op := .core (.slice #[0, 0, y0, x0] #[1, c, y1, x1] #[1, 1, 1, 1]),
+                    inputs := #[curVid], outputs := #[(slV, slTy)]
+                  }
+                  tyOf := tyOf.push (slV, slTy)
+                  let (vB, nds', tm', nid') := emitWUpsampleBlock slV bh bw s!"{lbl}_w_{hi}_{wi}" nodes tyOf nextId
+                  nodes := nds'; tyOf := tm'; nextId := nid'
+                  wBandVids := wBandVids.push vB
+                let rowBandV ←
+                  if wBandVids.size == 1 then pure wBandVids[0]!
+                  else
+                    let rv := nextId; nextId := nextId + 1
+                    let rTy : TensorType := { shape := #[1, c, bh, sw * w], dtype := xTy0.dtype }
+                    nodes := nodes.push {
+                      name := s!"{lbl}_wcat_{hi}", op := .core (.concat 3), inputs := wBandVids, outputs := #[(rv, rTy)]
+                    }
+                    tyOf := tyOf.push (rv, rTy)
+                    pure rv
+                hBandVids := hBandVids.push rowBandV
+              curVid ←
+                if hBandVids.size == 1 then pure hBandVids[0]!
+                else
+                  let fv := nextId; nextId := nextId + 1
+                  let fTy : TensorType := { shape := #[1, c, h, sw * w], dtype := xTy0.dtype }
+                  nodes := nodes.push {
+                    name := s!"{lbl}_hcat", op := .core (.concat 2), inputs := hBandVids, outputs := #[(fv, fTy)]
+                  }
+                  tyOf := tyOf.push (fv, fTy)
+                  pure fv
+              curW := sw * w
+          if sh > 1 then
+            let u1 := nextId; let u2 := nextId + 1; let u3 := nextId + 2; nextId := nextId + 3
+            let ty1 : TensorType := { shape := #[1, c * h, 1, curW], dtype := xTy0.dtype }
+            let ty2 : TensorType := { shape := #[1, c * h, sh, curW], dtype := xTy0.dtype }
+            let ty3 : TensorType := { shape := #[1, c, sh * h, curW], dtype := xTy0.dtype }
+            nodes := nodes
+              |>.push { name := s!"{lbl}_hrs1", op := .core (.reshape ty1.shape), inputs := #[curVid], outputs := #[(u1, ty1)] }
+              |>.push { name := s!"{lbl}_hdup", op := .core (.concat 2), inputs := Array.replicate sh u1, outputs := #[(u2, ty2)] }
+              |>.push { name := lbl, op := .core (.reshape ty3.shape), inputs := #[u2], outputs := #[(u3, ty3)] }
+            tyOf := tyOf.push (u1, ty1) |>.push (u2, ty2) |>.push (u3, ty3)
+            curVid := u3
+          valOf := setAssoc valOf out0 curVid
+
+      | "Reshape" =>
+        if inps.size != 2 then throw s!"{ctx}: Reshape requires 2 inputs (data, shape)"
+        let some sc := lookupAssoc consts inps[1]!
+          | throw s!"{ctx}: Reshape target shape '{inps[1]!}' must be a constant int64 tensor"
+        let rawTarget ← sc.int64s
+        let allowZero := nd.attrInt "allowzero" 0 != 0
+        match virt5D.find? fun e => e.1 == inps[0]! with
+        | some (_, base4DVid, base4DShape, shape5D, _, rep) =>
+          let outShape ← resolveReshapeShapeIR shape5D rawTarget allowZero ctx
+          let nKv := base4DShape[1]!; let lDim := base4DShape[2]!; let dDim := base4DShape[3]!
+          if outShape != #[1, nKv * rep, lDim, dDim] then
+            throw s!"{ctx}: 5D GQA Reshape target {outShape.toList} != expected [1,{nKv * rep},{lDim},{dDim}]"
+          if rep == 1 then
+            valOf := setAssoc valOf out0 base4DVid
+            elidedCount := elidedCount + 1
+          else if nKv == 1 then
+            let outVid := nextId; nextId := nextId + 1
+            let outTy : TensorType := { shape := outShape, dtype := .fp16 }
+            nodes := nodes.push {
+              name := lbl, op := .core (.concat 1), inputs := Array.replicate rep base4DVid, outputs := #[(outVid, outTy)]
+            }
+            tyOf := tyOf.push (outVid, outTy)
+            valOf := setAssoc valOf out0 outVid
+          else
+            -- Interleaved GQA head repeat `[h0, ..., h0, h1, ..., h1, ...]` via per-head `slice` + single `concat(axis=1)`
+            let mut catInps : Array ValueId := Array.mkEmpty (nKv * rep)
+            let headTy : TensorType := { shape := #[1, 1, lDim, dDim], dtype := .fp16 }
+            for hi in [:nKv] do
+              let hVid := nextId; nextId := nextId + 1
+              nodes := nodes.push {
+                name := s!"{lbl}_kv{hi}"
+                op := .core (.slice #[0, hi, 0, 0] #[1, hi + 1, lDim, dDim] #[1, 1, 1, 1])
+                inputs := #[base4DVid]
+                outputs := #[(hVid, headTy)]
+              }
+              tyOf := tyOf.push (hVid, headTy)
+              for _ in [:rep] do
+                catInps := catInps.push hVid
+            let outVid := nextId; nextId := nextId + 1
+            let outTy : TensorType := { shape := outShape, dtype := .fp16 }
+            nodes := nodes.push {
+              name := lbl, op := .core (.concat 1), inputs := catInps, outputs := #[(outVid, outTy)]
+            }
+            tyOf := tyOf.push (outVid, outTy)
+            valOf := setAssoc valOf out0 outVid
+        | none =>
+          let (xVid, xTy) ← lookupRuntime valOf tyOf inps[0]! ctx
+          let outShape ← resolveReshapeShapeIR xTy.shape rawTarget allowZero ctx
+          let outVid := nextId; nextId := nextId + 1
+          let outTy : TensorType := { shape := outShape, dtype := .fp16 }
+          nodes := nodes.push {
+            name := lbl, op := .core (.reshape outShape), inputs := #[xVid], outputs := #[(outVid, outTy)]
+          }
+          tyOf := tyOf.push (outVid, outTy)
+          valOf := setAssoc valOf out0 outVid
 
       | "Flatten" =>
         if inps.size != 1 then throw s!"{ctx}: Flatten requires 1 input"
@@ -1382,8 +1951,8 @@ def decodeOnnxToHighGraph (model : OnnxModel) (opts : LowerOptions := {}) :
           let onnxAx := axInt.toNat
           if seen[onnxAx]! then throw s!"{ctx}: Slice duplicate axis {onnxAx}"
           seen := seen.set! onnxAx true
-          if rank == 3 && onnxAx != 2 then
-            throw s!"{ctx}: 3D Slice axis {axRaw} not supported (only last axis 2/-1 is supported on 3D [H,M,K])"
+          if rank == 3 && onnxAx != 2 && onnxAx != 0 then
+            throw s!"{ctx}: 3D Slice axis {axRaw} not supported (only axis 0 or last axis 2/-1 is supported on 3D [H,M,K])"
           let stInt := steps[i]!
           if stInt <= 0 then throw s!"{ctx}: Slice step {stInt} must be > 0"
           let dim : Int := (xTy.shape[onnxAx]! : Int)
@@ -1427,9 +1996,12 @@ def decodeOnnxToHighGraph (model : OnnxModel) (opts : LowerOptions := {}) :
 -- End-to-End ONNX -> L1 TensorIR -> L2 AneIR -> L3 MachineIR -> L4 SyncAndEmit
 -- ============================================================================
 
-/-- Lower a decoded `OnnxModel` through `SSAGraph HighOp` → `runStandardPipeline` → `SSAGraph CoreOp`
-    → L2 `AneProgram` (plus backwards-compatible `GraphSpec` for single-output models) and `LowerSummary`. -/
-def lowerOnnx (model : OnnxModel) (opts : LowerOptions := {}) : Except String LowerResult := do
+/-- Internal lowering driver: when `requireCompatSpec = true`, single-output models must also
+    lower cleanly to legacy `GraphSpec` (`lowerOnnx` compatibility); when `false` (`compileOnnx`),
+    models using L2-only capabilities (constant materialization, scratch transpose, multi-output)
+    compile directly through `AneProgram` (L2 -> L3 -> L4). -/
+private def lowerOnnxInternal (model : OnnxModel) (opts : LowerOptions := {})
+    (requireCompatSpec : Bool := true) : Except String LowerResult := do
   let (highGraph, decodeElided, sfUsed) ← decodeOnnxToHighGraph model opts
   let pipeCfg : PassConfig := {
     enableFusion := !opts.noFuse
@@ -1461,25 +2033,36 @@ def lowerOnnx (model : OnnxModel) (opts : LowerOptions := {}) : Except String Lo
     outShapes4D := outShapes4D.push oSh4
 
   -- Build backwards-compatible `GraphSpec` for single-output models (`--emit-graph-dir` & legacy tests);
-  -- multi-output models compile directly through `aneProgram` (L2 -> L3 -> L4).
-  let (compatSpec, compatInputs, primaryOutId) ←
+  -- multi-output models (and L2-only features such as constant materialization or scratch transpose)
+  -- compile directly through `aneProgram` (L2 -> L3 -> L4).
+  let mkAneCompatSpec := fun () =>
+    let gInps : Array GraphInput := aneProg.graph.inputs.map fun (_, nm, ty) =>
+      let sh := (tensorTypeToShape4D ty nm).toOption.getD { n := 1, c := 1, h := 1, w := 1 }
+      { name := nm, shape := shape4DToDims sh }
+    let dummySpec : GraphSpec := {
+      target := opts.target
+      inputs := gInps
+      nodes := #[]
+      defaultPlacement := opts.placement
+      stripMode := opts.stripMode
+      outputs := outNames
+    }
+    (dummySpec, gInps, outNames[0]!)
+
+  let (compatSpec, compatInputs, primaryOutId, hasCompatSpec) ←
     if pipeRes.coreGraph.outputs.size == 1 then
-      let bridged ← coreGraphToGraphSpec pipeRes.coreGraph opts.placement opts.stripMode opts.allowViewOps
-      pure (bridged.spec, bridged.spec.inputs, bridged.outputId)
+      if requireCompatSpec then
+        let bridged ← coreGraphToGraphSpec pipeRes.coreGraph opts.placement opts.stripMode opts.allowViewOps
+        pure (bridged.spec, bridged.spec.inputs, bridged.outputId, true)
+      else
+        match coreGraphToGraphSpec pipeRes.coreGraph opts.placement opts.stripMode opts.allowViewOps with
+        | .ok bridged => pure (bridged.spec, bridged.spec.inputs, bridged.outputId, true)
+        | .error _ =>
+          let (ds, gi, po) := mkAneCompatSpec ()
+          pure (ds, gi, po, false)
     else
-      let mut gInps : Array GraphInput := Array.mkEmpty aneProg.graph.inputs.size
-      for (_, nm, ty) in aneProg.graph.inputs do
-        let sh := (tensorTypeToShape4D ty nm).toOption.getD { n := 1, c := 1, h := 1, w := 1 }
-        gInps := gInps.push { name := nm, shape := shape4DToDims sh }
-      let dummySpec : GraphSpec := {
-        target := opts.target
-        inputs := gInps
-        nodes := #[]
-        defaultPlacement := opts.placement
-        stripMode := opts.stripMode
-        outputs := outNames
-      }
-      pure (dummySpec, gInps, outNames[0]!)
+      let (ds, gi, po) := mkAneCompatSpec ()
+      pure (ds, gi, po, false)
 
   let summary : LowerSummary := {
     target := opts.target
@@ -1490,7 +2073,7 @@ def lowerOnnx (model : OnnxModel) (opts : LowerOptions := {}) : Except String Lo
     outputs := outNames
     outputShapes := outShapes4D
     onnxNodeCount := model.graph.nodes.size
-    nodeCount := if pipeRes.coreGraph.outputs.size == 1 then compatSpec.nodes.size else aneProg.graph.nodes.size
+    nodeCount := if hasCompatSpec then compatSpec.nodes.size else aneProg.graph.nodes.size
     fusedBnCount := pipeRes.stats.fusedBnCount
     fusedActCount := pipeRes.stats.fusedActCount
     fusedMatmulCount := pipeRes.stats.fusedMatmulCount
@@ -1510,11 +2093,15 @@ def lowerOnnx (model : OnnxModel) (opts : LowerOptions := {}) : Except String Lo
     aneProgram := aneProg
   }
 
+/-- Lower an `OnnxModel` into `LowerResult` (including legacy `GraphSpec` for single-output models). -/
+def lowerOnnx (model : OnnxModel) (opts : LowerOptions := {}) : Except String LowerResult :=
+  lowerOnnxInternal model opts true
+
 /-- Lower an `OnnxModel` directly through L1 (`TensorIR`) → L2 (`AneIR` + SOK + rolling cascades) →
     L3 (`MachineIR` + `MemoryPlan`) → L4 (`SyncAndEmit`) into a verified HWX + 4 LOAD sections.
     Supports both single-output and multi-output (`1..3` outputs) ONNX models natively! -/
 def compileOnnx (model : OnnxModel) (opts : LowerOptions := {}) : Except String CompiledOnnx := do
-  let lowered ← lowerOnnx model opts
+  let lowered ← lowerOnnxInternal model opts false
   let (finalAne, cm) ← compileAneProgram lowered.aneProgram opts.stripMode
   let compiled := compiledMachineToGraph cm (some finalAne)
   pure {
@@ -1572,6 +2159,8 @@ private def convActFields (act : ConvActivation) : List (String × Json) :=
 def emitGraphDir (outDir : System.FilePath) (res : LowerResult) : IO (Except String Unit) := do
   if res.summary.outputs.size > 1 then
     return .error "emitGraphDir does not yet support multi-output ONNX models"
+  if res.spec.nodes.isEmpty && !res.aneProgram.graph.nodes.isEmpty then
+    return .error "emitGraphDir does not support models requiring L2 constant materialization or scratch transpose"
   try
     IO.FS.createDirAll outDir
   catch e =>
