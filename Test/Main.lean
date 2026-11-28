@@ -10830,8 +10830,82 @@ def runC4Tests : IO (Array TestResult) := do
 
 end C4Tests
 
+namespace C5aTests
+
+open Vane.IR
+open Vane.Ane
+open Vane.Backend.LayoutSelect
+
+def runC5aTests : IO (Array TestResult) := do
+  let mut results : Array TestResult := #[]
+
+  -- Nit 1 regression: CoreFuse must NOT fold 4D [0,3,2,1] transpose into MatMul when heads > 1
+  -- (4D [1, heads*K, 1, M] has C = heads*K != K, so a global C<->W transpose would mix heads),
+  -- while single-head 4D [1, K, 1, M] -> [1, M, 1, K] with B : [1, K, 1, N] still folds cleanly.
+  results := results.push (checkOk "c5a reg: CoreFuse guards 4D head-stacked [0,3,2,1] MatMul transpose fold" (do
+    let aHeadRaw : TensorType := { shape := #[1, 8, 1, 16], dtype := .fp16 }   -- pre-transpose [1, 8, 1, 16]
+    let aTrMulti : TensorType := { shape := #[1, 16, 1, 8], dtype := .fp16 }   -- heads=2, m=8, k=8 => [1, heads*m, 1, k]
+    let bMulti : TensorType := { shape := #[1, 16, 1, 4], dtype := .fp16 }     -- heads=2, k=8, n=4 => [1, heads*k, 1, n]
+    let outMulti : TensorType := { shape := #[1, 16, 1, 4], dtype := .fp16 }
+    let gMulti : SSAGraph CoreOp := {
+      target := .h17
+      inputs := #[(0, "a_raw", aHeadRaw), (1, "b", bMulti)]
+      nodes := #[
+        { name := "trA", op := .transpose #[0, 3, 2, 1], inputs := #[0], outputs := #[(2, aTrMulti)] },
+        { name := "mm", op := .matmul false false f16PosOne, inputs := #[2, 1], outputs := #[(3, outMulti)] }
+      ]
+      outputs := #[3]
+    }
+    let (_, _, multiCnt) ← coreFuse gMulti
+    if multiCnt != 0 then
+      throw s!"expected 0 fused matmuls on multi-head 4D [1,16,1,8] x [1,16,1,4], got {multiCnt}"
+
+    let aSingleRaw : TensorType := { shape := #[1, 8, 1, 4], dtype := .fp16 }  -- [1, K=8, 1, M=4]
+    let aSingleTr : TensorType := { shape := #[1, 4, 1, 8], dtype := .fp16 }   -- [1, M=4, 1, K=8]
+    let bSingle : TensorType := { shape := #[1, 8, 1, 6], dtype := .fp16 }     -- [1, K=8, 1, N=6]
+    let outSingle : TensorType := { shape := #[1, 4, 1, 6], dtype := .fp16 }
+    let gSingle : SSAGraph CoreOp := {
+      target := .h17
+      inputs := #[(0, "a_raw", aSingleRaw), (1, "b", bSingle)]
+      nodes := #[
+        { name := "trA", op := .transpose #[0, 3, 2, 1], inputs := #[0], outputs := #[(2, aSingleTr)] },
+        { name := "mm", op := .matmul false false f16PosOne, inputs := #[2, 1], outputs := #[(3, outSingle)] }
+      ]
+      outputs := #[3]
+    }
+    let (_, _, singleCnt) ← coreFuse gSingle
+    if singleCnt != 1 then
+      throw s!"expected 1 fused matmul on single-head 4D [1,4,1,8] x [1,8,1,6], got {singleCnt}"
+  ))
+
+  -- Blocker 1 regression: LayoutSelect sets batchN = heads on matmul_join when heads > 1 and m > 16
+  results := results.push (checkOk "c5a reg: LayoutSelect sets batchN = heads on batched matmul_join (m > 16)" (do
+    let aTy : TensorType := { shape := #[4, 24, 16], dtype := .fp16 }
+    let bTy : TensorType := { shape := #[4, 16, 8], dtype := .fp16 }
+    let yTy : TensorType := { shape := #[4, 24, 8], dtype := .fp16 }
+    let gCore : SSAGraph CoreOp := {
+      target := .h17
+      inputs := #[(0, "a", aTy), (1, "b", bTy)]
+      nodes := #[
+        { name := "mm", op := .matmul false false f16PosOne, inputs := #[0, 1], outputs := #[(2, yTy)] }
+      ]
+      outputs := #[2]
+    }
+    let prog ← lowerCoreToAne gCore
+    let joins := prog.graph.nodes.filter fun nd =>
+      match nd.op with
+      | .dmaView desc lbl => lbl == "matmul_join" && desc.concatAxis? == some 1 && desc.batchN == 4
+      | _ => false
+    if joins.size != 1 then
+      throw s!"expected 1 matmul_join dmaView with concatAxis?=some 1 and batchN=4, got {joins.size}"
+  ))
+
+  pure results
+
+end C5aTests
+
 def main : IO UInt32 := do
-  let results := (← runAllTests) ++ (← runM4Tests) ++ (← runM5aTests) ++ (← runM5bTests) ++ (← runM5cTests) ++ (← runM5dTests) ++ (← runM7bTests) ++ (← runM8aTests) ++ (← C1Tests.runC1Tests) ++ (← C2Tests.runC2Tests) ++ (← C4Tests.runC4Tests) ++ (← runTargetMatrixTests)
+  let results := (← runAllTests) ++ (← runM4Tests) ++ (← runM5aTests) ++ (← runM5bTests) ++ (← runM5cTests) ++ (← runM5dTests) ++ (← runM7bTests) ++ (← runM8aTests) ++ (← C1Tests.runC1Tests) ++ (← C2Tests.runC2Tests) ++ (← C4Tests.runC4Tests) ++ (← C5aTests.runC5aTests) ++ (← runTargetMatrixTests)
   let mut passed := 0
   let mut failed := 0
   for r in results do

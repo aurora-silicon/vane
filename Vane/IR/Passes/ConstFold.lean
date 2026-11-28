@@ -12,7 +12,7 @@ open Vane.Quant
 -- ============================================================================
 
 /-- Transpose an array of elements of logical shape `shape` according to valid `perm`. -/
-private def transposeFloatArray (shape : Array Nat) (perm : Array Nat) (vals : Array Float) :
+def transposeFloatArray (shape : Array Nat) (perm : Array Nat) (vals : Array Float) :
     Option (Array Float) := Id.run do
   let shList := shape.toList
   if !isValidPerm perm || perm.size != shList.length || !shList.all (· > 0) then
@@ -33,7 +33,7 @@ private def transposeFloatArray (shape : Array Nat) (perm : Array Nat) (vals : A
   return some out
 
 /-- Transpose raw fp16 little-endian bytes of logical shape `shape` according to valid `perm`. -/
-private def transposeFp16Bytes (shape : Array Nat) (perm : Array Nat) (bs : ByteArray) :
+def transposeFp16Bytes (shape : Array Nat) (perm : Array Nat) (bs : ByteArray) :
     Option ByteArray := Id.run do
   let shList := shape.toList
   if !isValidPerm perm || perm.size != shList.length || !shList.all (· > 0) then
@@ -55,7 +55,7 @@ private def transposeFp16Bytes (shape : Array Nat) (perm : Array Nat) (bs : Byte
     out := out.push lo |>.push hi
   return some out
 
-private def evalScalarUnary (op : ElemUnaryOp) (x : Float) : Option Float :=
+def evalScalarUnary (op : ElemUnaryOp) (x : Float) : Option Float :=
   let r? : Option Float := match op with
     | .abs => some (Float.abs x)
     | .neg => some (-x)
@@ -74,7 +74,7 @@ private def evalScalarUnary (op : ElemUnaryOp) (x : Float) : Option Float :=
   | some r => if r.isNaN || r.isInf then none else some r
   | none => none
 
-private def evalScalarBinary (op : ElemBinaryOp) (a b : Float) : Option Float :=
+def evalScalarBinary (op : ElemBinaryOp) (a b : Float) : Option Float :=
   let r? : Option Float := match op with
     | .add => some (a + b)
     | .sub => some (a - b)
@@ -88,7 +88,7 @@ private def evalScalarBinary (op : ElemBinaryOp) (a b : Float) : Option Float :=
 
 /-- Check whether every consumer of `deqId` is a quant-capable `conv` (as its weight input 1)
     and `deqId` is not a graph output. -/
-private def allConsumersQuantCapableConv {Op : Type} [HasCoreOps Op]
+def allConsumersQuantCapableConv {Op : Type} [HasCoreOps Op]
     (g : SSAGraph Op) (deqId : ValueId) : Bool :=
   if g.outputs.contains deqId then
     false

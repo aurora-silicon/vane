@@ -158,7 +158,7 @@ private def extractConvWeightF64 (st : ConvDecompState) (wId : ValueId) (kh kw :
       | throw s!"{ctx}: conv weight %{wId} must be float"
     pure (wTy, vals)
 
-private def intSign (x : Int) : Int :=
+def intSign (x : Int) : Int :=
   if x < 0 then -1 else if x > 0 then 1 else 0
 
 /-- Emit a single 1-pixel depthwise (or `Cin=1` dense) `3x3 stride=1 pad=same` shift node

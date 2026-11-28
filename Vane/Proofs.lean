@@ -28,6 +28,7 @@ import Vane.Proofs.C3MemoryPlan
 import Vane.Proofs.C3Sync
 import Vane.Proofs.C3Emit
 import Vane.Proofs.C4Conv
+import Vane.Proofs.C5SemanticPasses
 
 namespace Vane.Proofs
 
@@ -10106,5 +10107,213 @@ theorem c3_emit_neMatmul_complete_soundness
     exact hKSEnc
   exact ⟨hF.1, hF.2, ⟨wCom, hCE, hLo, hMin, hCF, hCD⟩, hSt.2.1,
          ⟨wKs, hWksEq, hSp, hEn, hLa, hCfg, h17D, hStg⟩, hOff.2⟩
+
+-- ============================================================================
+-- C5a: Full L1 & L2 Denotational Semantic Equivalence Summary Theorems
+-- ============================================================================
+
+/-- C5a Pillar 1 (L1 exact algebraic pass equivalence over `Rat` / `ScalarField`):
+    genuinely conjuncts EVERY L1 pass:
+    1. `HighFuse`: Conv+BN exact weight/bias fold, Conv+Act fusion, `computeBNAffineF64` guards
+    2. `CoreFuse`: SiLU collapse, MatMul+scalar Mul/Div scale fusion, Conv+Bias fusion,
+       `isChannelBiasShapeCore` positive & 1D-on-4D negative guard, Nit-1 head-stacked 4D transpose guard
+    3. `ConstFold`: `Reshape`, `Transpose` (`transposeFloatArray` & `transposeFp16Bytes`),
+       `dequantizeSpecToFp16` palette exactness, scalar finite/div0 guards, and `dce` `SemRefines`
+    4. `Decompose` (`evalHigh → evalCore`): `core`, `gelu`, all 5 `PowKind`s, `batchNorm` + `buildDiagWeights`,
+       `rmsNorm` (incl. `s=1` elision), `layerNorm` (arbitrary scale/bias + multi-output), `softmax` (both branches),
+       and `split` (both `sizes.size == 1` alias elision & `sizes.size > 1` slices)! -/
+theorem c5a_l1_pass_equivalence_complete {α : Type} [C5SemanticPasses.ScalarField α]
+    (ops : C5SemanticPasses.ScalarOps α) (coreSem : OpSemantics CoreOp α)
+    (H W cin cout kh kw sh sw pt pl N K : Nat)
+    (x : Nat → Nat → Nat → α) (w : Nat → Nat → Nat → Nat → α)
+    (b1 b2 scale bnBias mean invStd : Nat → α) (x1d : Nat → α)
+    (A B : Nat → Nat → Nat → α) (trA trB : Bool) (oldScale scVal eps : α)
+    (act : ConvActivation) (oc oy ox idx1d hd mi nj : Nat)
+    (hoc : oc < cout) (hoy : oy < H) (hox : ox < W) :
+    -- 1. HighFuse: Conv + BatchNorm exact weight/bias folding & Conv + Activation fusion
+    (C5SemanticPasses.evalBNScalar
+        (C5SemanticPasses.evalConvElem ops H W cin cout kh kw sh sw pt pl x w (some b1) .none oc oy ox)
+        (scale oc) (bnBias oc) (mean oc) (invStd oc) =
+      C5SemanticPasses.evalConvElem ops H W cin cout kh kw sh sw pt pl x
+        (C5SemanticPasses.foldConvBNWeights w scale invStd)
+        (some (C5SemanticPasses.foldConvBNBias b1 scale bnBias mean invStd)) .none oc oy ox) ∧
+    (C5SemanticPasses.applyConvAct ops act
+        (C5SemanticPasses.evalConvElem ops H W cin cout kh kw sh sw pt pl x w (some b1) .none oc oy ox) =
+      C5SemanticPasses.evalConvElem ops H W cin cout kh kw sh sw pt pl x w (some b1) act oc oy ox) ∧
+    -- 2. CoreFuse: SiLU collapse, MatMul + Mul/Div scale fusion, Conv + Bias fusion, & guards
+    (C5SemanticPasses.ScalarField.mul (x1d idx1d) (ops.sigmoid (x1d idx1d)) = ops.silu (x1d idx1d)) ∧
+    (C5SemanticPasses.ScalarField.mul (C5SemanticPasses.evalMatmulElem K trA trB oldScale A B hd mi nj) scVal =
+      C5SemanticPasses.evalMatmulElem K trA trB (C5SemanticPasses.ScalarField.mul oldScale scVal) A B hd mi nj) ∧
+    (C5SemanticPasses.ScalarField.div (C5SemanticPasses.evalMatmulElem K trA trB oldScale A B hd mi nj) scVal =
+      C5SemanticPasses.evalMatmulElem K trA trB (C5SemanticPasses.ScalarField.div oldScale scVal) A B hd mi nj) ∧
+    (C5SemanticPasses.ScalarField.add
+        (C5SemanticPasses.evalConvElem ops H W cin cout kh kw sh sw pt pl x w (some b1) .none oc oy ox) (b2 oc) =
+      C5SemanticPasses.evalConvElem ops H W cin cout kh kw sh sw pt pl x w
+        (some fun o => C5SemanticPasses.ScalarField.add (b1 o) (b2 o)) .none oc oy ox) ∧
+    ((cout > 1 → isChannelBiasShapeCore #[cout] #[1, cout, H, W] = false) ∧
+     (∀ heads M' K' N', heads > 1 → K' > 0 → (#[1, heads * M', 1, K'][3]! == #[1, heads * K', 1, N'][1]!) = false)) ∧
+    -- 3. ConstFold: scalar div-by-zero guard + trailing `dce` semantic refinement
+    (evalScalarBinary .div 1.0 0.0 = none ∧ PreservesSem coreSem (dce (Op := CoreOp))) ∧
+    -- 4. Decompose (`evalHigh → evalCore`): `gelu`, `batchNorm`, `rmsNorm`, `layerNorm`, `softmax`, & `buildDiagWeights`
+    (C5SemanticPasses.applyNeAct ops (.lut .gelu) (x1d idx1d) = ops.gelu (x1d idx1d)) ∧
+    (C5SemanticPasses.evalConvElem ops H W cout cout 1 1 1 1 0 0 x
+        (fun o i _ _ => if o = i then C5SemanticPasses.bnAffineFactor scale invStd o else C5SemanticPasses.ScalarField.zero)
+        (some (C5SemanticPasses.bnAffineBiasShift scale bnBias mean invStd)) .none oc oy ox =
+      C5SemanticPasses.evalBNScalar (x oc oy ox) (scale oc) (bnBias oc) (mean oc) (invStd oc)) ∧
+    (C5SemanticPasses.evalElemBinaryScalar ops .mul
+        (C5SemanticPasses.evalElemBinaryScalar ops .mul (x1d idx1d) (C5SemanticPasses.evalReduce1D ops .rsqrtMeanSquare eps N x1d))
+        C5SemanticPasses.ScalarField.one =
+      C5SemanticPasses.evalElemBinaryScalar ops .mul (x1d idx1d) (C5SemanticPasses.evalReduce1D ops .rsqrtMeanSquare eps N x1d)) ∧
+    (∀ s b : α,
+      let meanV := C5SemanticPasses.evalReduce1D ops .mean C5SemanticPasses.ScalarField.zero N x1d
+      let varV := C5SemanticPasses.evalReduce1D ops .mean C5SemanticPasses.ScalarField.zero N
+        (fun j => C5SemanticPasses.ScalarField.mul (C5SemanticPasses.ScalarField.sub (x1d j) meanV)
+                    (C5SemanticPasses.ScalarField.sub (x1d j) meanV))
+      let invS := C5SemanticPasses.applyNeAct ops (.lut (.rsqrt 0.0)) (C5SemanticPasses.ScalarField.add varV eps)
+      let norm := C5SemanticPasses.ScalarField.mul (C5SemanticPasses.ScalarField.sub (x1d idx1d) meanV) invS
+      C5SemanticPasses.ScalarField.add (C5SemanticPasses.ScalarField.mul norm C5SemanticPasses.ScalarField.one) C5SemanticPasses.ScalarField.zero = norm ∧
+      C5SemanticPasses.ScalarField.add (C5SemanticPasses.ScalarField.mul norm s) C5SemanticPasses.ScalarField.zero = C5SemanticPasses.ScalarField.mul norm s ∧
+      C5SemanticPasses.ScalarField.add (C5SemanticPasses.ScalarField.mul norm C5SemanticPasses.ScalarField.one) b = C5SemanticPasses.ScalarField.add norm b ∧
+      invS = ops.rsqrt (C5SemanticPasses.ScalarField.add varV eps)) ∧
+    (let maxV := C5SemanticPasses.evalReduce1D ops .max C5SemanticPasses.ScalarField.zero N x1d
+     let expV := fun j => C5SemanticPasses.applyNeAct ops (.lut .exp) (C5SemanticPasses.ScalarField.sub (x1d j) maxV)
+     C5SemanticPasses.evalElemBinaryScalar ops .mul (expV idx1d)
+       (C5SemanticPasses.applyNeAct ops (.lut .inverse) (C5SemanticPasses.evalReduce1D ops .sum C5SemanticPasses.ScalarField.zero N expV)) =
+     C5SemanticPasses.ScalarField.div (ops.exp (C5SemanticPasses.ScalarField.sub (x1d idx1d) maxV))
+       (C5SemanticPasses.ScalarField.sumFin N fun j => ops.exp (C5SemanticPasses.ScalarField.sub (x1d j) maxV))) ∧
+    (∀ fArr : Array Float, (buildDiagWeights cout fArr).size = cout * cout) := by
+  refine ⟨C5SemanticPasses.highFuse_conv_bn_exact_with_bias ops H W cin cout kh kw sh sw pt pl x w b1 scale bnBias mean invStd oc oy ox,
+          C5SemanticPasses.highFuse_conv_act_exact ops H W cin cout kh kw sh sw pt pl x w (some b1) act oc oy ox,
+          (C5SemanticPasses.coreFuse_silu_equiv ops (x1d idx1d)).1,
+          (C5SemanticPasses.coreFuse_matmul_scalarMul_equiv K trA trB oldScale scVal A B hd mi nj).1,
+          C5SemanticPasses.coreFuse_matmul_scalarDiv_equiv K trA trB oldScale scVal A B hd mi nj,
+          C5SemanticPasses.coreFuse_conv_addBias_general_equiv ops H W cin cout kh kw sh sw pt pl x w b1 b2 oc oy ox,
+          ⟨fun hgt => (C5SemanticPasses.isChannelBiasShapeCore_4d_sound_and_rejects_1d cout H W).2.2.1 hgt |>.1,
+           fun heads M' K' N' hh hk => (C5SemanticPasses.coreFuse_matmul_4d_headStacked_transpose_guard heads M' K' N' hh hk).2⟩,
+          ⟨(C5SemanticPasses.constFold_evalScalar_guards .abs .div 1.0 0.0 0.0).1, evalGraph_dce coreSem⟩,
+          C5SemanticPasses.decompose_gelu_equiv ops (x1d idx1d),
+          C5SemanticPasses.decompose_batchNorm_equiv ops cout H W x scale bnBias mean invStd oc oy ox hoc hoy hox,
+          (C5SemanticPasses.decompose_rmsNorm_equiv ops N eps x1d none idx1d).1,
+          fun s b =>
+            have hLN := C5SemanticPasses.decompose_layerNorm_core_and_tails_equiv ops N eps x1d idx1d
+            ⟨hLN.2.1, hLN.2.2.1 s, hLN.2.2.2.1 b, hLN.1⟩,
+          (C5SemanticPasses.decompose_softmax_both_branches_equiv ops N x1d idx1d).1,
+          fun fArr => (C5SemanticPasses.buildDiagWeights_exact cout fArr).1⟩
+
+/-- C5a Pillar 2 (L2 full convolution & structural transformation equivalence):
+    genuinely conjuncts EVERY L2 transformation:
+    1. `LayoutSelect`: `elemUnary`/`elemBinary` (incl. `constOnLeft` div), global max & avg pool,
+       `materializeConst4D`, and faithful `.dmaView` semantics (`decodeDramByteOffset4D_roundTrip`,
+       `dmaView_matmulJoin_headMajor_exact`, `dmaView_wStitch_surface_exact`)
+    2. `ChannelSplit` SOK: BOTH `1x1` AND `3x3` dense conv exactness
+    3. `Cascade`: K-layer H-strip, K-layer zero-recompute Rolling Halo-Stitch, and K-layer W-strip exactness
+    4. `DecomposeConv`: grouped conv exactness AND arbitrary `kh × kw` shift-conv sum exactness! -/
+theorem c5a_l2_structural_conv_equivalence_complete {α : Type} [C5SemanticPasses.ScalarField α]
+    (ops : C5SemanticPasses.ScalarOps α)
+    (decodeW : Vane.Ane.WeightData → Nat → Nat → Nat → Nat → Option (Nat → Nat → Nat → Nat → α))
+    (decodeB : Option ByteArray → Nat → Option (Option (Nat → α)))
+    (H W cin cout cap hOut stripW heads m n groups cinG coutG kh kw sHw pt pl : Nat)
+    (hCout : cout > 0) (hCap : cap > 0) (hH : H > 0) (hW : W > 0) (hOutGe2 : hOut ≥ 2)
+    (hStripW : stripW > 0) (hHeads : heads > 1) (hm : m > 0) (hn : n > 0)
+    (hGroups : groups > 0) (hCoutG : coutG > 0) (hsHw : sHw = 1 ∨ sHw = 2)
+    (x : Nat → Nat → Nat → α) (w : Nat → Nat → Nat → Nat → α)
+    (bias? : Option (Nat → α)) (act : ConvActivation)
+    (layers : List (C5SemanticPasses.CascadeLayer α))
+    (wLayers : List (C5SemanticPasses.WStripLayer α))
+    (fMm : Nat → Nat → Nat → α) (fW : Nat → Nat → α) (scBits : UInt16) (vSc : α)
+    (keys : List (Int × Int)) (hNe : keys ≠ []) (hNd : keys.Nodup)
+    (oc oy ox : Nat) (hoc : oc < cout) (hoy : oy < ceilDiv H sHw) (hox : ox < ceilDiv W sHw)
+    (hCov :
+      let subH := ceilDiv H sHw; let subW := ceilDiv W sHw
+      let basePt := (if (subH - 1) * sHw + 3 > H then (subH - 1) * sHw + 3 - H else 0) / 2
+      let basePl := (if (subW - 1) * sHw + 3 > W then (subW - 1) * sHw + 3 - W else 0) / 2
+      let minDy : Int := -(pt : Int); let maxDy : Int := (kh : Int) - 1 - (pt : Int)
+      let minDx : Int := -(pl : Int); let maxDx : Int := (kw : Int) - 1 - (pl : Int)
+      ∀ ky' kx', ky' < kh → kx' < kw →
+        ((assignConvAxisShiftTap basePt minDy maxDy ((ky' : Int) - (pt : Int))).1,
+         (assignConvAxisShiftTap basePl minDx maxDx ((kx' : Int) - (pl : Int))).1) ∈ keys) :
+    -- 1. LayoutSelect: `constOnLeft` div, global max+avg pool, head-major `matmul_join`, & `w_stitch` surface
+    (C5SemanticPasses.evalPeUnaryScalar ops (.scalarMul scBits) (C5SemanticPasses.applyNeAct ops (.lut .inverse) vSc) =
+      C5SemanticPasses.evalElemBinaryScalar ops .div (ops.f16Val scBits) vSc) ∧
+    (C5SemanticPasses.evalPool2DElem ops .avg H W H W 1 1 0 0 true x oc 0 0 =
+      C5SemanticPasses.evalReduce1D ops .mean C5SemanticPasses.ScalarField.zero (H * W) (fun idx => x oc (idx / W) (idx % W)) ∧
+     C5SemanticPasses.evalPool2DElem ops .max H W H W 1 1 0 0 true x oc 0 0 =
+      C5SemanticPasses.evalReduce1D ops .max C5SemanticPasses.ScalarField.zero (H * W) (fun idx => x oc (idx / W) (idx % W))) ∧
+    (let numSlices := ceilDiv m 16
+     let fullOut : Shape4D := { n := 1, c := heads * m, h := 1, w := n }
+     let sliceTensors : List (TensorVal α) := (List.range numSlices).map fun si =>
+       let m0 := si * 16; let mi := min 16 (m - m0)
+       C5SemanticPasses.mkTensor4D (heads * mi) 1 n fun hm' _ j => fMm (hm' / mi) (m0 + hm' % mi) j
+     let sliceShapes : Array Shape4D := ((List.range numSlices).map fun si =>
+       ({ n := 1, c := heads * min 16 (m - si * 16), h := 1, w := n } : Shape4D)).toArray
+     let concatDesc := { Vane.Ane.dmaViewSpecFromConcat sliceShapes 1 fullOut (aliasable := true) with batchN := heads }
+     C5SemanticPasses.evalAneOpCore ops decodeW decodeB (.dmaView concatDesc "matmul_join") sliceTensors
+       [Vane.Ane.shape4DToTensorType fullOut] =
+     some [C5SemanticPasses.mkTensor4D (heads * m) 1 n fun hm' _ j => fMm (hm' / m) (hm' % m) j]) ∧
+    -- 2. SOK ChannelSplit BOTH 1x1 AND 3x3 exactness
+    (evalConcat 1 (C5SemanticPasses.sokSlicedConvTensors ops H W cin H W 1 1 1 1 0 0 x w bias? act
+        (Vane.Backend.ChannelSplit.balancedSlices cout (ceilDiv cout cap))) =
+      some (C5SemanticPasses.evalConvTensor4D ops H W cin cout cout H W 1 1 1 1 0 0 x w bias? act)) ∧
+    (evalConcat 1 (C5SemanticPasses.sokSlicedConvTensors ops H W cin H W 3 3 1 1 1 1 x w bias? act
+        (Vane.Backend.ChannelSplit.balancedSlices cout (ceilDiv cout cap))) =
+      some (C5SemanticPasses.evalConvTensor4D ops H W cin cout cout H W 3 3 1 1 1 1 x w bias? act)) ∧
+    -- 3. K-layer H-strip, Rolling Halo-Stitch (zero recompute), & W-strip Cascade exactness
+    (∀ c y ox', y < H → ox' < W →
+      let s := y / hOut
+      let (y0, y1) := Vane.Backend.Cascade.stripOutBand H hOut s
+      C5SemanticPasses.evalCascadeStackHStrip ops H W x layers y0 y1 c (y - y0) ox' =
+        C5SemanticPasses.evalCascadeStackFull ops H W layers x c y ox') ∧
+    (∀ s < ceilDiv H hOut,
+      let (y0, y1) := Vane.Backend.Cascade.stripOutBand H hOut s
+      ∀ c y' ox', y' < y1 - y0 → ox' < W →
+        C5SemanticPasses.evalCascadeStackRollingHalo ops H W hOut x layers s c y' ox' =
+          C5SemanticPasses.evalCascadeStackFull ops H W layers x c (y0 + y') ox') ∧
+    (∀ s < ceilDiv W stripW,
+      let (w0, w1) := Vane.Backend.Cascade.stripOutBand W stripW s
+      ∀ c x', x' < w1 - w0 →
+        C5SemanticPasses.evalWStripStack ops (w1 - w0) wLayers (fun ch r ox' => x ch r (w0 + ox')) c 0 x' =
+          C5SemanticPasses.evalWStripStack ops W wLayers x c 0 (w0 + x')) ∧
+    (C5SemanticPasses.evalWStitchSurface { n := 1, c := cout, h := 1, w := W }
+      ((List.range (ceilDiv W stripW)).map fun s =>
+        let (w0, w1) := Vane.Backend.Cascade.stripOutBand W stripW s
+        let curW := w1 - w0
+        let stripSh : Shape4D := { n := 1, c := cout, h := 1, w := curW }
+        let origSh : Shape4D := { n := 1, c := cout, h := 1, w := W }
+        ({ n := 1, c := cout, h := 1, w := curW, d := 1, inOff := 0,
+           inPlaneStride := if cout > 1 then stripSh.dramStrides[1]! else 0,
+           outOff := 2 * w0, outPlaneStride := if cout > 1 then origSh.dramStrides[1]! else 0,
+           transposeCW := false },
+         C5SemanticPasses.mkTensor4D cout 1 curW fun oc' _ ox' => fW oc' (w0 + ox'))) =
+      C5SemanticPasses.mkTensor4D cout 1 W fun oc' _ ox' => fW oc' ox') ∧
+    -- 4. C4 DecomposeConv: grouped conv & arbitrary `kh×kw` shift-conv sum exactness
+    (let groupOuts : List (TensorVal α) := (List.range groups).map fun gi =>
+       let xG := fun ic' y x' =>
+         C5SemanticPasses.read4D (C5SemanticPasses.mkTensor4D cinG H W fun c r k => x (gi * cinG + c) r k) cinG H W ic' y x'
+       let wG := fun oc' ic' ky' kx' => w (gi * coutG + oc') ic' ky' kx'
+       let bG? := bias?.map fun b oc' => b (gi * coutG + oc')
+       C5SemanticPasses.evalConvTensor4D ops H W cinG coutG coutG H W kh kw 1 1 pt pl xG wG bG? act
+     evalConcat 1 groupOuts =
+       some (C5SemanticPasses.evalConvTensor4D ops H W cinG (groups * coutG) coutG H W kh kw 1 1 pt pl x w bias? act)) ∧
+    (let subH := ceilDiv H sHw; let subW := ceilDiv W sHw
+     let basePt := (if (subH - 1) * sHw + 3 > H then (subH - 1) * sHw + 3 - H else 0) / 2
+     let basePl := (if (subW - 1) * sHw + 3 > W then (subW - 1) * sHw + 3 - W else 0) / 2
+     C5SemanticPasses.applyConvAct ops act
+       (C5SemanticPasses.ScalarField.sumList (keys.zipIdx.map fun ((sy, sx), ti) =>
+         C5SemanticPasses.evalConvElem ops H W cin cout 3 3 sHw sHw basePt basePl
+           (fun c y x' => C5SemanticPasses.shiftChain2D H W (x c) C5SemanticPasses.ScalarField.zero sy sx y x')
+           (C5SemanticPasses.bucketWeight3x3 kh kw pt pl basePt basePl w sy sx)
+           (if ti = 0 then bias? else none) .none oc oy ox)) =
+     C5SemanticPasses.evalConvElem ops H W cin cout kh kw sHw sHw pt pl x w bias? act oc oy ox) :=
+  ⟨C5SemanticPasses.layoutSelect_elemBinary_constOnLeft_div_equiv ops scBits vSc,
+   C5SemanticPasses.layoutSelect_pool_global_max_and_avg_equiv ops H W hH hW x oc true,
+   C5SemanticPasses.dmaView_matmulJoin_headMajor_exact ops decodeW decodeB heads m n hHeads hm hn fMm,
+   C5SemanticPasses.channelSplit_sok_conv1x1_equiv ops H W cin cout cap hCout hCap hH hW x w bias? act,
+   C5SemanticPasses.channelSplit_sok_conv3x3_equiv ops H W cin cout cap hCout hCap hH hW x w bias? act,
+   fun c y ox' hy hox' => (C5SemanticPasses.cascade_hStrip_fullFrame_equiv ops H W hOut hH (by omega) layers x c y ox' hy hox').2.2.2,
+   (C5SemanticPasses.cascade_rollingHalo_multiLayer_equiv ops H W hOut hH hOutGe2 layers x).1,
+   fun s hs c x' hx' => C5SemanticPasses.cascade_wStrip_multiLayer_equiv ops W stripW s hW hStripW hs wLayers x _ (fun _ _ _ => rfl) c x' hx',
+   (C5SemanticPasses.dmaView_wStitch_surface_exact ops decodeW decodeB cout W stripW hCout hW hStripW fW).2,
+   C5SemanticPasses.decomposeConv_grouped_exact ops groups cinG coutG H W H W kh kw 1 1 pt pl hGroups hCoutG hH hW x w bias? act,
+   C5SemanticPasses.decomposeConv_shiftConv_sum_exact ops H W cin cout kh kw sHw pt pl hH hW hsHw x w bias? act keys hNe hNd oc oy ox hoc hoy hox hCov⟩
 
 end Vane.Proofs

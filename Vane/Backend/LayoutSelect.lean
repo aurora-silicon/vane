@@ -650,7 +650,7 @@ def lowerCoreToAne (g : SSAGraph CoreOp) (opts : LayoutSelectOptions := {}) :
             ndsC := n1; msC := m1; shMC := s1; nidC := id1
             sliceVids := sliceVids.push sv
             sliceShapes := sliceShapes.push slSh
-          let concatDesc := dmaViewSpecFromConcat sliceShapes 1 fullOut (aliasable := true)
+          let concatDesc := { dmaViewSpecFromConcat sliceShapes 1 fullOut (aliasable := true) with batchN := heads }
           let (v, n1, m1, s1, id1) := pushAneNode ndsC msC shMC nidC s!"{mmBase}_join" mmBase
             (.dmaView concatDesc "matmul_join") sliceVids fullOut
           pure (v, n1, m1, s1, id1, uC)
